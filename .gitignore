@@ -1,0 +1,39 @@
+# Dependencias
+node_modules/
+.pnpm-store/
+
+# Build web (Vite)
+dist/
+
+# Entorno
+.env
+.env.local
+.env.*.local
+
+# Android / Gradle
+.gradle/
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/capacitor-cordova-android-plugins/
+*.iml
+.idea/
+captures/
+*.jks
+*.keystore
+
+# APKs sueltos (los publicados viven en releases/)
+*.apk
+*.aab
+!releases/*.apk
+
+# Sistema / editor
+.DS_Store
+Thumbs.db
+*.log
+.vscode/*
+!.vscode/extensions.json
+
+# TypeScript
+*.tsbuildinfo

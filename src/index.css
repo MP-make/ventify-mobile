@@ -1,0 +1,33 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --brand-primary: #047857;
+  --safe-area-top: max(env(safe-area-inset-top, 0px), 32px);
+  --safe-area-bottom: max(env(safe-area-inset-bottom, 0px), 24px);
+}
+
+body {
+  touch-action: manipulation;
+  -webkit-user-select: none;
+  user-select: none;
+  background-color: #f5f5f5;
+  color: #171717;
+  margin: 0;
+  padding: 0;
+}
+
+input, textarea {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* Safe area padding utilities */
+.pt-safe {
+  padding-top: calc(max(env(safe-area-inset-top, 0px), 32px) + 0.5rem);
+}
+
+.pb-safe {
+  padding-bottom: calc(max(env(safe-area-inset-bottom, 0px), 24px) + 0.75rem);
+}

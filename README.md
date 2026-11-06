@@ -128,6 +128,9 @@ de consulta para portar funcionalidades a la app Vite/Capacitor.
   (y `capacitor.config.ts` apunta a `dist`).
 - Se agregó la animación `shake` faltante (usada en el modal de PIN) al
   `tailwind.config.js`.
+- Se quitó de `android/build.gradle` el bloque `subprojects { compileOptions 17 }`:
+  los plugins de Capacitor 8 exigen Java 21 + `jvmToolchain(21)` y el override a 17
+  rompía el build (`Inconsistent JVM-target compatibility`).
 - Versiones de Capacitor: `@capacitor/core` y `@capacitor/android` **8.6.0**,
   `@capacitor/cli` **7.x**. Es la combinación con la que se generó y compiló el
   proyecto Android actual; si se sube el CLI a 8 conviene regenerar `android/` con

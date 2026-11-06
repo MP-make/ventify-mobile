@@ -30,18 +30,9 @@ allprojects {
     }
 }
 
-subprojects {
-    afterEvaluate { project ->
-        if (project.hasProperty('android')) {
-            project.android {
-                compileOptions {
-                    sourceCompatibility JavaVersion.VERSION_17
-                    targetCompatibility JavaVersion.VERSION_17
-                }
-            }
-        }
-    }
-}
+// NOTA: no forzar compileOptions aquí. Los plugins de Capacitor 8 fijan
+// Java 21 + jvmToolchain(21); sobreescribirlos a 17 rompe el build con
+// "Inconsistent JVM-target compatibility".
 
 task clean(type: Delete) {
     delete rootProject.buildDir

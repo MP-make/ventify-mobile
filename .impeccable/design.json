@@ -1,0 +1,156 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-10T20:41:54Z",
+  "title": "Design System: Ventify Mobile",
+  "extensions": {
+    "colorMeta": {
+      "neutral-paper": {
+        "role": "neutral",
+        "displayName": "Cool Paper",
+        "canonical": "#F5F7FB"
+      },
+      "surface-white": {
+        "role": "neutral",
+        "displayName": "White Surface",
+        "canonical": "#FFFFFF"
+      },
+      "surface-muted": {
+        "role": "neutral",
+        "displayName": "Muted Surface",
+        "canonical": "#F0F3F9"
+      },
+      "ink-navy": {
+        "role": "neutral",
+        "displayName": "Navy Ink",
+        "canonical": "#17243D"
+      },
+      "text-secondary": {
+        "role": "neutral",
+        "displayName": "Secondary Ink",
+        "canonical": "#596981"
+      },
+      "text-muted": {
+        "role": "neutral",
+        "displayName": "Muted Ink",
+        "canonical": "#65748B"
+      },
+      "border-soft": {
+        "role": "neutral",
+        "displayName": "Soft Border",
+        "canonical": "#DFE6F0"
+      },
+      "brand-blue": {
+        "role": "primary",
+        "displayName": "Ventify Action Blue",
+        "canonical": "#315BE8"
+      },
+      "brand-blue-soft": {
+        "role": "primary",
+        "displayName": "Soft Action Blue",
+        "canonical": "#EAF0FF"
+      },
+      "brand-violet": {
+        "role": "secondary",
+        "displayName": "Graph Violet",
+        "canonical": "#7545D9"
+      },
+      "brand-violet-soft": {
+        "role": "secondary",
+        "displayName": "Soft Violet",
+        "canonical": "#F1ECFC"
+      },
+      "success": {
+        "role": "tertiary",
+        "displayName": "Success Green",
+        "canonical": "#087F5B"
+      },
+      "success-soft": {
+        "role": "tertiary",
+        "displayName": "Soft Success",
+        "canonical": "#E8F6EF"
+      },
+      "warning": {
+        "role": "tertiary",
+        "displayName": "Caution Amber",
+        "canonical": "#A65E09"
+      },
+      "warning-soft": {
+        "role": "tertiary",
+        "displayName": "Soft Caution",
+        "canonical": "#FFF4DE"
+      },
+      "danger": {
+        "role": "tertiary",
+        "displayName": "Alert Red",
+        "canonical": "#BF3545"
+      },
+      "danger-soft": {
+        "role": "tertiary",
+        "displayName": "Soft Alert",
+        "canonical": "#FFF0F1"
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Screen title",
+        "purpose": "Primary page identity."
+      },
+      "section": {
+        "displayName": "Section heading",
+        "purpose": "Names grouped task content."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Operational instructions and content."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Field, navigation, and compact metadata."
+      }
+    },
+    "breakpoints": [
+      {
+        "name": "tablet-navigation",
+        "value": "900px"
+      }
+    ]
+  },
+  "components": [],
+  "narrative": {
+    "northStar": "El espacio de trabajo Ventify",
+    "overview": "Ventify Mobile is a calm, recognizable workspace for retail tasks. Its light surfaces keep product, money, and status information easy to scan; the original Ventify cart-and-growth mark carries identity, while blue marks the next action and violet gives secondary information a distinct place. The visual language stays practical and native to a phone or tablet rather than turning operational screens into marketing pages.\n\nComposition follows the task: a clear screen title and useful context, a small number of grouped sections, and a visible next action. Cards are for genuinely grouped information such as a product, cash shift, or customer details; a flat layout with headings is preferred for navigation and settings. Real data and Spanish labels remain the product content.",
+    "keyCharacteristics": [
+      "Light operational canvas, white content surfaces, navy text, and precise Ventify blue actions.",
+      "Original logo asset and consistent brand shell across sign-in and operations.",
+      "Compact, task-first hierarchy that adapts from a bottom phone navigation to a left tablet rail.",
+      "Status color carries meaning; it does not replace the brand palette."
+    ],
+    "rules": [
+      {
+        "name": "The Semantic Color Rule",
+        "body": "Green, amber, and red communicate state; they are not alternate brand colors. Do not use the reserved dark palette for the general operational workspace; it remains available for camera and other specialized dark surfaces.",
+        "section": "colors"
+      },
+      {
+        "name": "The Readable Numbers Rule",
+        "body": "Monetary values and quantities take visual priority over metadata. Keep full currency context where shown and do not replace live values with illustrative claims.",
+        "section": "typography"
+      }
+    ],
+    "dos": [
+      "Do use the shared `ui` roles from `src/lib/theme.ts` for operational surfaces and brand actions.",
+      "Do pair the original logo with the established navy, blue, and violet identity.",
+      "Do make product name, price, stock, and the next action scannable before secondary metadata.",
+      "Do keep touch actions at least 48 px where the layout permits, and account for safe areas in fixed bars and sheets.",
+      "Do retain the compact pill form for filter and state chips while keeping primary actions and cards rectangular.",
+      "Do treat the listed PNG captures as Expo Web design references with sample data, not as native-emulator evidence."
+    ],
+    "donts": [
+      "Don't turn the overall operational workspace dark or make green the dominant brand/action color.",
+      "Don't replace the logo mark with an emoji, a generic store symbol, or an invented V.",
+      "Don't use decorative gradients, glows, heavy shadows, or repeated cards as the only way to organize a screen.",
+      "Don't invent sales, stock, savings, or performance claims in examples or empty states.",
+      "Don't claim native-device verification from Expo Web captures."
+    ]
+  }
+}

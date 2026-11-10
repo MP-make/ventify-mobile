@@ -1,351 +1,375 @@
 /**
- * Tipos del módulo de facturación electrónica (SUNAT / UBL 2.1)
- *
- * Este módulo implementa la emisión directa contra SUNAT (modelo de
- * proveedor tecnológico / emisor con sistema propio): el XML se genera,
- * firma y envía directamente al webservice de SUNAT sin intermediarios.
+ * SUNAT Electronic Invoicing (UBL 2.1) Types, Catalogs & Peruvian Fiscal Validators
+ * Complete fiscal declarations, Modulo 11 RUC validation, and tax breakdown
  */
 
-/** Tipos de documento (Catálogo 01 SUNAT) */
+// ============================================================================
+// 1. SUNAT UBL 2.1 CATALOGS
+// ============================================================================
+
+/** Catálogo 01: Tipo de Documento */
 export const DOCUMENT_TYPES = {
   FACTURA: '01',
   BOLETA: '03',
   NOTA_CREDITO: '07',
   NOTA_DEBITO: '08',
   GUIA_REMISION: '09',
-} as const
+  NOTA_VENTA: '80',
+} as const;
 
-export type DocumentType = (typeof DOCUMENT_TYPES)[keyof typeof DOCUMENT_TYPES]
+export type DocumentType =
+  | (typeof DOCUMENT_TYPES)[keyof typeof DOCUMENT_TYPES]
+  | 'nota_venta'
+  | 'boleta'
+  | 'factura'
+  | 'cotizacion';
 
-/** Códigos de documento de identidad (Catálogo 06 SUNAT) */
+/** Catálogo 06: Códigos de Tipo de Documento de Identidad */
 export const IDENTITY_TYPES = {
   RUC: '6',
   DNI: '1',
   CARNET_EXTRANJERIA: '4',
   PASAPORTE: '7',
   OTROS: '0',
-} as const
+} as const;
 
-export type IdentityType = (typeof IDENTITY_TYPES)[keyof typeof IDENTITY_TYPES]
+export type IdentityType = (typeof IDENTITY_TYPES)[keyof typeof IDENTITY_TYPES];
 
-/** Unidades de medida (Catálogo 03 SUNAT) */
+/** Catálogo 03: Códigos de Unidades de Medida */
 export const UNIT_CODES = {
-  NIU: 'NIU', // Unidad internacional de negocio (unidad)
-  KG: 'KGM',
-  G: 'GRM',
-  M: 'MTR',
-  M2: 'MTK',
-  M3: 'MTQ',
-  L: 'LTR',
-  ML: 'MLT',
-  CAJA: 'BX',
-  PAQUETE: 'PK',
-  DOCENA: 'DZN',
-  CIENTO: 'HUR',
-} as const
+  NIU: 'NIU', // Unidad
+  KG: 'KGM',  // Kilogramo
+  G: 'GRM',   // Gramo
+  M: 'MTR',   // Metro
+  M2: 'MTK',  // Metro cuadrado
+  M3: 'MTQ',  // Metro cúbico
+  L: 'LTR',   // Litro
+  ML: 'MLT',  // Mililitro
+  CAJA: 'BX', // Caja
+  PAQUETE: 'PK', // Paquete
+  DOCENA: 'DZN', // Docena
+} as const;
 
-export type UnitCode = (typeof UNIT_CODES)[keyof typeof UNIT_CODES]
+export type UnitCode = (typeof UNIT_CODES)[keyof typeof UNIT_CODES];
 
-/** Datos fiscales del emisor (quien factura) */
-export type InvoiceEmitterConfig = {
-  /** Número de RUC del emisor */
-  ruc: string
-  /** Razón social / nombre legal */
-  razonSocial: string
-  /** Nombre comercial (opcional) */
-  nombreComercial?: string
-  /** Dirección fiscal completa */
-  direccion: string
-  /** Código de ubigeo (6 dígitos, ej. 120103) */
-  ubigeo: string
-  /** Distrito (obligatorio para SUNAT) */
-  distrito: string
-  /** Provincia */
-  provincia: string
-  /** Departamento */
-  departamento: string
-  /** Código de país (SIEMPRE "PE") */
-  pais: string
+/** Catálogo 07: Códigos de Tipo de Afectación del IGV */
+export const TAX_EXEMPTION_CODES = {
+  GRAVADO_OPERACION_ONEROSA: '10',
+  GRAVADO_RETIRO_PREMIO: '11',
+  GRAVADO_RETIRO_DONACION: '12',
+  EXONERADO_OPERACION_ONEROSA: '20',
+  INAFECTO_OPERACION_ONEROSA: '30',
+  EXPORTACION: '40',
+} as const;
+
+export type TaxExemptionCode =
+  (typeof TAX_EXEMPTION_CODES)[keyof typeof TAX_EXEMPTION_CODES];
+
+// ============================================================================
+// 2. FISCAL DATA STRUCTURES
+// ============================================================================
+
+/** Datos fiscales del emisor */
+export interface InvoiceEmitterConfig {
+  ruc: string;
+  razonSocial: string;
+  nombreComercial?: string;
+  direccion: string;
+  ubigeo: string;
+  distrito: string;
+  provincia: string;
+  departamento: string;
+  pais: string;
 }
 
-/** Datos del cliente/adquirente (opcional para boleta) */
-export type InvoiceCustomer = {
-  /** Identidad: RUC (6), DNI (1), etc. */
-  identityType: IdentityType
-  /** Número de documento */
-  identityNumber: string
-  /** Nombre / razón social del adquirente */
-  name: string
-  /** Dirección (opcional para boleta) */
-  address?: string
-  /** Email (opcional) */
-  email?: string
-} | null
-
-/** Línea de detalle de un comprobante */
-export type InvoiceLine = {
-  /** Identificador de línea (1..n) */
-  lineId: number
-  /** Descripción del producto/servicio */
-  description: string
-  /** Código de producto (opcional) */
-  productCode?: string
-  /** Cantidad vendida */
-  quantity: number
-  /** Unidad de medida (catálogo 03) */
-  unitCode: UnitCode
-  /** Precio unitario SIN impuestos (base imponible por unidad) */
-  unitPrice: number
-  /** Precio unitario con IGV incluido (precio de venta al público) */
-  unitPriceInclTax: number
-  /** Base imponible de la línea */
-  lineBase: number
-  /** Impuesto (IGV) de la línea */
-  lineTax: number
-  /** Total de la línea (base + impuesto) */
-  lineTotal: number
-  /** Código de afectación del IGV (catálogo 07). 10 = gravado. */
-  taxExemptionCode?: string
-  /** Tasa de IGV aplicada en la línea (%) */
-  taxRate?: number
+/** Datos del cliente / adquirente */
+export interface InvoiceCustomer {
+  identityType: IdentityType;
+  identityNumber: string;
+  name: string;
+  address?: string;
+  email?: string;
 }
 
-/** Totales calculados del comprobante */
-export type InvoiceTotals = {
-  /** Suma de bases imponibles */
-  baseTotal: number
-  /** Suma de impuestos (IGV) */
-  taxTotal: number
-  /** Monto total (base + impuesto) */
-  total: number
-  /** Suma de descuentos a nivel global (opcional) */
-  globalDiscount?: number
+/** Línea de detalle de comprobante */
+export interface InvoiceLine {
+  lineId: number;
+  description: string;
+  productCode?: string;
+  quantity: number;
+  unitCode: UnitCode;
+  unitPrice: number;
+  unitPriceInclTax: number;
+  lineBase: number;
+  lineTax: number;
+  lineTotal: number;
+  taxExemptionCode?: TaxExemptionCode | string;
+  taxRate?: number;
 }
 
-/** Datos para construir el XML de un comprobante */
-export type InvoiceData = {
-  documentType: DocumentType
-  /** Serie-número completo (ej. "F001-00000123") */
-  documentNumber: string
-  /** Fecha de emisión (formato yyyy-MM-dd) */
-  issueDate: string
-  /** Hora de emisión (formato HH:mm:ss, opcional) */
-  issueTime?: string
-  /** Moneda (SUNAT: PEN) */
-  currency: string
-  /** Tipo de operación (Catálogo 51). Default: 0101 = venta interna */
-  operationType?: string
-  /** Forma de pago (Catálogo 59). Default: "Contado" (o "Credito") */
-  paymentMeans?: string
-  emitter: InvoiceEmitterConfig
-  customer: InvoiceCustomer
-  lines: InvoiceLine[]
-  totals: InvoiceTotals
-  /** Notas/observaciones opcionales (cbc:Note) */
-  notes?: string[]
-  /** Leyendas tributarias SUNAT (Catálogo 52, cbc:Note con languageLocaleID) */
-  legends?: Array<{ code: string; text: string }>
-  /** Para notas de crédito/débito: documento de referencia */
-  reference?: {
-    /** Tipo de documento referenciado (01/03) */
-    type: DocumentType
-    /** Serie-número del documento original */
-    number: string
-    /** Motivo de la nota (catálogo 09) */
-    reasonCode: string
-    /** Descripción del motivo */
-    reasonDescription: string
-  }
+/** Totales calculados de comprobante */
+export interface InvoiceTotals {
+  baseTotal: number;
+  taxTotal: number;
+  total: number;
+  globalDiscount?: number;
 }
 
-/** Resultado del CDR (constancia de recepción) */
-export type CdrResult = {
-  /** Código de respuesta SUNAT: 0 = aceptado */
-  responseCode: number
-  /** Descripción general (ej. "La Factura ... ha sido aceptada") */
-  description: string
-  /** Notas adicionales / errores por línea */
-  notes: string[]
-  /** Código de constancia (hash) */
-  cdrCode?: string
-  /** Fecha/hora del CDR */
-  responseDate?: string
-  responseTime?: string
+/** Datos para el XML / CDR */
+export interface CdrResult {
+  responseCode: number;
+  description: string;
+  notes: string[];
+  cdrCode?: string;
+  responseDate?: string;
+  responseTime?: string;
 }
 
-export const isCdrAccepted = (cdr: CdrResult): boolean => cdr.responseCode === 0
+/** Desglose tributario inmutable para impresión */
+export interface InvoiceReceiptAmounts {
+  taxed: number;
+  exempt: number;
+  unaffected: number;
+  igv: number;
+  otherTaxes?: number;
+  total: number;
+}
 
-/** Estado de un documento en Firestore */
+/** Estado del comprobante en el sistema */
 export const INVOICE_STATUS = {
   PENDING: 'pending',
   SENDING: 'sending',
   ACCEPTED: 'accepted',
   REJECTED: 'rejected',
   ERROR: 'error',
-} as const
+} as const;
 
-export type InvoiceStatus = (typeof INVOICE_STATUS)[keyof typeof INVOICE_STATUS]
+export type InvoiceStatus = (typeof INVOICE_STATUS)[keyof typeof INVOICE_STATUS];
 
-/** Configuración por sucursal (cada sucursal = serie propia) */
-export type EinvoiceBranchConfig = {
-  /** Series por tipo de documento (ej. '01': 'F032', '03': 'B032') */
-  series?: Partial<Record<DocumentType, string>>
-  /** Correlativos consumidos por serie de la sucursal */
-  correlatives?: Record<string, number>
-  /** Dirección de la sucursal (opcional; se usa en el comprobante) */
-  address?: string | null
-  /** Cajas adicionales de la misma sucursal, cada una con su propia serie SUNAT
-   * (la "caja 1" implícita usa series/correlatives de arriba). */
-  registers?: Record<string, {
-    name: string
-    series: Partial<Record<DocumentType, string>>
-    correlatives: Record<string, number>
-  }>
+/** Documento de comprobante emitido */
+export interface Einvoice {
+  id: string;
+  accountId: string;
+  saleId: string;
+  branchId?: string;
+  documentType: DocumentType;
+  documentNumber: string;
+  fileName: string;
+  status: InvoiceStatus;
+  cdr?: CdrResult;
+  xml?: string;
+  cdrB64?: string;
+  amount: number;
+  currency: string;
+  receiptAmounts?: InvoiceReceiptAmounts;
+  createdAt: number;
+  updatedAt: number;
+  attempts: number;
 }
 
-/** Configuración de facturación de una cuenta (documento einvoice-config) */
-export type EinvoiceConfig = {
-  accountId: string
-  /** true si la cuenta tiene facturación electrónica habilitada */
-  enabled: boolean
-  /** Ambiente de emisión: 'beta' (homologación) | 'produccion' */
-  environment: 'beta' | 'produccion'
-  /** Datos fiscales del emisor */
-  emitter: InvoiceEmitterConfig
-  /** Usuario SOL (ej. "20611526572FACTURA" o similar) */
-  solUser: string
-  /** Clave SOL */
-  solPassword: string
-  /** Certificado digital PEM (base64) */
-  certPem: string
-  /** Clave privada PEM (base64) */
-  keyPem: string
-  /** Tasa de IGV por defecto (%) */
-  taxRate: number
-  /** Código de afectación de IGV por defecto (Catálogo 07: '10' Gravado, '20' Exonerado) */
-  taxExemptionCode?: string
-  /** true si el emisor opera en la Amazonía y está exonerado de IGV (Ley 27037) */
-  isAmazonExempt?: boolean
-  /** Serie configurada por tipo de documento */
-  series: Partial<Record<DocumentType, string>>
-  /** Correlativos consumidos por serie */
-  correlatives: Record<string, number>
-  /** Configuración por sucursal (serie y correlativo propios) */
-  branches?: Record<string, EinvoiceBranchConfig>
-  /** N.° de resolución SUNAT que autoriza el formato impreso del comprobante
-   * (ej. "0180050000781"), fijo para todo el RUC. Se imprime como
-   * "Autorizado mediante resolución Nro. {n}/SUNAT". */
-  printedFormatResolution?: string
-  updatedAt?: number
+// ============================================================================
+// 3. PERUVIAN FISCAL VALIDATORS (DNI & SUNAT MODULO 11 RUC)
+// ============================================================================
+
+/**
+ * Validador de DNI peruano: exactamente 8 dígitos numéricos
+ */
+export function isValidDNI(dni: string | undefined | null): boolean {
+  if (!dni) return false;
+  const clean = dni.trim();
+  return /^\d{8}$/.test(clean);
 }
 
-/** Datos de una guía de remisión electrónica (09) */
-export type DespatchLine = {
-  lineId: number
-  description: string
-  productCode?: string
-  quantity: number
-  unitCode: UnitCode
-}
+/**
+ * Validador oficial de RUC de SUNAT utilizando el algoritmo Módulo 11.
+ * 
+ * Reglas:
+ * 1. 11 dígitos numéricos.
+ * 2. Prefijos válidos: 10, 15, 16, 17 (persona natural), 20 (persona jurídica).
+ * 3. Factores de ponderación: [5, 4, 3, 2, 7, 6, 5, 4, 3, 2] para los primeros 10 dígitos.
+ * 4. Suma = suma(dígito[i] * factor[i]).
+ * 5. Dígito verificador = 11 - (Suma % 11).
+ *    Si el resultado es 10 -> 0.
+ *    Si el resultado es 11 -> 1.
+ * 6. Debe coincidir exactamente con el 11.° dígito.
+ */
+export function isValidRUC(ruc: string | undefined | null): boolean {
+  if (!ruc) return false;
+  const clean = ruc.trim();
+  if (!/^\d{11}$/.test(clean)) return false;
 
-export type DespatchData = {
-  /** Serie-número completo (ej. "T001-00000001") */
-  documentNumber: string
-  /** Fecha de emisión (yyyy-MM-dd) */
-  issueDate: string
-  /** Hora de emisión (HH:mm:ss) */
-  issueTime?: string
-  /** Motivo de traslado (Catálogo 20). 04 = entre establecimientos de la misma empresa */
-  reasonCode: string
-  /** Descripción del motivo (opcional) */
-  reasonDescription?: string
-  /** Modalidad de traslado (Catálogo 18). 01 = público, 02 = privado */
-  transportMode: string
-  /** Peso bruto total (KGM) */
-  grossWeight: number
-  emitter: InvoiceEmitterConfig
-  /** Sucursal/establecimiento de origen */
-  origin: {
-    name: string
-    address: string
-    ubigeo: string
-    distrito: string
-    provincia: string
-    departamento: string
+  // Validar prefijos válidos de SUNAT
+  const prefix = clean.substring(0, 2);
+  const validPrefixes = ['10', '15', '16', '17', '20'];
+  if (!validPrefixes.includes(prefix)) {
+    return false;
   }
-  /** Sucursal/establecimiento de destino */
-  destination: {
-    name: string
-    address: string
-    ubigeo: string
-    distrito: string
-    provincia: string
-    departamento: string
+
+  const weights = [5, 4, 3, 2, 7, 6, 5, 4, 3, 2];
+  let sum = 0;
+
+  for (let i = 0; i < 10; i++) {
+    sum += parseInt(clean[i], 10) * weights[i];
   }
-  lines: DespatchLine[]
-  notes?: string[]
+
+  const remainder = sum % 11;
+  let checkDigit = 11 - remainder;
+
+  if (checkDigit === 10) checkDigit = 0;
+  else if (checkDigit === 11) checkDigit = 1;
+
+  return checkDigit === parseInt(clean[10], 10);
 }
 
-/** Immutable monetary values extracted from the original fiscal XML for printing. */
-export type InvoiceReceiptAmounts = {
-  taxed: number
-  exempt: number
-  unaffected: number
-  igv: number
-  otherTaxes: number
-  total: number
+// ============================================================================
+// 4. TAX BREAKDOWN (OP. GRAVADA + IGV 18%)
+// ============================================================================
+
+export interface TaxTotalsResult {
+  opGravada: number;
+  igv: number;
+  total: number;
+  igvRate: number;
 }
 
-/** Documento de comprobante emitido (colección einvoices) */
-export type InvoiceCustomerSnapshot = NonNullable<InvoiceCustomer> & { identityType: '6' | '1' }
+/**
+ * Desglosa un total con IGV incluido (18%) en base imponible (opGravada),
+ * IGV y total redondeados a 2 decimales según los lineamientos de SUNAT.
+ */
+export function calculateTaxTotals(
+  totalWithIgv: number,
+  igvRate: number = 0.18
+): TaxTotalsResult {
+  const safeTotal = Math.max(0, Number(totalWithIgv) || 0);
+  const roundedTotal = Math.round(safeTotal * 100) / 100;
 
-export type InvoiceReceiptCustomer = Pick<NonNullable<InvoiceCustomer>, 'identityType' | 'identityNumber' | 'name' | 'address'>
+  // Base imponible = Total / (1 + igvRate)
+  const opGravada = Math.round((roundedTotal / (1 + igvRate)) * 100) / 100;
 
-export type Einvoice = {
-  customerSnapshot?: InvoiceCustomerSnapshot | null
-  receiptCustomer?: InvoiceReceiptCustomer
-  receiptIssuedAt?: number
-  replacesInvoiceId?: string
-  replacementCreditNoteId?: string
-  replacementId?: string
-  replacementClaimedAt?: number
-  einvoiceNoteId?: string
-  xmlRepair?: { version: 1; originalSha256: string; repairedAt: number }
+  // IGV = Total - Base imponible (asegura cuadre exacto de céntimos en ticket)
+  const igv = Math.round((roundedTotal - opGravada) * 100) / 100;
 
-  receiptAmounts?: InvoiceReceiptAmounts
-  id: string
-  accountId: string
-  saleId: string
-  /** Sucursal donde se emitió (para filtros por tienda) */
-  branchId?: string
-  documentType: DocumentType
-  /** Serie-número completo (ej. "F001-00000123") */
-  documentNumber: string
-  fileName: string
-  status: InvoiceStatus
-  cdr?: CdrResult
-  /** XML firmado (para auditoría / reenvío) */
-  xml?: string
-  /** CDR base64 (constancia original de SUNAT) */
-  cdrB64?: string
-  /** Para notas de crédito/débito: documento original referenciado */
-  reference?: {
-    type: DocumentType
-    number: string
-    reasonCode: string
-    reasonDescription: string
+  return {
+    opGravada,
+    igv,
+    total: roundedTotal,
+    igvRate,
+  };
+}
+
+// ============================================================================
+// 5. NUMBER TO SPANISH WORDS FOR PERUVIAN CURRENCY
+// ============================================================================
+
+const UNIDADES = [
+  '',
+  'UN',
+  'DOS',
+  'TRES',
+  'CUATRO',
+  'CINCO',
+  'SEIS',
+  'SIETE',
+  'OCHO',
+  'NUEVE',
+];
+
+const DIEZ_A_DIECINUEVE = [
+  'DIEZ',
+  'ONCE',
+  'DOCE',
+  'TRECE',
+  'CATORCE',
+  'QUINCE',
+  'DIECISEIS',
+  'DIECISIETE',
+  'DIECIOCHO',
+  'DIECINUEVE',
+];
+
+const DECENAS = [
+  '',
+  '',
+  'VEINTE',
+  'TREINTA',
+  'CUARENTA',
+  'CINCUENTA',
+  'SESENTA',
+  'SETENTA',
+  'OCHENTA',
+  'NOVENTA',
+];
+
+const CENTENAS = [
+  '',
+  'CIENTO',
+  'DOSCIENTOS',
+  'TRESCIENTOS',
+  'CUATROCIENTOS',
+  'QUINIENTOS',
+  'SEISCIENTOS',
+  'SETECIENTOS',
+  'OCHOCIENTOS',
+  'NOVECIENTOS',
+];
+
+function decenasATexto(n: number): string {
+  if (n < 10) return UNIDADES[n];
+  if (n < 20) return DIEZ_A_DIECINUEVE[n - 10];
+  if (n < 30) return n === 20 ? 'VEINTE' : `VEINTI${UNIDADES[n - 20]}`;
+  const d = Math.floor(n / 10);
+  const u = n % 10;
+  return u === 0 ? DECENAS[d] : `${DECENAS[d]} Y ${UNIDADES[u]}`;
+}
+
+function centenasATexto(n: number): string {
+  if (n === 0) return '';
+  if (n === 100) return 'CIEN';
+  const c = Math.floor(n / 100);
+  const resto = n % 100;
+  const partes: string[] = [];
+  if (c > 0) partes.push(CENTENAS[c]);
+  if (resto > 0) partes.push(decenasATexto(resto));
+  return partes.join(' ');
+}
+
+function enterosATexto(n: number): string {
+  if (n === 0) return 'CERO';
+  if (n === 1) return 'UN';
+
+  const millones = Math.floor(n / 1_000_000);
+  const miles = Math.floor((n % 1_000_000) / 1000);
+  const resto = n % 1000;
+
+  const partes: string[] = [];
+  if (millones > 0) {
+    partes.push(
+      millones === 1 ? 'UN MILLON' : `${centenasATexto(millones)} MILLONES`
+    );
   }
-  amount: number
-  currency: string
-  createdAt: number
-  updatedAt: number
-  /** Número de reintentos de envío */
-  attempts: number
-  /** Consultas/reintentos automáticos, independientes de los envíos. */
-  automaticRecoveryAttempts?: number
-  automaticRecoveryLastAttemptAt?: number
-  taxExemptionCode?: string
-  taxRate?: number
-  /** Error del último intento */
-  lastError?: string
+  if (miles > 0) {
+    partes.push(miles === 1 ? 'MIL' : `${centenasATexto(miles)} MIL`);
+  }
+  if (resto > 0) {
+    partes.push(centenasATexto(resto));
+  }
+  return partes.join(' ');
 }
+
+/**
+ * Convierte un importe monetario a su representación en letras según la normativa
+ * tributaria de SUNAT para comprobantes de pago peruanos.
+ * e.g. 120.50 -> "SON: CIENTO VEINTE CON 50/100 SOLES"
+ */
+export function numberToSpanishWordsPEN(amount: number): string {
+  const safeAmount = Math.max(0, Math.round(Number(amount || 0) * 100) / 100);
+  const entero = Math.floor(safeAmount);
+  const centavos = Math.round((safeAmount - entero) * 100);
+  const centavosStr = String(centavos).padStart(2, '0');
+
+  const textoEntero = enterosATexto(entero);
+  return `SON: ${textoEntero} CON ${centavosStr}/100 SOLES`;
+}
+
+/** Alias para compatibilidad con módulos existentes */
+export const amountToWordsSoles = numberToSpanishWordsPEN;

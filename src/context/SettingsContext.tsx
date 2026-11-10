@@ -1,102 +1,165 @@
-import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
-import { doc, onSnapshot, collection, query, where, getDoc, setDoc, serverTimestamp } from 'firebase/firestore';
-import { db } from '../firebase';
+import React, {
+  createContext,
+  useContext,
+  useState,
+  useEffect,
+  useCallback,
+  useMemo,
+} from 'react';
+import {
+  doc,
+  onSnapshot,
+  collection,
+  query,
+  where,
+  getDoc,
+  getDocs,
+  setDoc,
+  serverTimestamp,
+} from 'firebase/firestore';
+import NetInfo from '@react-native-community/netinfo';
+import { db } from '@/lib/firebase';
 import { useAuth } from './AuthContext';
+import {
+  Branch,
+  BusinessSettings,
+  PosSettings,
+  PosPaymentMethodConfig,
+  CashRegisterSession,
+} from '@/types';
+import {
+  processOfflineQueue,
+  getOfflineQueue,
+} from '@/services/offline-sync-service';
 
-export interface Branch {
-  id: string;
-  name: string;
-  address?: string;
-  phone?: string;
+declare module '@/types' {
+  interface BusinessSettings {
+    commercialAddress?: string;
+    commercialPhone?: string;
+  }
+  interface PosSettings {
+    ticketFooterMessage?: string;
+    digitalPhone?: string;
+    digitalName?: string;
+  }
 }
 
-export interface ActiveCashSessionData {
-  sessionId: string;
-  pointerId: string;
-  initialAmount: number;
+export interface ActiveCashSessionData extends Partial<CashRegisterSession> {
+  sessionId?: string;
+  pointerId?: string;
+  isOpen?: boolean;
   openedAt?: any;
-  branchId: string;
-  accountId: string;
+  openingBalance?: number;
+  totalIncome?: number;
+  totalExpenses?: number;
   cashSalesTotal?: number;
-  [key: string]: any;
 }
 
-export interface AccountPaymentMethod {
-  id: string;
-  name: string;
-  kind: 'cash' | 'digital' | 'card' | 'mixed' | 'credit';
-  enabled: boolean;
-  order: number;
-}
-
-export interface BusinessData {
-  businessName: string;
-  ruc?: string;
-  address?: string;
-  phone?: string;
-  email?: string;
-  description?: string;
-  website?: string;
-}
-
-export interface MobilePosSettings {
-  enableQuickSale: boolean;
-  defaultDocumentType: 'nota_venta' | 'boleta' | 'factura';
-  ticketFooterMessage: string;
-  showBusinessPhone: boolean;
-  showAddress: boolean;
-  showTaxId: boolean;
-  requireSellerSelection?: boolean;
-  allowMixedPayment?: boolean;
-}
-
-export const DEFAULT_POS_SETTINGS: MobilePosSettings = {
-  enableQuickSale: true,
-  defaultDocumentType: 'nota_venta',
-  ticketFooterMessage: '¡Gracias por su compra!',
-  showBusinessPhone: true,
-  showAddress: true,
-  showTaxId: true,
-  requireSellerSelection: false,
-  allowMixedPayment: true,
-};
-
-const DEFAULT_METHODS: AccountPaymentMethod[] = [
-  { id: 'efectivo', name: 'Efectivo', kind: 'cash', enabled: true, order: 0 },
-  { id: 'yape', name: 'Yape', kind: 'digital', enabled: true, order: 1 },
-  { id: 'plin', name: 'Plin', kind: 'digital', enabled: true, order: 2 },
-  { id: 'tarjeta', name: 'Tarjeta', kind: 'card', enabled: true, order: 3 },
-  { id: 'transferencia', name: 'Transferencia', kind: 'digital', enabled: true, order: 4 },
+export const DEFAULT_PAYMENT_METHODS: PosPaymentMethodConfig[] = [
+  {
+    id: 'efectivo',
+    name: 'Efectivo',
+    kind: 'cash',
+    enabled: true,
+    order: 0,
+    reportCategory: 'cash',
+  },
+  {
+    id: 'yape',
+    name: 'Yape',
+    kind: 'digital',
+    enabled: true,
+    order: 1,
+    provider: 'yape',
+    reportCategory: 'digital',
+  },
+  {
+    id: 'plin',
+    name: 'Plin',
+    kind: 'digital',
+    enabled: true,
+    order: 2,
+    provider: 'plin',
+    reportCategory: 'digital',
+  },
+  {
+    id: 'tarjeta',
+    name: 'Tarjeta',
+    kind: 'terminal',
+    enabled: true,
+    order: 3,
+    reportCategory: 'card',
+  },
+  {
+    id: 'transferencia',
+    name: 'Transferencia',
+    kind: 'digital',
+    enabled: true,
+    order: 4,
+    reportCategory: 'digital',
+  },
 ];
 
-interface SettingsContextType {
+export const DEFAULT_POS_SETTINGS: PosSettings = {
+  id: 'pos_default',
+  accountId: '',
+  methods: DEFAULT_PAYMENT_METHODS,
+  enableQuickSale: true,
+  allowMixedPayment: true,
+  requireSellerSelection: false,
+  ticketTemplate: 'standard',
+};
+
+export const DEFAULT_BUSINESS_SETTINGS: BusinessSettings = {
+  id: 'biz_default',
+  businessName: 'Ventify POS',
+  ruc: '',
+  address: '',
+  phone: '',
+  email: '',
+  accountId: '',
+};
+
+export interface SettingsContextType {
   primaryColor: string;
   businessName: string;
-  businessData: BusinessData;
+  businessSettings: BusinessSettings;
+  businessData: BusinessSettings; // Alias para compatibilidad con vistas legacy
+  posSettings: PosSettings;
   branches: Branch[];
   activeBranchName: string;
+  activeBranch: Branch | null;
   isCashOpen: boolean;
   activeCashSession: ActiveCashSessionData | null;
-  paymentMethods: AccountPaymentMethod[];
-  allPaymentMethods: AccountPaymentMethod[];
-  posSettings: MobilePosSettings;
-  updateBusinessData: (patch: Partial<BusinessData>) => Promise<void>;
-  updatePosSettings: (patch: Partial<MobilePosSettings>) => Promise<void>;
+  paymentMethods: PosPaymentMethodConfig[];
+  allPaymentMethods: PosPaymentMethodConfig[];
+  isOnline: boolean;
+  offlineQueueCount: number;
+  refreshOfflineCount: () => Promise<number>;
+  updateBusinessSettings: (patch: Partial<BusinessSettings>) => Promise<void>;
+  updateBusinessData: (patch: Partial<BusinessSettings>) => Promise<void>;
+  updatePosSettings: (patch: Partial<PosSettings>) => Promise<void>;
   togglePaymentMethod: (methodId: string, enabled: boolean) => Promise<void>;
   refreshCashStatus: () => void;
 }
 
 const SettingsContext = createContext<SettingsContextType>({
-  primaryColor: '#047857',
+  primaryColor: '#10B981',
   businessName: 'Ventify POS',
-  businessData: { businessName: 'Ventify POS' },
+  businessSettings: DEFAULT_BUSINESS_SETTINGS,
+  businessData: DEFAULT_BUSINESS_SETTINGS,
+  posSettings: DEFAULT_POS_SETTINGS,
   branches: [],
   activeBranchName: 'Tienda Principal',
+  activeBranch: null,
   isCashOpen: false,
   activeCashSession: null,
-  paymentMethods: DEFAULT_METHODS,
-  allPaymentMethods: DEFAULT_METHODS,
-  posSettings: DEFAULT_POS_SETTINGS,
+  paymentMethods: DEFAULT_PAYMENT_METHODS,
+  allPaymentMethods: DEFAULT_PAYMENT_METHODS,
+  isOnline: true,
+  offlineQueueCount: 0,
+  refreshOfflineCount: async () => 0,
+  updateBusinessSettings: async () => {},
   updateBusinessData: async () => {},
   updatePosSettings: async () => {},
   togglePaymentMethod: async () => {},
@@ -105,93 +168,170 @@ const SettingsContext = createContext<SettingsContextType>({
 
 export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const { accountId, branchId, setBranchId, user } = useAuth();
-  const [primaryColor, setPrimaryColor] = useState('#047857');
-  const [businessName, setBusinessName] = useState('Ventify POS');
-  const [businessData, setBusinessData] = useState<BusinessData>({ businessName: 'Ventify POS' });
-  const [branches, setBranches] = useState<Branch[]>([]);
-  const [isCashOpen, setIsCashOpen] = useState(false);
-  const [activeCashSession, setActiveCashSession] = useState<ActiveCashSessionData | null>(null);
-  const [allPaymentMethods, setAllPaymentMethods] = useState<AccountPaymentMethod[]>(DEFAULT_METHODS);
-  const [paymentMethods, setPaymentMethods] = useState<AccountPaymentMethod[]>(DEFAULT_METHODS);
-  const [posSettings, setPosSettings] = useState<MobilePosSettings>(DEFAULT_POS_SETTINGS);
 
-  // 1. Appearance & Business Name
+  const [primaryColor, setPrimaryColor] = useState<string>('#10B981');
+  const [businessSettings, setBusinessSettings] = useState<BusinessSettings>(DEFAULT_BUSINESS_SETTINGS);
+  const [posSettings, setPosSettings] = useState<PosSettings>(DEFAULT_POS_SETTINGS);
+  const [branches, setBranches] = useState<Branch[]>([]);
+  const [isCashOpen, setIsCashOpen] = useState<boolean>(false);
+  const [activeCashSession, setActiveCashSession] = useState<ActiveCashSessionData | null>(null);
+  const [allPaymentMethods, setAllPaymentMethods] = useState<PosPaymentMethodConfig[]>(DEFAULT_PAYMENT_METHODS);
+  const [isOnline, setIsOnline] = useState<boolean>(true);
+  const [offlineQueueCount, setOfflineQueueCount] = useState<number>(0);
+
+  // 1. Refrescar el contador de ventas offline en cola local
+  const refreshOfflineCount = useCallback(async (): Promise<number> => {
+    try {
+      const queue = await getOfflineQueue();
+      const count = queue.length;
+      setOfflineQueueCount(count);
+      return count;
+    } catch {
+      return 0;
+    }
+  }, []);
+
+  // 2. Monitoreo reactivo de conectividad de red con NetInfo
+  useEffect(() => {
+    let wasOffline = false;
+
+    // Estado inicial
+    NetInfo.fetch().then((state) => {
+      const online = Boolean(state.isConnected && state.isInternetReachable !== false);
+      setIsOnline(online);
+      refreshOfflineCount();
+    });
+
+    const unsubscribeNet = NetInfo.addEventListener((state) => {
+      const online = Boolean(state.isConnected && state.isInternetReachable !== false);
+      setIsOnline(online);
+
+      // Si se recupera la conexión, disparar la cola offline de inmediato
+      if (online && wasOffline) {
+        console.log('[SettingsContext] Red restablecida. Sincronizando cola offline...');
+        processOfflineQueue()
+          .then(() => {
+            refreshOfflineCount();
+          })
+          .catch((err) => {
+            console.warn('[SettingsContext] Error procesando cola offline al volver conexión:', err);
+          });
+      }
+
+      wasOffline = !online;
+      refreshOfflineCount();
+    });
+
+    return () => {
+      unsubscribeNet();
+    };
+  }, [refreshOfflineCount]);
+
+  // 3. Suscripción a ajustes del negocio y POS en Firestore (con carga inmediata RPC)
   useEffect(() => {
     if (!accountId) return;
 
-    // Appearance doc
+    // 3.1. Ajustes de apariencia
     const appearanceRef = doc(db, 'settings', `${accountId}_appearance`);
-    const unsubAppearance = onSnapshot(appearanceRef, (snap) => {
+    const applyAppearance = (snap: any) => {
       if (snap.exists()) {
         const data = snap.data();
-        const color = data.primaryColor || '#047857';
-        setPrimaryColor(color);
-        document.documentElement.style.setProperty('--brand-primary', color);
+        if (data.primaryColor) {
+          setPrimaryColor(data.primaryColor);
+        }
       }
-    }, (err) => console.warn('[SettingsContext] appearance error:', err));
+    };
+    getDoc(appearanceRef).then(applyAppearance).catch(() => {});
+    const unsubAppearance = onSnapshot(
+      appearanceRef,
+      applyAppearance,
+      (err) => console.warn('[SettingsContext] appearance snapshot error:', err)
+    );
 
-    // Business info doc
+    // 3.2. Información de negocio (RUC, razón social, dirección, teléfono, logo, series)
     const businessRef = doc(db, 'settings', `${accountId}_business`);
-    const unsubBusiness = onSnapshot(businessRef, (snap) => {
+    const applyBusiness = (snap: any) => {
       if (snap.exists()) {
         const data = snap.data();
-        if (data.businessName) setBusinessName(data.businessName);
-        setBusinessData({
-          businessName: data.businessName || 'Ventify POS',
+        setBusinessSettings({
+          id: snap.id,
+          accountId,
+          businessName: data.businessName || data.name || 'Ventify POS',
+          description: data.description || '',
           ruc: data.ruc || data.taxId || '',
           address: data.address || data.fiscalAddress || '',
-          phone: data.phone || '',
+          phone: data.phone || data.commercialPhone || '',
           email: data.email || '',
-          description: data.description || '',
           website: data.website || '',
+          enableFractionalUnits: data.enableFractionalUnits !== false,
+          enableMinSalePrice: data.enableMinSalePrice !== false,
+          createdAt: data.createdAt,
+          updatedAt: data.updatedAt,
+          ...data,
         });
       }
-    }, (err) => console.warn('[SettingsContext] business error:', err));
+    };
+    getDoc(businessRef).then(applyBusiness).catch(() => {});
+    const unsubBusiness = onSnapshot(
+      businessRef,
+      applyBusiness,
+      (err) => console.warn('[SettingsContext] business snapshot error:', err)
+    );
 
-    // POS Settings doc (Métodos de pago del negocio + Parámetros)
-    const posSettingsRef = doc(db, 'settings', `${accountId}_pos`);
-    const unsubPos = onSnapshot(posSettingsRef, (snap) => {
+    // 3.3. Configuración del POS (métodos de pago habilitados, Yape/Plin, pie de ticket, comprobante por defecto)
+    const posRef = doc(db, 'settings', `${accountId}_pos`);
+    const applyPos = (snap: any) => {
       if (snap.exists()) {
         const data = snap.data();
 
-        // Parámetros del POS
-        setPosSettings({
-          enableQuickSale: data.enableQuickSale !== false,
-          defaultDocumentType: data.defaultDocumentType || 'nota_venta',
-          ticketFooterMessage: data.ticketFooterMessage || '¡Gracias por su compra!',
-          showBusinessPhone: data.showBusinessPhone !== false,
-          showAddress: data.showAddress !== false,
-          showTaxId: data.showTaxId !== false,
-          requireSellerSelection: data.requireSellerSelection === true,
+        const loadedPosSettings: PosSettings = {
+          id: snap.id,
+          accountId,
+          methods: Array.isArray(data.methods) && data.methods.length > 0
+            ? data.methods
+            : DEFAULT_PAYMENT_METHODS,
           allowMixedPayment: data.allowMixedPayment !== false,
-        });
+          enableQuickSale: data.enableQuickSale !== false,
+          enableLinkedScanner: data.enableLinkedScanner === true,
+          enableDeviceCameraScanner: data.enableDeviceCameraScanner !== false,
+          enableCatalogFilters: data.enableCatalogFilters !== false,
+          enableMobileBarcodeScanner: data.enableMobileBarcodeScanner !== false,
+          enableSellerAttribution: data.enableSellerAttribution === true,
+          requireSellerSelection: data.requireSellerSelection === true,
+          defaultMethodId: data.defaultMethodId || 'efectivo',
+          ticketTemplate: data.ticketTemplate || 'standard',
+          ...data,
+        };
 
-        // Métodos de pago configurados
+        setPosSettings(loadedPosSettings);
+
         if (Array.isArray(data.methods) && data.methods.length > 0) {
-          const allList = data.methods
+          const formatted = data.methods
             .filter((m: any) => m.kind !== 'mixed')
             .sort((a: any, b: any) => (a.order || 0) - (b.order || 0))
-            .map((m: any) => ({
+            .map((m: any, idx: number) => ({
               id: m.id,
               name: m.name,
               kind: m.kind || 'digital',
               enabled: m.enabled !== false,
-              order: m.order || 0,
+              order: m.order ?? idx,
+              reportCategory: m.reportCategory || (m.kind === 'cash' ? 'cash' : 'digital'),
+              qrUrl: m.qrUrl,
+              qrLabel: m.qrLabel,
+              provider: m.provider,
             }));
-          setAllPaymentMethods(allList);
-
-          const enabledOnly = allList.filter((m) => m.enabled);
-          if (enabledOnly.length > 0) {
-            setPaymentMethods(enabledOnly);
-          } else {
-            setPaymentMethods(DEFAULT_METHODS);
-          }
+          setAllPaymentMethods(formatted);
         } else {
-          setAllPaymentMethods(DEFAULT_METHODS);
-          setPaymentMethods(DEFAULT_METHODS);
+          setAllPaymentMethods(DEFAULT_PAYMENT_METHODS);
         }
       }
-    }, (err) => console.warn('[SettingsContext] pos settings error:', err));
+    };
+    getDoc(posRef).then(applyPos).catch(() => {});
+    const unsubPos = onSnapshot(
+      posRef,
+      applyPos,
+      (err) => console.warn('[SettingsContext] pos snapshot error:', err)
+    );
 
     return () => {
       unsubAppearance();
@@ -200,204 +340,320 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     };
   }, [accountId]);
 
-  // 2. Branches & Auto-selection
+  // 4. Suscripción a sucursales de la cuenta (con carga inmediata RPC)
   useEffect(() => {
     if (!accountId) return;
-    const branchesQuery = query(collection(db, 'branches'), where('accountId', '==', accountId));
-    const unsub = onSnapshot(branchesQuery, (snap) => {
-      const list: Branch[] = snap.docs.map((d) => ({
-        id: d.id,
-        name: d.data().name || 'Sucursal',
-        address: d.data().address,
-        phone: d.data().phone,
-      }));
+
+    const branchesQ = query(
+      collection(db, 'branches'),
+      where('accountId', '==', accountId)
+    );
+
+    const applyBranchesSnap = (snap: any) => {
+      const list: Branch[] = snap.docs.map((d: any) => {
+        const data = d.data();
+        return {
+          id: d.id,
+          name: data.name || 'Sucursal',
+          address: data.address || data.commercialAddress || '',
+          phone: data.phone || '',
+          email: data.email || '',
+          accountId,
+          isActive: data.isActive !== false,
+          ruc: data.ruc,
+          commercialAddress: data.commercialAddress,
+          fiscalAddress: data.fiscalAddress,
+          receiptLogo: data.receiptLogo,
+          receiptFooter: data.receiptFooter,
+          ...data,
+        };
+      });
+
       setBranches(list);
 
-      // Si branchId sigue en 'main' o no coincide con ninguna sede existente,
-      // adoptar la primera sucursal real de la lista
       if (list.length > 0) {
         if (branchId === 'main' || !list.some((b) => b.id === branchId)) {
-          setBranchId(list[0].id);
+          setBranchId(list[0].id!);
         }
       }
-    }, (err) => console.warn('[SettingsContext] branches error:', err));
+    };
 
-    return () => unsub();
+    getDocs(branchesQ)
+      .then(applyBranchesSnap)
+      .catch((err) => console.warn('[SettingsContext] initial branches getDocs warning:', err));
+
+    const unsubBranches = onSnapshot(
+      branchesQ,
+      applyBranchesSnap,
+      (err) => console.warn('[SettingsContext] branches snapshot error:', err)
+    );
+
+    return () => unsubBranches();
   }, [accountId, branchId, setBranchId]);
 
-  // 3. Cash Session Status (Sincronización multi-sucursal y puntero de caja)
+  // 5. Suscripción en tiempo real al estado de la Caja (Caja Z y punteros activos)
   useEffect(() => {
     if (!accountId) return;
 
-    // Escuchar sesiones abiertas en cash_register_sessions (status == 'open')
-    const sessionsQuery = query(
+    let isSubscribed = true;
+
+    // Escuchar sesiones abiertas en cash_register_sessions
+    const sessionsQ = query(
       collection(db, 'cash_register_sessions'),
       where('accountId', '==', accountId),
       where('status', '==', 'open')
     );
 
-    const unsubSessions = onSnapshot(sessionsQuery, async (snap) => {
+    const handleSessionsSnapshot = async (snap: any) => {
+      if (!isSubscribed) return;
+
       if (!snap.empty) {
-        // 1. Buscar coincidencia por sucursal y usuario operador
-        let targetDoc = snap.docs.find((d) => {
+        // 1. Buscar coincidencia por sucursal y usuario
+        let target = snap.docs.find((d: any) => {
           const data = d.data();
           const matchesBranch = !branchId || branchId === 'main' || data.branchId === branchId;
           return matchesBranch && user?.uid && data.startedBy === user.uid;
         });
 
-        // 2. Buscar coincidencia por sucursal actual
-        if (!targetDoc) {
-          targetDoc = snap.docs.find((d) => {
-            const data = d.data();
-            return data.branchId === branchId;
+          // 2. Buscar por sucursal actual
+          if (!target) {
+            target = snap.docs.find((d: any) => {
+              const data = d.data();
+              return data.branchId === branchId;
+            });
+          }
+
+          // 3. Fallback: primera sesión abierta del negocio
+          if (!target) {
+            target = snap.docs[0];
+          }
+
+          const data = target.data();
+          const sId = target.id;
+
+          setIsCashOpen(true);
+          setActiveCashSession({
+            id: sId,
+            sessionId: sId,
+            branchId: data.branchId || branchId,
+            accountId,
+            status: 'open',
+            initialAmount: Number(data.initialAmount ?? 0),
+            openTime: Number(data.openTime ?? data.openedAt ?? Date.now()),
+            startedBy: data.startedBy,
+            startedByName: data.startedByName || user?.displayName || '',
+            cashSales: Number(data.cashSales ?? 0),
+            totalSales: Number(data.totalSales ?? 0),
+            expectedAmount: Number(data.expectedAmount ?? data.initialAmount ?? 0),
+            isOpen: true,
+            ...data,
           });
+          return;
         }
 
-        // 3. Fallback: primera sesión abierta del negocio (ej. Owner con acceso global)
-        if (!targetDoc) {
-          targetDoc = snap.docs[0];
-        }
+        // Si no hubo documentos directos abiertos, verificar punteros de sesión activa
+        // `active_${branchId}` o `active_${accountId}_${branchId}`
+        if (branchId && branchId !== 'main') {
+          try {
+            const possiblePointerIds = [
+              `active_${branchId}`,
+              `active_${accountId}_${branchId}`,
+              user?.uid ? `active_${accountId}_${branchId}_${user.uid}` : null,
+            ].filter(Boolean) as string[];
 
-        const data = targetDoc.data();
-        if (data.branchId && data.branchId !== 'main' && branchId === 'main') {
-          setBranchId(data.branchId);
-        }
+            for (const ptrId of possiblePointerIds) {
+              const ptrSnap = await getDoc(doc(db, 'cash_register_sessions', ptrId));
+              if (ptrSnap.exists()) {
+                const ptrData = ptrSnap.data();
+                const activeSessionId = ptrData.activeSessionId || ptrData.sessionId;
 
-        const sId = targetDoc.id;
-        setIsCashOpen(true);
-        setActiveCashSession({
-          sessionId: sId,
-          pointerId: `active_${accountId}_${data.branchId || branchId}_${data.startedBy || user?.uid || 'user'}`,
-          initialAmount: data.initialAmount ?? 0,
-          openedAt: data.openTime || data.openedAt || null,
-          branchId: data.branchId || branchId,
-          accountId,
-          startedByName: data.startedByName || '',
-          startedBy: data.startedBy || '',
-          cashSales: data.cashSales ?? 0,
-          expectedAmount: data.expectedAmount ?? data.initialAmount ?? 0,
-          ...data,
-        });
-        return;
-      }
-
-      // Si no hubo documentos directos con status 'open', revisar puntero multicaja activo
-      if (branchId) {
-        try {
-          const operatorPointer = user?.uid ? `active_${accountId}_${branchId}_${user.uid}` : null;
-          const branchPointer = `active_${accountId}_${branchId}`;
-          const pointerIdToUse = operatorPointer || branchPointer;
-
-          const pointerSnap = await getDoc(doc(db, 'cash_register_sessions', pointerIdToUse));
-          if (pointerSnap.exists()) {
-            const pData = pointerSnap.data();
-            const sId = pData.activeSessionId || pData.sessionId;
-            if (sId) {
-              const sessionSnap = await getDoc(doc(db, 'cash_register_sessions', sId));
-              if (sessionSnap.exists() && sessionSnap.data()?.status === 'open') {
-                const sData = sessionSnap.data();
-                setIsCashOpen(true);
-                setActiveCashSession({
-                  sessionId: sId,
-                  pointerId: pointerSnap.id,
-                  initialAmount: sData.initialAmount ?? pData.initialAmount ?? 0,
-                  openedAt: sData.openTime || sData.openedAt || null,
-                  branchId,
-                  accountId,
-                  startedByName: sData.startedByName || '',
-                  startedBy: sData.startedBy || '',
-                  cashSales: sData.cashSales ?? 0,
-                  expectedAmount: sData.expectedAmount ?? sData.initialAmount ?? 0,
-                  ...sData,
-                });
-                return;
+                if (activeSessionId) {
+                  const sessSnap = await getDoc(doc(db, 'cash_register_sessions', activeSessionId));
+                  if (sessSnap.exists() && sessSnap.data()?.status === 'open') {
+                    const sData = sessSnap.data();
+                    if (!isSubscribed) return;
+                    setIsCashOpen(true);
+                    setActiveCashSession({
+                      id: activeSessionId,
+                      sessionId: activeSessionId,
+                      pointerId: ptrId,
+                      branchId,
+                      accountId,
+                      status: 'open',
+                      initialAmount: Number(sData.initialAmount ?? ptrData.initialAmount ?? 0),
+                      openTime: Number(sData.openTime ?? Date.now()),
+                      startedBy: sData.startedBy,
+                      startedByName: sData.startedByName || '',
+                      cashSales: Number(sData.cashSales ?? 0),
+                      totalSales: Number(sData.totalSales ?? 0),
+                      expectedAmount: Number(sData.expectedAmount ?? 0),
+                      isOpen: true,
+                      ...sData,
+                    });
+                    return;
+                  }
+                }
               }
             }
+          } catch (ptrErr) {
+            console.warn('[SettingsContext] Error resolving active cash session pointer:', ptrErr);
           }
-        } catch (ptrErr) {
-          console.warn('[SettingsContext] pointer resolution error:', ptrErr);
+        }
+
+        if (isSubscribed) {
+          setIsCashOpen(false);
+          setActiveCashSession(null);
+        }
+    };
+
+    getDocs(sessionsQ).then(handleSessionsSnapshot).catch(() => {});
+
+    const unsubSessions = onSnapshot(
+      sessionsQ,
+      handleSessionsSnapshot,
+      (err) => {
+        console.warn('[SettingsContext] Cash sessions listener error:', err);
+        if (isSubscribed) {
+          setIsCashOpen(false);
+          setActiveCashSession(null);
         }
       }
-
-      setIsCashOpen(false);
-      setActiveCashSession(null);
-    }, (err) => {
-      console.warn('[SettingsContext] cash sessions query error:', err);
-      setIsCashOpen(false);
-      setActiveCashSession(null);
-    });
-
-    return () => unsubSessions();
-  }, [accountId, branchId, user?.uid, setBranchId]);
-
-  // Guardar datos del negocio
-  const updateBusinessData = useCallback(async (patch: Partial<BusinessData>) => {
-    if (!accountId) return;
-    const cleanPatch = Object.fromEntries(
-      Object.entries(patch).filter(([_, v]) => v !== undefined)
     );
-    await setDoc(doc(db, 'settings', `${accountId}_business`), {
-      ...cleanPatch,
-      updatedAt: serverTimestamp(),
-    }, { merge: true });
-  }, [accountId]);
 
-  // Guardar parámetros del POS
-  const updatePosSettings = useCallback(async (patch: Partial<MobilePosSettings>) => {
-    if (!accountId) return;
-    const cleanPatch = Object.fromEntries(
-      Object.entries(patch).filter(([_, v]) => v !== undefined)
-    );
-    await setDoc(doc(db, 'settings', `${accountId}_pos`), {
-      ...cleanPatch,
-      updatedAt: serverTimestamp(),
-    }, { merge: true });
-  }, [accountId]);
+    return () => {
+      isSubscribed = false;
+      unsubSessions();
+    };
+  }, [accountId, branchId, user?.uid, user?.displayName]);
 
-  // Activar o desactivar método de pago
-  const togglePaymentMethod = useCallback(async (methodId: string, enabled: boolean) => {
-    if (!accountId) return;
-    const updated = allPaymentMethods.map((m) =>
-      m.id === methodId ? { ...m, enabled } : m
-    );
-    setAllPaymentMethods(updated);
-    await setDoc(doc(db, 'settings', `${accountId}_pos`), {
-      methods: updated.map((m, idx) => ({
-        id: m.id,
-        name: m.name,
-        kind: m.kind,
-        enabled: m.enabled,
-        order: idx,
-      })),
-      updatedAt: serverTimestamp(),
-    }, { merge: true });
-  }, [accountId, allPaymentMethods]);
-
-  const activeBranchName =
-    branches.find((b) => b.id === branchId)?.name || 'Tienda Principal';
-
-  return (
-    <SettingsContext.Provider
-      value={{
-        primaryColor,
-        businessName,
-        businessData,
-        branches,
-        activeBranchName,
-        isCashOpen,
-        activeCashSession,
-        paymentMethods,
-        allPaymentMethods,
-        posSettings,
-        updateBusinessData,
-        updatePosSettings,
-        togglePaymentMethod,
-        refreshCashStatus: () => {},
-      }}
-    >
-      {children}
-    </SettingsContext.Provider>
+  // 6. Actualizar datos de configuración de empresa
+  const updateBusinessSettings = useCallback(
+    async (patch: Partial<BusinessSettings>) => {
+      if (!accountId) return;
+      const cleanPatch = Object.fromEntries(
+        Object.entries(patch).filter(([_, v]) => v !== undefined)
+      );
+      await setDoc(
+        doc(db, 'settings', `${accountId}_business`),
+        {
+          ...cleanPatch,
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+    },
+    [accountId]
   );
+
+  // 7. Actualizar parámetros y métodos del POS
+  const updatePosSettings = useCallback(
+    async (patch: Partial<PosSettings>) => {
+      if (!accountId) return;
+      const cleanPatch = Object.fromEntries(
+        Object.entries(patch).filter(([_, v]) => v !== undefined)
+      );
+      await setDoc(
+        doc(db, 'settings', `${accountId}_pos`),
+        {
+          ...cleanPatch,
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+    },
+    [accountId]
+  );
+
+  // 8. Activar o desactivar un método de pago
+  const togglePaymentMethod = useCallback(
+    async (methodId: string, enabled: boolean) => {
+      if (!accountId) return;
+      const updated = allPaymentMethods.map((m) =>
+        m.id === methodId ? { ...m, enabled } : m
+      );
+      setAllPaymentMethods(updated);
+
+      await setDoc(
+        doc(db, 'settings', `${accountId}_pos`),
+        {
+          methods: updated.map((m, idx) => ({
+            id: m.id,
+            name: m.name,
+            kind: m.kind,
+            enabled: m.enabled,
+            order: idx,
+            reportCategory: m.reportCategory,
+            provider: m.provider,
+            qrUrl: m.qrUrl,
+          })),
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+    },
+    [accountId, allPaymentMethods]
+  );
+
+  // Métodos de pago activos filtrados para la pantalla de cobro
+  const paymentMethods = useMemo(() => {
+    const enabledOnly = allPaymentMethods.filter((m) => m.enabled !== false);
+    return enabledOnly.length > 0 ? enabledOnly : DEFAULT_PAYMENT_METHODS;
+  }, [allPaymentMethods]);
+
+  const activeBranch = useMemo(
+    () => branches.find((b) => b.id === branchId) || null,
+    [branches, branchId]
+  );
+
+  const activeBranchName = useMemo(
+    () => activeBranch?.name || businessSettings.businessName || 'Tienda Principal',
+    [activeBranch, businessSettings.businessName]
+  );
+
+  const contextValue = useMemo(
+    () => ({
+      primaryColor,
+      businessName: businessSettings.businessName || 'Ventify POS',
+      businessSettings,
+      businessData: businessSettings,
+      posSettings,
+      branches,
+      activeBranchName,
+      activeBranch,
+      isCashOpen,
+      activeCashSession,
+      paymentMethods,
+      allPaymentMethods,
+      isOnline,
+      offlineQueueCount,
+      refreshOfflineCount,
+      updateBusinessSettings,
+      updateBusinessData: updateBusinessSettings,
+      updatePosSettings,
+      togglePaymentMethod,
+      refreshCashStatus: () => {},
+    }),
+    [
+      primaryColor,
+      businessSettings,
+      posSettings,
+      branches,
+      activeBranchName,
+      activeBranch,
+      isCashOpen,
+      activeCashSession,
+      paymentMethods,
+      allPaymentMethods,
+      isOnline,
+      offlineQueueCount,
+      refreshOfflineCount,
+      updateBusinessSettings,
+      updatePosSettings,
+      togglePaymentMethod,
+    ]
+  );
+
+  return <SettingsContext.Provider value={contextValue}>{children}</SettingsContext.Provider>;
 };
 
 export const useSettings = () => useContext(SettingsContext);

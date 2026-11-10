@@ -1,128 +1,109 @@
 /**
- * Generador de comandos ESC/POS para impresoras térmicas (80mm y 58mm).
- * Produce buffers binarios Uint8Array compatibles con Epson, Star, Xprinter, POS-80, Bixolon, etc.
+ * Ventify Mobile ESC/POS Thermal Receipt Builder & HTML Renderer
+ * Generates binary byte arrays for 58mm / 80mm Bluetooth/USB thermal printers,
+ * Base64 bridges, and print-ready HTML for expo-print (AirPrint / Android Print).
  */
 
+import {
+  Sale,
+  CashRegisterSession,
+  BusinessSettings,
+  Branch,
+  CartItem,
+} from '../../types';
+import {
+  calculateTaxTotals,
+  numberToSpanishWordsPEN,
+} from '../invoicing/types';
+import { formatPEN, formatDatePE } from '../theme';
+
+// ============================================================================
+// 1. CONFIGURATION & INTERFACES
+// ============================================================================
+
 export interface EscPosOptions {
-  paperWidth?: 80 | 58; // 80mm = ~48 caracteres por línea, 58mm = ~32 caracteres por línea
+  /** Paper width: 80mm = ~48 cols, 58mm = ~32 cols */
+  paperWidth?: 80 | 58;
+  /** Automatically trigger partial paper cut at the end */
   autoCut?: boolean;
+  /** Send electronic cash drawer kick pulse */
   openDrawer?: boolean;
+  /** Layout template style */
   ticketTemplate?: 'standard' | 'compact';
 }
 
-export interface ReceiptItem {
-  name: string;
-  quantity: number;
-  price: number;
-  total: number;
-  sku?: string;
-  unit?: string;
+export interface CashClosureData {
+  totalIncomes?: number;
+  totalExpenses?: number;
+  expectedAmount?: number;
+  countedAmount?: number;
+  difference?: number;
+  closedByName?: string;
+  notes?: string;
 }
 
-export interface EscPosReceiptData {
-  businessName?: string;
-  description?: string;
-  address?: string;
-  storeAddress?: string;
-  fiscalAddress?: string;
-  ruc?: string;
-  phone?: string;
-  email?: string;
-  sellerName?: string;
-  documentTitle: string; // 'FACTURA', 'BOLETA DE VENTA', 'NOTA DE PEDIDO'
-  documentNumber: string;
-  date: string;
-  time: string;
-  paymentMethod: string;
-  customerName?: string;
-  customerDocType?: string; // 'DNI' | 'RUC'
-  customerDocNumber?: string;
-  customerAddress?: string;
-  items: ReceiptItem[];
-  subtotal: number;
-  tax?: number;
-  fiscalAmounts?: import("../invoicing/types").InvoiceReceiptAmounts;
-  total: number;
-  amountInWords?: string;
-  cashReceived?: number;
-  changeGiven?: number;
-  depositInfo?: {
-    type: 'reservation' | 'order';
-    number: number;
-    originalTotal: number;
-    depositAmount: number;
-    remainingAmount: number;
-  };
-  footerNote?: string;
-  consultUrl?: string;
-  qrContent?: string;
-  isOfflinePending?: boolean;
-  isElectronicInvoice?: boolean;
-  ticketTemplate?: 'standard' | 'compact';
-  reference?: {
-    type?: string;
-    number?: string;
-    reasonCode?: string;
-    reasonDescription?: string;
-  };
-}
+// ============================================================================
+// 2. ESC/POS BINARY BUILDER CLASS
+// ============================================================================
 
 export class EscPosBuilder {
   private buffer: number[] = [];
-  private cols: number;
+  public readonly cols: number;
 
-  constructor(private options: EscPosOptions = {}) {
+  constructor(public readonly options: EscPosOptions = {}) {
     this.cols = options.paperWidth === 58 ? 32 : 48;
     this.init();
   }
 
-  /** Inicializar la impresora */
+  /** ESC @ - Initialize printer to default state */
   init(): this {
-    this.buffer.push(0x1b, 0x40); // ESC @
+    this.buffer.push(0x1b, 0x40);
     return this;
   }
 
-  /** Abrir cajón monedero (si está conectado) */
+  /** ESC p - Open cash drawer (pin 2 pulse 50ms) */
   openCashDrawer(): this {
-    this.buffer.push(0x1b, 0x70, 0x00, 0x19, 0xfa); // ESC p 0 25 250
+    this.buffer.push(0x1b, 0x70, 0x00, 0x19, 0xfa);
     return this;
   }
 
-  /** Alineación */
+  /** ESC a - Alignment (0: Left, 1: Center, 2: Right) */
   align(alignment: 'left' | 'center' | 'right'): this {
     const code = alignment === 'center' ? 0x01 : alignment === 'right' ? 0x02 : 0x00;
-    this.buffer.push(0x1b, 0x61, code); // ESC a n
+    this.buffer.push(0x1b, 0x61, code);
     return this;
   }
 
-  /** Negrita */
+  /** ESC E - Bold emphasis toggle */
   bold(enable: boolean = true): this {
-    this.buffer.push(0x1b, 0x45, enable ? 0x01 : 0x00); // ESC E n
+    this.buffer.push(0x1b, 0x45, enable ? 0x01 : 0x00);
     return this;
   }
 
-  /** Tamaño de texto */
+  /** GS ! - Text character sizing */
   size(mode: 'normal' | 'double-height' | 'double-width' | 'double'): this {
     let n = 0x00;
     if (mode === 'double-height') n = 0x01;
     else if (mode === 'double-width') n = 0x10;
     else if (mode === 'double') n = 0x11;
-    this.buffer.push(0x1d, 0x21, n); // GS ! n
+    this.buffer.push(0x1d, 0x21, n);
     return this;
   }
 
-  /** Normaliza texto en español para CP437/ASCII */
+  /** Strips diacritics and converts to printer-safe ASCII / CP437 */
   private sanitizeText(text: string): string {
+    if (!text) return '';
     return text
       .normalize('NFD')
-      .replace(/[\u0300-\u036f]/g, '') // Quitar tildes compuestas
-      .replace(/ñ/g, 'n')
-      .replace(/Ñ/g, 'N')
+      .replace(/[\u0300-\u036f]/g, '') // remove accent marks
+      .replace(/[ñ]/g, 'n')
+      .replace(/[Ñ]/g, 'N')
+      .replace(/[¿¡]/g, '')
       .replace(/•/g, '-')
-      .replace(/[^\x20-\x7E\n\r]/g, ''); // Solo caracteres ASCII imprimibles
+      .replace(/[^\x20-\x7E\n\r]/g, ''); // ASCII printable only
   }
 
-  /** Agregar texto plano */
+  /** Append raw sanitized text */
   text(str: string): this {
     const sanitized = this.sanitizeText(str);
     for (let i = 0; i < sanitized.length; i++) {
@@ -131,25 +112,25 @@ export class EscPosBuilder {
     return this;
   }
 
-  /** Agregar línea de texto con salto */
+  /** Append line with Line Feed (LF 0x0A) */
   line(str: string = ''): this {
     this.text(str);
-    this.buffer.push(0x0a); // LF
+    this.buffer.push(0x0a);
     return this;
   }
 
-  /** Salto de N líneas */
+  /** ESC d - Feed N lines */
   feed(lines: number = 1): this {
-    this.buffer.push(0x1b, 0x64, Math.max(1, lines)); // ESC d n
+    this.buffer.push(0x1b, 0x64, Math.max(1, lines));
     return this;
   }
 
-  /** Línea divisoria discontinua o sólida */
+  /** Print horizontal divider line */
   divider(char: string = '-'): this {
     return this.line(char.repeat(this.cols));
   }
 
-  /** Fila con dos columnas (etiqueta a la izquierda, valor a la derecha) */
+  /** Two columns justified: left label, right value */
   twoColumns(left: string, right: string): this {
     const cleanLeft = this.sanitizeText(left);
     const cleanRight = this.sanitizeText(right);
@@ -157,280 +138,517 @@ export class EscPosBuilder {
     return this.line(`${cleanLeft}${' '.repeat(spaceCount)}${cleanRight}`);
   }
 
-  /** Fila de producto con SKU, cantidad, unidad, precio y total en 2 líneas */
-  itemRow(name: string, qty: number, unitPrice: number, total: number, sku?: string, unit?: string): this {
-    const skuStr = (sku || '').trim().toUpperCase();
+  /** Three columns: quantity/sku, name, total */
+  itemRow(name: string, qty: number, unitPrice: number, total: number, unit?: string): this {
     const unitStr = (unit || 'UND').trim().toUpperCase();
-    const qtyUnitStr = `${qty} ${unitStr}`;
+    const qtyStr = `${qty} ${unitStr}`;
     const priceStr = unitPrice.toFixed(2);
-    const totalStr = total.toFixed(2);
+    const totalStr = `S/ ${total.toFixed(2)}`;
 
-    // Línea 1: SKU   CANT   PRECIO   TOTAL
-    if (skuStr) {
-      const line1 = `${skuStr.padEnd(12)} ${qtyUnitStr.padStart(10)} ${priceStr.padStart(8)} ${totalStr.padStart(10)}`;
-      this.line(line1);
-    } else {
-      const line1 = `${qtyUnitStr.padEnd(15)} ${priceStr.padStart(12)} ${totalStr.padStart(15)}`;
-      this.line(line1);
-    }
+    // Line 1: QTY x PRICE -> TOTAL
+    const leftPart = `${qtyStr} x ${priceStr}`;
+    const spaceCount = Math.max(1, this.cols - leftPart.length - totalStr.length);
+    this.line(`${leftPart}${' '.repeat(spaceCount)}${totalStr}`);
 
-    // Línea 2: Descripción completa
+    // Line 2: Product Name indented
     const cleanName = this.sanitizeText(name);
     this.line(`  ${cleanName}`);
     return this;
   }
 
-  /** Imprimir Código QR nativo ESC/POS */
-  qr(data: string, size: number = 5): this {
+  /** Native ESC/POS QR Code Model 2 */
+  qr(data: string, size: number = 4): this {
     const cleanData = this.sanitizeText(data);
     const len = cleanData.length + 3;
     const pL = len % 256;
     const pH = Math.floor(len / 256);
 
-    // 1. Modelo 2
+    // 1. Model 2
     this.buffer.push(0x1d, 0x28, 0x6b, 0x04, 0x00, 0x31, 0x41, 0x32, 0x00);
-    // 2. Tamaño del módulo (size: 1..16, típicamente 4..6)
-    this.buffer.push(0x1d, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x43, Math.min(10, Math.max(3, size)));
-    // 3. Nivel de corrección de errores (M = 49)
+    // 2. Module size (3..8)
+    this.buffer.push(0x1d, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x43, Math.min(8, Math.max(3, size)));
+    // 3. Error correction level (M: 49)
     this.buffer.push(0x1d, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x45, 0x31);
-    // 4. Almacenar datos en el buffer de la impresora
+    // 4. Store data
     this.buffer.push(0x1d, 0x28, 0x6b, pL, pH, 0x31, 0x50, 0x30);
     for (let i = 0; i < cleanData.length; i++) {
       this.buffer.push(cleanData.charCodeAt(i));
     }
-    // 5. Imprimir el QR almacenado
+    // 5. Print stored QR
     this.buffer.push(0x1d, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x51, 0x30);
     return this;
   }
 
-  /** Cortar papel */
+  /** GS V - Paper Cut (partial cut) */
   cut(partial: boolean = true, feedLines: number = 3): this {
     this.feed(Math.max(1, feedLines));
-    // GS V 65 3 (alimenta N líneas y realiza corte parcial)
     this.buffer.push(0x1d, 0x56, partial ? 0x42 : 0x41, 0x00);
     return this;
   }
 
-  /** Retorna los bytes binarios */
+  /** Returns raw binary buffer */
   build(): Uint8Array {
     return new Uint8Array(this.buffer);
   }
+}
 
-  /**
-   * Construye el ticket completo de venta/comprobante a partir de los datos.
-   */
-  static buildReceipt(data: EscPosReceiptData, options: EscPosOptions = {}): Uint8Array {
-    const builder = new EscPosBuilder(options);
-    const isCompact = (options.ticketTemplate || data.ticketTemplate) === 'compact';
+// ============================================================================
+// 3. BASE64 CONVERTER
+// ============================================================================
 
-    if (options.openDrawer) {
-      builder.openCashDrawer();
+/**
+ * Encodes Uint8Array binary buffer to Base64 string
+ * Safe for React Native native modules and Bluetooth bridges
+ */
+export function uint8ArrayToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  const len = bytes.byteLength;
+  for (let i = 0; i < len; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  // In modern React Native / JS environments, btoa is available globally
+  if (typeof btoa === 'function') {
+    return btoa(binary);
+  }
+  // Fallback to manual base64 encoder if btoa is unavailable
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  let result = '';
+  let i = 0;
+  while (i < len) {
+    const b1 = bytes[i++];
+    const b2 = i < len ? bytes[i++] : 0;
+    const b3 = i < len ? bytes[i++] : 0;
+
+    const cp1 = b1 >> 2;
+    const cp2 = ((b1 & 3) << 4) | (b2 >> 4);
+    let cp3 = ((b2 & 15) << 2) | (b3 >> 6);
+    let cp4 = b3 & 63;
+
+    if (i - 1 > len) {
+      cp3 = 64;
+      cp4 = 64;
+    } else if (i > len) {
+      cp4 = 64;
     }
 
-    // Blindaje de Factura: Nunca imprimir 'FACTURA' ni 'FACTURA ELECTRONICA' sin aceptación y CDR
-    let resolvedTitle = data.documentTitle;
-    const isFacturaTitle = /FACTURA/i.test(resolvedTitle);
-    if (isFacturaTitle && (data.isElectronicInvoice !== true || data.isOfflinePending)) {
-      resolvedTitle = 'NOTA DE VENTA';
-    }
+    result += chars[cp1] + chars[cp2] + (cp3 === 64 ? '=' : chars[cp3]) + (cp4 === 64 ? '=' : chars[cp4]);
+  }
+  return result;
+}
 
-    // ── Encabezado ──
-    builder.align('center');
-    if (data.isOfflinePending) {
-      builder.bold(true).line('PENDIENTE DE SINCRONIZACION');
-      builder.line('OPERACION OFFLINE - NO CONFIRMADA').bold(false);
-      builder.divider('*');
-    }
-    if (data.description && !isCompact) {
-      builder.bold(true).line(`"${data.description.replace(/^["'“”]|["'“”]$/g, '').trim()}"`).bold(false);
-    }
-    if (data.businessName) {
-      builder.bold(true).size('double-height').line(data.businessName).size('normal').bold(false);
-    }
-    if (data.ruc) {
-      builder.bold(true).line(`RUC: ${data.ruc}`).bold(false);
-    }
+/** Alias export */
+export const toBase64 = uint8ArrayToBase64;
 
-    if (isCompact) {
-      // Modo compacto: Imprime solo la dirección de la sucursal de venta (sin apilar la fiscal)
-      const storeOnly = data.storeAddress || data.address;
-      if (storeOnly) {
-        builder.line(storeOnly);
-      }
-    } else {
-      const mainAddress = data.fiscalAddress || data.address;
-      if (mainAddress) {
-        builder.line(mainAddress);
-      }
-      if (data.storeAddress && (!mainAddress || data.storeAddress.trim().toLowerCase() !== mainAddress.trim().toLowerCase())) {
-        builder.line(mainAddress ? `Tienda: ${data.storeAddress}` : data.storeAddress);
-      }
-    }
+// ============================================================================
+// 4. SALE RECEIPT ESC/POS BUILDER
+// ============================================================================
 
-    if (data.phone) {
-      builder.line(`Telf. ${data.phone}`);
-    }
-    if (data.email && !isCompact) {
-      builder.line(`E-mail: ${data.email}`);
-    }
+/**
+ * Builds binary ESC/POS ticket for sales and electronic invoices.
+ * Includes Peruvian tax compliance protection: if a Factura or Boleta lacks
+ * accepted CDR, it is safely degraded to "NOTA DE VENTA".
+ */
+export function buildSaleReceiptEscPos(
+  sale: Sale,
+  business: Partial<BusinessSettings & Branch> = {},
+  options: EscPosOptions = {}
+): Uint8Array {
+  const builder = new EscPosBuilder(options);
+  const isCompact = options.ticketTemplate === 'compact';
 
-    // ── Título del comprobante ──
-    builder.divider('.');
-    builder.bold(true).size('double-height').line(resolvedTitle).size('normal');
-    builder.bold(true).line(data.documentNumber).bold(false);
-    builder.divider('.');
-
-    // ── Datos de la venta ──
-    builder.align('left');
-    builder.twoColumns('Fecha:', `${data.date} ${data.time}`);
-    if (data.sellerName) {
-      builder.twoColumns('Vendedor:', data.sellerName);
-    }
-    if (data.customerName) {
-      builder.line(`Cliente: ${data.customerName.toUpperCase()}`);
-      if (data.customerDocNumber) {
-        builder.line(`${data.customerDocType || 'Doc'}: ${data.customerDocNumber}`);
-      }
-      if (data.customerAddress) {
-        builder.line(`Direccion: ${data.customerAddress.toUpperCase()}`);
-      }
-    }
-    if (data.reference && data.reference.number) {
-      const refDoc = data.reference.type === '01' ? 'Factura' : data.reference.type === '03' ? 'Boleta' : (data.reference.type || 'Doc');
-      builder.line(`Doc. Modifica: ${refDoc} ${data.reference.number}`);
-      const reason = data.reference.reasonDescription || data.reference.reasonCode;
-      if (reason) {
-        builder.line(`Motivo: ${reason}`);
-      }
-    }
-    const isCreditNote = /NOTA DE CR/i.test(data.documentTitle);
-    const isDebitNote = /NOTA DE DEB/i.test(data.documentTitle);
-    const isNote = isCreditNote || isDebitNote;
-
-    if (!isNote) {
-      builder.twoColumns('Forma de pago:', 'CONTADO');
-    }
-
-    // ── Detalle de productos ──
-    builder.divider('.');
-    builder.bold(true).line('SKU          CANT      PRECIO     TOTAL').bold(false);
-    builder.divider('.');
-
-    for (const item of data.items) {
-      builder.itemRow(item.name, item.quantity, item.price, item.total, item.sku, item.unit);
-    }
-
-    // ── Totales ──
-    builder.divider('.');
-    const isNotaNoFiscal = data.isElectronicInvoice === false || (!data.fiscalAmounts && !isNote && /NOTA/i.test(data.documentTitle));
-    if (isNotaNoFiscal) {
-      builder.twoColumns('Subtotal:', `S/ ${data.subtotal.toFixed(2)}`);
-    } else if (data.fiscalAmounts) {
-      const f = data.fiscalAmounts;
-      const hasFiscal = f.taxed > 0 || f.exempt > 0 || f.unaffected > 0 || f.igv > 0 || (f.otherTaxes ?? 0) > 0;
-      if (hasFiscal) {
-        if (f.taxed > 0) builder.twoColumns('Op. Gravada:', `S/ ${f.taxed.toFixed(2)}`);
-        if (f.exempt > 0) builder.twoColumns('Op. Exonerada:', `S/ ${f.exempt.toFixed(2)}`);
-        if (f.unaffected > 0) builder.twoColumns('Op. Inafecta:', `S/ ${f.unaffected.toFixed(2)}`);
-        if (f.igv > 0) builder.twoColumns('IGV:', `S/ ${f.igv.toFixed(2)}`);
-        if (f.otherTaxes > 0) builder.twoColumns('Otros tributos:', `S/ ${f.otherTaxes.toFixed(2)}`);
-      } else {
-        builder.twoColumns('Subtotal:', `S/ ${data.subtotal.toFixed(2)}`);
-      }
-    } else if (data.tax !== undefined && data.tax > 0) {
-      builder.twoColumns('Op. Gravada:', `S/ ${(data.subtotal).toFixed(2)}`);
-      builder.twoColumns('IGV:', `S/ ${data.tax.toFixed(2)}`);
-    } else {
-      builder.twoColumns('Subtotal:', `S/ ${data.subtotal.toFixed(2)}`);
-    }
-
-    if (data.depositInfo) {
-      builder.divider('.');
-      const label = data.depositInfo.type === 'reservation' ? 'Reserva #' : 'Pedido #';
-      builder.align('center').line(`Completando ${label}${data.depositInfo.number}`).align('left');
-      builder.twoColumns('Total Original:', `S/ ${data.depositInfo.originalTotal.toFixed(2)}`);
-      builder.twoColumns('Adelanto Pagado:', `S/ ${data.depositInfo.depositAmount.toFixed(2)}`);
-      builder.twoColumns('Saldo Restante:', `S/ ${data.depositInfo.remainingAmount.toFixed(2)}`);
-    }
-
-    builder.bold(true).size('double-height');
-    builder.twoColumns('Total:', `S/ ${data.total.toFixed(2)}`);
-    builder.size('normal').bold(false);
-
-    if (data.amountInWords) {
-      builder.divider('.');
-      builder.align('center').bold(true).line(`SON: ${data.amountInWords.toUpperCase()}`).bold(false).align('left');
-    }
-
-    if (!isNote) {
-      builder.divider('.');
-      builder.bold(true).twoColumns(`PAGO: ${data.paymentMethod.toUpperCase()}`, `S/ ${data.total.toFixed(2)}`).bold(false);
-    }
-
-    // ── Representación impresa y QR ──
-    builder.divider('.');
-    builder.align('center');
-    if (data.isElectronicInvoice && !data.isOfflinePending && resolvedTitle !== 'NOTA DE VENTA') {
-      builder.line(`Representacion impresa de la ${resolvedTitle}`);
-    } else {
-      builder.line('Documento no valido como comprobante fiscal');
-      builder.line('Constancia de pedido interno');
-    }
-
-    if (data.qrContent) {
-      if (!isCompact) builder.feed(1);
-      builder.qr(data.qrContent, options.paperWidth === 58 ? 4 : 5);
-      if (!isCompact) builder.feed(1);
-    }
-
-    builder.line('Consulta tu comprobante en');
-    builder.bold(true).line(data.consultUrl || 'https://comprobantes.tandiashop.com/').bold(false);
-
-    // Agradecimiento: si hay footerNote y ya incluye agradecimiento, o en modo compacto si footerNote existe, no duplicar
-    const hasCustomFooter = Boolean(data.footerNote && data.footerNote.trim().length > 0);
-    const customFooterHasThanks = hasCustomFooter && /gracias|agradece/i.test(data.footerNote!);
-
-    if (hasCustomFooter) {
-      if (!isCompact) builder.feed(1);
-      builder.bold(true).line(data.footerNote!).bold(false);
-    }
-
-    if (!customFooterHasThanks && (!isCompact || !hasCustomFooter)) {
-      if (!isCompact && !hasCustomFooter) builder.feed(1);
-      builder.bold(true).line('¡¡GRACIAS POR SU COMPRA!!').bold(false);
-    }
-
-    builder.divider('.');
-    builder.feed(isCompact ? 1 : 2);
-
-    if (options.autoCut !== false) {
-      builder.cut(true, isCompact ? 1 : 3);
-    }
-
-    return builder.build();
+  // 1. Kick cash drawer if requested
+  if (options.openDrawer) {
+    builder.openCashDrawer();
   }
 
-  /**
-   * Construye un ticket de prueba para diagnosticar la conexión.
-   */
-  static buildTestTicket(options: EscPosOptions = {}): Uint8Array {
-    const builder = new EscPosBuilder(options);
-    if (options.openDrawer) {
-      builder.openCashDrawer();
+  // 2. Resolve fiscal title with anti-evasion / tax protection
+  let rawDocType = String(sale.documentType || 'nota_venta').toLowerCase();
+  let isFiscal = rawDocType === 'factura' || rawDocType === 'boleta' || rawDocType === '01' || rawDocType === '03';
+
+  // Strict tax protection: if marked as Factura/Boleta without accepted CDR or offline pending, degrade to NOTA DE VENTA
+  let displayTitle = 'NOTA DE VENTA';
+  if (isFiscal) {
+    if (sale.sunatStatus === 'accepted' && !sale.isOfflinePending) {
+      displayTitle = rawDocType.includes('factura') || rawDocType === '01' ? 'FACTURA ELECTRONICA' : 'BOLETA DE VENTA ELECTRONICA';
+    } else {
+      displayTitle = 'NOTA DE VENTA';
+      isFiscal = false;
     }
-    builder.align('center');
-    builder.bold(true).size('double-height').line('VENTIFY POS').size('normal').bold(false);
-    builder.line('Prueba de Impresion Directa USB');
-    builder.divider('=');
-    builder.line(`Fecha: ${new Date().toLocaleDateString('es-ES')}`);
-    builder.line(`Hora: ${new Date().toLocaleTimeString('es-ES')}`);
-    builder.line(`Ancho: ${options.paperWidth === 58 ? '58mm (32 cols)' : '80mm (48 cols)'}`);
-    builder.divider('-');
-    builder.bold(true).line('CONEXION EXITOSA!').bold(false);
-    builder.line('La ticketera responde correctamente');
-    builder.divider('=');
-    builder.feed(2);
-    builder.cut(true);
-    return builder.build();
+  } else if (rawDocType === 'cotizacion' || rawDocType === 'cot') {
+    displayTitle = 'COTIZACION';
   }
+
+  // 3. Business Header
+  builder.align('center');
+  if (sale.isOfflinePending) {
+    builder.bold(true).line('*** OPERACION OFFLINE ***');
+    builder.line('PENDIENTE DE SINCRONIZACION').bold(false);
+    builder.divider('*');
+  }
+
+  const businessName = business.businessName || business.name || 'VENTIFY POS';
+  builder.bold(true).size('double-height').line(businessName).size('normal').bold(false);
+
+  if (business.description && !isCompact) {
+    builder.line(`"${business.description}"`);
+  }
+
+  if (business.ruc) {
+    builder.bold(true).line(`RUC: ${business.ruc}`).bold(false);
+  }
+
+  const storeAddress = business.commercialAddress || business.address;
+  if (storeAddress) {
+    builder.line(storeAddress);
+  }
+  if (business.commercialPhone || business.phone) {
+    builder.line(`Telf: ${business.commercialPhone || business.phone}`);
+  }
+
+  // 4. Document Series & Number
+  builder.divider('.');
+  builder.bold(true).size('double-height').line(displayTitle).size('normal');
+  const docNumber = sale.documentNumber || `V-${String(sale.saleNumber || 1).padStart(6, '0')}`;
+  builder.bold(true).line(docNumber).bold(false);
+  builder.divider('.');
+
+  // 5. Sale Meta & Customer
+  builder.align('left');
+  builder.twoColumns('Fecha:', formatDatePE(sale.date));
+  const operator = sale.cashierUsername || sale.sellerName;
+  if (operator) {
+    builder.twoColumns('Cajero/Vend:', operator);
+  }
+
+  if (sale.customerName) {
+    builder.line(`Cliente: ${sale.customerName.toUpperCase()}`);
+    if (sale.customerRuc) {
+      builder.line(`RUC: ${sale.customerRuc}`);
+    } else if (sale.customerDni) {
+      builder.line(`DNI: ${sale.customerDni}`);
+    }
+    if (sale.customerAddress) {
+      builder.line(`Direccion: ${sale.customerAddress.toUpperCase()}`);
+    }
+  }
+
+  builder.twoColumns('Forma de pago:', (sale.paymentMethod || 'EFECTIVO').toUpperCase());
+
+  // 6. Products Table
+  builder.divider('.');
+  builder.bold(true).line('CANT / PRECIO UNIT                TOTAL').bold(false);
+  builder.divider('.');
+
+  for (const item of sale.items || []) {
+    const qty = Number(item.quantity) || 1;
+    const price = Number(item.price) || 0;
+    const total = Number(item.lineTotal ?? qty * price);
+    builder.itemRow(item.name, qty, price, total, item.unitOfMeasure);
+  }
+
+  // 7. Totals & Tax Breakdown
+  builder.divider('.');
+  const taxInfo = calculateTaxTotals(sale.total);
+
+  if (isFiscal) {
+    builder.twoColumns('Op. Gravada (18%):', formatPEN(taxInfo.opGravada));
+    builder.twoColumns('IGV (18%):', formatPEN(taxInfo.igv));
+  } else {
+    builder.twoColumns('Subtotal:', formatPEN(sale.subtotal || taxInfo.opGravada));
+  }
+
+  builder.divider('.');
+  builder.bold(true).size('double-height');
+  builder.twoColumns('TOTAL:', formatPEN(sale.total));
+  builder.size('normal').bold(false);
+
+  // 8. Cash Received & Change
+  if (sale.cashReceived && sale.cashReceived > 0) {
+    builder.divider('.');
+    builder.twoColumns('Efectivo Recibido:', formatPEN(sale.cashReceived));
+    builder.twoColumns('Vuelto:', formatPEN(sale.changeGiven ?? Math.max(0, sale.cashReceived - sale.total)));
+  }
+
+  // 9. Amount in Words
+  const words = sale.amountInWords || numberToSpanishWordsPEN(sale.total);
+  builder.divider('.');
+  builder.align('center').bold(true).line(words).bold(false);
+
+  // 10. QR Code
+  builder.divider('.');
+  let qrData = sale.qrContent;
+  if (!qrData && isFiscal && business.ruc) {
+    // Standard SUNAT QR string format
+    const docTypeNum = displayTitle.includes('FACTURA') ? '01' : '03';
+    const clientDocType = sale.customerRuc ? '6' : sale.customerDni ? '1' : '-';
+    const clientDocNum = sale.customerRuc || sale.customerDni || '-';
+    const dateFormatted = new Date(sale.date).toISOString().split('T')[0];
+    qrData = `${business.ruc}|${docTypeNum}|${docNumber}|${taxInfo.igv.toFixed(2)}|${sale.total.toFixed(2)}|${dateFormatted}|${clientDocType}|${clientDocNum}|`;
+  }
+
+  if (qrData) {
+    builder.feed(1);
+    builder.qr(qrData, options.paperWidth === 58 ? 4 : 5);
+    builder.feed(1);
+  }
+
+  // 11. Footer & Consultation URL
+  const consultUrl = business.consultUrl || sale.consultUrl || 'https://ventify.com.pe/comprobantes';
+  builder.line('Consulta tu comprobante en:');
+  builder.bold(true).line(consultUrl).bold(false);
+
+  const footer = business.receiptFooter || sale.footerNote || '¡GRACIAS POR SU PREFERENCIA!';
+  builder.feed(1);
+  builder.bold(true).line(footer).bold(false);
+  builder.divider('.');
+
+  // 12. Paper Cut
+  if (options.autoCut !== false) {
+    builder.cut(true, isCompact ? 2 : 4);
+  }
+
+  return builder.build();
+}
+
+// ============================================================================
+// 5. CASH REGISTER CLOSURE (CORTE Z) ESC/POS BUILDER
+// ============================================================================
+
+/**
+ * Builds binary ESC/POS thermal ticket for Cash Register Shift Closure (Corte Z).
+ */
+export function buildCashClosureEscPos(
+  session: CashRegisterSession,
+  closureData: CashClosureData = {},
+  business: Partial<BusinessSettings & Branch> = {},
+  options: EscPosOptions = {}
+): Uint8Array {
+  const builder = new EscPosBuilder(options);
+
+  if (options.openDrawer) {
+    builder.openCashDrawer();
+  }
+
+  builder.align('center');
+  const businessName = business.businessName || business.name || 'VENTIFY POS';
+  builder.bold(true).size('double-height').line(businessName).size('normal').bold(false);
+
+  if (business.ruc) {
+    builder.line(`RUC: ${business.ruc}`);
+  }
+
+  builder.divider('=');
+  builder.bold(true).size('double').line('CIERRE DE CAJA').line('(CORTE Z)').size('normal').bold(false);
+  builder.divider('=');
+
+  builder.align('left');
+  builder.twoColumns('Caja:', session.registerName || session.registerId || 'Caja 01');
+  builder.twoColumns('Sesion ID:', session.id ? session.id.slice(0, 12) : 'N/A');
+  builder.twoColumns('Cajero:', session.startedByName || session.startedBy || 'N/A');
+  builder.twoColumns('Apertura:', formatDatePE(session.openTime));
+  builder.twoColumns('Cierre:', formatDatePE(session.closeTime || Date.now()));
+
+  builder.divider('-');
+  builder.bold(true).line('RESUMEN DE FONDOS').bold(false);
+  builder.twoColumns('Fondo Inicial (Apertura):', formatPEN(session.initialAmount));
+
+  builder.divider('-');
+  builder.bold(true).line('VENTAS POR METODO DE PAGO').bold(false);
+  builder.twoColumns('Ventas Efectivo:', formatPEN(session.cashSales));
+  builder.twoColumns('Ventas Tarjeta:', formatPEN(session.cardSales));
+  builder.twoColumns('Ventas Digitales (Yape/Plin):', formatPEN(session.digitalSales));
+  if (session.creditSales !== undefined && session.creditSales > 0) {
+    builder.twoColumns('Ventas Fiado / Credito:', formatPEN(session.creditSales));
+  }
+  builder.twoColumns('Total Ventas:', formatPEN(session.totalSales));
+  builder.twoColumns('Total Transacciones:', String(session.transactionCount || 0));
+
+  builder.divider('-');
+  builder.bold(true).line('MOVIMIENTOS DE CAJA').bold(false);
+  const incomes = closureData.totalIncomes ?? 0;
+  const expenses = closureData.totalExpenses ?? 0;
+  builder.twoColumns('Ingresos Extra:', formatPEN(incomes));
+  builder.twoColumns('Egresos / Gastos:', formatPEN(expenses));
+
+  builder.divider('-');
+  builder.bold(true).size('double-height').line('ARQUEO DE EFECTIVO').size('normal').bold(false);
+  const expected = session.expectedAmount ?? closureData.expectedAmount ?? (session.initialAmount + session.cashSales + incomes - expenses);
+  const counted = session.countedAmount ?? closureData.countedAmount ?? expected;
+  const diff = session.difference ?? closureData.difference ?? (counted - expected);
+
+  builder.twoColumns('Efectivo Esperado:', formatPEN(expected));
+  builder.bold(true).twoColumns('Efectivo Recontado:', formatPEN(counted)).bold(false);
+
+  builder.bold(true);
+  if (diff === 0) {
+    builder.twoColumns('Diferencia:', 'S/ 0.00 (CUADRADO)');
+  } else if (diff > 0) {
+    builder.twoColumns('Diferencia (Sobrante):', `+${formatPEN(diff)}`);
+  } else {
+    builder.twoColumns('Diferencia (Faltante):', formatPEN(diff));
+  }
+  builder.bold(false);
+
+  builder.divider('.');
+  builder.feed(2);
+  builder.align('center');
+  builder.line('_____________________________');
+  builder.line(session.startedByName || 'Firma Cajero');
+  builder.feed(2);
+  builder.line('_____________________________');
+  builder.line('Firma Supervisor / Administrador');
+  builder.feed(1);
+  builder.divider('=');
+
+  if (options.autoCut !== false) {
+    builder.cut(true, 3);
+  }
+
+  return builder.build();
+}
+
+// ============================================================================
+// 6. CLEAN 80MM HTML TICKET RENDERER (EXPO-PRINT)
+// ============================================================================
+
+/**
+ * Builds standalone, pixel-perfect 80mm HTML receipt string for expo-print.
+ * Renders native PDF or prints wirelessly using iOS AirPrint & Android Print Service.
+ */
+export function buildReceiptHtml(
+  sale: Sale,
+  business: Partial<BusinessSettings & Branch> = {}
+): string {
+  const isFiscal = sale.documentType === 'factura' || sale.documentType === 'boleta' || sale.documentType === '01' || sale.documentType === '03';
+  const taxInfo = calculateTaxTotals(sale.total);
+  const words = sale.amountInWords || numberToSpanishWordsPEN(sale.total);
+  const docNumber = sale.documentNumber || `V-${String(sale.saleNumber || 1).padStart(6, '0')}`;
+  const businessName = business.businessName || business.name || 'VENTIFY POS';
+  const consultUrl = business.consultUrl || sale.consultUrl || 'https://ventify.com.pe/comprobantes';
+  const footer = business.receiptFooter || sale.footerNote || '¡Gracias por su compra!';
+
+  const itemsRows = (sale.items || [])
+    .map((item: CartItem) => {
+      const qty = Number(item.quantity) || 1;
+      const price = Number(item.price) || 0;
+      const total = Number(item.lineTotal ?? qty * price);
+      return `
+        <tr>
+          <td style="text-align: left; padding: 4px 0;">
+            <div style="font-weight: bold;">${item.name}</div>
+            <div style="font-size: 11px; color: #555;">${qty} ${item.unitOfMeasure || 'UND'} x S/ ${price.toFixed(2)}</div>
+          </td>
+          <td style="text-align: right; vertical-align: top; padding: 4px 0; font-weight: bold;">
+            S/ ${total.toFixed(2)}
+          </td>
+        </tr>
+      `;
+    })
+    .join('');
+
+  return `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Comprobante ${docNumber}</title>
+  <style>
+    @page {
+      size: 80mm auto;
+      margin: 0;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+      font-size: 13px;
+      line-height: 1.35;
+      color: #000;
+      background: #fff;
+      margin: 0;
+      padding: 16px 12px;
+      max-width: 300px;
+      margin: 0 auto;
+    }
+    .center { text-align: center; }
+    .bold { font-weight: bold; }
+    .divider { border-top: 1px dashed #000; margin: 8px 0; }
+    .divider-double { border-top: 2px solid #000; margin: 8px 0; }
+    .row { display: flex; justify-content: space-between; margin: 3px 0; }
+    .table-items { width: 100%; border-collapse: collapse; margin: 8px 0; }
+    .title { font-size: 16px; font-weight: 800; letter-spacing: 0.5px; }
+    .total-title { font-size: 17px; font-weight: 800; }
+  </style>
+</head>
+<body>
+  <div class="center">
+    ${sale.isOfflinePending ? '<div class="bold" style="background: #000; color: #fff; padding: 2px;">*** OFFLINE PENDIENTE ***</div>' : ''}
+    <div class="title">${businessName}</div>
+    ${business.description ? `<div style="font-size: 12px; margin-top: 2px;">"${business.description}"</div>` : ''}
+    ${business.ruc ? `<div class="bold" style="margin-top: 2px;">RUC: ${business.ruc}</div>` : ''}
+    ${business.commercialAddress || business.address ? `<div>${business.commercialAddress || business.address}</div>` : ''}
+    ${business.commercialPhone || business.phone ? `<div>Telf: ${business.commercialPhone || business.phone}</div>` : ''}
+  </div>
+
+  <div class="divider"></div>
+  <div class="center bold title" style="font-size: 14px;">
+    ${isFiscal ? (String(sale.documentType).includes('factura') || sale.documentType === '01' ? 'FACTURA ELECTRONICA' : 'BOLETA DE VENTA ELECTRONICA') : 'NOTA DE VENTA'}
+  </div>
+  <div class="center bold" style="font-size: 14px;">${docNumber}</div>
+  <div class="divider"></div>
+
+  <div class="row"><span>Fecha:</span><span>${formatDatePE(sale.date)}</span></div>
+  ${sale.cashierUsername || sale.sellerName ? `<div class="row"><span>Cajero/Vend:</span><span>${sale.cashierUsername || sale.sellerName}</span></div>` : ''}
+  ${sale.customerName ? `
+    <div style="margin-top: 4px;">
+      <div class="bold">Cliente: ${sale.customerName.toUpperCase()}</div>
+      ${sale.customerRuc ? `<div>RUC: ${sale.customerRuc}</div>` : ''}
+      ${sale.customerDni ? `<div>DNI: ${sale.customerDni}</div>` : ''}
+      ${sale.customerAddress ? `<div>Dirección: ${sale.customerAddress}</div>` : ''}
+    </div>
+  ` : ''}
+  <div class="row" style="margin-top: 4px;"><span>Forma de Pago:</span><span class="bold">${(sale.paymentMethod || 'EFECTIVO').toUpperCase()}</span></div>
+
+  <div class="divider"></div>
+  <table class="table-items">
+    <thead>
+      <tr style="border-bottom: 1px dashed #000;">
+        <th style="text-align: left; padding-bottom: 4px;">DETALLE</th>
+        <th style="text-align: right; padding-bottom: 4px;">TOTAL</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${itemsRows}
+    </tbody>
+  </table>
+
+  <div class="divider"></div>
+  ${isFiscal ? `
+    <div class="row"><span>Op. Gravada (18%):</span><span>${formatPEN(taxInfo.opGravada)}</span></div>
+    <div class="row"><span>IGV (18%):</span><span>${formatPEN(taxInfo.igv)}</span></div>
+  ` : `
+    <div class="row"><span>Subtotal:</span><span>${formatPEN(sale.subtotal || taxInfo.opGravada)}</span></div>
+  `}
+  <div class="divider"></div>
+  <div class="row total-title" style="margin: 6px 0;">
+    <span>TOTAL:</span>
+    <span>${formatPEN(sale.total)}</span>
+  </div>
+
+  ${sale.cashReceived && sale.cashReceived > 0 ? `
+    <div class="divider"></div>
+    <div class="row"><span>Efectivo Recibido:</span><span>${formatPEN(sale.cashReceived)}</span></div>
+    <div class="row"><span>Vuelto:</span><span>${formatPEN(sale.changeGiven ?? Math.max(0, sale.cashReceived - sale.total))}</span></div>
+  ` : ''}
+
+  <div class="divider"></div>
+  <div class="center bold" style="font-size: 11px; margin: 6px 0;">${words}</div>
+
+  <div class="divider"></div>
+  <div class="center" style="font-size: 11px; margin-top: 8px;">
+    <div>Consulta tu comprobante en:</div>
+    <div class="bold">${consultUrl}</div>
+    <div class="bold" style="font-size: 13px; margin-top: 8px;">${footer}</div>
+  </div>
+</body>
+</html>
+  `.trim();
 }

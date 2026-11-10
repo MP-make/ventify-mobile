@@ -1,127 +1,79 @@
-# Ventify Mobile 📱
+# Ventify POS Mobile v2.0 — App Nativa Android & iOS
 
-App móvil de **Ventify POS**: cliente React + Vite empaquetado con Capacitor para Android.
-Es un proyecto **independiente** del repositorio web principal (`Arcay322/Ventify`), pensado
-para iterar la app móvil sin tocar el código del portal Next.js.
+Aplicación móvil **100% nativa** para **Android** e **iOS** del ecosistema **Ventify SaaS POS**, construida con **React Native 0.76 + Expo SDK 52 (New Architecture: Fabric + TurboModules/JSI + Hermes)** y sincronizada a nivel transaccional con el núcleo de [`ventify`](file:///home/arcay/ventify).
 
 ---
 
-## Stack
+## Arquitectura Nativa y Rendimiento
 
-| Capa | Tecnología |
-| --- | --- |
-| UI | React 18 + TypeScript |
-| Bundler | Vite 8 |
-| Estilos | TailwindCSS 3 (+ `tailwindcss-animate`) |
-| Backend | Firebase Auth / Firestore (persistencia local habilitada) |
-| Escaneo | `@zxing/browser` (cámara) |
-| Nativo | Capacitor 8 → Android (Kotlin/Java) |
-| Impresión | Plugin nativo propio `ThermalPrinter` (ESC/POS, Bluetooth) |
+A diferencia de la versión preliminar v1.0 basada en WebView/Capacitor (archivada en `legacy/capacitor-v1/` y en la rama `legacy-capacitor-v1`), **Ventify Mobile v2.0** ejecuta vistas nativas reales (`android.view.View` y `UIView`) compiladas a bytecode AOT con **Hermes**:
 
----
-
-## Estructura
-
-```
-.
-├── index.html                 # Entry point de Vite
-├── vite.config.mts            # Build web → dist/
-├── capacitor.config.ts        # Config de Capacitor (webDir: dist)
-├── src/
-│   ├── App.tsx                # Shell principal (tabs, PIN lock, listeners)
-│   ├── main.tsx
-│   ├── firebase.ts            # Init de Firebase (cache persistente)
-│   ├── components/            # Header, BottomNav, modales, scanner…
-│   ├── context/               # Auth, Cart, Products, Settings
-│   ├── views/                 # POS, Catálogo, Inventario, Historial, Ajustes, Login
-│   ├── services/              # Impresora térmica, notificaciones
-│   └── lib/printing/          # escpos-builder.ts (generador ESC/POS)
-├── public/                    # Assets estáticos
-├── android/                   # Proyecto Android generado por Capacitor
-│   └── app/src/main/java/pe/com/ventify/pos/
-│       ├── MainActivity.java
-│       └── ThermalPrinterPlugin.java
-└── releases/                  # APKs compilados
-```
-
-`android/capacitor.settings.gradle` apunta a `../node_modules/@capacitor/*`, por eso
-`node_modules` **debe** estar en la raíz del repo (estructura ya preparada así).
+- **Renderizado Nativo (New Architecture / Fabric)**: Cero WebView, transiciones a 60/120 FPS y listas recicladas de alto rendimiento con `@shopify/flash-list` para catálogos de +10,000 SKUs en dispositivos de gama media/baja.
+- **Escáner de Cámara por Hardware (`expo-camera` / `CameraView`)**: Detección nativa de códigos `EAN-13`, `EAN-8`, `Code-128`, `UPC-A`, `QR`, con control de linterna (`torch`), modo continuo y vibración háptica (`expo-haptics`).
+- **Integridad Contable 100% Compatible con Ventify Web**:
+  - Transacciones atómicas en Firestore (`runTransaction`) en [`src/services/sale-service.ts`](file:///home/arcay/.gemini/antigravity/scratch/ventify-mobile/src/services/sale-service.ts).
+  - Registro oficial de movimientos de caja en **`cash_register_movements`** y actualización de **`cash_register_sessions/active_${branchId}`** para cuadre exacto en el **Cierre Z** tanto en web como en móvil.
+  - Trazabilidad completa de inventario en el **Kardex (`inventory_movements`)** con `previousStock`, `newStock`, factor de conversión de presentaciones y motivo.
+  - Soporte completo para **Presentaciones** (Unidad, Pack, Caja), **Variantes** (Talla/Color), **Precios por Sucursal**, **Piso de Precio (`minSalePrice`)** y **Venta por Peso / Fracción (kg, g, lt)**.
+- **Resiliencia Offline (`src/services/offline-sync-service.ts`)**:
+  - Cola persistente local con `offlineId` idempotente, detección automática de red con `@react-native-community/netinfo`, deduplicación y bandeja de cuarentena ante conflictos.
+- **Impresión Térmica Bluetooth (ESC/POS 58mm / 80mm) y Tickets PDF**:
+  - Constructor binario ESC/POS ([`src/lib/printing/escpos-builder.ts`](file:///home/arcay/.gemini/antigravity/scratch/ventify-mobile/src/lib/printing/escpos-builder.ts)) con soporte de 58mm y 80mm, corte automático de papel (`GS V`), apertura de gaveta de dinero (`ESC p`) y QR tributario SUNAT.
+  - Impresión PDF nativa y envío directo de comprobantes por **WhatsApp** mediante `expo-print` y `expo-sharing`.
 
 ---
 
-## Puesta en marcha
+## Módulos Incluidos
+
+1. **Punto de Venta (POS) — `app/(tabs)/index.tsx` & `src/components/CheckoutModal.tsx`**:
+   - Escáner nativo embebido y en pantalla completa.
+   - Búsqueda O(1) por código de barras principal, códigos alternativos, SKU, presentaciones y variantes.
+   - Modal de **Venta por Peso** (con cálculo inverso por importe en Soles) y **Venta Rápida** (concepto libre).
+   - **Ventas en Pausa (Hold Carts)** persistentes.
+   - **Gestor de Cotizaciones (`QuotesManagerModal.tsx`)**: Conversión directa de cotización al carrito POS en 1 toque y envío de proforma PDF por WhatsApp.
+   - **Modo Pistola Lectora Inalámbrica para PC (`CompanionScannerModal.tsx`)**: Vinculación por QR con Ventify Web para transmitir códigos de barras en milisegundos al mostrador PC.
+   - **Checkout Completo**: Nota de Venta, Boleta Electrónica SUNAT (`03`), Factura Electrónica SUNAT (`01`) y Cotización.
+   - Consulta en vivo de **DNI (RENIEC)** y **RUC (SUNAT)** con validación oficial módulo 11.
+   - Cobro en **Efectivo** (atajos de billetes S/ 10, 20, 50, 100, 200), **Yape**, **Plin**, **Tarjeta**, **Transferencia**, **Pago Mixto (Split Payment)** y **Fiado (Crédito)**.
+2. **Inventario, Kardex, Transferencias y Abastecimiento — `app/(tabs)/catalog.tsx`**:
+   - KPIs de inventario en tiempo real por sucursal.
+   - Creación/edición de productos con generador automático de código de barras peruano (`775...`), presentaciones y cálculo de margen.
+   - Ajuste rápido de stock con motivo auditado en el **Kardex (`inventory_movements`)**.
+   - **Transferencias de Mercadería entre Sucursales** (`transfers`).
+   - **Proveedores y Órdenes de Compra (`SuppliersPurchaseModal.tsx`)**: Directorio de proveedores con autocompletado RUC SUNAT, creación de órdenes de compra (`purchase_orders`) y recepción atómica de mercadería con recálculo de **Costo Promedio Ponderado (`costPrice`)** y Kardex.
+3. **Centro de Operaciones (Caja Z, Clientes/Fiados, Reservas y Personal) — `app/(tabs)/operations.tsx`**:
+   - **Control de Caja y Cierre Z**: Apertura de turno, registro de ingresos/egresos de caja chica, arqueo en vivo y Cierre Z con impresión térmica.
+   - **Clientes y Fiados (CRM)**: Directorio de clientes, control de línea de crédito, alertas de deuda y registro de abonos parciales/totales (`fiado_payments`).
+   - **Pedidos y Reservas**: Separación de stock (`reservedStock`), control de anticipos y entrega/liberación.
+   - **Equipo, Planillas y Solicitudes de Venta (`PayrollUsersModal.tsx`)**: Gestión de usuarios/roles, registro de sueldos/adelantos/comisiones (`payroll_movements`) con descuento en caja abierta y bandeja de aprobación de solicitudes de venta (`sale_requests`).
+4. **Historial, Facturación SUNAT, Estado de Resultados (P&L) y Venty IA — `app/(tabs)/history.tsx`**:
+   - Reportes financieros (Ventas totales, Ganancia estimada, Ticket promedio, Efectivo vs Digital).
+   - **Estado de Resultados Ejecutivo P&L (`FinancialPnlModal.tsx`)**: Cascada contable completa (Ingresos Netos, Costo de Mercadería Vendida COGS, Utilidad Bruta, Gastos Operativos + Planillas, Utilidad Neta Real), ranking de productos más rentables, rendimiento por vendedor y exportación a PDF.
+   - Reimpresión térmica Bluetooth, envío de ticket PDF por WhatsApp y **Anulación / Devolución de Venta** con reversión atómica de stock y Kardex.
+   - **Asistente Venty IA**: Consultas ejecutivas en lenguaje natural sobre el estado del negocio en tiempo real.
+5. **Ajustes de Terminal y Seguridad — `app/(tabs)/settings.tsx`**:
+   - Configuración de impresora térmica Bluetooth (58mm/80mm), monitor de cola offline, cambio de sucursal activa, datos de empresa/Yape/Plin y **Bloqueo Rápido por PIN de 4 dígitos** (`expo-secure-store`).
+
+---
+
+## Comandos de Desarrollo y Compilación Nativa
 
 ```bash
-npm install
-cp .env.example .env      # completar credenciales de Firebase
-npm run dev               # http://localhost:5173
+# 1. Instalar dependencias
+npm install --legacy-peer-deps
+
+# 2. Iniciar servidor de desarrollo Metro (Expo)
+npm start
+
+# 3. Compilar y ejecutar binario nativo en Android
+npm run android
+
+# 4. Compilar y ejecutar binario nativo en iOS (requiere macOS + Xcode)
+npm run ios
+
+# 5. Verificar tipos TypeScript
+npm run typecheck
+
+# 6. Ejecutar suite de pruebas unitarias y de lógica de negocio
+npm test
 ```
-
-### Compilar la web
-
-```bash
-npm run build             # genera dist/
-npm run preview           # sirve dist/ para probar
-```
-
-### Android
-
-Requisitos: **JDK 21** (Capacitor 8 lo exige al compilar los plugins), Android SDK
-(`ANDROID_HOME`) y `android/local.properties` con `sdk.dir=/ruta/al/Android/Sdk`.
-Si tienes varias JDKs instaladas, exporta `JAVA_HOME` apuntando a la 21 antes de Gradle:
-
-```bash
-export JAVA_HOME=$HOME/jdks/jdk-21.0.13+9   # ajusta a tu ruta
-```
-
-```bash
-npm run cap:sync          # build web + copia assets y regenera plugins Android
-npm run apk:debug         # APK de depuración → android/app/build/outputs/apk/debug/
-npm run apk:release       # APK de release (requiere keystore configurado)
-npm run cap:open          # abre Android Studio
-```
-
-> `cap:sync` es obligatorio al menos una vez (y después de cambiar plugins): genera
-> `android/capacitor-cordova-android-plugins/`, que no se versiona. Sin ese paso Gradle
-> falla con `cordova.variables.gradle ... does not exist`.
-
-> El APK compilado del último build está en `releases/`.
-
----
-
-## Variables de entorno
-
-Se inyectan en **tiempo de build** vía `define` en `vite.config.ts` (por eso el prefijo
-`NEXT_PUBLIC_`, para mantener compatibilidad con el `.env` del proyecto web):
-
-- `NEXT_PUBLIC_FIREBASE_API_KEY`
-- `NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN`
-- `NEXT_PUBLIC_FIREBASE_PROJECT_ID`
-- `NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET`
-- `NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID`
-- `NEXT_PUBLIC_FIREBASE_APP_ID`
-- `NEXT_PUBLIC_APP_URL` (opcional)
-
-⚠️ Las claves de Firebase quedan embebidas en el bundle. Son claves públicas de cliente;
-la seguridad real depende de `firestore.rules` (que vive en el repo web).
-
----
-
-## Notas de migración
-
-- `mobile/src` importaba `@/lib/printing/escpos-builder` del repo web; el archivo se copió
-  a `src/lib/printing/escpos-builder.ts` y el alias `@` ahora resuelve a `./src`.
-  Ese generador depende de `../invoicing/types`, así que también se copió a
-  `src/lib/invoicing/types.ts` (archivo autónomo, solo tipos y constantes SUNAT).
-- `vite.config.ts` pasó a `vite.config.mts` para cargarse como ESM (sin `__dirname`).
-- El build ya no escribe en `../out` ni depende de la raíz del repo web: usa `./dist`
-  (y `capacitor.config.ts` apunta a `dist`).
-- Se agregó la animación `shake` faltante (usada en el modal de PIN) al
-  `tailwind.config.js`.
-- Se quitó de `android/build.gradle` el bloque `subprojects { compileOptions 17 }`:
-  los plugins de Capacitor 8 exigen Java 21 + `jvmToolchain(21)` y el override a 17
-  rompía el build (`Inconsistent JVM-target compatibility`).
-- Versiones de Capacitor: `@capacitor/core` y `@capacitor/android` **8.6.0**,
-  `@capacitor/cli` **7.x**. Es la combinación con la que se generó y compiló el
-  proyecto Android actual; si se sube el CLI a 8 conviene regenerar `android/` con
-  `npx cap sync` y validar el build.

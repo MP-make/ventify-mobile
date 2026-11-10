@@ -1,0 +1,73 @@
+{
+  "expo": {
+    "name": "Ventify POS",
+    "slug": "ventify-mobile",
+    "version": "2.0.0",
+    "orientation": "portrait",
+    "scheme": "ventify",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "jsEngine": "hermes",
+    "splash": {
+      "image": "./assets/brand/ventify-logo.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#F5F7FB"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "pe.com.ventify.pos",
+      "buildNumber": "1",
+      "jsEngine": "hermes",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Ventify necesita acceso a la c\u00e1mara para escanear c\u00f3digos de barras y QR de productos en tiempo real.",
+        "NSBluetoothAlwaysUsageDescription": "Ventify utiliza Bluetooth para conectarse e imprimir tickets en impresoras t\u00e9rmicas port\u00e1tiles (58mm/80mm).",
+        "NSBluetoothPeripheralUsageDescription": "Ventify utiliza Bluetooth para imprimir comprobantes y tickets de venta.",
+        "NSPhotoLibraryUsageDescription": "Ventify necesita acceso a tu galer\u00eda para subir fotos de productos y c\u00f3digos QR de cobro."
+      }
+    },
+    "android": {
+      "package": "pe.com.ventify.pos",
+      "versionCode": 2,
+      "jsEngine": "hermes",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/brand/ventify-logo.png",
+        "backgroundColor": "#FFFFFF"
+      },
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.FLASHLIGHT",
+        "android.permission.VIBRATE",
+        "android.permission.BLUETOOTH",
+        "android.permission.BLUETOOTH_ADMIN",
+        "android.permission.BLUETOOTH_SCAN",
+        "android.permission.BLUETOOTH_CONNECT",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.POST_NOTIFICATIONS"
+      ]
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Permitir a Ventify usar la c\u00e1mara para escanear c\u00f3digos de barras de productos.",
+          "microphonePermission": false,
+          "recordAudioAndroid": false
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "color": "#315BE8"
+        }
+      ],
+      "expo-secure-store",
+      "expo-font"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    },
+    "icon": "./assets/brand/ventify-logo.png"
+  }
+}

@@ -41,8 +41,7 @@ para iterar la app móvil sin tocar el código del portal Next.js.
 │   └── app/src/main/java/pe/com/ventify/pos/
 │       ├── MainActivity.java
 │       └── ThermalPrinterPlugin.java
-├── releases/                  # APKs compilados
-└── legacy/                    # Copia de referencia (ver más abajo)
+└── releases/                  # APKs compilados
 ```
 
 `android/capacitor.settings.gradle` apunta a `../node_modules/@capacitor/*`, por eso
@@ -105,15 +104,6 @@ Se inyectan en **tiempo de build** vía `define` en `vite.config.ts` (por eso el
 
 ⚠️ Las claves de Firebase quedan embebidas en el bundle. Son claves públicas de cliente;
 la seguridad real depende de `firestore.rules` (que vive en el repo web).
-
----
-
-## `legacy/nextjs-mobile-route/`
-
-Copia de referencia de la implementación móvil que se había hecho dentro del repo web,
-en `src/app/(operational)/mobile/` (Next.js App Router). **No compila aquí**: depende de
-componentes, contextos y utilidades del proyecto Next.js. Se conserva solo como material
-de consulta para portar funcionalidades a la app Vite/Capacitor.
 
 ---
 

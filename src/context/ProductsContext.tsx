@@ -39,6 +39,7 @@ export interface ProductsContextType {
   getProductStock: (product: Product, branchIdOverride?: string) => number;
   getProductAvailableStock: (product: Product, branchIdOverride?: string) => number;
   refreshProducts: () => void;
+  upsertProduct: (product: Product) => void;
 }
 
 const DEFAULT_STATS: InventoryStats = {
@@ -60,6 +61,7 @@ const ProductsContext = createContext<ProductsContextType>({
   getProductStock: () => 0,
   getProductAvailableStock: () => 0,
   refreshProducts: () => {},
+  upsertProduct: () => {},
 });
 
 export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
@@ -72,6 +74,16 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   >([]);
 
   const previousAlertCount = useRef<number>(0);
+  const localRecentProductsRef = useRef<Map<string, Product>>(new Map());
+
+  const upsertProduct = useCallback((product: Product) => {
+    if (!product || !product.id) return;
+    localRecentProductsRef.current.set(product.id, product);
+    setProducts((prev) => {
+      const filtered = prev.filter((p) => p.id !== product.id);
+      return [product, ...filtered];
+    });
+  }, []);
 
   const mapSnapshotDocs = useCallback(
     (docs: any[]): Product[] =>
@@ -128,6 +140,17 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     let isMounted = true;
     setLoading(true);
 
+    const mergeWithLocals = (incoming: Product[]): Product[] => {
+      const incomingIds = new Set(incoming.map((p) => p.id));
+      const locals: Product[] = [];
+      for (const [id, localProd] of localRecentProductsRef.current.entries()) {
+        if (!incomingIds.has(id)) {
+          locals.push(localProd);
+        }
+      }
+      return [...locals, ...incoming];
+    };
+
     // Etapa 1: Carga rápida de los primeros 150 productos vía HTTP RPC para que cuentas con 8,000+ SKUs (ej. demo@ventify.pe) pinten en <300ms
     const fastQuery = query(
       collection(db, 'products'),
@@ -138,7 +161,8 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     getDocs(fastQuery)
       .then((snap) => {
         if (!isMounted) return;
-        setProducts((prev) => (prev.length > snap.docs.length ? prev : mapSnapshotDocs(snap.docs)));
+        const mapped = mapSnapshotDocs(snap.docs);
+        setProducts((prev) => (prev.length > snap.docs.length ? prev : mergeWithLocals(mapped)));
         setLoading(false);
       })
       .catch((err) => {
@@ -146,18 +170,18 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         if (isMounted) setLoading(false);
       });
 
-    // Etapa 2: Sincronización en tiempo real acotada a 800 productos para fluidez en móvil
+    // Etapa 2: Sincronización en tiempo real ampliada a 1200 productos para fluidez en móvil
     const realtimeQuery = query(
       collection(db, 'products'),
       where('accountId', '==', accountId),
-      limit(800)
+      limit(1200)
     );
 
     const unsubscribe = onSnapshot(
       realtimeQuery,
       (snapshot) => {
         if (!isMounted) return;
-        setProducts(mapSnapshotDocs(snapshot.docs));
+        setProducts(mergeWithLocals(mapSnapshotDocs(snapshot.docs)));
         setLoading(false);
       },
       (err) => {
@@ -355,6 +379,7 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       getProductStock: getProductStockHelper,
       getProductAvailableStock: getProductAvailableStockHelper,
       refreshProducts,
+      upsertProduct,
     }),
     [
       products,
@@ -366,6 +391,7 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       getProductStockHelper,
       getProductAvailableStockHelper,
       refreshProducts,
+      upsertProduct,
     ]
   );
 

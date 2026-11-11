@@ -167,6 +167,8 @@ export interface Product {
 /** Item in POS Cart */
 export interface CartItem {
   id: string;
+  productId?: string;
+  product?: Product;
   name: string;
   price: number;
   quantity: number;
@@ -500,8 +502,8 @@ export interface Customer {
   phone?: string;
   address?: string;
   notes?: string;
-  totalPurchases: number;
-  totalSpent: number;
+  totalPurchases?: number;
+  totalSpent?: number;
   accountId?: string;
   credits?: number;
   currentDebt?: number;

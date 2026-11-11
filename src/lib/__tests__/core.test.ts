@@ -5,6 +5,7 @@ import {
   generateId,
   generateEAN13Peru,
 } from '../theme';
+import { cleanFirestoreData } from '../firebase-utils';
 import {
   isValidDNI,
   isValidRUC,
@@ -25,6 +26,11 @@ import {
   buildReceiptHtml,
   toBase64,
 } from '../printing/escpos-builder';
+import {
+  normalizeRole,
+  roleHasPermission,
+  effectivePermissions,
+} from '../role-permissions';
 import type { Product, Sale, CashRegisterSession } from '../../types';
 
 describe('Ventify Mobile Core Libs', () => {
@@ -253,6 +259,123 @@ describe('Ventify Mobile Core Libs', () => {
       expect(html).toContain('Bodega El Éxito');
       expect(html).toContain('Inka Cola 500ml');
       expect(html).toContain('S/ 7.00');
+    });
+  });
+
+  describe('Role Permissions & Granular Limits', () => {
+    it('normalizes roles in Spanish and English', () => {
+      expect(normalizeRole('Dueño')).toBe('owner');
+      expect(normalizeRole('Propietario')).toBe('owner');
+      expect(normalizeRole('Administrador')).toBe('admin');
+      expect(normalizeRole('Gerente')).toBe('manager');
+      expect(normalizeRole('Cajero')).toBe('cashier');
+      expect(normalizeRole('Vendedor')).toBe('seller');
+      expect(normalizeRole('owner')).toBe('owner');
+      expect(normalizeRole('admin')).toBe('admin');
+      expect(normalizeRole('manager')).toBe('manager');
+      expect(normalizeRole('cashier')).toBe('cashier');
+      expect(normalizeRole('seller')).toBe('seller');
+      expect(normalizeRole('')).toBe('cashier');
+    });
+
+    it('enforces cashier limitations matching the web app', () => {
+      // Cashiers CAN register sales, modify price in POS, and request transfers
+      expect(roleHasPermission('cashier', 'register_sale')).toBe(true);
+      expect(roleHasPermission('cashier', 'modify_price')).toBe(true);
+      expect(roleHasPermission('cashier', 'request_transfer')).toBe(true);
+      expect(roleHasPermission('cashier', 'manage_customers')).toBe(true);
+
+      // Cashiers CANNOT manage products, adjust inventory, view reports, or view margins
+      expect(roleHasPermission('cashier', 'manage_products')).toBe(false);
+      expect(roleHasPermission('cashier', 'manage_inventory_adjustments')).toBe(false);
+      expect(roleHasPermission('cashier', 'view_reports')).toBe(false);
+      expect(roleHasPermission('cashier', 'view_margins')).toBe(false);
+      expect(roleHasPermission('cashier', 'manage_users')).toBe(false);
+      expect(roleHasPermission('cashier', 'access_suppliers')).toBe(false);
+    });
+
+    it('allows owners and admins full access', () => {
+      expect(roleHasPermission('owner', 'manage_products')).toBe(true);
+      expect(roleHasPermission('owner', 'view_margins')).toBe(true);
+      expect(roleHasPermission('owner', 'manage_users')).toBe(true);
+      expect(roleHasPermission('admin', 'manage_products')).toBe(true);
+      expect(roleHasPermission('admin', 'view_margins')).toBe(true);
+    });
+
+    it('respects customPermissions granted and revoked', () => {
+      // Cashier with granted manage_products
+      const customGrant = { granted: ['manage_products'] as any[] };
+      expect(roleHasPermission('cashier', 'manage_products', customGrant)).toBe(true);
+
+      // Cashier with revoked modify_price
+      const customRevoke = { revoked: ['modify_price'] as any[] };
+      expect(roleHasPermission('cashier', 'modify_price', customRevoke)).toBe(false);
+    });
+  });
+
+  describe('Firestore Sanitization Utility', () => {
+    it('removes undefined fields recursively from objects and arrays', () => {
+      const dirty = {
+        name: 'Venta',
+        total: 100,
+        notes: undefined,
+        customer: {
+          name: 'Juan',
+          phone: undefined,
+          meta: {
+            tags: undefined,
+            active: true,
+          },
+        },
+        items: [
+          {
+            id: 'item1',
+            presentation: undefined,
+            variant: undefined,
+            quantity: 2,
+          },
+        ],
+      };
+
+      const cleaned = cleanFirestoreData(dirty);
+      expect(cleaned).toEqual({
+        name: 'Venta',
+        total: 100,
+        customer: {
+          name: 'Juan',
+          meta: {
+            active: true,
+          },
+        },
+        items: [
+          {
+            id: 'item1',
+            quantity: 2,
+          },
+        ],
+      });
+      expect('notes' in cleaned).toBe(false);
+      expect('presentation' in cleaned.items[0]).toBe(false);
+      expect('variant' in cleaned.items[0]).toBe(false);
+    });
+
+    it('preserves Firestore FieldValues, Dates and numbers', () => {
+      const date = new Date();
+      const mockTimestamp = { seconds: 123456, nanoseconds: 789 };
+      const data = {
+        date,
+        createdAt: mockTimestamp,
+        amount: 0,
+        emptyStr: '',
+        nullVal: null,
+      };
+
+      const cleaned = cleanFirestoreData(data);
+      expect(cleaned.date).toBe(date);
+      expect(cleaned.createdAt).toEqual(mockTimestamp);
+      expect(cleaned.amount).toBe(0);
+      expect(cleaned.emptyStr).toBe('');
+      expect(cleaned.nullVal).toBeNull();
     });
   });
 });

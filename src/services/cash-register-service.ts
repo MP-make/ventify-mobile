@@ -12,6 +12,7 @@ import type { Sale } from '@/types';
 import {
   collection,
   doc,
+  addDoc,
   runTransaction,
   serverTimestamp,
   query,
@@ -24,6 +25,7 @@ import {
   QuerySnapshot,
   DocumentData,
   Timestamp,
+  limit,
 } from 'firebase/firestore';
 
 // ============================================================================
@@ -193,19 +195,21 @@ export const openCashSession = async (
 
   const pointerId = `active_${branchId}`;
   const pointerRef = doc(db, CASH_SESSIONS_COLLECTION, pointerId);
+  const userPointerId = `active_${accountId}_${branchId}_${userId}`;
+  const userPointerRef = doc(db, CASH_SESSIONS_COLLECTION, userPointerId);
   const sessionId = `session_${accountId}_${branchId}_${Date.now()}`;
   const sessionRef = doc(db, CASH_SESSIONS_COLLECTION, sessionId);
-  const movementRef = doc(collection(db, CASH_MOVEMENTS_COLLECTION));
 
   const createdSession = await runTransaction(db, async (tx) => {
-    // 1. Verificar si ya existe una sesión abierta activa en esta sucursal
-    const pointerSnap = await tx.get(pointerRef);
-    if (pointerSnap.exists()) {
-      const pData = pointerSnap.data();
-      if (pData.status === 'open') {
-        throw new Error(
-          `Ya existe una sesión de caja abierta en esta sucursal (Operador: ${pData.startedByName || 'Cajero'}). Ciérrala antes de abrir una nueva.`
-        );
+    // 1. Verificar si este operador específico ya tiene una caja abierta
+    const userPointerSnap = await tx.get(userPointerRef);
+    if (userPointerSnap.exists() && userPointerSnap.data()?.status === 'open') {
+      const activeId = userPointerSnap.data()?.activeSessionId;
+      if (activeId) {
+        const activeSnap = await tx.get(doc(db, CASH_SESSIONS_COLLECTION, activeId));
+        if (activeSnap.exists() && activeSnap.data()?.status === 'open') {
+          throw new Error('Ya tienes un turno de caja abierto en esta sucursal. Ciérralo antes de abrir uno nuevo.');
+        }
       }
     }
 
@@ -220,6 +224,7 @@ export const openCashSession = async (
       openingBalance: Math.round(openingBalance * 100) / 100,
       status: 'open',
       openedAt: serverTimestamp(),
+      openTime: serverTimestamp(),
       notes: notes || '',
       cashSales: 0,
       cardSales: 0,
@@ -233,7 +238,7 @@ export const openCashSession = async (
 
     tx.set(sessionRef, sessionData);
 
-    // 3. Configurar puntero determinista de sesión activa
+    // 3. Configurar puntero determinista de sesión de sucursal
     tx.set(pointerRef, {
       activeSessionId: sessionId,
       accountId,
@@ -248,18 +253,17 @@ export const openCashSession = async (
       transactionCount: 0,
     });
 
-    // 4. Registrar movimiento inicial en la colección oficial cash_register_movements
-    tx.set(movementRef, {
-      sessionId,
+    // 4. Configurar puntero por operador (multicajas como en la web)
+    tx.set(userPointerRef, {
+      activeSessionId: sessionId,
       accountId,
       branchId,
-      type: 'income',
-      category: 'opening',
-      amount: Math.round(openingBalance * 100) / 100,
-      description: 'Monto de apertura de caja',
-      createdBy: userId,
-      createdByName: userName,
-      createdAt: serverTimestamp(),
+      startedBy: userId,
+      startedByName: userName,
+      initialAmount: Math.round(openingBalance * 100) / 100,
+      status: 'open',
+      openedAt: serverTimestamp(),
+      lastUpdated: serverTimestamp(),
     });
 
     return {
@@ -267,6 +271,26 @@ export const openCashSession = async (
       openedAt: Date.now(),
     } as CashSession;
   });
+
+  // Movimiento de apertura registrado fuera de la transacción para cumplir con las reglas de Firestore
+  if (openingBalance > 0) {
+    try {
+      await addDoc(collection(db, CASH_MOVEMENTS_COLLECTION), {
+        sessionId,
+        accountId,
+        branchId,
+        type: 'income',
+        category: 'opening',
+        amount: Math.round(openingBalance * 100) / 100,
+        description: 'Monto de apertura de caja',
+        createdBy: userId,
+        createdByName: userName,
+        createdAt: serverTimestamp(),
+      });
+    } catch (movErr) {
+      console.warn('[CashRegisterService] Movimiento de apertura diferido:', movErr);
+    }
+  }
 
   return createdSession;
 };
@@ -276,20 +300,58 @@ export const openCashSession = async (
  */
 export const getActiveCashSession = async (
   branchId: string,
-  accountId?: string
+  accountId?: string,
+  userId?: string
 ): Promise<CashSession | null> => {
   try {
-    const pointerRef = doc(db, CASH_SESSIONS_COLLECTION, `active_${branchId}`);
-    const pointerSnap = await getDoc(pointerRef);
+    let activeSessionId: string | null = null;
 
-    if (!pointerSnap.exists()) return null;
-    const pointerData = pointerSnap.data();
+    // 1. Probar puntero del usuario/operador si se proporcionan accountId y userId
+    if (accountId && userId) {
+      const userPointerRef = doc(db, CASH_SESSIONS_COLLECTION, `active_${accountId}_${branchId}_${userId}`);
+      const userPointerSnap = await getDoc(userPointerRef);
+      if (userPointerSnap.exists()) {
+        const uData = userPointerSnap.data();
+        if (uData.status === 'open' && uData.activeSessionId) {
+          activeSessionId = uData.activeSessionId;
+        }
+      }
 
-    if (pointerData.status !== 'open' || !pointerData.activeSessionId) {
-      return null;
+      // Si no hay puntero pero sí userId, buscar en la colección por startedBy
+      if (!activeSessionId) {
+        const userSessionQ = query(
+          collection(db, CASH_SESSIONS_COLLECTION),
+          where('accountId', '==', accountId),
+          where('branchId', '==', branchId),
+          where('status', '==', 'open'),
+          where('startedBy', '==', userId),
+          limit(1)
+        );
+        const userSessionSnap = await getDocs(userSessionQ);
+        if (!userSessionSnap.empty) {
+          activeSessionId = userSessionSnap.docs[0].id;
+        }
+      }
+
+      // Si el operador específico no tiene sesión abierta, retornar null (sin fallback a otro usuario)
+      if (!activeSessionId) {
+        return null;
+      }
+    } else {
+      // 2. Solo si NO se especificó un operador puntual, consultar puntero global de sucursal
+      const pointerRef = doc(db, CASH_SESSIONS_COLLECTION, `active_${branchId}`);
+      const pointerSnap = await getDoc(pointerRef);
+      if (pointerSnap.exists()) {
+        const pData = pointerSnap.data();
+        if (pData.status === 'open' && pData.activeSessionId) {
+          activeSessionId = pData.activeSessionId;
+        }
+      }
     }
 
-    const sessionRef = doc(db, CASH_SESSIONS_COLLECTION, pointerData.activeSessionId);
+    if (!activeSessionId) return null;
+
+    const sessionRef = doc(db, CASH_SESSIONS_COLLECTION, activeSessionId);
     const sessionSnap = await getDoc(sessionRef);
 
     if (!sessionSnap.exists() || sessionSnap.data()?.status !== 'open') {
@@ -297,6 +359,11 @@ export const getActiveCashSession = async (
     }
 
     const data = sessionSnap.data();
+    // Si se solicitó un usuario específico, verificar que startedBy coincida
+    if (userId && data.startedBy && data.startedBy !== userId) {
+      return null;
+    }
+
     return {
       id: sessionSnap.id,
       ...data,
@@ -612,12 +679,21 @@ export const closeCashSession = async (
   const reportRef = doc(collection(db, CASH_REPORTS_COLLECTION));
   const reportId = reportRef.id;
   const pointerRef = doc(db, CASH_SESSIONS_COLLECTION, `active_${branchId}`);
+  const userPointerRef = sessionData.startedBy
+    ? doc(db, CASH_SESSIONS_COLLECTION, `active_${accountId}_${branchId}_${sessionData.startedBy}`)
+    : null;
 
   // 3. Transacción atómica de Cierre Z
   await runTransaction(db, async (tx) => {
     const freshSessionSnap = await tx.get(sessionRef);
     if (!freshSessionSnap.exists() || freshSessionSnap.data()?.status === 'closed') {
       throw new Error('La sesión de caja ya se encuentra cerrada.');
+    }
+
+    let userPointerExists = false;
+    if (userPointerRef) {
+      const uSnap = await tx.get(userPointerRef);
+      userPointerExists = uSnap.exists();
     }
 
     // Actualizar documento de sesión
@@ -655,6 +731,9 @@ export const closeCashSession = async (
 
     // Liberar puntero de sucursal
     tx.delete(pointerRef);
+    if (userPointerExists && userPointerRef) {
+      tx.delete(userPointerRef);
+    }
   });
 
   return {

@@ -22,6 +22,7 @@ import {
   updateDoc,
   Timestamp,
 } from 'firebase/firestore';
+import { cleanFirestoreData } from '@/lib/firebase-utils';
 
 // ============================================================================
 // CONSTANTES
@@ -75,6 +76,10 @@ export interface StockTransfer {
   id: string;
   transferNumber?: string;
   accountId: string;
+  sourceBranchId?: string;
+  sourceBranchName?: string;
+  destinationBranchId?: string;
+  destinationBranchName?: string;
   fromBranchId: string;
   fromBranchName?: string;
   toBranchId: string;
@@ -204,7 +209,7 @@ export const saveProduct = async (
     payload.id = productId;
     payload.createdAt = serverTimestamp();
 
-    await setDoc(newDocRef, payload);
+    await setDoc(newDocRef, cleanFirestoreData(payload));
 
     // Si tiene stock inicial en alguna sucursal, registrar movimientos en inventory_movements
     const initialMovements = Object.entries(stockMap).filter(([_, qty]) => typeof qty === 'number' && qty > 0);
@@ -212,7 +217,7 @@ export const saveProduct = async (
     for (const [branchId, qty] of initialMovements) {
       try {
         const mvRef = doc(collection(db, INVENTORY_MOVEMENTS_COLLECTION));
-        await setDoc(mvRef, {
+        await setDoc(mvRef, cleanFirestoreData({
           accountId: productData.accountId,
           branchId,
           productId,
@@ -227,14 +232,14 @@ export const saveProduct = async (
           userId: userProfile.uid,
           userName: userProfile.displayName || userProfile.email || 'Usuario',
           createdAt: serverTimestamp(),
-        });
+        }));
       } catch (err) {
         console.warn(`[InventoryService] Error registrando Kardex inicial para ${productId}:`, err);
       }
     }
   } else {
     const existingDocRef = doc(db, PRODUCTS_COLLECTION, productId);
-    await updateDoc(existingDocRef, payload);
+    await updateDoc(existingDocRef, cleanFirestoreData(payload));
   }
 
   return productId;
@@ -476,6 +481,10 @@ export const createStockTransfer = async (
     tx.set(transferDocRef, {
       id: transferId,
       accountId,
+      sourceBranchId: fromBranchId,
+      sourceBranchName: fromBranchName || '',
+      destinationBranchId: toBranchId,
+      destinationBranchName: toBranchName || '',
       fromBranchId,
       fromBranchName: fromBranchName || '',
       toBranchId,
@@ -597,14 +606,33 @@ export const getStockTransfers = async (
     const q = query(coll, ...constraints);
     const snapshot = await getDocs(q);
 
-    let transfers: StockTransfer[] = snapshot.docs.map((d) => ({
-      id: d.id,
-      ...(d.data() as any),
-    }));
+    let transfers: StockTransfer[] = snapshot.docs.map((d) => {
+      const data = d.data();
+      const srcId = data.sourceBranchId || data.fromBranchId || '';
+      const destId = data.destinationBranchId || data.toBranchId || '';
+      const srcName = data.sourceBranchName || data.fromBranchName || '';
+      const destName = data.destinationBranchName || data.toBranchName || '';
+
+      return {
+        id: d.id,
+        transferNumber: data.transferNumber || `TRF-${d.id.slice(-4).toUpperCase()}`,
+        ...data,
+        sourceBranchId: srcId,
+        destinationBranchId: destId,
+        fromBranchId: srcId,
+        toBranchId: destId,
+        fromBranchName: srcName,
+        toBranchName: destName,
+      } as StockTransfer;
+    });
 
     if (branchId && branchId !== 'all') {
       transfers = transfers.filter(
-        (t) => t.fromBranchId === branchId || t.toBranchId === branchId
+        (t) =>
+          t.sourceBranchId === branchId ||
+          t.destinationBranchId === branchId ||
+          t.fromBranchId === branchId ||
+          t.toBranchId === branchId
       );
     }
 

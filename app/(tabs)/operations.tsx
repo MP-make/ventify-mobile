@@ -64,8 +64,10 @@ import {
   closeCashSession,
   registerCashMovement,
   subscribeToSessionMovements,
+  getActiveCashSession,
   CashMovement,
   CashMovementType,
+  CashSession,
 } from '@/services/cash-register-service';
 
 import {
@@ -87,6 +89,7 @@ import {
 } from '@/services/thermal-printer-service';
 
 import { lookupDocument } from '@/lib/dni-ruc-service';
+import { usePermissions } from '@/hooks/usePermissions';
 
 // Sub-módulos disponibles
 type OperationsTab = 'cash' | 'crm' | 'orders';
@@ -95,10 +98,12 @@ import { PayrollUsersModal } from '@/components/PayrollUsersModal';
 
 export default function OperationsScreen() {
   const insets = useSafeAreaInsets();
-  const { user, userProfile, accountId, branchId, role } = useAuth();
+  const { user, userProfile, accountId, branchId, role, setActiveBranchId } = useAuth();
+  const { canManageUsers, canViewAllCashSessions } = usePermissions();
   const {
     businessSettings,
     activeBranch,
+    branches,
     isCashOpen,
     activeCashSession,
     refreshCashStatus,
@@ -107,6 +112,41 @@ export default function OperationsScreen() {
 
   const [activeTab, setActiveTab] = useState<OperationsTab>('cash');
   const [payrollModalOpen, setPayrollModalOpen] = useState<boolean>(false);
+
+  // Multi-caja para Dueños y Administradores
+  const [branchSessions, setBranchSessions] = useState<Record<string, CashSession | null>>({});
+  const [loadingBranchSessions, setLoadingBranchSessions] = useState<boolean>(false);
+
+  const fetchBranchSessions = useCallback(async () => {
+    if ((role !== 'owner' && role !== 'admin') || !branches || branches.length <= 1) return;
+    setLoadingBranchSessions(true);
+    try {
+      const results: Record<string, CashSession | null> = {};
+      for (const b of branches) {
+        const bId = b.id || 'main';
+        const sess = await getActiveCashSession(bId, accountId || undefined);
+        results[bId] = sess;
+      }
+      setBranchSessions(results);
+    } catch (err) {
+      console.warn('[Operations] Error al obtener sesiones multicaja:', err);
+    } finally {
+      setLoadingBranchSessions(false);
+    }
+  }, [branches?.length, role, accountId]);
+
+  useEffect(() => {
+    fetchBranchSessions();
+  }, [fetchBranchSessions, isCashOpen, branchId]);
+
+  const handleSwitchBranchCash = (targetBranchId: string, branchName: string) => {
+    setActiveBranchId(targetBranchId);
+    setTimeout(() => {
+      refreshCashStatus();
+      fetchBranchSessions();
+    }, 200);
+    Alert.alert('Caja Cambiada', `Ahora estás operando en la caja de "${branchName}".`);
+  };
 
   // ============================================================================
   // ESTADOS DEL SUB-MÓDULO 1: CONTROL DE CAJA Y ARQUEO
@@ -118,6 +158,11 @@ export default function OperationsScreen() {
   // Movimientos de caja en vivo
   const [movements, setMovements] = useState<CashMovement[]>([]);
   const [loadingMovements, setLoadingMovements] = useState<boolean>(false);
+
+  // Ventas del turno activo en vivo para desglose detallado de pagos
+  const [sessionSales, setSessionSales] = useState<any[]>([]);
+  const [loadingSessionSales, setLoadingSessionSales] = useState<boolean>(false);
+  const [cashSubView, setCashSubView] = useState<'movements' | 'sales'>('movements');
 
   // Modales de movimiento manual (Ingreso / Egreso)
   const [movementModalVisible, setMovementModalVisible] = useState<boolean>(false);
@@ -212,26 +257,192 @@ export default function OperationsScreen() {
   }, [activeCashSession?.sessionId, activeCashSession?.id, isCashOpen]);
 
   // ============================================================================
+  // EFECTO: CARGAR VENTAS DEL TURNO EN VIVO (DESGLOSE MULTI-PAGO)
+  // ============================================================================
+  useEffect(() => {
+    const sessId = activeCashSession?.sessionId || activeCashSession?.id;
+    if (!sessId || !accountId || !isCashOpen) {
+      setSessionSales([]);
+      return;
+    }
+
+    setLoadingSessionSales(true);
+    const q = query(
+      collection(db, 'sales'),
+      where('accountId', '==', accountId),
+      where('sessionId', '==', sessId)
+    );
+
+    const unsubscribe = onSnapshot(
+      q,
+      (snapshot) => {
+        const salesList = snapshot.docs.map((d) => ({ id: d.id, ...d.data() }));
+        salesList.sort((a: any, b: any) => {
+          const tA = a.createdAt?.toMillis?.() || a.date || 0;
+          const tB = b.createdAt?.toMillis?.() || b.date || 0;
+          return tB - tA;
+        });
+        setSessionSales(salesList);
+        setLoadingSessionSales(false);
+      },
+      (err) => {
+        console.warn('[Operations] Error cargando ventas del turno:', err);
+        setLoadingSessionSales(false);
+      }
+    );
+
+    return () => {
+      unsubscribe();
+    };
+  }, [activeCashSession?.sessionId, activeCashSession?.id, accountId, isCashOpen]);
+
+  // Desglose de ventas por método de pago calculado en vivo
+  const salesBreakdown = useMemo(() => {
+    let cash = 0;
+    let yape = 0;
+    let plin = 0;
+    let card = 0;
+    let transfer = 0;
+    let credit = 0;
+
+    let countCash = 0;
+    let countYape = 0;
+    let countPlin = 0;
+    let countCard = 0;
+    let countTransfer = 0;
+    let countCredit = 0;
+
+    for (const sale of sessionSales) {
+      if (sale.status === 'cancelled') continue;
+      const total = sale.total || 0;
+      const pMethod = (sale.paymentMethod || '').toLowerCase();
+
+      // Si tiene desglose de pagos múltiples (payments)
+      if (Array.isArray(sale.payments) && sale.payments.length > 0) {
+        for (const split of sale.payments) {
+          const cat = (split.category || '').toLowerCase();
+          const amt = split.amount || 0;
+          const provider = (split.digitalProvider || '').toLowerCase();
+
+          if (cat === 'cash') {
+            cash += amt;
+            countCash++;
+          } else if (cat === 'card') {
+            card += amt;
+            countCard++;
+          } else if (cat === 'digital') {
+            if (provider === 'yape') {
+              yape += amt;
+              countYape++;
+            } else if (provider === 'plin') {
+              plin += amt;
+              countPlin++;
+            } else {
+              transfer += amt;
+              countTransfer++;
+            }
+          } else if (cat === 'credit') {
+            credit += amt;
+            countCredit++;
+          }
+        }
+      } else {
+        if (pMethod === 'efectivo' || pMethod === 'cash') {
+          cash += total;
+          countCash++;
+        } else if (pMethod === 'tarjeta' || pMethod === 'card') {
+          card += total;
+          countCard++;
+        } else if (pMethod === 'yape') {
+          yape += total;
+          countYape++;
+        } else if (pMethod === 'plin') {
+          plin += total;
+          countPlin++;
+        } else if (pMethod === 'transferencia' || pMethod === 'transfer') {
+          transfer += total;
+          countTransfer++;
+        } else if (pMethod === 'fiado' || pMethod === 'credit') {
+          credit += total;
+          countCredit++;
+        } else {
+          if (sale.cashAmount && sale.cashAmount > 0) {
+            cash += sale.cashAmount;
+            countCash++;
+          }
+          if (sale.cardAmount && sale.cardAmount > 0) {
+            card += sale.cardAmount;
+            countCard++;
+          }
+          if (sale.digitalAmount && sale.digitalAmount > 0) {
+            yape += sale.digitalAmount;
+            countYape++;
+          }
+        }
+      }
+    }
+
+    // Fallback con acumuladores de la sesión si la lista aún está vacía
+    if (sessionSales.length === 0 && activeCashSession) {
+      cash = activeCashSession.cashSales || 0;
+      card = activeCashSession.cardSales || 0;
+      const dig = (activeCashSession as any).digitalSales;
+      if (typeof dig === 'number') {
+        yape = dig;
+      } else if (typeof dig === 'object' && dig !== null) {
+        yape = dig.yape || 0;
+        plin = dig.plin || 0;
+        transfer = dig.transfer || 0;
+        card = dig.card || card;
+      }
+      credit = (activeCashSession as any).creditSales || 0;
+    }
+
+    const totalDigital = yape + plin + card + transfer;
+    const totalAll = cash + totalDigital + credit;
+
+    return {
+      cash: Math.round(cash * 100) / 100,
+      yape: Math.round(yape * 100) / 100,
+      plin: Math.round(plin * 100) / 100,
+      card: Math.round(card * 100) / 100,
+      transfer: Math.round(transfer * 100) / 100,
+      credit: Math.round(credit * 100) / 100,
+      totalDigital: Math.round(totalDigital * 100) / 100,
+      totalAll: Math.round(totalAll * 100) / 100,
+      counts: {
+        cash: countCash,
+        yape: countYape,
+        plin: countPlin,
+        card: countCard,
+        transfer: countTransfer,
+        credit: countCredit,
+        total: sessionSales.length,
+      },
+    };
+  }, [sessionSales, activeCashSession]);
+
+  // ============================================================================
   // EFECTO: CARGAR CLIENTES Y FIADOS
   // ============================================================================
   const loadCustomersData = useCallback(async () => {
     if (!accountId) return;
     setLoadingCustomers(true);
     try {
-      const data = await getCustomers(accountId, customerSearch);
+      const data = await getCustomers(accountId);
       setCustomers(data);
     } catch (err) {
       console.error('Error cargando clientes:', err);
     } finally {
       setLoadingCustomers(false);
     }
-  }, [accountId, customerSearch]);
+  }, [accountId]);
 
   useEffect(() => {
-    if (activeTab === 'crm') {
+    if (activeTab === 'crm' && customers.length === 0) {
       loadCustomersData();
     }
-  }, [activeTab, loadCustomersData]);
+  }, [activeTab, customers.length, loadCustomersData]);
 
   // ============================================================================
   // EFECTO: CARGAR PEDIDOS Y RESERVAS
@@ -250,26 +461,27 @@ export default function OperationsScreen() {
   }, [accountId, branchId]);
 
   useEffect(() => {
-    if (activeTab === 'orders') {
+    if (activeTab === 'orders' && reservations.length === 0) {
       loadReservationsData();
     }
-  }, [activeTab, loadReservationsData]);
+  }, [activeTab, reservations.length, loadReservationsData]);
 
-  // Cargar catálogo rápido para modal de reservas
+  // Cargar catálogo rápido para modal de reservas (solo cuando se abre el modal)
   useEffect(() => {
-    if (!accountId) return;
+    if (!newReservationModalVisible || !accountId || productCatalog.length > 0) return;
     const q = query(collection(db, 'products'), where('accountId', '==', accountId));
     getDocs(q).then((snap) => {
       const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
       setProductCatalog(list);
     }).catch(() => {});
-  }, [accountId]);
+  }, [newReservationModalVisible, accountId, productCatalog.length]);
 
   // ============================================================================
   // ACCIONES SUB-MÓDULO 1: CAJA Y CIERRE Z
   // ============================================================================
   const handleOpenCash = async () => {
-    const initialAmt = parseFloat(openingBalanceInput.replace(',', '.'));
+    const cleanInput = openingBalanceInput.trim().replace(',', '.');
+    const initialAmt = cleanInput === '' ? 0 : parseFloat(cleanInput);
     if (isNaN(initialAmt) || initialAmt < 0) {
       Alert.alert('Monto Inválido', 'Ingrese un fondo inicial en efectivo válido (mínimo S/ 0.00).');
       return;
@@ -433,13 +645,22 @@ export default function OperationsScreen() {
   // ACCIONES SUB-MÓDULO 2: CLIENTES Y FIADOS
   // ============================================================================
   const filteredCustomers = useMemo(() => {
+    const term = customerSearch.trim().toLowerCase();
     return customers.filter((c) => {
       const debt = Number(c.currentDebt) || 0;
       if (customerFilter === 'with_debt' && debt <= 0) return false;
       if (customerFilter === 'no_debt' && debt > 0) return false;
-      return true;
+      if (!term) return true;
+      const name = (c.name || '').toLowerCase();
+      const doc = (c.documentNumber || '').toLowerCase();
+      const phone = (c.phone || '').toLowerCase();
+      return name.includes(term) || doc.includes(term) || phone.includes(term);
     });
-  }, [customers, customerFilter]);
+  }, [customers, customerFilter, customerSearch]);
+
+  const displayedCustomers = useMemo(() => {
+    return filteredCustomers.slice(0, 30);
+  }, [filteredCustomers]);
 
   const kpisCartera = useMemo(() => {
     let totalDebt = 0;
@@ -588,6 +809,10 @@ export default function OperationsScreen() {
     });
   }, [reservations, reservationTypeFilter, reservationStatusFilter]);
 
+  const displayedReservations = useMemo(() => {
+    return filteredReservations.slice(0, 30);
+  }, [filteredReservations]);
+
   const handleAddProductToReservation = (prod: any) => {
     const existing = orderItems.find((it) => it.productId === prod.id);
     if (existing) {
@@ -720,6 +945,86 @@ export default function OperationsScreen() {
     );
   };
 
+  const renderSalePaymentBadges = (sale: any) => {
+    if (Array.isArray(sale.payments) && sale.payments.length > 0) {
+      return sale.payments.map((p: any, idx: number) => {
+        const cat = (p.category || '').toLowerCase();
+        const prov = (p.digitalProvider || '').toLowerCase();
+        let label = 'Otro';
+        let color: string = ui.textSecondary;
+        let bg: string = ui.surfaceMuted;
+
+        if (cat === 'cash') {
+          label = 'Efectivo';
+          color = '#16A34A';
+          bg = '#DCFCE7';
+        } else if (cat === 'card') {
+          label = 'Tarjeta';
+          color = '#2563EB';
+          bg = '#EFF6FF';
+        } else if (cat === 'credit') {
+          label = 'Fiado';
+          color = '#EA580C';
+          bg = '#FFEDD5';
+        } else if (cat === 'digital') {
+          if (prov === 'yape') {
+            label = 'Yape';
+            color = '#7E22CE';
+            bg = '#F3E8FF';
+          } else if (prov === 'plin') {
+            label = 'Plin';
+            color = '#0284C7';
+            bg = '#E0F2FE';
+          } else {
+            label = 'Transf.';
+            color = '#4F46E5';
+            bg = '#EEF2FF';
+          }
+        }
+        return (
+          <View key={idx} style={[styles.methodBadgePill, { backgroundColor: bg }]}>
+            <Text style={[styles.methodBadgeText, { color }]}>
+              {label} {p.amount ? formatPEN(p.amount) : ''}
+            </Text>
+          </View>
+        );
+      });
+    }
+
+    const m = (sale.paymentMethod || '').toLowerCase();
+    let label = 'Efectivo';
+    let color: string = '#16A34A';
+    let bg: string = '#DCFCE7';
+
+    if (m === 'yape') {
+      label = 'Yape';
+      color = '#7E22CE';
+      bg = '#F3E8FF';
+    } else if (m === 'plin') {
+      label = 'Plin';
+      color = '#0284C7';
+      bg = '#E0F2FE';
+    } else if (m === 'tarjeta' || m === 'card') {
+      label = 'Tarjeta';
+      color = '#2563EB';
+      bg = '#EFF6FF';
+    } else if (m === 'transferencia' || m === 'transfer') {
+      label = 'Transferencia';
+      color = '#4F46E5';
+      bg = '#EEF2FF';
+    } else if (m === 'fiado' || m === 'credit') {
+      label = 'Fiado';
+      color = '#EA580C';
+      bg = '#FFEDD5';
+    }
+
+    return (
+      <View style={[styles.methodBadgePill, { backgroundColor: bg }]}>
+        <Text style={[styles.methodBadgeText, { color }]}>{label}</Text>
+      </View>
+    );
+  };
+
   // ============================================================================
   // RENDER PRINCIPAL
   // ============================================================================
@@ -727,73 +1032,64 @@ export default function OperationsScreen() {
     <View style={styles.screen}>
       <Header />
 
-      <ScreenHeading
-        title={activeTab === 'cash' ? 'Caja' : activeTab === 'crm' ? 'Clientes y fiados' : 'Pedidos y reservas'}
-        subtitle={activeTab === 'cash'
-          ? `${activeBranch?.name || 'Tienda Principal'} · Control de turno y movimientos`
-          : activeTab === 'crm'
-            ? 'Consulta saldos y gestiona tu cartera de clientes'
-            : 'Organiza pedidos y reservas con stock comprometido'}
-        action={(
+      <View style={styles.compactHeaderRow}>
+        <Text style={styles.compactHeaderTitle}>
+          {activeTab === 'cash' ? 'Caja' : activeTab === 'crm' ? 'Clientes' : 'Pedidos'}
+        </Text>
+        {canManageUsers ? (
           <TouchableOpacity
-            style={styles.teamButton}
+            style={styles.compactTeamButton}
             onPress={() => setPayrollModalOpen(true)}
             accessibilityRole="button"
             accessibilityLabel="Abrir equipo y planilla"
           >
-            <UserCheck size={18} color={ui.primary} />
-            <Text style={styles.teamButtonText}>Equipo</Text>
+            <UserCheck size={16} color={ui.primary} />
+            <Text style={styles.compactTeamButtonText}>Equipo</Text>
           </TouchableOpacity>
-        )}
-      />
+        ) : null}
+      </View>
 
-      {/* Navegación entre áreas de operación */}
-      <ScrollView
-        horizontal
-        showsHorizontalScrollIndicator={false}
-        style={styles.tabSelectorScroll}
-        contentContainerStyle={styles.tabSelector}
-      >
+      {/* Navegación entre áreas de operación centrada */}
+      <View style={styles.centeredTabsContainer}>
         <TouchableOpacity
-          style={[styles.tabButton, activeTab === 'cash' && styles.tabButtonActive]}
+          style={[styles.centeredTabButton, activeTab === 'cash' && styles.centeredTabButtonActive]}
           onPress={() => setActiveTab('cash')}
           accessibilityRole="tab"
           accessibilityState={{ selected: activeTab === 'cash' }}
-          accessibilityLabel="Caja y cierre de turno"
+          accessibilityLabel="Caja"
         >
-          <Wallet size={18} color={activeTab === 'cash' ? ui.primary : ui.textSecondary} />
-          <Text style={[styles.tabButtonText, activeTab === 'cash' && styles.tabButtonTextActive]}>
+          <Wallet size={17} color={activeTab === 'cash' ? ui.primary : ui.textSecondary} />
+          <Text style={[styles.centeredTabText, activeTab === 'cash' && styles.centeredTabTextActive]}>
             Caja
           </Text>
         </TouchableOpacity>
 
         <TouchableOpacity
-          style={[styles.tabButton, activeTab === 'crm' && styles.tabButtonActive]}
+          style={[styles.centeredTabButton, activeTab === 'crm' && styles.centeredTabButtonActive]}
           onPress={() => setActiveTab('crm')}
           accessibilityRole="tab"
           accessibilityState={{ selected: activeTab === 'crm' }}
-          accessibilityLabel="Clientes y fiados"
+          accessibilityLabel="Clientes"
         >
-          <Users size={18} color={activeTab === 'crm' ? ui.primary : ui.textSecondary} />
-          <Text style={[styles.tabButtonText, activeTab === 'crm' && styles.tabButtonTextActive]}>
+          <Users size={17} color={activeTab === 'crm' ? ui.primary : ui.textSecondary} />
+          <Text style={[styles.centeredTabText, activeTab === 'crm' && styles.centeredTabTextActive]}>
             Clientes
           </Text>
         </TouchableOpacity>
 
         <TouchableOpacity
-          style={[styles.tabButton, activeTab === 'orders' && styles.tabButtonActive]}
+          style={[styles.centeredTabButton, activeTab === 'orders' && styles.centeredTabButtonActive]}
           onPress={() => setActiveTab('orders')}
           accessibilityRole="tab"
           accessibilityState={{ selected: activeTab === 'orders' }}
-          accessibilityLabel="Pedidos y reservas"
+          accessibilityLabel="Pedidos"
         >
-          <CalendarClock size={18} color={activeTab === 'orders' ? ui.primary : ui.textSecondary} />
-          <Text style={[styles.tabButtonText, activeTab === 'orders' && styles.tabButtonTextActive]}>
+          <CalendarClock size={17} color={activeTab === 'orders' ? ui.primary : ui.textSecondary} />
+          <Text style={[styles.centeredTabText, activeTab === 'orders' && styles.centeredTabTextActive]}>
             Pedidos
           </Text>
         </TouchableOpacity>
-
-      </ScrollView>
+      </View>
 
       <ScrollView
         style={styles.contentContainer}
@@ -907,14 +1203,14 @@ export default function OperationsScreen() {
                     <View style={styles.statBox}>
                       <Text style={styles.statLabel}>Ventas Efectivo</Text>
                       <Text style={[styles.statValue, { color: ui.success }]}>
-                        +{formatPEN(activeCashSession?.cashSales ?? 0)}
+                        +{formatPEN(salesBreakdown.cash > 0 ? salesBreakdown.cash : (activeCashSession?.cashSales ?? 0))}
                       </Text>
                     </View>
 
                     <View style={styles.statBox}>
                       <Text style={styles.statLabel}>Ventas Digitales</Text>
                       <Text style={[styles.statValue, { color: ui.success }]}>
-                        {formatPEN(activeCashSession?.digitalSales ?? 0)}
+                        {formatPEN(salesBreakdown.totalDigital > 0 ? salesBreakdown.totalDigital : (activeCashSession?.digitalSales ?? 0))}
                       </Text>
                     </View>
 
@@ -935,8 +1231,95 @@ export default function OperationsScreen() {
                     <View style={styles.statBox}>
                       <Text style={styles.statLabel}>Transacciones</Text>
                       <Text style={styles.statValue}>
-                        {activeCashSession?.transactionCount ?? movements.length}
+                        {sessionSales.length > 0 ? sessionSales.length : (activeCashSession?.transactionCount ?? movements.length)}
                       </Text>
+                    </View>
+                  </View>
+
+                  {/* Desglose Detallado por Método de Pago */}
+                  <View style={styles.paymentBreakdownCard}>
+                    <View style={styles.paymentBreakdownHeader}>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                        <Coins size={18} color={ui.primary} />
+                        <Text style={styles.paymentBreakdownTitle}>Desglose por Método de Pago</Text>
+                      </View>
+                      <Text style={styles.paymentBreakdownTotal}>
+                        Total: {formatPEN(salesBreakdown.totalAll)}
+                      </Text>
+                    </View>
+
+                    <View style={styles.paymentBreakdownGrid}>
+                      {/* Efectivo */}
+                      <View style={styles.methodBox}>
+                        <View style={styles.methodHeader}>
+                          <View style={[styles.methodIconBadge, { backgroundColor: '#DCFCE7' }]}>
+                            <Coins size={13} color="#16A34A" />
+                          </View>
+                          <Text style={styles.methodName}>Efectivo</Text>
+                        </View>
+                        <Text style={[styles.methodAmount, { color: '#16A34A' }]}>{formatPEN(salesBreakdown.cash)}</Text>
+                        <Text style={styles.methodCount}>{salesBreakdown.counts.cash} {salesBreakdown.counts.cash === 1 ? 'venta' : 'ventas'}</Text>
+                      </View>
+
+                      {/* Yape */}
+                      <View style={styles.methodBox}>
+                        <View style={styles.methodHeader}>
+                          <View style={[styles.methodIconBadge, { backgroundColor: '#F3E8FF' }]}>
+                            <Smartphone size={13} color="#7E22CE" />
+                          </View>
+                          <Text style={styles.methodName}>Yape</Text>
+                        </View>
+                        <Text style={[styles.methodAmount, { color: '#7E22CE' }]}>{formatPEN(salesBreakdown.yape)}</Text>
+                        <Text style={styles.methodCount}>{salesBreakdown.counts.yape} {salesBreakdown.counts.yape === 1 ? 'venta' : 'ventas'}</Text>
+                      </View>
+
+                      {/* Plin */}
+                      <View style={styles.methodBox}>
+                        <View style={styles.methodHeader}>
+                          <View style={[styles.methodIconBadge, { backgroundColor: '#E0F2FE' }]}>
+                            <Smartphone size={13} color="#0284C7" />
+                          </View>
+                          <Text style={styles.methodName}>Plin</Text>
+                        </View>
+                        <Text style={[styles.methodAmount, { color: '#0284C7' }]}>{formatPEN(salesBreakdown.plin)}</Text>
+                        <Text style={styles.methodCount}>{salesBreakdown.counts.plin} {salesBreakdown.counts.plin === 1 ? 'venta' : 'ventas'}</Text>
+                      </View>
+
+                      {/* Tarjeta */}
+                      <View style={styles.methodBox}>
+                        <View style={styles.methodHeader}>
+                          <View style={[styles.methodIconBadge, { backgroundColor: '#EFF6FF' }]}>
+                            <CreditCard size={13} color="#2563EB" />
+                          </View>
+                          <Text style={styles.methodName}>Tarjeta</Text>
+                        </View>
+                        <Text style={[styles.methodAmount, { color: '#2563EB' }]}>{formatPEN(salesBreakdown.card)}</Text>
+                        <Text style={styles.methodCount}>{salesBreakdown.counts.card} {salesBreakdown.counts.card === 1 ? 'venta' : 'ventas'}</Text>
+                      </View>
+
+                      {/* Transferencia */}
+                      <View style={styles.methodBox}>
+                        <View style={styles.methodHeader}>
+                          <View style={[styles.methodIconBadge, { backgroundColor: '#EEF2FF' }]}>
+                            <Building2 size={13} color="#4F46E5" />
+                          </View>
+                          <Text style={styles.methodName}>Transferencia</Text>
+                        </View>
+                        <Text style={[styles.methodAmount, { color: '#4F46E5' }]}>{formatPEN(salesBreakdown.transfer)}</Text>
+                        <Text style={styles.methodCount}>{salesBreakdown.counts.transfer} {salesBreakdown.counts.transfer === 1 ? 'venta' : 'ventas'}</Text>
+                      </View>
+
+                      {/* Fiado / Crédito */}
+                      <View style={styles.methodBox}>
+                        <View style={styles.methodHeader}>
+                          <View style={[styles.methodIconBadge, { backgroundColor: '#FFEDD5' }]}>
+                            <FileText size={13} color="#EA580C" />
+                          </View>
+                          <Text style={styles.methodName}>Fiado / Crédito</Text>
+                        </View>
+                        <Text style={[styles.methodAmount, { color: '#EA580C' }]}>{formatPEN(salesBreakdown.credit)}</Text>
+                        <Text style={styles.methodCount}>{salesBreakdown.counts.credit} {salesBreakdown.counts.credit === 1 ? 'venta' : 'ventas'}</Text>
+                      </View>
                     </View>
                   </View>
 
@@ -984,64 +1367,241 @@ export default function OperationsScreen() {
                   </TouchableOpacity>
                 </View>
 
-                {/* Lista de Movimientos de Caja del Turno */}
+                {/* Lista de Movimientos de Caja y Ventas del Turno */}
                 <View style={styles.card}>
-                  <SectionHeading
-                    title="Movimientos del turno"
-                    action={<TouchableOpacity
-                      onPress={refreshCashStatus}
-                      style={styles.iconButton}
-                      accessibilityRole="button"
-                      accessibilityLabel="Actualizar movimientos de caja"
+                  <View style={styles.cashSubTabSelector}>
+                    <TouchableOpacity
+                      style={[styles.cashSubTabBtn, cashSubView === 'movements' && styles.cashSubTabBtnActive]}
+                      onPress={() => setCashSubView('movements')}
                     >
-                      <RefreshCw size={16} color={ui.textSecondary} />
-                    </TouchableOpacity>}
-                  />
+                      <Receipt size={16} color={cashSubView === 'movements' ? ui.primary : ui.textSecondary} />
+                      <Text style={[styles.cashSubTabText, cashSubView === 'movements' && styles.cashSubTabTextActive]}>
+                        Movimientos ({movements.length})
+                      </Text>
+                    </TouchableOpacity>
 
-                  {loadingMovements ? (
-                    <ActivityIndicator color={ui.primary} style={{ marginVertical: 20 }} />
-                  ) : movements.length === 0 ? (
-                    <View style={styles.emptyContainer}>
-                      <Receipt size={32} color={ui.textMuted} />
-                      <Text style={styles.emptyText}>No hay movimientos registrados en este turno.</Text>
-                    </View>
-                  ) : (
-                    movements.map((m) => {
-                      const isIncome = m.type === 'income';
-                      return (
-                        <View key={m.id} style={styles.movementItem}>
-                          <View
-                            style={[
-                              styles.movementBadge,
-                              { backgroundColor: isIncome ? ui.successSoft : ui.dangerSoft },
-                            ]}
-                          >
-                            {isIncome ? (
-                              <ArrowUpRight size={16} color={ui.success} />
-                            ) : (
-                              <ArrowDownRight size={16} color={ui.danger} />
-                            )}
-                          </View>
-                          <View style={{ flex: 1, marginLeft: 12 }}>
-                            <Text style={styles.movementTitle}>{m.description || 'Movimiento de caja'}</Text>
-                            <Text style={styles.movementSub}>
-                              {formatDatePE(m.createdAt)} • {m.createdByName || 'Operador'}
+                    <TouchableOpacity
+                      style={[styles.cashSubTabBtn, cashSubView === 'sales' && styles.cashSubTabBtnActive]}
+                      onPress={() => setCashSubView('sales')}
+                    >
+                      <Coins size={16} color={cashSubView === 'sales' ? ui.primary : ui.textSecondary} />
+                      <Text style={[styles.cashSubTabText, cashSubView === 'sales' && styles.cashSubTabTextActive]}>
+                        Ventas del Turno ({sessionSales.length})
+                      </Text>
+                    </TouchableOpacity>
+                  </View>
+
+                  {cashSubView === 'movements' ? (
+                    loadingMovements ? (
+                      <ActivityIndicator color={ui.primary} style={{ marginVertical: 20 }} />
+                    ) : movements.length === 0 ? (
+                      <View style={styles.emptyContainer}>
+                        <Receipt size={32} color={ui.textMuted} />
+                        <Text style={styles.emptyText}>No hay movimientos registrados en este turno.</Text>
+                      </View>
+                    ) : (
+                      movements.map((m) => {
+                        const isIncome = m.type === 'income';
+                        return (
+                          <View key={m.id} style={styles.movementItem}>
+                            <View
+                              style={[
+                                styles.movementBadge,
+                                { backgroundColor: isIncome ? ui.successSoft : ui.dangerSoft },
+                              ]}
+                            >
+                              {isIncome ? (
+                                <ArrowUpRight size={16} color={ui.success} />
+                              ) : (
+                                <ArrowDownRight size={16} color={ui.danger} />
+                              )}
+                            </View>
+                            <View style={{ flex: 1, marginLeft: 12 }}>
+                              <Text style={styles.movementTitle}>{m.description || 'Movimiento de caja'}</Text>
+                              <Text style={styles.movementSub}>
+                                {formatDatePE(m.createdAt)} • {m.createdByName || 'Operador'}
+                              </Text>
+                            </View>
+                            <Text
+                              style={[
+                                styles.movementAmount,
+                                { color: isIncome ? ui.success : ui.danger },
+                              ]}
+                            >
+                              {isIncome ? '+' : '-'}{formatPEN(m.amount)}
                             </Text>
                           </View>
-                          <Text
-                            style={[
-                              styles.movementAmount,
-                              { color: isIncome ? ui.success : ui.danger },
-                            ]}
-                          >
-                            {isIncome ? '+' : '-'}{formatPEN(m.amount)}
-                          </Text>
-                        </View>
-                      );
-                    })
+                        );
+                      })
+                    )
+                  ) : (
+                    loadingSessionSales ? (
+                      <ActivityIndicator color={ui.primary} style={{ marginVertical: 20 }} />
+                    ) : sessionSales.length === 0 ? (
+                      <View style={styles.emptyContainer}>
+                        <Coins size={32} color={ui.textMuted} />
+                        <Text style={styles.emptyText}>No hay ventas realizadas en este turno todavía.</Text>
+                      </View>
+                    ) : (
+                      sessionSales.map((sale) => {
+                        const isCancelled = sale.status === 'cancelled';
+                        const timeStr = formatDatePE(sale.createdAt || sale.date);
+                        return (
+                          <View key={sale.id} style={styles.saleItemRow}>
+                            <View style={{ flex: 1 }}>
+                              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                                <Text style={styles.movementTitle}>
+                                  {sale.correlative || `#VTA-${String(sale.saleNumber || '').padStart(5, '0')}`}
+                                </Text>
+                                {isCancelled && (
+                                  <View style={[styles.methodBadgePill, { backgroundColor: ui.dangerSoft }]}>
+                                    <Text style={[styles.methodBadgeText, { color: ui.danger }]}>Anulada</Text>
+                                  </View>
+                                )}
+                              </View>
+                              <Text style={styles.movementSub}>
+                                {timeStr} • {sale.customerName || 'Cliente Varios'}
+                              </Text>
+                              <View style={{ flexDirection: 'row', flexWrap: 'wrap', marginTop: 4 }}>
+                                {renderSalePaymentBadges(sale)}
+                              </View>
+                            </View>
+                            <Text
+                              style={[
+                                styles.movementAmount,
+                                { color: isCancelled ? ui.textMuted : ui.text },
+                              ]}
+                            >
+                              {formatPEN(sale.total || 0)}
+                            </Text>
+                          </View>
+                        );
+                      })
+                    )
                   )}
                 </View>
               </>
+            )}
+
+            {/* Monitoreo Multi-caja para Dueños y Administradores */}
+            {(role === 'owner' || role === 'admin') && branches.length > 1 && (
+              <View style={styles.card}>
+                <View style={styles.multiCashHeader}>
+                  <View style={[styles.iconBadge, { backgroundColor: ui.primarySoft }]}>
+                    <Building2 size={20} color={ui.primary} />
+                  </View>
+                  <View style={{ flex: 1, marginLeft: 10 }}>
+                    <Text style={styles.cardTitle}>Monitoreo Multi-caja</Text>
+                    <Text style={styles.cardSubtitle}>
+                      Supervisión y control de sucursales en tiempo real
+                    </Text>
+                  </View>
+                  <TouchableOpacity
+                    onPress={fetchBranchSessions}
+                    style={styles.iconButton}
+                    accessibilityRole="button"
+                    accessibilityLabel="Recargar estado de sucursales"
+                  >
+                    <RefreshCw size={16} color={ui.textSecondary} />
+                  </TouchableOpacity>
+                </View>
+
+                {loadingBranchSessions ? (
+                  <ActivityIndicator color={ui.primary} style={{ marginVertical: 16 }} />
+                ) : (
+                  <View style={styles.branchesList}>
+                    {branches.map((b) => {
+                      const bId = b.id || 'main';
+                      const isCurrent = bId === branchId;
+                      const session = branchSessions[bId];
+                      const isOpen = session?.status === 'open';
+
+                      return (
+                        <View
+                          key={bId}
+                          style={[
+                            styles.branchItemCard,
+                            isCurrent && styles.branchItemCardActive,
+                          ]}
+                        >
+                          <View style={styles.branchItemTop}>
+                            <View style={{ flex: 1 }}>
+                              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                                <Text style={styles.branchItemName}>{b.name || 'Sucursal'}</Text>
+                                {isCurrent ? (
+                                  <View style={styles.currentBranchBadge}>
+                                    <Text style={styles.currentBranchBadgeText}>Caja Actual</Text>
+                                  </View>
+                                ) : null}
+                              </View>
+                              <Text style={styles.branchItemCode}>
+                                {b.address || 'Tienda física'}
+                              </Text>
+                            </View>
+
+                            <View
+                              style={[
+                                styles.branchStatusBadge,
+                                { backgroundColor: isOpen ? ui.primarySoft : ui.surfaceMuted },
+                              ]}
+                            >
+                              <View
+                                style={[
+                                  styles.branchStatusDot,
+                                  { backgroundColor: isOpen ? ui.primary : ui.textMuted },
+                                ]}
+                              />
+                              <Text
+                                style={[
+                                  styles.branchStatusBadgeText,
+                                  { color: isOpen ? ui.primary : ui.textSecondary },
+                                ]}
+                              >
+                                {isOpen ? 'ABIERTA' : 'CERRADA'}
+                              </Text>
+                            </View>
+                          </View>
+
+                          {isOpen && session ? (
+                            <View style={styles.branchSessionMetrics}>
+                              <View style={styles.branchMetricCol}>
+                                <Text style={styles.branchMetricLabel}>Cajero:</Text>
+                                <Text style={styles.branchMetricValue} numberOfLines={1}>
+                                  {session.startedByName || 'Cajero'}
+                                </Text>
+                              </View>
+                              <View style={styles.branchMetricCol}>
+                                <Text style={styles.branchMetricLabel}>Apertura:</Text>
+                                <Text style={styles.branchMetricValue}>
+                                  {formatPEN(session.openingBalance || session.initialAmount || 0)}
+                                </Text>
+                              </View>
+                              <View style={styles.branchMetricCol}>
+                                <Text style={styles.branchMetricLabel}>Efectivo Actual:</Text>
+                                <Text style={[styles.branchMetricValue, { color: ui.primary, fontWeight: '700' }]}>
+                                  {formatPEN(session.expectedAmount || 0)}
+                                </Text>
+                              </View>
+                            </View>
+                          ) : null}
+
+                          {!isCurrent ? (
+                            <TouchableOpacity
+                              style={styles.switchBranchBtn}
+                              onPress={() => handleSwitchBranchCash(bId, b.name || 'Sucursal')}
+                              accessibilityRole="button"
+                              accessibilityLabel={`Entrar a la caja de ${b.name}`}
+                            >
+                              <Text style={styles.switchBranchBtnText}>Entrar a esta caja</Text>
+                              <ChevronRight size={14} color={ui.primary} />
+                            </TouchableOpacity>
+                          ) : null}
+                        </View>
+                      );
+                    })}
+                  </View>
+                )}
+              </View>
             )}
           </View>
         )}
@@ -1156,77 +1716,87 @@ export default function OperationsScreen() {
                 <Text style={styles.emptyText}>No se encontraron clientes en esta vista.</Text>
               </View>
             ) : (
-              filteredCustomers.map((cust) => {
-                const debt = Number(cust.currentDebt) || 0;
-                const limit = Number(cust.creditLimit) || 1;
-                const debtRatio = Math.min(1, debt / limit);
+              <>
+                {displayedCustomers.map((cust) => {
+                  const debt = Number(cust.currentDebt) || 0;
+                  const limit = Number(cust.creditLimit) || 1;
+                  const debtRatio = Math.min(1, debt / limit);
 
-                return (
-                  <View key={cust.id} style={styles.customerCard}>
-                    <View style={styles.customerTop}>
-                      <View style={{ flex: 1 }}>
-                        <Text style={styles.customerName}>{cust.name}</Text>
-                        <Text style={styles.customerDoc}>
-                          {cust.documentType || 'DOC'}: {cust.documentNumber || 'Sin número'}
-                          {cust.phone ? ` • Tel: ${cust.phone}` : ''}
-                        </Text>
+                  return (
+                    <View key={cust.id} style={styles.customerCard}>
+                      <View style={styles.customerTop}>
+                        <View style={{ flex: 1 }}>
+                          <Text style={styles.customerName}>{cust.name}</Text>
+                          <Text style={styles.customerDoc}>
+                            {cust.documentType || 'DOC'}: {cust.documentNumber || 'Sin número'}
+                            {cust.phone ? ` • Tel: ${cust.phone}` : ''}
+                          </Text>
+                        </View>
+
+                        {debt > 0 ? (
+                          <View style={{ alignItems: 'flex-end' }}>
+                            <Text style={styles.debtLabel}>DEUDA ACTIVA</Text>
+                            <Text style={styles.debtValue}>{formatPEN(debt)}</Text>
+                          </View>
+                        ) : (
+                          <View style={styles.cleanDebtBadge}>
+                            <Text style={styles.cleanDebtText}>AL DÍA</Text>
+                          </View>
+                        )}
                       </View>
 
-                      {debt > 0 ? (
-                        <View style={{ alignItems: 'flex-end' }}>
-                          <Text style={styles.debtLabel}>DEUDA ACTIVA</Text>
-                          <Text style={styles.debtValue}>{formatPEN(debt)}</Text>
+                      {/* Barra de uso de línea de crédito */}
+                      <View style={styles.creditLineBox}>
+                        <View style={styles.creditLineLabels}>
+                          <Text style={styles.creditLineText}>Línea: {formatPEN(limit)}</Text>
+                          <Text style={styles.creditLineText}>
+                            Uso: {Math.round(debtRatio * 100)}%
+                          </Text>
                         </View>
-                      ) : (
-                        <View style={styles.cleanDebtBadge}>
-                          <Text style={styles.cleanDebtText}>AL DÍA</Text>
+                        <View style={styles.progressBarBg}>
+                          <View
+                            style={[
+                              styles.progressBarFill,
+                              {
+                                width: `${debtRatio * 100}%`,
+                                backgroundColor:
+                                  debtRatio > 0.8
+                                    ? ui.danger
+                                    : debtRatio > 0.5
+                                    ? ui.warning
+                                    : ui.primary,
+                              },
+                            ]}
+                          />
                         </View>
+                      </View>
+
+                      {/* Botón de Abonar si tiene deuda */}
+                      {debt > 0 && (
+                        <TouchableOpacity
+                          style={styles.abonoButton}
+                          onPress={() => {
+                            setSelectedDebtor(cust);
+                            setPaymentAmount(String(debt));
+                            setPaymentModalVisible(true);
+                          }}
+                        >
+                          <Receipt size={16} color={ui.onPrimary} />
+                          <Text style={styles.abonoButtonText}>Cobrar Abono de Deuda</Text>
+                        </TouchableOpacity>
                       )}
                     </View>
+                  );
+                })}
 
-                    {/* Barra de uso de línea de crédito */}
-                    <View style={styles.creditLineBox}>
-                      <View style={styles.creditLineLabels}>
-                        <Text style={styles.creditLineText}>Línea: {formatPEN(limit)}</Text>
-                        <Text style={styles.creditLineText}>
-                          Uso: {Math.round(debtRatio * 100)}%
-                        </Text>
-                      </View>
-                      <View style={styles.progressBarBg}>
-                        <View
-                          style={[
-                            styles.progressBarFill,
-                            {
-                              width: `${debtRatio * 100}%`,
-                              backgroundColor:
-                                debtRatio > 0.8
-                                  ? ui.danger
-                                  : debtRatio > 0.5
-                                  ? ui.warning
-                                  : ui.primary,
-                            },
-                          ]}
-                        />
-                      </View>
-                    </View>
-
-                    {/* Botón de Abonar si tiene deuda */}
-                    {debt > 0 && (
-                      <TouchableOpacity
-                        style={styles.abonoButton}
-                        onPress={() => {
-                          setSelectedDebtor(cust);
-                          setPaymentAmount(String(debt));
-                          setPaymentModalVisible(true);
-                        }}
-                      >
-                        <Receipt size={16} color={ui.onPrimary} />
-                        <Text style={styles.abonoButtonText}>Cobrar Abono de Deuda</Text>
-                      </TouchableOpacity>
-                    )}
+                {filteredCustomers.length > 30 && (
+                  <View style={{ paddingVertical: 14, alignItems: 'center' }}>
+                    <Text style={{ fontSize: 13, color: ui.textMuted }}>
+                      Mostrando 30 de {filteredCustomers.length} clientes. Use el buscador para afinar.
+                    </Text>
                   </View>
-                );
-              })
+                )}
+              </>
             )}
           </View>
         )}
@@ -1299,127 +1869,137 @@ export default function OperationsScreen() {
                 <Text style={styles.emptyText}>No hay pedidos ni reservas activos.</Text>
               </View>
             ) : (
-              filteredReservations.map((item) => {
-                const isPending = item.status === 'pending' || item.status === 'ready';
-                const isDelivered = item.status === 'completed';
-                const isCancelled = item.status === 'cancelled';
+              <>
+                {displayedReservations.map((item) => {
+                  const isPending = item.status === 'pending' || item.status === 'ready';
+                  const isDelivered = item.status === 'completed';
+                  const isCancelled = item.status === 'cancelled';
 
-                return (
-                  <View key={item.id} style={styles.reservationCard}>
-                    <View style={styles.reservationTop}>
-                      <View style={styles.badgeRow}>
-                        <View
-                          style={[
-                            styles.typeBadge,
-                            { backgroundColor: item.type === 'order' ? ui.primarySoft : ui.accentSoft },
-                          ]}
-                        >
-                          <Text
+                  return (
+                    <View key={item.id} style={styles.reservationCard}>
+                      <View style={styles.reservationTop}>
+                        <View style={styles.badgeRow}>
+                          <View
                             style={[
-                              styles.typeBadgeText,
-                              { color: item.type === 'order' ? ui.primary : ui.accent },
+                              styles.typeBadge,
+                              { backgroundColor: item.type === 'order' ? ui.primarySoft : ui.accentSoft },
                             ]}
                           >
-                            {item.type === 'order' ? 'PEDIDO' : 'RESERVA'} #{item.id.slice(-6).toUpperCase()}
-                          </Text>
-                        </View>
+                            <Text
+                              style={[
+                                styles.typeBadgeText,
+                                { color: item.type === 'order' ? ui.primary : ui.accent },
+                              ]}
+                            >
+                              {item.type === 'order' ? 'PEDIDO' : 'RESERVA'} #{item.id.slice(-6).toUpperCase()}
+                            </Text>
+                          </View>
 
-                        <View
-                          style={[
-                            styles.statusBadge,
-                            {
-                              backgroundColor: isDelivered
-                                ? ui.successSoft
-                                : isCancelled
-                                ? ui.dangerSoft
-                                : ui.warningSoft,
-                            },
-                          ]}
-                        >
-                          <Text
+                          <View
                             style={[
-                              styles.statusBadgeText,
+                              styles.statusBadge,
                               {
-                                color: isDelivered
-                                  ? ui.success
+                                backgroundColor: isDelivered
+                                  ? ui.successSoft
                                   : isCancelled
-                                  ? ui.danger
-                                  : ui.warning,
+                                  ? ui.dangerSoft
+                                  : ui.warningSoft,
                               },
                             ]}
                           >
-                            {isDelivered ? 'ENTREGADO' : isCancelled ? 'CANCELADO' : 'PENDIENTE'}
+                            <Text
+                              style={[
+                                styles.statusBadgeText,
+                                {
+                                  color: isDelivered
+                                    ? ui.success
+                                    : isCancelled
+                                    ? ui.danger
+                                    : ui.warning,
+                                },
+                              ]}
+                            >
+                              {isDelivered ? 'ENTREGADO' : isCancelled ? 'CANCELADO' : 'PENDIENTE'}
+                            </Text>
+                          </View>
+                        </View>
+
+                        <Text style={styles.resClientName}>{item.customer?.name || 'Cliente sin nombre'}</Text>
+                        {item.customer?.phone && (
+                          <Text style={styles.resClientPhone}>Tel: {item.customer.phone}</Text>
+                        )}
+                      </View>
+
+                      {/* Ítems reservados */}
+                      <View style={styles.resItemsList}>
+                        {item.items?.map((it, idx) => (
+                          <View key={idx} style={styles.resItemRow}>
+                            <Text style={styles.resItemName}>
+                              • {it.quantity}x {it.productName}
+                            </Text>
+                            <Text style={styles.resItemPrice}>
+                              {formatPEN(it.price * it.quantity)}
+                            </Text>
+                          </View>
+                        ))}
+                      </View>
+
+                      {/* Resumen Financiero */}
+                      <View style={styles.resFinancialRow}>
+                        <View>
+                          <Text style={styles.resFinLabel}>Total</Text>
+                          <Text style={styles.resFinValue}>{formatPEN(item.total)}</Text>
+                        </View>
+                        <View>
+                          <Text style={styles.resFinLabel}>Adelanto Pagado</Text>
+                          <Text style={[styles.resFinValue, { color: ui.success }]}>
+                            {formatPEN(item.depositAmount || 0)}
+                          </Text>
+                        </View>
+                        <View>
+                          <Text style={styles.resFinLabel}>Saldo Pendiente</Text>
+                          <Text style={[styles.resFinValue, { color: ui.warning }]}>
+                            {formatPEN(item.remainingAmount || 0)}
                           </Text>
                         </View>
                       </View>
 
-                      <Text style={styles.resClientName}>{item.customer?.name || 'Cliente sin nombre'}</Text>
-                      {item.customer?.phone && (
-                        <Text style={styles.resClientPhone}>Tel: {item.customer.phone}</Text>
+                      {/* Acciones de Entrega o Cancelación */}
+                      {isPending && (
+                        <View style={styles.resActionRow}>
+                          <TouchableOpacity
+                            style={[styles.resActionButton, { borderColor: ui.danger }]}
+                            onPress={() => handleCompleteOrCancelOrder(item, 'cancel')}
+                          >
+                            <XCircle size={16} color={ui.danger} />
+                            <Text style={[styles.resActionText, { color: ui.danger }]}>
+                              Cancelar Reserva
+                            </Text>
+                          </TouchableOpacity>
+
+                          <TouchableOpacity
+                            style={[styles.resActionButton, { backgroundColor: ui.primary, borderColor: ui.primary }]}
+                            onPress={() => handleCompleteOrCancelOrder(item, 'complete')}
+                          >
+                            <CheckCircle2 size={16} color={ui.onPrimary} />
+                            <Text style={[styles.resActionText, { color: ui.onPrimary, fontWeight: 'bold' }]}>
+                              Marcar Entregado
+                            </Text>
+                          </TouchableOpacity>
+                        </View>
                       )}
                     </View>
+                  );
+                })}
 
-                    {/* Ítems reservados */}
-                    <View style={styles.resItemsList}>
-                      {item.items?.map((it, idx) => (
-                        <View key={idx} style={styles.resItemRow}>
-                          <Text style={styles.resItemName}>
-                            • {it.quantity}x {it.productName}
-                          </Text>
-                          <Text style={styles.resItemPrice}>
-                            {formatPEN(it.price * it.quantity)}
-                          </Text>
-                        </View>
-                      ))}
-                    </View>
-
-                    {/* Resumen Financiero */}
-                    <View style={styles.resFinancialRow}>
-                      <View>
-                        <Text style={styles.resFinLabel}>Total</Text>
-                        <Text style={styles.resFinValue}>{formatPEN(item.total)}</Text>
-                      </View>
-                      <View>
-                        <Text style={styles.resFinLabel}>Adelanto Pagado</Text>
-                        <Text style={[styles.resFinValue, { color: ui.success }]}>
-                          {formatPEN(item.depositAmount || 0)}
-                        </Text>
-                      </View>
-                      <View>
-                        <Text style={styles.resFinLabel}>Saldo Pendiente</Text>
-                        <Text style={[styles.resFinValue, { color: ui.warning }]}>
-                          {formatPEN(item.remainingAmount || 0)}
-                        </Text>
-                      </View>
-                    </View>
-
-                    {/* Acciones de Entrega o Cancelación */}
-                    {isPending && (
-                      <View style={styles.resActionRow}>
-                        <TouchableOpacity
-                          style={[styles.resActionButton, { borderColor: ui.danger }]}
-                          onPress={() => handleCompleteOrCancelOrder(item, 'cancel')}
-                        >
-                          <XCircle size={16} color={ui.danger} />
-                          <Text style={[styles.resActionText, { color: ui.danger }]}>
-                            Cancelar Reserva
-                          </Text>
-                        </TouchableOpacity>
-
-                        <TouchableOpacity
-                          style={[styles.resActionButton, { backgroundColor: ui.primary, borderColor: ui.primary }]}
-                          onPress={() => handleCompleteOrCancelOrder(item, 'complete')}
-                        >
-                          <CheckCircle2 size={16} color={ui.onPrimary} />
-                          <Text style={[styles.resActionText, { color: ui.onPrimary, fontWeight: 'bold' }]}>
-                            Marcar Entregado
-                          </Text>
-                        </TouchableOpacity>
-                      </View>
-                    )}
+                {filteredReservations.length > 30 && (
+                  <View style={{ paddingVertical: 14, alignItems: 'center' }}>
+                    <Text style={{ fontSize: 13, color: ui.textMuted }}>
+                      Mostrando 30 de {filteredReservations.length} pedidos/reservas.
+                    </Text>
                   </View>
-                );
-              })
+                )}
+              </>
             )}
           </View>
         )}
@@ -2230,6 +2810,128 @@ const styles = StyleSheet.create({
     borderRadius: theme.borderRadius.sm,
     padding: 12,
   },
+  paymentBreakdownCard: {
+    backgroundColor: ui.surfaceMuted,
+    borderRadius: theme.borderRadius.md,
+    borderWidth: 1,
+    borderColor: ui.border,
+    padding: 14,
+    gap: 10,
+    marginTop: 4,
+  },
+  paymentBreakdownHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingBottom: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: ui.border,
+  },
+  paymentBreakdownTitle: {
+    fontSize: theme.typography.sizes.sm,
+    fontWeight: '700',
+    color: ui.text,
+  },
+  paymentBreakdownTotal: {
+    fontSize: theme.typography.sizes.sm,
+    fontWeight: '800',
+    color: ui.primary,
+  },
+  paymentBreakdownGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  methodBox: {
+    width: '48%',
+    backgroundColor: ui.surface,
+    borderRadius: theme.borderRadius.sm,
+    padding: 10,
+    borderWidth: 1,
+    borderColor: ui.border,
+  },
+  methodHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginBottom: 4,
+  },
+  methodIconBadge: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  methodName: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: ui.textSecondary,
+  },
+  methodAmount: {
+    fontSize: 15,
+    fontWeight: '800',
+    color: ui.text,
+    marginTop: 2,
+  },
+  methodCount: {
+    fontSize: 11,
+    color: ui.textMuted,
+    marginTop: 1,
+  },
+  cashSubTabSelector: {
+    flexDirection: 'row',
+    backgroundColor: ui.surfaceMuted,
+    borderRadius: theme.borderRadius.md,
+    padding: 4,
+    gap: 4,
+    marginBottom: 12,
+  },
+  cashSubTabBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 9,
+    borderRadius: theme.borderRadius.sm,
+    gap: 6,
+  },
+  cashSubTabBtnActive: {
+    backgroundColor: ui.surface,
+    elevation: 1,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.08,
+    shadowRadius: 1,
+  },
+  cashSubTabText: {
+    fontSize: 12.5,
+    fontWeight: '600',
+    color: ui.textSecondary,
+  },
+  cashSubTabTextActive: {
+    color: ui.primary,
+    fontWeight: '700',
+  },
+  saleItemRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: ui.border,
+    gap: 10,
+  },
+  methodBadgePill: {
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 6,
+    marginRight: 4,
+    marginTop: 2,
+  },
+  methodBadgeText: {
+    fontSize: 11,
+    fontWeight: '700',
+  },
   statLabel: {
     fontSize: ui.font.small,
     color: ui.textSecondary,
@@ -2919,6 +3621,168 @@ const styles = StyleSheet.create({
   totalAmount: {
     fontSize: 14,
     fontWeight: 'bold',
+    color: ui.primary,
+  },
+  compactHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 20,
+    paddingTop: 10,
+    paddingBottom: 6,
+  },
+  compactHeaderTitle: {
+    fontSize: 20,
+    fontWeight: '800',
+    color: ui.text,
+    letterSpacing: -0.5,
+  },
+  compactTeamButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: theme.borderRadius.md,
+    backgroundColor: ui.primarySoft,
+  },
+  compactTeamButtonText: {
+    fontSize: ui.font.small,
+    color: ui.primary,
+    fontWeight: '700',
+  },
+  centeredTabsContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    paddingHorizontal: 20,
+    paddingVertical: 6,
+  },
+  centeredTabButton: {
+    flex: 1,
+    minHeight: 44,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 8,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: ui.border,
+    backgroundColor: ui.surface,
+    gap: 6,
+  },
+  centeredTabButtonActive: {
+    backgroundColor: ui.primarySoft,
+    borderColor: ui.primary,
+  },
+  centeredTabText: {
+    fontSize: ui.font.small,
+    color: ui.textSecondary,
+    fontWeight: theme.typography.weights.medium,
+  },
+  centeredTabTextActive: {
+    color: ui.primary,
+    fontWeight: theme.typography.weights.bold,
+  },
+  multiCashHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  branchesList: {
+    gap: 10,
+  },
+  branchItemCard: {
+    backgroundColor: ui.surfaceMuted,
+    borderRadius: 12,
+    padding: 12,
+    borderWidth: 1,
+    borderColor: ui.border,
+    gap: 8,
+  },
+  branchItemCardActive: {
+    borderColor: ui.primary,
+    backgroundColor: ui.surface,
+  },
+  branchItemTop: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+  },
+  branchItemName: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: ui.text,
+  },
+  currentBranchBadge: {
+    backgroundColor: ui.primarySoft,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 6,
+  },
+  currentBranchBadgeText: {
+    fontSize: 10,
+    fontWeight: 'bold',
+    color: ui.primary,
+  },
+  branchItemCode: {
+    fontSize: 11,
+    color: ui.textSecondary,
+    marginTop: 2,
+  },
+  branchStatusBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 12,
+  },
+  branchStatusDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+  },
+  branchStatusBadgeText: {
+    fontSize: 10,
+    fontWeight: 'bold',
+  },
+  branchSessionMetrics: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    backgroundColor: ui.surface,
+    padding: 8,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: ui.border,
+  },
+  branchMetricCol: {
+    flex: 1,
+  },
+  branchMetricLabel: {
+    fontSize: 10,
+    color: ui.textSecondary,
+  },
+  branchMetricValue: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: ui.text,
+    marginTop: 1,
+  },
+  switchBranchBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 4,
+    paddingVertical: 8,
+    borderRadius: 8,
+    backgroundColor: ui.primarySoft,
+    marginTop: 4,
+  },
+  switchBranchBtnText: {
+    fontSize: 12,
+    fontWeight: '700',
     color: ui.primary,
   },
 });

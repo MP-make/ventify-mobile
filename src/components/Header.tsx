@@ -14,35 +14,57 @@ export const Header: React.FC<HeaderProps> = ({ title, showBranchSelector = true
   const { lockTerminal, branchId, setActiveBranchId, allBranchesAccess, role } = useAuth();
   const { businessName, activeBranchName, branches, isCashOpen, isOnline, offlineQueueCount } = useSettings();
   const [branchModalVisible, setBranchModalVisible] = useState(false);
-  const canSwitchBranch = allBranchesAccess || role === 'owner' || role === 'admin' || branches.length > 1;
+  const canSwitchBranch = Boolean(allBranchesAccess || role === 'owner' || role === 'admin') && branches.length > 1;
   const handleSelectBranch = (bId: string) => { setActiveBranchId(bId); setBranchModalVisible(false); };
 
   return (
     <>
-      <View style={[styles.container, { paddingTop: insets.top + 8 }]}>
-        <View style={styles.brandRow}>
-          <BrandLogo size={34} />
-          <TouchableOpacity onPress={lockTerminal} style={styles.lockButton} accessibilityRole="button" accessibilityLabel="Bloquear terminal con PIN" accessibilityHint="Solicita el PIN para volver a usar el terminal">
-            <Lock size={19} color={ui.textSecondary} />
-          </TouchableOpacity>
-        </View>
-        <View style={styles.contextRow}>
+      <View style={[styles.container, { paddingTop: insets.top + 6 }]}>
+        <View style={styles.singleBarRow}>
           {showBranchSelector ? (
-            <TouchableOpacity onPress={() => canSwitchBranch && setBranchModalVisible(true)} disabled={!canSwitchBranch} style={styles.branchButton} accessibilityRole="button" accessibilityLabel={`Sucursal activa: ${activeBranchName}${canSwitchBranch ? '. Cambiar sucursal' : ''}`} accessibilityState={{ disabled: !canSwitchBranch }}>
-              <Store size={15} color={ui.textSecondary} />
+            <TouchableOpacity
+              onPress={() => canSwitchBranch && setBranchModalVisible(true)}
+              disabled={!canSwitchBranch}
+              style={styles.branchButton}
+              accessibilityRole="button"
+              accessibilityLabel={`Sucursal activa: ${activeBranchName}${canSwitchBranch ? '. Cambiar sucursal' : ''}`}
+              accessibilityState={{ disabled: !canSwitchBranch }}
+            >
+              <View style={styles.storeIconMini}>
+                <Store size={14} color={ui.primary} />
+              </View>
               <Text style={styles.branchName} numberOfLines={1}>{activeBranchName || businessName}</Text>
-              {canSwitchBranch && branches.length > 1 && <ChevronDown size={14} color={ui.textSecondary} />}
+              {canSwitchBranch && <ChevronDown size={14} color={ui.textSecondary} />}
             </TouchableOpacity>
-          ) : <Text style={styles.branchName} numberOfLines={1}>{title || businessName}</Text>}
-          <View style={[styles.cashStatus, { backgroundColor: isCashOpen ? ui.successSoft : ui.surfaceMuted }]}>
-            <View style={[styles.dot, { backgroundColor: isCashOpen ? ui.success : ui.textMuted }]} />
-            <Text style={[styles.cashText, { color: isCashOpen ? ui.success : ui.textSecondary }]}>{isCashOpen ? 'Caja abierta' : 'Caja cerrada'}</Text>
+          ) : (
+            <View style={styles.titleWrapper}>
+              <Text style={styles.branchName} numberOfLines={1}>{title || businessName}</Text>
+            </View>
+          )}
+
+          <View style={styles.rightActions}>
+            <View style={[styles.cashStatus, { backgroundColor: isCashOpen ? ui.successSoft : ui.surfaceMuted }]}>
+              <View style={[styles.dot, { backgroundColor: isCashOpen ? ui.success : ui.textMuted }]} />
+              <Text style={[styles.cashText, { color: isCashOpen ? ui.success : ui.textSecondary }]}>
+                {isCashOpen ? 'Caja abierta' : 'Caja cerrada'}
+              </Text>
+            </View>
+            <TouchableOpacity
+              onPress={lockTerminal}
+              style={styles.lockButton}
+              accessibilityRole="button"
+              accessibilityLabel="Bloquear terminal con PIN"
+              accessibilityHint="Solicita el PIN para volver a usar el terminal"
+            >
+              <Lock size={16} color={ui.textSecondary} />
+            </TouchableOpacity>
           </View>
         </View>
+
         {!isOnline ? (
-          <View style={styles.notice}><WifiOff size={14} color={ui.warning} /><Text style={styles.noticeText}>Sin conexión{offlineQueueCount > 0 ? ` · ${offlineQueueCount} pendientes de sincronizar` : ''}</Text></View>
+          <View style={styles.notice}><WifiOff size={13} color={ui.warning} /><Text style={styles.noticeText}>Sin conexión{offlineQueueCount > 0 ? ` · ${offlineQueueCount} pendientes de sincronizar` : ''}</Text></View>
         ) : offlineQueueCount > 0 ? (
-          <View style={styles.notice}><CloudOff size={14} color={ui.warning} /><Text style={styles.noticeText}>{offlineQueueCount} pendientes de sincronizar</Text></View>
+          <View style={styles.notice}><CloudOff size={13} color={ui.warning} /><Text style={styles.noticeText}>{offlineQueueCount} pendientes de sincronizar</Text></View>
         ) : null}
       </View>
       <Modal visible={branchModalVisible} transparent animationType="fade" onRequestClose={() => setBranchModalVisible(false)}>
@@ -50,7 +72,7 @@ export const Header: React.FC<HeaderProps> = ({ title, showBranchSelector = true
           <View style={[styles.sheet, { paddingBottom: Math.max(insets.bottom, 20) }]} onStartShouldSetResponder={() => true}>
             <View style={styles.sheetHeader}>
               <View style={styles.copy}><Text style={styles.sheetTitle}>Tus sucursales</Text><Text style={styles.sheetSubtitle}>Elige dónde vas a trabajar.</Text></View>
-              <TouchableOpacity style={styles.lockButton} onPress={() => setBranchModalVisible(false)} accessibilityRole="button" accessibilityLabel="Cerrar selección de sucursal"><X size={21} color={ui.textSecondary} /></TouchableOpacity>
+              <TouchableOpacity style={styles.sheetCloseButton} onPress={() => setBranchModalVisible(false)} accessibilityRole="button" accessibilityLabel="Cerrar selección de sucursal"><X size={20} color={ui.textSecondary} /></TouchableOpacity>
             </View>
             <ScrollView showsVerticalScrollIndicator={false}>
               {branches.map(b => {
@@ -71,27 +93,30 @@ export const Header: React.FC<HeaderProps> = ({ title, showBranchSelector = true
   );
 };
 const styles = StyleSheet.create({
-  container: { backgroundColor: ui.surface, paddingHorizontal: 20, paddingBottom: 4, borderBottomWidth: 1, borderBottomColor: ui.border },
-  brandRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
-  lockButton: { width: 48, height: 48, alignItems: 'center', justifyContent: 'center', borderRadius: 12, backgroundColor: ui.surfaceMuted },
-  contextRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
-  branchButton: { flex: 1, minWidth: 0, minHeight: 48, flexDirection: 'row', alignItems: 'center', gap: 7 },
-  branchName: { flexShrink: 1, color: ui.textSecondary, fontSize: 13, fontWeight: '500' },
-  cashStatus: { flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 9, paddingVertical: 5, borderRadius: 8 },
+  container: { backgroundColor: ui.surface, paddingHorizontal: 14, paddingBottom: 6, borderBottomWidth: 1, borderBottomColor: ui.border },
+  singleBarRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8, minHeight: 38 },
+  branchButton: { flex: 1, minWidth: 0, flexDirection: 'row', alignItems: 'center', gap: 6 },
+  titleWrapper: { flex: 1, minWidth: 0 },
+  storeIconMini: { width: 26, height: 26, borderRadius: 7, backgroundColor: ui.primarySoft, alignItems: 'center', justifyContent: 'center' },
+  branchName: { flexShrink: 1, color: ui.text, fontSize: 13, fontWeight: '700' },
+  rightActions: { flexDirection: 'row', alignItems: 'center', gap: 8, flexShrink: 0 },
+  lockButton: { width: 34, height: 34, alignItems: 'center', justifyContent: 'center', borderRadius: 9, backgroundColor: ui.surfaceMuted },
+  sheetCloseButton: { width: 38, height: 38, alignItems: 'center', justifyContent: 'center', borderRadius: 10, backgroundColor: ui.surfaceMuted },
+  cashStatus: { flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 8, paddingVertical: 5, borderRadius: 8 },
   dot: { width: 6, height: 6, borderRadius: 3 },
   cashText: { fontSize: 11, fontWeight: '600' },
-  notice: { flexDirection: 'row', alignItems: 'center', gap: 6, backgroundColor: ui.warningSoft, padding: 9, borderRadius: 8, marginBottom: 8 },
-  noticeText: { flex: 1, color: ui.warning, fontSize: 12 },
+  notice: { flexDirection: 'row', alignItems: 'center', gap: 6, backgroundColor: ui.warningSoft, padding: 6, borderRadius: 7, marginTop: 4 },
+  noticeText: { flex: 1, color: ui.warning, fontSize: 11 },
   overlay: { flex: 1, backgroundColor: 'rgba(17,28,49,0.40)', justifyContent: 'flex-end' },
   sheet: { backgroundColor: ui.surface, padding: 20, borderTopLeftRadius: 24, borderTopRightRadius: 24, maxHeight: '80%', width: '100%', maxWidth: 640, alignSelf: 'center' },
-  sheetHeader: { flexDirection: 'row', alignItems: 'center', gap: 12, marginBottom: 20 },
+  sheetHeader: { flexDirection: 'row', alignItems: 'center', gap: 12, marginBottom: 16 },
   copy: { flex: 1, minWidth: 0 },
-  sheetTitle: { fontSize: 23, fontWeight: '700', color: ui.text, letterSpacing: -0.5 },
-  sheetSubtitle: { fontSize: 14, color: ui.textSecondary, marginTop: 5 },
-  branchCard: { flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 16, paddingHorizontal: 12, borderRadius: 12, marginBottom: 6 },
+  sheetTitle: { fontSize: 20, fontWeight: '700', color: ui.text, letterSpacing: -0.4 },
+  sheetSubtitle: { fontSize: 13, color: ui.textSecondary, marginTop: 3 },
+  branchCard: { flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 12, paddingHorizontal: 12, borderRadius: 12, marginBottom: 6 },
   selectedBranch: { backgroundColor: ui.primarySoft },
-  storeIcon: { width: 44, height: 44, borderRadius: 12, backgroundColor: ui.surfaceMuted, alignItems: 'center', justifyContent: 'center' },
-  branchTitle: { color: ui.text, fontSize: 16, fontWeight: '600' },
-  addressRow: { flexDirection: 'row', alignItems: 'center', gap: 4, marginTop: 5 },
+  storeIcon: { width: 40, height: 40, borderRadius: 10, backgroundColor: ui.surfaceMuted, alignItems: 'center', justifyContent: 'center' },
+  branchTitle: { color: ui.text, fontSize: 15, fontWeight: '600' },
+  addressRow: { flexDirection: 'row', alignItems: 'center', gap: 4, marginTop: 4 },
   address: { flex: 1, color: ui.textSecondary, fontSize: 12 },
 });

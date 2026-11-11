@@ -376,9 +376,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // 4. Cambiar sucursal activa
   const setActiveBranchId = useCallback((newBranchId: string) => {
     if (!newBranchId) return;
+    if (role === 'cashier' && !allBranchesAccess) {
+      console.warn('[AuthContext] Cajero sin acceso multitienda no puede cambiar de sucursal');
+      return;
+    }
     setBranchIdState(newBranchId);
     AsyncStorage.setItem(STORAGE_BRANCH_ID_KEY, newBranchId).catch(() => {});
-  }, []);
+  }, [role, allBranchesAccess]);
 
   // 5. Iniciar sesión con email y contraseña
   const login = useCallback(

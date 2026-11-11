@@ -32,6 +32,7 @@ import {
   QuerySnapshot,
 } from 'firebase/firestore';
 import type { CartItem, Product, Customer } from '@/types';
+import { cleanFirestoreData } from '@/lib/firebase-utils';
 
 // ============================================================================
 // CONSTANTES DE COLECCIONES
@@ -583,15 +584,13 @@ export const createQuote = async (input: CreateQuoteInput): Promise<Quote> => {
     updatedAt: serverTimestamp(),
   };
 
-  // Limpieza de campos undefined
-  Object.keys(payload).forEach((k) => {
-    if (payload[k] === undefined) delete payload[k];
-  });
+  // Limpieza profunda y recursiva de campos undefined para Firestore
+  const cleanPayload = cleanFirestoreData(payload);
 
-  const docRef = await addDoc(collection(db, QUOTES_COLLECTION), payload);
+  const docRef = await addDoc(collection(db, QUOTES_COLLECTION), cleanPayload);
   return {
     id: docRef.id,
-    ...payload,
+    ...cleanPayload,
   } as Quote;
 };
 

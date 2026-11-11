@@ -19,6 +19,7 @@ import {
   Camera,
   CameraOff,
   Zap,
+  ZapOff,
   Pause,
   Play,
   Scale,
@@ -40,6 +41,10 @@ import {
   FileText,
   Laptop,
   Barcode,
+  Tag,
+  Check,
+  CalendarClock,
+  User,
 } from 'lucide-react-native';
 import { CameraView, useCameraPermissions, BarcodeScanningResult } from 'expo-camera';
 import * as Haptics from 'expo-haptics';
@@ -48,6 +53,7 @@ import { useCart } from '@/context/CartContext';
 import { useProducts } from '@/context/ProductsContext';
 import { useAuth } from '@/context/AuthContext';
 import { useSettings } from '@/context/SettingsContext';
+import { usePermissions } from '@/hooks/usePermissions';
 import { formatPEN, ui } from '@/lib/theme';
 import { ScreenHeading, SectionHeading } from '@/components/ui';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -57,18 +63,38 @@ import { WeightQuantityModal } from '@/components/WeightQuantityModal';
 import { CheckoutModal } from '@/components/CheckoutModal';
 import { CompanionScannerModal } from '@/components/CompanionScannerModal';
 import { QuotesManagerModal } from '@/components/QuotesManagerModal';
+import { InlineFilterBar } from '@/components/InlineFilterBar';
+import { createReservationOrOrder } from '@/services/crm-operations-service';
+import {
+  catalogBrand,
+  catalogSizes,
+  DEFAULT_CATALOG_BRANDS,
+  DEFAULT_CATALOG_SIZES,
+  mergeCatalogOptions,
+  normalizeCatalogLabel,
+} from '@/lib/catalog-filters';
 import type { Product, CartItem, PausedSale, ProductPresentation } from '@/types';
 
 export const triggerScanHaptic = () => {
   Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
 };
 
+const normalizeStr = (str: string = '') =>
+  str
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim();
+
 export default function PosCounterScreen() {
   const insets = useSafeAreaInsets();
-  const { branchId, accountId } = useAuth();
+  const { branchId, accountId, user, userProfile } = useAuth();
+  const { posSettings, activeCashSession } = useSettings();
+  const { canModifyPrice } = usePermissions();
   const { products, categories, loading: productsLoading, findByBarcode, getProductStock } = useProducts();
   const {
     items,
+    customer,
     total,
     totalAmount,
     itemCount,
@@ -87,15 +113,30 @@ export default function PosCounterScreen() {
   const safeTotal = totalAmount ?? total ?? 0;
   const safeCount = itemCount ?? totalItemsCount ?? 0;
 
-  // 1. Buscador y Visor de Cámara Embebido
+  // 1. Buscador, Categorías y Filtros de Catálogo
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedCategory, setSelectedCategory] = useState('Todas');
+  const [categoryDropdownExpanded, setCategoryDropdownExpanded] = useState(false);
+  const [categorySearchQuery, setCategorySearchQuery] = useState('');
+  const [selectedBrand, setSelectedBrand] = useState('Todas');
+  const [selectedSize, setSelectedSize] = useState('Todas');
   const [isCameraActive, setIsCameraActive] = useState(false);
   const [torchOn, setTorchOn] = useState(false);
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [fullscreenScannerOpen, setFullscreenScannerOpen] = useState(false);
   const lastScannedCodeRef = useRef<string>('');
   const scanCooldownRef = useRef<boolean>(false);
+
+  // Modal Reserva
+  const [reservationModalOpen, setReservationModalOpen] = useState(false);
+  const [resCustomerName, setResCustomerName] = useState('');
+  const [resCustomerPhone, setResCustomerPhone] = useState('');
+  const [resCustomerDoc, setResCustomerDoc] = useState('');
+  const [resDepositStr, setResDepositStr] = useState('');
+  const [resDepositMethod, setResDepositMethod] = useState<'cash' | 'yape' | 'plin' | 'card'>('cash');
+  const [resDays, setResDays] = useState('7');
+  const [resNotes, setResNotes] = useState('');
+  const [isSavingRes, setIsSavingRes] = useState(false);
 
   // 2. Modales Especiales
   const [checkoutModalOpen, setCheckoutModalOpen] = useState(false);
@@ -146,7 +187,8 @@ export default function PosCounterScreen() {
       scanCooldownRef.current = true;
       setTimeout(() => {
         scanCooldownRef.current = false;
-      }, 1000);
+        lastScannedCodeRef.current = '';
+      }, 1200);
 
       const match = findByBarcode(cleanCode);
       if (!match) {
@@ -211,29 +253,172 @@ export default function PosCounterScreen() {
 
   // Escaneo desde la cámara embebida
   const handleCameraScan = (result: BarcodeScanningResult) => {
-    if (result.data && result.data !== lastScannedCodeRef.current) {
+    if (result.data && (!scanCooldownRef.current || result.data !== lastScannedCodeRef.current)) {
       lastScannedCodeRef.current = result.data;
       handleBarcodeDetected(result.data);
     }
   };
 
-  // Filtrado de productos por categoría y texto
+  const enableCatalogFilters = !!posSettings?.enableCatalogFilters;
+
+  // Marcas únicas del catálogo (incluye atributos y marcas predeterminadas como en la web)
+  const availableBrands = useMemo(() => {
+    const extracted = products.map(catalogBrand).filter(Boolean);
+    return ['Todas', ...mergeCatalogOptions(DEFAULT_CATALOG_BRANDS, extracted)];
+  }, [products]);
+
+  // Tallas / Medidas únicas del catálogo
+  const availableSizes = useMemo(() => {
+    const extracted = products.flatMap(catalogSizes).filter(Boolean);
+    return ['Todas', ...mergeCatalogOptions(DEFAULT_CATALOG_SIZES, extracted)];
+  }, [products]);
+
+  // Filtrado de productos por categoría, marca, talla y texto (insensible a tildes)
   const filteredProducts = useMemo(() => {
-    const q = searchQuery.trim().toLowerCase();
+    const q = normalizeCatalogLabel(searchQuery);
     return products.filter((p) => {
+      // 1. Filtro Categoría
       const matchCat =
         selectedCategory === 'Todas' ||
-        (selectedCategory === 'Sin Categoría' ? !p.category : p.category === selectedCategory);
-
+        (selectedCategory === 'Sin Categoría'
+          ? !p.category
+          : normalizeCatalogLabel(p.category) === normalizeCatalogLabel(selectedCategory));
       if (!matchCat) return false;
+
+      // 2. Filtro Marca
+      if (selectedBrand !== 'Todas') {
+        const pBrand = normalizeCatalogLabel(catalogBrand(p));
+        if (pBrand !== normalizeCatalogLabel(selectedBrand)) {
+          return false;
+        }
+      }
+
+      // 3. Filtro Talla / Medida
+      if (selectedSize !== 'Todas') {
+        const pSizes = catalogSizes(p).map(normalizeCatalogLabel);
+        if (!pSizes.includes(normalizeCatalogLabel(selectedSize))) {
+          return false;
+        }
+      }
+
+      // 4. Texto libre (nombre, sku, código o marca)
       if (!q) return true;
 
-      const nameMatch = p.name?.toLowerCase().includes(q);
-      const barcodeMatch = p.barcode?.toLowerCase().includes(q);
-      const skuMatch = p.sku?.toLowerCase().includes(q);
-      return nameMatch || barcodeMatch || skuMatch;
+      const normName = normalizeCatalogLabel(p.name);
+      const normBarcode = normalizeCatalogLabel(p.barcode || '');
+      const normSku = normalizeCatalogLabel(p.sku || '');
+      const normBrand = normalizeCatalogLabel(catalogBrand(p));
+      return (
+        normName.includes(q) ||
+        normBarcode.includes(q) ||
+        normSku.includes(q) ||
+        normBrand.includes(q)
+      );
     });
-  }, [products, searchQuery, selectedCategory]);
+  }, [products, searchQuery, selectedCategory, selectedBrand, selectedSize]);
+
+  // Lista de categorías con conteo de productos
+  const categoryListWithCounts = useMemo(() => {
+    const rawCategories = ['Todas', ...categories.filter((c) => c !== 'Todas' && c !== 'Todos')];
+    return rawCategories.map((cat) => {
+      const count =
+        cat === 'Todas'
+          ? products.length
+          : cat === 'Sin Categoría'
+          ? products.filter((p) => !p.category).length
+          : products.filter((p) => p.category === cat).length;
+      return { name: cat, count };
+    });
+  }, [categories, products]);
+
+  // Categorías filtradas por el buscador del selector (insensible a tildes e iniciales)
+  const filteredCategoriesList = useMemo(() => {
+    const q = normalizeStr(categorySearchQuery);
+    if (!q) return categoryListWithCounts;
+    return categoryListWithCounts.filter((c) => {
+      const norm = normalizeStr(c.name);
+      return norm.includes(q) || norm.startsWith(q);
+    });
+  }, [categoryListWithCounts, categorySearchQuery]);
+
+  // Confirmar y Guardar Reserva desde POS
+  const handleConfirmReservation = async () => {
+    if (!resCustomerName.trim()) {
+      Alert.alert('Datos Incompletos', 'Por favor ingresa el nombre del cliente para la reserva.');
+      return;
+    }
+    if (items.length === 0) {
+      Alert.alert('Carrito Vacío', 'Agrega productos para reservar.');
+      return;
+    }
+
+    const depositNum = parseFloat(resDepositStr) || 0;
+    if (depositNum < 0) {
+      Alert.alert('Monto Inválido', 'El adelanto no puede ser negativo.');
+      return;
+    }
+    if (depositNum > safeTotal) {
+      Alert.alert('Adelanto Excedido', 'El adelanto no puede ser mayor al total de la reserva.');
+      return;
+    }
+
+    try {
+      setIsSavingRes(true);
+      const days = parseInt(resDays, 10) || 7;
+      const pickupDate = new Date();
+      pickupDate.setDate(pickupDate.getDate() + days);
+      const pad = (n: number) => String(n).padStart(2, '0');
+      const pickupDateStr = `${pickupDate.getFullYear()}-${pad(pickupDate.getMonth() + 1)}-${pad(pickupDate.getDate())}`;
+
+      await createReservationOrOrder({
+        accountId: accountId || 'default',
+        branchId: branchId || 'main',
+        sessionId: activeCashSession?.sessionId || (activeCashSession as any)?.id,
+        type: 'reservation',
+        items: items.map((it) => ({
+          productId: it.id,
+          productName: it.name,
+          quantity: it.quantity,
+          price: it.price,
+          sku: it.sku || '',
+          presentationQty: it.presentation?.conversionFactor || 1,
+        })),
+        total: safeTotal,
+        depositAmount: depositNum,
+        paymentMethod: depositNum > 0 ? resDepositMethod : 'cash',
+        customer: {
+          name: resCustomerName.trim(),
+          phone: resCustomerPhone.trim() || undefined,
+          documentNumber: resCustomerDoc.trim() || undefined,
+        },
+        pickupDate: pickupDateStr,
+        notes: resNotes.trim() || undefined,
+        userProfile: {
+          uid: user?.uid || 'user_pos',
+          displayName: userProfile?.displayName || user?.displayName || 'Vendedor',
+          email: user?.email || '',
+        },
+      });
+
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      Alert.alert(
+        '¡Reserva Creada!',
+        `Se reservaron los productos exitosamente para ${resCustomerName.trim()}. Vence en ${days} días.`
+      );
+      setReservationModalOpen(false);
+      setCartDrawerOpen(false);
+      clearCart();
+      setResCustomerName('');
+      setResCustomerPhone('');
+      setResCustomerDoc('');
+      setResDepositStr('');
+      setResNotes('');
+    } catch (err: any) {
+      Alert.alert('Error al Reservar', err?.message || 'No se pudo crear la reserva.');
+    } finally {
+      setIsSavingRes(false);
+    }
+  };
 
   // Selección manual de producto desde el catálogo
   const handleProductSelect = (product: Product) => {
@@ -289,7 +474,12 @@ export default function PosCounterScreen() {
       Alert.alert('Carrito Vacío', 'Agrega productos antes de pausar la venta.');
       return;
     }
-    const label = `Cuenta ${pausedSales.length + 1} (${items.length} ítems)`;
+    const customerName = customer?.name?.trim();
+    const itemsCountStr = `${items.length} ${items.length === 1 ? 'ítem' : 'ítems'}`;
+    const label = customerName
+      ? `${customerName} (${itemsCountStr})`
+      : `Cuenta ${pausedSales.length + 1} (${itemsCountStr})`;
+
     await pauseCurrentSale(label);
     Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
     Alert.alert('Venta en Espera', `La cuenta "${label}" ha sido retenida.`);
@@ -331,21 +521,6 @@ export default function PosCounterScreen() {
     <View style={styles.container}>
       {/* 1. BARRA DE BÚSQUEDA Y CONTROL DEL ESCÁNER */}
       <View style={styles.topBar}>
-        <ScreenHeading
-          title="Nueva venta"
-          subtitle="Busca un producto o escanea su código"
-          action={(
-            <TouchableOpacity
-              style={styles.quickSaleHeaderAction}
-              onPress={() => setQuickSaleModalOpen(true)}
-              accessibilityRole="button"
-              accessibilityLabel="Agregar venta rápida"
-            >
-              <Plus size={18} color={ui.onPrimary} />
-              <Text style={styles.quickSaleHeaderActionText}>Venta rápida</Text>
-            </TouchableOpacity>
-          )}
-        />
         <View style={styles.searchRow}>
           <View style={styles.searchInputWrapper}>
             <Search size={18} color={ui.textSecondary} style={styles.searchIcon} />
@@ -376,171 +551,128 @@ export default function PosCounterScreen() {
             ) : null}
           </View>
 
+          {/* Contador compacto de productos en la fila superior */}
+          <View style={styles.searchCountBadge}>
+            <Text style={styles.searchCountBadgeNumber}>
+              {productsLoading ? '…' : filteredProducts.length}
+            </Text>
+            <Text style={styles.searchCountBadgeLabel}>prod.</Text>
+          </View>
+
           {/* Escaneo como acción contextual del buscador */}
           <TouchableOpacity
-            style={[styles.cameraActionBtn, styles.scanActionBtn, isCameraActive && styles.cameraActionBtnActive]}
-            onPress={() => setFullscreenScannerOpen(true)}
-            accessibilityRole="button"
-            accessibilityLabel="Escanear producto"
-            activeOpacity={0.7}
-          >
-            <Barcode size={20} color={ui.primary} />
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            style={styles.cameraActionBtn}
+            style={[
+              styles.cameraActionBtn,
+              styles.scanActionBtn,
+              isCameraActive && styles.scanActionBtnActive,
+            ]}
             onPress={toggleInlineCamera}
             accessibilityRole="button"
-            accessibilityLabel={isCameraActive ? 'Ocultar cámara integrada' : 'Abrir cámara integrada'}
-            accessibilityState={{ selected: isCameraActive }}
+            accessibilityLabel={isCameraActive ? 'Cerrar lector de código de barras' : 'Escanear producto'}
             activeOpacity={0.7}
           >
-            {isCameraActive ? <CameraOff size={18} color={ui.primary} /> : <Maximize2 size={18} color={ui.textSecondary} />}
+            <Barcode size={20} color={isCameraActive ? ui.onPrimary : ui.primary} />
           </TouchableOpacity>
         </View>
 
-        {/* Visor de Cámara Embebida */}
-        {isCameraActive ? (
-          <View style={styles.inlineCameraContainer}>
-            <CameraView
-              style={styles.inlineCamera}
-              enableTorch={torchOn}
-              barcodeScannerSettings={{
-                barcodeTypes: ['ean13', 'ean8', 'qr', 'code128', 'code39', 'upc_a', 'upc_e'],
-              }}
-              onBarcodeScanned={handleCameraScan}
-            >
-              <View style={styles.cameraOverlayInner}>
-                <View style={styles.scanTargetBox} />
-                <View style={styles.cameraControlsBar}>
-                  <TouchableOpacity
-                    style={styles.torchBtn}
-                    onPress={() => setTorchOn((prev) => !prev)}
-                  >
-                    {torchOn ? (
-                      <FlashlightOff size={18} color={ui.onPrimary} />
-                    ) : (
-                      <Flashlight size={18} color={ui.onPrimary} />
-                    )}
-                    <Text style={styles.torchText}>{torchOn ? 'Linterna ON' : 'Linterna'}</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    style={styles.closeCameraMiniBtn}
-                    onPress={() => setIsCameraActive(false)}
-                  >
-                    <Text style={styles.closeCameraMiniText}>Ocultar</Text>
-                  </TouchableOpacity>
-                </View>
+        {/* Ventanita de Lector de Código de Barras Inline (sin cambiar de página ni abrir modal) */}
+        {isCameraActive && (
+          <View style={styles.inlineScannerCard}>
+            <View style={styles.inlineScannerTopBar}>
+              <View style={styles.inlineScannerTitleWrap}>
+                <Barcode size={16} color={ui.primary} />
+                <Text style={styles.inlineScannerTitle}>Escáner de Productos</Text>
               </View>
-            </CameraView>
+              <View style={styles.inlineScannerActions}>
+                <TouchableOpacity
+                  style={[styles.inlineScannerActionBtn, torchOn && styles.inlineScannerActionBtnActive]}
+                  onPress={() => setTorchOn((prev) => !prev)}
+                  accessibilityRole="button"
+                  accessibilityLabel="Alternar linterna"
+                >
+                  {torchOn ? <ZapOff size={14} color={ui.onPrimary} /> : <Zap size={14} color={ui.textSecondary} />}
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.inlineScannerActionBtn}
+                  onPress={() => {
+                    setIsCameraActive(false);
+                    setTorchOn(false);
+                  }}
+                  accessibilityRole="button"
+                  accessibilityLabel="Cerrar lector"
+                >
+                  <X size={14} color={ui.textSecondary} />
+                </TouchableOpacity>
+              </View>
+            </View>
+
+            <View style={styles.inlineCameraBox}>
+              <CameraView
+                style={styles.inlineCamera}
+                facing="back"
+                enableTorch={torchOn}
+                barcodeScannerSettings={{
+                  barcodeTypes: ['qr', 'ean13', 'ean8', 'code128', 'code39', 'upc_a', 'upc_e'],
+                }}
+                onBarcodeScanned={handleCameraScan}
+              />
+              <View style={styles.inlineReticle} />
+              <View style={styles.inlineScanBanner}>
+                <Text style={styles.inlineScanBannerText}>Apunta al código de barras del producto</Text>
+              </View>
+            </View>
           </View>
-        ) : null}
+        )}
 
-        {/* 2. ACCIONES RÁPIDAS DE MOSTRADOR */}
-        <View style={styles.quickActionsGroup}>
-          <ScrollView
-          horizontal
-          showsHorizontalScrollIndicator={false}
-          contentContainerStyle={styles.quickActionsBar}
-          >
-          {/* Botón Ventas en Pausa */}
-          <TouchableOpacity
-            style={[styles.quickActionPill, pausedSales.length > 0 && styles.quickActionPillActive]}
-            onPress={() => setPausedModalOpen(true)}
-            accessibilityRole="button"
-            accessibilityLabel={`Ventas en pausa${pausedSales.length ? `, ${pausedSales.length}` : ''}`}
-            activeOpacity={0.7}
-          >
-            <Pause size={15} color={pausedSales.length > 0 ? ui.primary : ui.textSecondary} />
-            <Text
-              style={[
-                styles.quickActionPillText,
-                pausedSales.length > 0 && { color: ui.primary, fontWeight: '700' },
-              ]}
-            >
-              En Pausa
-            </Text>
-            {pausedSales.length > 0 ? (
-              <View style={styles.pausedBadge}>
-                <Text style={styles.pausedBadgeText}>{pausedSales.length}</Text>
-              </View>
-            ) : null}
-          </TouchableOpacity>
-
-          {/* Botón Peso / Fracción */}
-          <TouchableOpacity
-            style={styles.quickActionPill}
-            onPress={() => setWeightSelectorOpen(true)}
-            accessibilityRole="button"
-            accessibilityLabel="Productos por peso o fracción"
-            activeOpacity={0.7}
-          >
-            <Scale size={15} color={ui.accent} />
-            <Text style={styles.quickActionPillText}>Peso / Fracción</Text>
-          </TouchableOpacity>
-
-          {/* Botón Cotizaciones */}
-          <TouchableOpacity
-            style={styles.quickActionPill}
-            onPress={() => setQuotesModalOpen(true)}
-            accessibilityRole="button"
-            accessibilityLabel="Abrir cotizaciones"
-            activeOpacity={0.7}
-          >
-            <FileText size={15} color={ui.accent} />
-            <Text style={styles.quickActionPillText}>Cotizaciones</Text>
-          </TouchableOpacity>
-
-          {/* Botón Escáner Remoto PC */}
-          <TouchableOpacity
-            style={styles.quickActionPill}
-            onPress={() => setCompanionScannerOpen(true)}
-            accessibilityRole="button"
-            accessibilityLabel="Abrir escáner conectado a PC"
-            activeOpacity={0.7}
-          >
-            <Laptop size={15} color={ui.primary} />
-            <Text style={styles.quickActionPillText}>Escáner PC</Text>
-          </TouchableOpacity>
-          </ScrollView>
-        </View>
-
-        {/* 3. PILLS HORIZONTALES DE CATEGORÍAS */}
-        <ScrollView
-          horizontal
-          showsHorizontalScrollIndicator={false}
-          style={styles.categoriesScroll}
-          contentContainerStyle={styles.categoriesContent}
-        >
-          {['Todas', ...categories.filter((c) => c !== 'Todas' && c !== 'Todos')].map((cat) => {
-            const isSelected = selectedCategory === cat;
-            return (
+        {/* 2. SELECTORES DE CATEGORÍA, MARCA Y MEDIDA (INLINE BUSCADOR) */}
+        <InlineFilterBar
+          groups={[
+            {
+              id: 'category',
+              label: 'Categorías',
+              selectedValue: selectedCategory,
+              options: categoryListWithCounts,
+              onSelect: (cat) => setSelectedCategory(cat),
+              onClear: () => setSelectedCategory('Todas'),
+              icon: 'category',
+            },
+            {
+              id: 'brand',
+              label: 'Marcas',
+              selectedValue: selectedBrand,
+              options: availableBrands.map((b) => ({ name: b })),
+              onSelect: (b: string) => setSelectedBrand(b),
+              onClear: () => setSelectedBrand('Todas'),
+              icon: 'brand' as const,
+            },
+            {
+              id: 'size',
+              label: 'Medidas',
+              selectedValue: selectedSize,
+              options: availableSizes.map((s) => ({ name: s })),
+              onSelect: (s: string) => setSelectedSize(s),
+              onClear: () => setSelectedSize('Todas'),
+              icon: 'size' as const,
+            },
+          ]}
+          rightElement={
+            pausedSales.length > 0 ? (
               <TouchableOpacity
-                key={cat}
-                style={[styles.catPill, isSelected && styles.catPillSelected]}
-                onPress={() => setSelectedCategory(cat)}
+                style={styles.pausedBadgeChip}
+                onPress={() => setPausedModalOpen(true)}
                 accessibilityRole="button"
-                accessibilityState={{ selected: isSelected }}
-                accessibilityLabel={`Categoría ${cat}`}
-                activeOpacity={0.7}
+                accessibilityLabel={`Ventas en pausa: ${pausedSales.length}`}
               >
-                <Text style={[styles.catPillText, isSelected && styles.catPillTextSelected]}>
-                  {cat}
-                </Text>
+                <Pause size={12} color={ui.primary} />
+                <Text style={styles.pausedBadgeChipText}>Pausa ({pausedSales.length})</Text>
               </TouchableOpacity>
-            );
-          })}
-        </ScrollView>
+            ) : undefined
+          }
+        />
       </View>
 
       {/* 4. CATÁLOGO VISUAL DE PRODUCTOS (FLASHLIST DE ALTO RENDIMIENTO) */}
       <View style={styles.catalogArea}>
-        <View style={styles.catalogHeading}>
-          <SectionHeading
-            title="Catálogo"
-            subtitle={productsLoading ? 'Cargando catálogo…' : `${filteredProducts.length} productos`}
-          />
-        </View>
         {productsLoading ? (
           <View style={styles.loadingBox}>
             <ActivityIndicator size="large" color={ui.primary} />
@@ -774,7 +906,7 @@ export default function PosCounterScreen() {
                               <Text style={styles.savePriceBtnText}>OK</Text>
                             </TouchableOpacity>
                           </View>
-                        ) : (
+                        ) : canModifyPrice ? (
                           <TouchableOpacity
                             style={styles.unitPriceBadge}
                             accessibilityRole="button"
@@ -789,6 +921,12 @@ export default function PosCounterScreen() {
                             </Text>
                             <Edit3 size={12} color={ui.textSecondary} style={{ marginLeft: 4 }} />
                           </TouchableOpacity>
+                        ) : (
+                          <View style={styles.unitPriceBadge}>
+                            <Text style={styles.unitPriceBadgeText}>
+                              {formatPEN(itemPrice)} / {item.unitOfMeasure || 'und'}
+                            </Text>
+                          </View>
                         )}
 
                         {/* Eliminar Ítem */}
@@ -814,8 +952,23 @@ export default function PosCounterScreen() {
                   style={styles.pauseSaleFooterBtn}
                   onPress={handlePauseCurrentSale}
                 >
-                  <Pause size={16} color={ui.primary} />
-                  <Text style={styles.pauseSaleFooterText}>Pausar Cuenta</Text>
+                  <Pause size={15} color={ui.textSecondary} />
+                  <Text style={styles.pauseSaleFooterText}>Pausar</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.reserveFooterBtn}
+                  onPress={() => {
+                    if (items.length === 0) {
+                      Alert.alert('Carrito Vacío', 'Agrega productos al carrito para crear una reserva.');
+                      return;
+                    }
+                    setReservationModalOpen(true);
+                  }}
+                  accessibilityRole="button"
+                  accessibilityLabel="Reservar productos del carrito"
+                >
+                  <CalendarClock size={15} color={ui.accent} />
+                  <Text style={styles.reserveFooterText}>Reservar</Text>
                 </TouchableOpacity>
                 <TouchableOpacity
                   style={[styles.checkoutBtn, (safeCount === 0 || safeTotal <= 0) && styles.checkoutBtnDisabled]}
@@ -833,7 +986,7 @@ export default function PosCounterScreen() {
         </View>
       </Modal>
 
-      {/* MODAL DE VENTA RÁPIDA (CONCEPTO LIBRE) */}
+      {/* MODAL DE MONTO LIBRE (ÍTEM SIN CATALOGAR) */}
       <Modal
         visible={quickSaleModalOpen}
         animationType="fade"
@@ -844,15 +997,15 @@ export default function PosCounterScreen() {
           <View style={styles.subModalCard}>
             <View style={styles.subModalHeader}>
               <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-                <Zap size={18} color={ui.warning} />
-                <Text style={styles.subModalTitle}>Venta Rápida (Concepto Libre)</Text>
+                <Plus size={18} color={ui.primary} />
+                <Text style={styles.subModalTitle}>Monto Libre (Ítem no catalogado)</Text>
               </View>
               <TouchableOpacity onPress={() => setQuickSaleModalOpen(false)}>
                 <X size={20} color={ui.textSecondary} />
               </TouchableOpacity>
             </View>
 
-            <Text style={styles.inputLabel}>Descripción / Concepto</Text>
+            <Text style={styles.inputLabel}>Concepto o Descripción</Text>
             <TextInput
               style={styles.formInput}
               value={quickConcept}
@@ -891,6 +1044,167 @@ export default function PosCounterScreen() {
         </View>
       </Modal>
 
+      {/* MODAL DE RESERVA DE PRODUCTOS */}
+      <Modal
+        visible={reservationModalOpen}
+        animationType="fade"
+        transparent
+        onRequestClose={() => setReservationModalOpen(false)}
+      >
+        <KeyboardAvoidingView
+          behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+          style={styles.subModalOverlay}
+        >
+          <View style={styles.subModalCard}>
+            <View style={styles.subModalHeader}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                <CalendarClock size={18} color={ui.accent} />
+                <Text style={styles.subModalTitle}>Crear Reserva</Text>
+              </View>
+              <TouchableOpacity onPress={() => setReservationModalOpen(false)}>
+                <X size={20} color={ui.textSecondary} />
+              </TouchableOpacity>
+            </View>
+
+            <ScrollView style={{ maxHeight: 420 }} showsVerticalScrollIndicator={false}>
+              {/* Resumen de items a reservar */}
+              <View style={styles.resSummaryCard}>
+                <Text style={styles.resSummaryTitle}>
+                  {items.length} {items.length === 1 ? 'producto' : 'productos'} · Total: {formatPEN(safeTotal)}
+                </Text>
+                <Text style={styles.resSummarySub}>
+                  El stock se apartará automáticamente de la sucursal actual.
+                </Text>
+              </View>
+
+              <Text style={styles.inputLabel}>
+                Nombre del Cliente <Text style={{ color: ui.danger }}>*</Text>
+              </Text>
+              <TextInput
+                style={styles.formInput}
+                value={resCustomerName}
+                onChangeText={setResCustomerName}
+                placeholder="Ej. Juan Pérez"
+                placeholderTextColor={ui.textMuted}
+              />
+
+              <View style={{ flexDirection: 'row', gap: 10 }}>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.inputLabel}>Teléfono / WhatsApp</Text>
+                  <TextInput
+                    style={styles.formInput}
+                    value={resCustomerPhone}
+                    onChangeText={setResCustomerPhone}
+                    placeholder="999 999 999"
+                    keyboardType="phone-pad"
+                    placeholderTextColor={ui.textMuted}
+                  />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.inputLabel}>DNI (opcional)</Text>
+                  <TextInput
+                    style={styles.formInput}
+                    value={resCustomerDoc}
+                    onChangeText={setResCustomerDoc}
+                    placeholder="8 dígitos"
+                    keyboardType="numeric"
+                    maxLength={8}
+                    placeholderTextColor={ui.textMuted}
+                  />
+                </View>
+              </View>
+
+              <View style={{ flexDirection: 'row', gap: 10 }}>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.inputLabel}>Adelanto / Seña (S/)</Text>
+                  <TextInput
+                    style={[styles.formInput, { fontWeight: '700', color: ui.primary }]}
+                    value={resDepositStr}
+                    onChangeText={setResDepositStr}
+                    placeholder="0.00"
+                    keyboardType="decimal-pad"
+                    placeholderTextColor={ui.textMuted}
+                  />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.inputLabel}>Días límite</Text>
+                  <TextInput
+                    style={styles.formInput}
+                    value={resDays}
+                    onChangeText={setResDays}
+                    placeholder="7"
+                    keyboardType="numeric"
+                    placeholderTextColor={ui.textMuted}
+                  />
+                </View>
+              </View>
+
+              {/* Si hay adelanto, método de pago */}
+              {parseFloat(resDepositStr) > 0 && (
+                <View style={{ marginTop: 8 }}>
+                  <Text style={styles.inputLabel}>Método del Adelanto</Text>
+                  <View style={styles.resMethodRow}>
+                    {(['cash', 'yape', 'plin', 'card'] as const).map((m) => (
+                      <TouchableOpacity
+                        key={m}
+                        style={[
+                          styles.resMethodChip,
+                          resDepositMethod === m && styles.resMethodChipActive,
+                        ]}
+                        onPress={() => setResDepositMethod(m)}
+                      >
+                        <Text
+                          style={[
+                            styles.resMethodChipText,
+                            resDepositMethod === m && styles.resMethodChipTextActive,
+                          ]}
+                        >
+                          {m === 'cash' ? 'Efectivo' : m === 'card' ? 'Tarjeta' : m.toUpperCase()}
+                        </Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                </View>
+              )}
+
+              <Text style={styles.inputLabel}>Notas / Observaciones</Text>
+              <TextInput
+                style={[styles.formInput, { height: 60, textAlignVertical: 'top' }]}
+                value={resNotes}
+                onChangeText={setResNotes}
+                placeholder="Ej. Recoge el fin de semana..."
+                placeholderTextColor={ui.textMuted}
+                multiline
+              />
+            </ScrollView>
+
+            <View style={styles.subModalActions}>
+              <TouchableOpacity
+                style={styles.subModalCancelBtn}
+                onPress={() => setReservationModalOpen(false)}
+                disabled={isSavingRes}
+              >
+                <Text style={styles.subModalCancelText}>Cancelar</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.subModalConfirmBtn, isSavingRes && { opacity: 0.6 }]}
+                onPress={handleConfirmReservation}
+                disabled={isSavingRes}
+              >
+                {isSavingRes ? (
+                  <ActivityIndicator size="small" color={ui.onPrimary} />
+                ) : (
+                  <>
+                    <CalendarClock size={16} color={ui.onPrimary} />
+                    <Text style={styles.subModalConfirmText}>Confirmar Reserva</Text>
+                  </>
+                )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
+
       {/* MODAL DE CUENTAS EN PAUSA */}
       <Modal
         visible={pausedModalOpen}
@@ -920,6 +1234,14 @@ export default function PosCounterScreen() {
                   <View key={ps.id} style={styles.pausedItemCard}>
                     <View style={{ flex: 1 }}>
                       <Text style={styles.pausedItemTitle}>{ps.label}</Text>
+                      {Boolean(ps.customer?.name) && (
+                        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4, marginTop: 2, marginBottom: 2 }}>
+                          <User size={12} color={ui.primary} />
+                          <Text style={{ fontSize: 12, color: ui.text, fontWeight: '600' }} numberOfLines={1}>
+                            {ps.customer?.name}
+                          </Text>
+                        </View>
+                      )}
                       <Text style={styles.pausedItemDetails}>
                         {ps.items?.length || 0} ítems | Total: {formatPEN(ps.total || 0)}
                       </Text>
@@ -1099,6 +1421,30 @@ const styles = StyleSheet.create({
     marginHorizontal: 20,
     marginTop: 4,
   },
+  searchCountBadge: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 12,
+    backgroundColor: ui.surfaceMuted,
+    borderWidth: 1,
+    borderColor: ui.border,
+    alignItems: 'center',
+    justifyContent: 'center',
+    minWidth: 44,
+    height: 48,
+  },
+  searchCountBadgeNumber: {
+    fontSize: 13,
+    fontWeight: '800',
+    color: ui.text,
+    lineHeight: 15,
+  },
+  searchCountBadgeLabel: {
+    fontSize: 9,
+    fontWeight: '600',
+    color: ui.textSecondary,
+    lineHeight: 11,
+  },
   searchInputWrapper: {
     flex: 1,
     flexDirection: 'row',
@@ -1141,66 +1487,85 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: ui.primarySoft,
   },
-  inlineCameraContainer: {
-    height: 180,
+  scanActionBtnActive: {
+    backgroundColor: ui.primary,
+    borderColor: ui.primary,
+  },
+  inlineScannerCard: {
+    backgroundColor: ui.surface,
     borderRadius: 14,
+    borderWidth: 1,
+    borderColor: ui.primary,
     overflow: 'hidden',
-    marginTop: 10,
-    backgroundColor: '#000000',
+    marginHorizontal: 20,
+    marginTop: 8,
+    marginBottom: 4,
+  },
+  inlineScannerTopBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    backgroundColor: ui.surfaceMuted,
+  },
+  inlineScannerTitleWrap: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  inlineScannerTitle: {
+    fontSize: 13,
+    fontWeight: 'bold',
+    color: ui.text,
+  },
+  inlineScannerActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  inlineScannerActionBtn: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: ui.surface,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  inlineScannerActionBtnActive: {
+    backgroundColor: ui.primary,
+  },
+  inlineCameraBox: {
+    height: 160,
+    backgroundColor: '#000',
+    position: 'relative',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   inlineCamera: {
-    flex: 1,
+    ...StyleSheet.absoluteFillObject,
   },
-  cameraOverlayInner: {
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.3)',
-    justifyContent: 'space-between',
-    padding: 10,
-    alignItems: 'center',
-  },
-  scanTargetBox: {
-    width: 200,
-    height: 80,
+  inlineReticle: {
+    width: '75%',
+    height: 90,
+    borderRadius: 8,
     borderWidth: 2,
     borderColor: ui.primary,
-    borderRadius: 10,
-    marginTop: 20,
-    backgroundColor: 'rgba(255,255,255,0.05)',
+    borderStyle: 'dashed',
+    backgroundColor: 'rgba(255, 255, 255, 0.05)',
   },
-  cameraControlsBar: {
-    width: '100%',
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
+  inlineScanBanner: {
+    position: 'absolute',
+    bottom: 8,
+    backgroundColor: 'rgba(0, 0, 0, 0.65)',
+    paddingHorizontal: 12,
+    paddingVertical: 4,
+    borderRadius: 12,
   },
-  torchBtn: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-    backgroundColor: 'rgba(0,0,0,0.5)',
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-    minHeight: 48,
-    justifyContent: 'center',
-    borderRadius: 16,
-  },
-  torchText: {
-    color: ui.surface,
+  inlineScanBannerText: {
     fontSize: 11,
-    fontWeight: '600',
-  },
-  closeCameraMiniBtn: {
-    backgroundColor: 'rgba(255,255,255,0.25)',
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-    minHeight: 48,
-    justifyContent: 'center',
-    borderRadius: 16,
-  },
-  closeCameraMiniText: {
-    color: ui.surface,
-    fontSize: 11,
-    fontWeight: '600',
+    color: '#FFFFFF',
+    fontWeight: '500',
   },
   quickActionsBar: {
     flexDirection: 'row',
@@ -1248,41 +1613,156 @@ const styles = StyleSheet.create({
     fontSize: 10,
     fontWeight: '700',
   },
-  categoriesScroll: {
-    marginTop: 8,
+  catalogTopBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
     marginHorizontal: 20,
+    marginTop: 10,
   },
-  categoriesContent: {
-    gap: 6,
-  },
-  catPill: {
-    paddingHorizontal: 12,
-    minHeight: 48,
-    justifyContent: 'center',
-    borderRadius: 16,
+  categoryPickerBtn: {
+    flex: 1,
+    minHeight: 38,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 7,
     backgroundColor: ui.surfaceMuted,
     borderWidth: 1,
     borderColor: ui.border,
+    borderRadius: 12,
+    paddingHorizontal: 12,
   },
-  catPillSelected: {
-    backgroundColor: ui.primary,
+  categoryPickerBtnActive: {
+    backgroundColor: ui.primarySoft,
     borderColor: ui.primary,
   },
-  catPillText: {
-    fontSize: 12,
-    fontWeight: '500',
+  categoryPickerText: {
+    flex: 1,
+    fontSize: 13,
+    fontWeight: '600',
     color: ui.textSecondary,
   },
-  catPillTextSelected: {
-    color: ui.onPrimary,
+  categoryPickerTextActive: {
+    color: ui.primary,
     fontWeight: '700',
+  },
+  clearCategoryBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: 10,
+    backgroundColor: ui.surfaceMuted,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  catalogItemsCount: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: ui.textMuted,
+  },
+  categoryModalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(17,28,49,0.40)',
+    justifyContent: 'flex-end',
+  },
+  categoryModalSheet: {
+    backgroundColor: ui.surface,
+    padding: 20,
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    maxHeight: '75%',
+    width: '100%',
+    maxWidth: 640,
+    alignSelf: 'center',
+  },
+  categoryModalHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 14,
+  },
+  categoryModalTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: ui.text,
+  },
+  modalCloseCircle: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: ui.surfaceMuted,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  catIconBoxActive: {
+    width: 32,
+    height: 32,
+    borderRadius: 8,
+    backgroundColor: ui.primarySoft,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  categorySearchWrapper: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: ui.surfaceMuted,
+    borderWidth: 1,
+    borderColor: ui.border,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    height: 42,
+    marginBottom: 12,
+  },
+  categorySearchInput: {
+    flex: 1,
+    fontSize: 14,
+    color: ui.text,
+    paddingVertical: 0,
+  },
+  categoryListScroll: {
+    maxHeight: 320,
+  },
+  categoryItemRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 12,
+    marginBottom: 4,
+  },
+  categoryItemRowSelected: {
+    backgroundColor: ui.primarySoft,
+  },
+  catIconBox: {
+    width: 32,
+    height: 32,
+    borderRadius: 8,
+    backgroundColor: ui.surfaceMuted,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  categoryItemName: {
+    fontSize: 14,
+    color: ui.text,
+    fontWeight: '500',
+  },
+  categoryCountBadge: {
+    backgroundColor: ui.surfaceMuted,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 10,
+  },
+  categoryCountBadgeSelected: {
+    backgroundColor: '#FFFFFF',
+  },
+  categoryCountBadgeText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: ui.textSecondary,
   },
   catalogArea: {
     flex: 1,
-    paddingTop: 8,
-  },
-  catalogHeading: {
-    paddingHorizontal: 20,
+    paddingTop: 4,
   },
   listContent: {
     paddingHorizontal: 20,
@@ -1795,5 +2275,150 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '700',
     color: ui.success,
+  },
+  pausedBadgeChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    backgroundColor: ui.primarySoft,
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+    borderRadius: 8,
+  },
+  pausedBadgeChipText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: ui.primary,
+  },
+  inlineCategoryDropdown: {
+    backgroundColor: ui.surface,
+    paddingHorizontal: 12,
+    paddingBottom: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: ui.border,
+    gap: 8,
+  },
+  inlineCatSearchRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: ui.surfaceMuted,
+    borderRadius: 8,
+    paddingHorizontal: 8,
+    height: 32,
+  },
+  inlineCatSearchInput: {
+    flex: 1,
+    fontSize: 12,
+    color: ui.text,
+    paddingVertical: 0,
+  },
+  inlineChipsScroll: {
+    flexDirection: 'row',
+    gap: 6,
+    paddingVertical: 2,
+  },
+  inlineCatChip: {
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 14,
+    backgroundColor: ui.surfaceMuted,
+  },
+  inlineCatChipActive: {
+    backgroundColor: ui.primary,
+  },
+  inlineCatChipText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: ui.textSecondary,
+  },
+  inlineCatChipTextActive: {
+    color: ui.surface,
+    fontWeight: '700',
+  },
+  filterSectionCompact: {
+    marginTop: 4,
+  },
+  filterSectionTitle: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: ui.textSecondary,
+    marginBottom: 4,
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+  },
+  inlineFilterChip: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 12,
+    backgroundColor: ui.surfaceMuted,
+    borderWidth: 1,
+    borderColor: 'transparent',
+  },
+  inlineFilterChipActive: {
+    backgroundColor: ui.primarySoft,
+    borderColor: ui.primary,
+  },
+  inlineFilterChipText: {
+    fontSize: 11,
+    color: ui.textSecondary,
+  },
+  inlineFilterChipTextActive: {
+    color: ui.primary,
+    fontWeight: '700',
+  },
+  reserveFooterBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 5,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    backgroundColor: ui.accentSoft,
+  },
+  reserveFooterText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: ui.accent,
+  },
+  resSummaryCard: {
+    backgroundColor: ui.accentSoft,
+    padding: 10,
+    borderRadius: 8,
+    marginBottom: 10,
+  },
+  resSummaryTitle: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: ui.text,
+  },
+  resSummarySub: {
+    fontSize: 11,
+    color: ui.textSecondary,
+    marginTop: 2,
+  },
+  resMethodRow: {
+    flexDirection: 'row',
+    gap: 6,
+    marginTop: 4,
+  },
+  resMethodChip: {
+    flex: 1,
+    paddingVertical: 6,
+    borderRadius: 6,
+    backgroundColor: ui.surfaceMuted,
+    alignItems: 'center',
+  },
+  resMethodChipActive: {
+    backgroundColor: ui.primary,
+  },
+  resMethodChipText: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: ui.textSecondary,
+  },
+  resMethodChipTextActive: {
+    color: ui.surface,
+    fontWeight: '700',
   },
 });

@@ -48,6 +48,7 @@ import {
 
 import { useAuth } from '@/context/AuthContext';
 import { useSettings } from '@/context/SettingsContext';
+import { usePermissions } from '@/hooks/usePermissions';
 import { Header } from '@/components/Header';
 import { ui, theme, formatPEN } from '@/lib/theme';
 import { ScreenHeading, SectionHeading } from '@/components/ui';
@@ -103,6 +104,8 @@ export default function SettingsScreen() {
     updateBusinessData,
     updatePosSettings,
   } = useSettings();
+
+  const { canManageSettings } = usePermissions();
 
   // ============================================================================
   // ESTADOS DE IMPRESORA TÉRMICA BLUETOOTH
@@ -331,6 +334,11 @@ export default function SettingsScreen() {
   // ACCIONES: GUARDAR DATOS DEL NEGOCIO Y YAPE
   // ============================================================================
   const handleSaveBusinessData = async () => {
+    if (!canManageSettings) {
+      Alert.alert('Acceso Denegado', 'Solo administradores o dueños pueden modificar los datos fiscales y métodos de cobro del negocio.');
+      return;
+    }
+
     if (!bizName.trim()) {
       Alert.alert('Nombre Requerido', 'La razón social no puede estar vacía.');
       return;
@@ -660,19 +668,31 @@ export default function SettingsScreen() {
               <Building2 size={22} color={ui.primary} />
             </View>
             <View style={{ flex: 1, marginLeft: 12 }}>
-              <Text style={styles.cardTitle}>Datos de Empresa & Yape/Plin</Text>
-              <Text style={styles.cardSubtitle}>Información tributaria y datos en tickets</Text>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                <Text style={styles.cardTitle}>Datos de Empresa & Yape/Plin</Text>
+                {!canManageSettings ? (
+                  <View style={{ backgroundColor: ui.warningSoft, paddingHorizontal: 6, paddingVertical: 2, borderRadius: 6 }}>
+                    <Text style={{ fontSize: 10, color: ui.warning, fontWeight: '700' }}>Solo Lectura</Text>
+                  </View>
+                ) : null}
+              </View>
+              <Text style={styles.cardSubtitle}>
+                {canManageSettings
+                  ? 'Información tributaria y datos en tickets'
+                  : 'Solo administradores pueden editar estos datos fiscales'}
+              </Text>
             </View>
           </View>
 
           <View style={styles.inputGroup}>
             <Text style={styles.inputLabel}>Razón Social / Nombre Comercial *</Text>
             <TextInput
-              style={styles.textInput}
+              style={[styles.textInput, !canManageSettings && { opacity: 0.7 }]}
               placeholder="Ej. Comercial Los Andes S.A.C."
               placeholderTextColor={ui.textMuted}
               value={bizName}
               onChangeText={setBizName}
+              editable={canManageSettings}
               accessibilityLabel="Razón social o nombre comercial"
             />
           </View>
@@ -680,13 +700,14 @@ export default function SettingsScreen() {
           <View style={styles.inputGroup}>
             <Text style={styles.inputLabel}>RUC (11 Dígitos)</Text>
             <TextInput
-              style={styles.textInput}
+              style={[styles.textInput, !canManageSettings && { opacity: 0.7 }]}
               placeholder="10765432101"
               placeholderTextColor={ui.textMuted}
               keyboardType="numeric"
               maxLength={11}
               value={bizRuc}
               onChangeText={setBizRuc}
+              editable={canManageSettings}
               accessibilityLabel="RUC, once dígitos"
             />
           </View>
@@ -694,11 +715,12 @@ export default function SettingsScreen() {
           <View style={styles.inputGroup}>
             <Text style={styles.inputLabel}>Dirección Fiscal</Text>
             <TextInput
-              style={styles.textInput}
+              style={[styles.textInput, !canManageSettings && { opacity: 0.7 }]}
               placeholder="Av. Aviación 1234, La Victoria"
               placeholderTextColor={ui.textMuted}
               value={bizAddress}
               onChangeText={setBizAddress}
+              editable={canManageSettings}
               accessibilityLabel="Dirección fiscal"
             />
           </View>
@@ -706,12 +728,13 @@ export default function SettingsScreen() {
           <View style={styles.inputGroup}>
             <Text style={styles.inputLabel}>Teléfono / WhatsApp de Contacto</Text>
             <TextInput
-              style={styles.textInput}
+              style={[styles.textInput, !canManageSettings && { opacity: 0.7 }]}
               placeholder="987654321"
               placeholderTextColor={ui.textMuted}
               keyboardType="phone-pad"
               value={bizPhone}
               onChangeText={setBizPhone}
+              editable={canManageSettings}
               accessibilityLabel="Teléfono o WhatsApp de contacto"
             />
           </View>
@@ -726,12 +749,13 @@ export default function SettingsScreen() {
             <View style={styles.inputGroup}>
               <Text style={styles.inputLabel}>Número de Celular Yape/Plin</Text>
               <TextInput
-                style={styles.textInput}
+                style={[styles.textInput, !canManageSettings && { opacity: 0.7 }]}
                 placeholder="987654321"
                 placeholderTextColor={ui.textMuted}
                 keyboardType="phone-pad"
                 value={yapeNumber}
                 onChangeText={setYapeNumber}
+                editable={canManageSettings}
                 accessibilityLabel="Número de celular Yape o Plin"
               />
             </View>
@@ -739,30 +763,33 @@ export default function SettingsScreen() {
             <View style={styles.inputGroup}>
               <Text style={styles.inputLabel}>Titular de la Cuenta</Text>
               <TextInput
-                style={styles.textInput}
+                style={[styles.textInput, !canManageSettings && { opacity: 0.7 }]}
                 placeholder="Ej. Juan Pérez"
                 placeholderTextColor={ui.textMuted}
                 value={yapeHolder}
                 onChangeText={setYapeHolder}
+                editable={canManageSettings}
                 accessibilityLabel="Titular de la cuenta Yape o Plin"
               />
             </View>
           </View>
 
-          <TouchableOpacity
-            style={[styles.saveButton, isSavingBiz && styles.buttonDisabled]}
-            onPress={handleSaveBusinessData}
-            disabled={isSavingBiz}
-          >
-            {isSavingBiz ? (
-              <ActivityIndicator color={ui.onPrimary} />
-            ) : (
-              <>
-                <Save size={18} color={ui.onPrimary} />
-                <Text style={styles.saveButtonText}>Guardar Datos del Negocio</Text>
-              </>
-            )}
-          </TouchableOpacity>
+          {canManageSettings ? (
+            <TouchableOpacity
+              style={[styles.saveButton, isSavingBiz && styles.buttonDisabled]}
+              onPress={handleSaveBusinessData}
+              disabled={isSavingBiz}
+            >
+              {isSavingBiz ? (
+                <ActivityIndicator color={ui.onPrimary} />
+              ) : (
+                <>
+                  <Save size={18} color={ui.onPrimary} />
+                  <Text style={styles.saveButtonText}>Guardar Datos del Negocio</Text>
+                </>
+              )}
+            </TouchableOpacity>
+          ) : null}
         </View>
 
         {/* ==================================================================== */}

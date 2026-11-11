@@ -12,6 +12,7 @@ import {
   Platform,
   ActivityIndicator,
   useWindowDimensions,
+  Image,
 } from 'react-native';
 import {
   X,
@@ -25,12 +26,20 @@ import {
   Percent,
   Save,
   Barcode,
+  ChevronDown,
+  ChevronUp,
+  Tag,
+  Ruler,
 } from 'lucide-react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
+import * as ImagePicker from 'expo-image-picker';
 import * as Haptics from 'expo-haptics';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { ui } from '@/lib/theme';
 import { SectionHeading } from '@/components/ui';
+import { useSettings } from '@/context/SettingsContext';
+import { usePermissions } from '@/hooks/usePermissions';
+import { DEFAULT_CATALOG_BRANDS, DEFAULT_CATALOG_SIZES } from '@/lib/catalog-filters';
 
 export interface ProductPresentation {
   id: string;
@@ -45,7 +54,10 @@ export interface ProductFormData {
   name: string;
   category: string;
   barcode: string;
+  barcodes?: string[];
   sku: string;
+  brand?: string;
+  sizeLabel?: string;
   unitOfMeasure: 'NIU' | 'KGM' | 'LTR' | 'BX' | string;
   price: number;
   minSalePrice: number;
@@ -54,6 +66,7 @@ export interface ProductFormData {
   minStock: number;
   presentations: ProductPresentation[];
   imageUrl?: string;
+  stockByBranch?: Record<string, number>;
 }
 
 interface ProductFormModalProps {
@@ -115,11 +128,19 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = ({
 }) => {
   const { width: windowWidth } = useWindowDimensions();
   const insets = useSafeAreaInsets();
+  const { branches, posSettings } = useSettings();
+  const { canManageProducts, canViewMargins } = usePermissions();
+  const enableCatalogFilters = !!posSettings?.enableCatalogFilters;
   const compactLayout = windowWidth < 380;
   const [name, setName] = useState('');
   const [category, setCategory] = useState('Abarrotes');
   const [barcode, setBarcode] = useState('');
   const [sku, setSku] = useState('');
+  const [brand, setBrand] = useState('');
+  const [sizeLabel, setSizeLabel] = useState('');
+  const [extraBarcodes, setExtraBarcodes] = useState<string[]>([]);
+  const [showExtraBarcodes, setShowExtraBarcodes] = useState(false);
+  const [scanningTarget, setScanningTarget] = useState<'main' | number>('main');
   const [unitOfMeasure, setUnitOfMeasure] = useState<'NIU' | 'KGM' | 'LTR' | 'BX'>('NIU');
   const [priceStr, setPriceStr] = useState('');
   const [minPriceStr, setMinPriceStr] = useState('');
@@ -127,6 +148,8 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = ({
   const [stockStr, setStockStr] = useState('0');
   const [minStockStr, setMinStockStr] = useState('3');
   const [presentations, setPresentations] = useState<ProductPresentation[]>([]);
+  const [imageUrl, setImageUrl] = useState<string | undefined>(undefined);
+  const [stockByBranch, setStockByBranch] = useState<Record<string, number>>({});
 
   // Sub-modal de presentación
   const [presModalOpen, setPresModalOpen] = useState(false);
@@ -140,6 +163,24 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = ({
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [isSaving, setIsSaving] = useState(false);
 
+  const handlePickImage = async () => {
+    try {
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ['images'],
+        allowsEditing: true,
+        aspect: [1, 1],
+        quality: 0.7,
+      });
+
+      if (!result.canceled && result.assets && result.assets.length > 0) {
+        setImageUrl(result.assets[0].uri);
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      }
+    } catch (err: any) {
+      Alert.alert('Error', 'No se pudo seleccionar la imagen de la galería.');
+    }
+  };
+
   useEffect(() => {
     if (visible) {
       if (product) {
@@ -147,6 +188,13 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = ({
         setCategory(product.category || 'Abarrotes');
         setBarcode(product.barcode || '');
         setSku(product.sku || '');
+        setBrand(product.brand || '');
+        setSizeLabel(product.sizeLabel || (Array.isArray(product.sizes) ? product.sizes[0] : ''));
+        const existingExtras = Array.isArray(product.barcodes)
+          ? product.barcodes.filter((b: string) => b && b !== product.barcode)
+          : [];
+        setExtraBarcodes(existingExtras);
+        setShowExtraBarcodes(existingExtras.length > 0);
         setUnitOfMeasure(product.unitOfMeasure || 'NIU');
         setPriceStr(product.price !== undefined ? String(product.price) : '');
         setMinPriceStr(
@@ -173,12 +221,30 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = ({
         setStockStr(String(currentStock));
         setMinStockStr(String(product.minStock || 3));
         setPresentations(product.presentations || []);
+        setImageUrl(product.imageUrl || product.thumbUrl || undefined);
+
+        if (product.stock && typeof product.stock === 'object') {
+          const map: Record<string, number> = {};
+          if (branches && branches.length > 0) {
+            branches.forEach((b) => {
+              const bId = b.id || 'main';
+              map[bId] = product.stock[bId] !== undefined ? product.stock[bId] : 0;
+            });
+          }
+          setStockByBranch(map);
+        } else {
+          setStockByBranch({ [branchId]: typeof product.stock === 'number' ? product.stock : 0 });
+        }
       } else {
         // Reset para nuevo producto
         setName('');
         setCategory('Abarrotes');
         setBarcode(generatePeruvianEan13());
         setSku('');
+        setBrand('');
+        setSizeLabel('');
+        setExtraBarcodes([]);
+        setShowExtraBarcodes(false);
         setUnitOfMeasure('NIU');
         setPriceStr('');
         setMinPriceStr('');
@@ -186,11 +252,23 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = ({
         setStockStr('0');
         setMinStockStr('3');
         setPresentations([]);
+        setImageUrl(undefined);
+
+        const initialMap: Record<string, number> = {};
+        if (branches && branches.length > 0) {
+          branches.forEach((b) => {
+            const bId = b.id || 'main';
+            initialMap[bId] = 0;
+          });
+        } else {
+          initialMap[branchId] = 0;
+        }
+        setStockByBranch(initialMap);
       }
       setScannerActive(false);
       setPresModalOpen(false);
     }
-  }, [visible, product, branchId]);
+  }, [visible, product, branchId, branches]);
 
   // Cálculos de márgenes
   const priceVal = parseFloat(priceStr) || 0;
@@ -213,7 +291,8 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = ({
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
   };
 
-  const handleStartScanner = async () => {
+  const handleStartScanner = async (target: 'main' | number = 'main') => {
+    setScanningTarget(target);
     if (!cameraPermission?.granted) {
       const result = await requestCameraPermission();
       if (!result.granted) {
@@ -226,10 +305,44 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = ({
 
   const handleBarcodeScanned = ({ data }: { data: string }) => {
     if (data) {
-      setBarcode(data.trim());
+      const clean = data.trim();
+      if (scanningTarget === 'main') {
+        setBarcode(clean);
+      } else if (typeof scanningTarget === 'number') {
+        setExtraBarcodes((prev) => {
+          const next = [...prev];
+          next[scanningTarget] = clean;
+          return next;
+        });
+      }
       setScannerActive(false);
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
     }
+  };
+
+  const handleAddExtraBarcode = () => {
+    setExtraBarcodes((prev) => [...prev, '']);
+    setShowExtraBarcodes(true);
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+  };
+
+  const handleRemoveExtraBarcode = (index: number) => {
+    setExtraBarcodes((prev) => prev.filter((_, i) => i !== index));
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+  };
+
+  const handleUpdateExtraBarcode = (index: number, val: string) => {
+    setExtraBarcodes((prev) => {
+      const next = [...prev];
+      next[index] = val;
+      return next;
+    });
+  };
+
+  const handleGenerateExtraBarcode = (index: number) => {
+    const ean = generatePeruvianEan13();
+    handleUpdateExtraBarcode(index, ean);
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
   };
 
   const handleAddPresentation = () => {
@@ -276,21 +389,36 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = ({
       return;
     }
 
+    const cleanExtraBarcodes = extraBarcodes
+      .map((b) => b.trim())
+      .filter((b) => b.length > 0 && b !== barcode.trim());
+
     const payload: ProductFormData = {
       id: product?.id,
       name: name.trim(),
       category: category.trim() || 'General',
       barcode: barcode.trim(),
+      barcodes: cleanExtraBarcodes,
       sku: sku.trim() || barcode.trim() || `SKU-${Date.now().toString().slice(-6)}`,
+      brand: enableCatalogFilters ? (brand.trim() || undefined) : undefined,
+      sizeLabel: enableCatalogFilters ? (sizeLabel.trim() || undefined) : undefined,
       unitOfMeasure,
       price: priceVal,
       minSalePrice: minPriceVal > 0 ? minPriceVal : priceVal,
       cost: costVal,
-      stock: parseFloat(stockStr) || 0,
+      stock: branches && branches.length > 1
+        ? (stockByBranch[branchId] ?? parseFloat(stockStr) ?? 0)
+        : parseFloat(stockStr) || 0,
       minStock: parseFloat(minStockStr) || 3,
       presentations,
-      imageUrl: product?.imageUrl || '',
+      imageUrl: imageUrl || product?.imageUrl || '',
+      stockByBranch: branches && branches.length > 1 ? stockByBranch : undefined,
     };
+
+    if (!canManageProducts) {
+      Alert.alert('Acceso Denegado', 'No cuentas con permisos para crear o modificar productos.');
+      return;
+    }
 
     try {
       setIsSaving(true);
@@ -375,14 +503,37 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = ({
             <Text style={styles.label}>
               Nombre del Producto <Text style={styles.required}>*</Text>
             </Text>
-            <TextInput
-              style={styles.input}
-              value={name}
-              onChangeText={setName}
-              accessibilityLabel="Nombre del producto, obligatorio"
-              placeholder="Ej. Gaseosa Inca Kola 500ml"
-              placeholderTextColor={ui.textMuted}
-            />
+            <View style={styles.nameWithImageRow}>
+              <TextInput
+                style={[styles.input, styles.inputWithImage]}
+                value={name}
+                onChangeText={setName}
+                accessibilityLabel="Nombre del producto, obligatorio"
+                placeholder="Ej. Gaseosa Inca Kola 500ml"
+                placeholderTextColor={ui.textMuted}
+              />
+              <TouchableOpacity
+                onPress={handlePickImage}
+                style={[styles.attachImageBtn, !!imageUrl && styles.attachImageBtnActive]}
+                accessibilityRole="button"
+                accessibilityLabel={imageUrl ? 'Cambiar imagen adjunta' : 'Adjuntar imagen'}
+                activeOpacity={0.7}
+              >
+                {imageUrl ? (
+                  <Image source={{ uri: imageUrl }} style={styles.attachedThumbnail} />
+                ) : (
+                  <Camera size={18} color={ui.primary} />
+                )}
+              </TouchableOpacity>
+            </View>
+            {imageUrl ? (
+              <View style={styles.imageActionRow}>
+                <Text style={styles.imageActionText}>Foto adjunta</Text>
+                <TouchableOpacity onPress={() => setImageUrl(undefined)}>
+                  <Text style={styles.imageRemoveText}>Quitar</Text>
+                </TouchableOpacity>
+              </View>
+            ) : null}
           </View>
 
           {/* 2. Código de Barras + EAN-13 Generator */}
@@ -415,13 +566,101 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = ({
               />
               <TouchableOpacity
                 style={styles.cameraScanBtn}
-                onPress={handleStartScanner}
+                onPress={() => handleStartScanner('main')}
                 activeOpacity={0.7}
                 accessibilityRole="button"
                 accessibilityLabel="Escanear código de barras con la cámara"
               >
                 <Camera size={18} color={ui.text} />
               </TouchableOpacity>
+            </View>
+
+            {/* Selector opcional desplegable: Códigos de Barras Adicionales */}
+            <View style={styles.extraBarcodesContainer}>
+              <TouchableOpacity
+                style={styles.extraBarcodesToggleBtn}
+                onPress={() => setShowExtraBarcodes(!showExtraBarcodes)}
+                activeOpacity={0.7}
+                accessibilityRole="button"
+                accessibilityLabel="Mostrar u ocultar códigos de barras adicionales"
+              >
+                <View style={styles.extraBarcodesToggleLeft}>
+                  <Barcode size={15} color={ui.primary} />
+                  <Text style={styles.extraBarcodesToggleText}>
+                    {extraBarcodes.length > 0
+                      ? `Códigos adicionales (${extraBarcodes.length})`
+                      : '+ Código de barras adicional (opcional)'}
+                  </Text>
+                </View>
+                {showExtraBarcodes ? (
+                  <ChevronUp size={16} color={ui.primary} />
+                ) : (
+                  <ChevronDown size={16} color={ui.textSecondary} />
+                )}
+              </TouchableOpacity>
+
+              {showExtraBarcodes && (
+                <View style={styles.extraBarcodesCard}>
+                  {extraBarcodes.length === 0 ? (
+                    <Text style={styles.extraBarcodesEmptyText}>
+                      Agrega códigos de barra alternativos (ej. packs, códigos de proveedor o presentaciones).
+                    </Text>
+                  ) : (
+                    extraBarcodes.map((altCode, idx) => (
+                      <View key={idx} style={styles.extraBarcodeItem}>
+                        <View style={styles.inputWithActionsRow}>
+                          <View style={styles.inputIconPrefix}>
+                            <Barcode size={16} color={ui.textMuted} />
+                          </View>
+                          <TextInput
+                            style={[styles.input, styles.inputFlex]}
+                            value={altCode}
+                            onChangeText={(text) => handleUpdateExtraBarcode(idx, text)}
+                            placeholder={`Código adicional ${idx + 1}`}
+                            placeholderTextColor={ui.textMuted}
+                            keyboardType="numeric"
+                          />
+                          <TouchableOpacity
+                            style={styles.pillActionBtnMini}
+                            onPress={() => handleGenerateExtraBarcode(idx)}
+                            activeOpacity={0.7}
+                            accessibilityLabel="Generar EAN-13"
+                          >
+                            <Shuffle size={13} color={ui.primary} />
+                          </TouchableOpacity>
+                          <TouchableOpacity
+                            style={styles.cameraScanBtn}
+                            onPress={() => handleStartScanner(idx)}
+                            activeOpacity={0.7}
+                            accessibilityLabel="Escanear con cámara"
+                          >
+                            <Camera size={16} color={ui.text} />
+                          </TouchableOpacity>
+                          <TouchableOpacity
+                            style={styles.extraBarcodeDeleteBtn}
+                            onPress={() => handleRemoveExtraBarcode(idx)}
+                            activeOpacity={0.7}
+                            accessibilityLabel="Eliminar código adicional"
+                          >
+                            <Trash2 size={16} color={ui.danger} />
+                          </TouchableOpacity>
+                        </View>
+                      </View>
+                    ))
+                  )}
+
+                  <TouchableOpacity
+                    style={styles.addExtraBarcodeBtn}
+                    onPress={handleAddExtraBarcode}
+                    activeOpacity={0.7}
+                    accessibilityRole="button"
+                    accessibilityLabel="Agregar otro código de barras"
+                  >
+                    <Plus size={14} color={ui.primary} />
+                    <Text style={styles.addExtraBarcodeBtnText}>Agregar otro código de barras</Text>
+                  </TouchableOpacity>
+                </View>
+              )}
             </View>
           </View>
 
@@ -484,7 +723,82 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = ({
             ))}
           </ScrollView>
 
-          {/* 4. Unidad de Medida SUNAT */}
+          {/* 4. Marca y Medida / Talla (SOLO SI LA CUENTA LO TIENE HABILITADO) */}
+          {enableCatalogFilters && (
+            <View style={styles.catalogFiltersSection}>
+              <View style={[styles.rowTwoCols, compactLayout && styles.rowTwoColsCompact]}>
+                <View style={[styles.formGroup, styles.colFlex, compactLayout && styles.colFlexCompact]}>
+                  <View style={styles.labelRow}>
+                    <Tag size={13} color={ui.primary} />
+                    <Text style={styles.label}>Marca (Opcional)</Text>
+                  </View>
+                  <TextInput
+                    style={styles.input}
+                    value={brand}
+                    onChangeText={setBrand}
+                    placeholder="Ej. Vargas, Gloria"
+                    placeholderTextColor={ui.textMuted}
+                  />
+                  {/* Chips rápidos de marcas populares */}
+                  <ScrollView
+                    horizontal
+                    showsHorizontalScrollIndicator={false}
+                    style={styles.miniChipsScroll}
+                    contentContainerStyle={styles.miniChipsContent}
+                    keyboardShouldPersistTaps="handled"
+                  >
+                    {DEFAULT_CATALOG_BRANDS.slice(0, 6).map((b) => (
+                      <TouchableOpacity
+                        key={b}
+                        style={[styles.miniChip, brand.toLowerCase() === b.toLowerCase() && styles.miniChipActive]}
+                        onPress={() => setBrand(b)}
+                      >
+                        <Text style={[styles.miniChipText, brand.toLowerCase() === b.toLowerCase() && styles.miniChipTextActive]}>
+                          {b}
+                        </Text>
+                      </TouchableOpacity>
+                    ))}
+                  </ScrollView>
+                </View>
+
+                <View style={[styles.formGroup, styles.colFlex, compactLayout && styles.colFlexCompact]}>
+                  <View style={styles.labelRow}>
+                    <Ruler size={13} color={ui.primary} />
+                    <Text style={styles.label}>Medida / Talla (Opcional)</Text>
+                  </View>
+                  <TextInput
+                    style={styles.input}
+                    value={sizeLabel}
+                    onChangeText={setSizeLabel}
+                    placeholder="Ej. 750 ml, 1 L, Pack"
+                    placeholderTextColor={ui.textMuted}
+                  />
+                  {/* Chips rápidos de medidas */}
+                  <ScrollView
+                    horizontal
+                    showsHorizontalScrollIndicator={false}
+                    style={styles.miniChipsScroll}
+                    contentContainerStyle={styles.miniChipsContent}
+                    keyboardShouldPersistTaps="handled"
+                  >
+                    {['750 ml', '1 Litro', '500 gr', 'Pack', '2 Plazas', 'Estándar'].map((s) => (
+                      <TouchableOpacity
+                        key={s}
+                        style={[styles.miniChip, sizeLabel.toLowerCase() === s.toLowerCase() && styles.miniChipActive]}
+                        onPress={() => setSizeLabel(s)}
+                      >
+                        <Text style={[styles.miniChipText, sizeLabel.toLowerCase() === s.toLowerCase() && styles.miniChipTextActive]}>
+                          {s}
+                        </Text>
+                      </TouchableOpacity>
+                    ))}
+                  </ScrollView>
+                </View>
+              </View>
+            </View>
+          )}
+
+          {/* 5. Unidad de Medida SUNAT */}
           <View style={styles.formGroup}>
             <Text style={styles.label}>Unidad de Medida (Estándar SUNAT)</Text>
             <View style={styles.unitsGrid}>
@@ -575,32 +889,73 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = ({
           </View>
 
           <SectionHeading title="Inventario" subtitle="Existencias actuales y alerta de reposición." />
-          <View style={[styles.rowTwoCols, compactLayout && styles.rowTwoColsCompact]}>
-            <View style={[styles.formGroup, styles.colFlex, compactLayout && styles.colFlexCompact]}>
-              <Text style={styles.label}>Stock Actual ({unitOfMeasure})</Text>
-              <TextInput
-                style={styles.input}
-                value={stockStr}
-                onChangeText={setStockStr}
-                accessibilityLabel={`Stock actual en ${unitOfMeasure}`}
-                placeholder="0"
-                keyboardType="numeric"
-                placeholderTextColor={ui.textMuted}
-              />
+          {branches && branches.length > 1 ? (
+            <View style={styles.formGroup}>
+              <Text style={styles.label}>Stock por Sucursal ({unitOfMeasure})</Text>
+              <View style={styles.branchStockList}>
+                {branches.map((b, idx) => {
+                  const bId = b.id || `branch_${idx}`;
+                  return (
+                    <View key={bId} style={styles.branchStockRow}>
+                      <Text style={styles.branchStockName} numberOfLines={1}>
+                        {b.name || 'Sucursal'}
+                      </Text>
+                      <TextInput
+                        style={styles.branchStockInput}
+                        value={stockByBranch[bId] !== undefined ? String(stockByBranch[bId]) : ''}
+                        onChangeText={(val) => {
+                          const num = parseFloat(val) || 0;
+                          setStockByBranch((prev) => ({ ...prev, [bId]: num }));
+                        }}
+                        keyboardType="numeric"
+                        placeholder="0"
+                        placeholderTextColor={ui.textMuted}
+                      />
+                    </View>
+                  );
+                })}
+              </View>
+              <View style={[styles.formGroup, { marginTop: 10 }]}>
+                <Text style={styles.label}>Alerta Stock Mínimo</Text>
+                <TextInput
+                  style={styles.input}
+                  value={minStockStr}
+                  onChangeText={setMinStockStr}
+                  accessibilityLabel="Alerta de stock mínimo"
+                  placeholder="3"
+                  keyboardType="numeric"
+                  placeholderTextColor={ui.textMuted}
+                />
+              </View>
             </View>
-            <View style={[styles.formGroup, styles.colFlex, compactLayout && styles.colFlexCompact]}>
-              <Text style={styles.label}>Alerta Stock Mínimo</Text>
-              <TextInput
-                style={styles.input}
-                value={minStockStr}
-                onChangeText={setMinStockStr}
-                accessibilityLabel="Alerta de stock mínimo"
-                placeholder="3"
-                keyboardType="numeric"
-                placeholderTextColor={ui.textMuted}
-              />
+          ) : (
+            <View style={[styles.rowTwoCols, compactLayout && styles.rowTwoColsCompact]}>
+              <View style={[styles.formGroup, styles.colFlex, compactLayout && styles.colFlexCompact]}>
+                <Text style={styles.label}>Stock Actual ({unitOfMeasure})</Text>
+                <TextInput
+                  style={styles.input}
+                  value={stockStr}
+                  onChangeText={setStockStr}
+                  accessibilityLabel={`Stock actual en ${unitOfMeasure}`}
+                  placeholder="0"
+                  keyboardType="numeric"
+                  placeholderTextColor={ui.textMuted}
+                />
+              </View>
+              <View style={[styles.formGroup, styles.colFlex, compactLayout && styles.colFlexCompact]}>
+                <Text style={styles.label}>Alerta Stock Mínimo</Text>
+                <TextInput
+                  style={styles.input}
+                  value={minStockStr}
+                  onChangeText={setMinStockStr}
+                  accessibilityLabel="Alerta de stock mínimo"
+                  placeholder="3"
+                  keyboardType="numeric"
+                  placeholderTextColor={ui.textMuted}
+                />
+              </View>
             </View>
-          </View>
+          )}
 
           <SectionHeading
             title="Presentaciones"
@@ -1279,6 +1634,191 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '700',
     color: ui.surface,
+  },
+  nameWithImageRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  inputWithImage: {
+    flex: 1,
+  },
+  attachImageBtn: {
+    width: 44,
+    height: 44,
+    borderRadius: 8,
+    backgroundColor: ui.surfaceMuted,
+    borderWidth: 1,
+    borderColor: ui.border,
+    alignItems: 'center',
+    justifyContent: 'center',
+    overflow: 'hidden',
+  },
+  attachImageBtnActive: {
+    borderColor: ui.primary,
+  },
+  attachedThumbnail: {
+    width: 44,
+    height: 44,
+    borderRadius: 7,
+  },
+  imageActionRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginTop: 4,
+  },
+  imageActionText: {
+    fontSize: 11,
+    color: ui.textSecondary,
+  },
+  imageRemoveText: {
+    fontSize: 11,
+    color: ui.danger,
+    fontWeight: '600',
+  },
+  branchStockList: {
+    gap: 6,
+    marginTop: 4,
+  },
+  branchStockRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: ui.surfaceMuted,
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    justifyContent: 'space-between',
+  },
+  branchStockName: {
+    flex: 1,
+    fontSize: 13,
+    fontWeight: '600',
+    color: ui.text,
+  },
+  branchStockInput: {
+    width: 90,
+    backgroundColor: ui.surface,
+    borderWidth: 1,
+    borderColor: ui.border,
+    borderRadius: 6,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    textAlign: 'right',
+    fontSize: 13,
+    fontWeight: '700',
+    color: ui.text,
+  },
+  extraBarcodesContainer: {
+    marginTop: 8,
+  },
+  extraBarcodesToggleBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: ui.primarySoft,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderWidth: 1,
+    borderColor: ui.primary,
+  },
+  extraBarcodesToggleLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  extraBarcodesToggleText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: ui.primary,
+  },
+  extraBarcodesCard: {
+    marginTop: 8,
+    padding: 10,
+    backgroundColor: ui.surface,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: ui.border,
+    gap: 8,
+  },
+  extraBarcodesEmptyText: {
+    fontSize: 11,
+    color: ui.textSecondary,
+    fontStyle: 'italic',
+  },
+  extraBarcodeItem: {
+    marginBottom: 4,
+  },
+  pillActionBtnMini: {
+    width: 32,
+    height: 38,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: ui.primarySoft,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: ui.primary,
+  },
+  extraBarcodeDeleteBtn: {
+    width: 34,
+    height: 38,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: ui.dangerSoft,
+    borderRadius: 6,
+  },
+  addExtraBarcodeBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    paddingVertical: 8,
+    backgroundColor: ui.surfaceMuted,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: ui.border,
+    borderStyle: 'dashed',
+  },
+  addExtraBarcodeBtnText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: ui.primary,
+  },
+  catalogFiltersSection: {
+    backgroundColor: ui.surface,
+    padding: 10,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: ui.border,
+    marginBottom: 12,
+  },
+  miniChipsScroll: {
+    marginTop: 4,
+  },
+  miniChipsContent: {
+    gap: 6,
+  },
+  miniChip: {
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 6,
+    backgroundColor: ui.surfaceMuted,
+    borderWidth: 1,
+    borderColor: ui.border,
+  },
+  miniChipActive: {
+    backgroundColor: ui.primarySoft,
+    borderColor: ui.primary,
+  },
+  miniChipText: {
+    fontSize: 10,
+    color: ui.textSecondary,
+    fontWeight: '500',
+  },
+  miniChipTextActive: {
+    color: ui.primary,
+    fontWeight: '700',
   },
 });
 

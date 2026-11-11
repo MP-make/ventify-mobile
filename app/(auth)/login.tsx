@@ -9,6 +9,7 @@ import {
   KeyboardAvoidingView,
   ScrollView,
   Platform,
+  Image,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
@@ -27,7 +28,6 @@ import * as Haptics from 'expo-haptics';
 import { useAuth } from '@/context/AuthContext';
 import { useSettings } from '@/context/SettingsContext';
 import { ui } from '@/lib/theme';
-import { BrandLogo } from '@/components/ui';
 
 export default function LoginScreen() {
   const insets = useSafeAreaInsets();
@@ -103,12 +103,27 @@ export default function LoginScreen() {
 
   return (
     <KeyboardAvoidingView style={styles.screen} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
-      <ScrollView contentContainerStyle={[styles.scroll, { paddingTop: insets.top + 36, paddingBottom: Math.max(insets.bottom, 24) }]} keyboardShouldPersistTaps="handled" keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'} showsVerticalScrollIndicator={false}>
+      <ScrollView contentContainerStyle={[styles.scroll, { paddingTop: insets.top + 16, paddingBottom: Math.max(insets.bottom, 24) }]} keyboardShouldPersistTaps="handled" keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'} showsVerticalScrollIndicator={false}>
         <View style={styles.body}>
-          <View style={styles.brand}><BrandLogo size={64} /></View>
-          <View style={styles.welcome}>
-            <Text accessibilityRole="header" style={styles.title}>Tu negocio,{'\n'}siempre contigo.</Text>
-            <Text style={styles.description}>Vende, controla tu inventario y lleva tu negocio desde un solo lugar.</Text>
+          {/* Header Compacto: Logo Circular + Nombre + Slogan al lado y descripción debajo */}
+          <View style={styles.compactHeader}>
+            <View style={styles.logoCircleContainer}>
+              <Image
+                source={require('../../assets/brand/ventify-logo.png')}
+                style={styles.logoCircularImage}
+                resizeMode="cover"
+                accessibilityIgnoresInvertColors
+              />
+            </View>
+            <View style={styles.headerTextGroup}>
+              <View style={styles.headerTopRow}>
+                <Text style={styles.brandWordmark}>ventify<Text style={styles.brandDot}>.</Text></Text>
+                <Text style={styles.headerSloganInline}>· Tu negocio, siempre contigo</Text>
+              </View>
+              <Text style={styles.headerSubtitle}>
+                Vende, controla tu inventario y lleva tu negocio desde un solo lugar.
+              </Text>
+            </View>
           </View>
           <View style={styles.form}>
             <Text style={styles.formTitle}>Bienvenido de nuevo</Text>
@@ -146,10 +161,65 @@ const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: ui.background },
   scroll: { flexGrow: 1, justifyContent: 'center', paddingHorizontal: 24 },
   body: { width: '100%', maxWidth: 460, alignSelf: 'center' },
-  brand: { marginBottom: 32 },
-  welcome: { marginBottom: 28 },
-  title: { color: ui.text, fontSize: 34, lineHeight: 41, fontWeight: '700', letterSpacing: -1.1 },
-  description: { color: ui.textSecondary, fontSize: 16, lineHeight: 24, marginTop: 12, maxWidth: 370 },
+  compactHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    marginBottom: 16,
+    paddingHorizontal: 2,
+  },
+  logoCircleContainer: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    overflow: 'hidden',
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1.5,
+    borderColor: ui.border,
+    alignItems: 'center',
+    justifyContent: 'center',
+    elevation: 2,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.1,
+    shadowRadius: 2,
+  },
+  logoCircularImage: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+  },
+  headerTextGroup: {
+    flex: 1,
+    justifyContent: 'center',
+  },
+  headerTopRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: 6,
+  },
+  brandWordmark: {
+    fontSize: 22,
+    fontWeight: '800',
+    letterSpacing: -0.8,
+    color: ui.text,
+  },
+  brandDot: {
+    color: ui.primary,
+  },
+  headerSloganInline: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: ui.textSecondary,
+    letterSpacing: -0.2,
+  },
+  headerSubtitle: {
+    fontSize: 11.5,
+    lineHeight: 16,
+    color: ui.textMuted,
+    marginTop: 2,
+  },
   form: { backgroundColor: ui.surface, borderRadius: 16, padding: 24 },
   formTitle: { color: ui.text, fontSize: 21, fontWeight: '700', letterSpacing: -0.4 },
   formDescription: { color: ui.textSecondary, fontSize: 14, marginTop: 6, marginBottom: 12 },

@@ -13,6 +13,7 @@ expo-env.d.ts
 android/.gradle/
 android/app/build/
 android/build/
+android/capacitor-cordova-android-plugins/build/
 android/local.properties
 ios/Pods/
 ios/build/

@@ -23,6 +23,7 @@ import {
   limit,
   Timestamp,
 } from 'firebase/firestore';
+import { cleanFirestoreData } from '@/lib/firebase-utils';
 
 // ============================================================================
 // CONSTANTES Y CONFIGURACIÓN
@@ -35,7 +36,7 @@ const INVENTORY_MOVEMENTS_COLLECTION = 'inventory_movements';
 const CASH_SESSIONS_COLLECTION = 'cash_register_sessions';
 const CASH_MOVEMENTS_COLLECTION = 'cash_register_movements';
 const CUSTOMERS_COLLECTION = 'customers';
-const COUNTERS_COLLECTION = 'counters';
+const COUNTERS_COLLECTION = 'sale_counters';
 const RECEIVABLES_COLLECTION = 'accounts_receivable';
 
 const DEFAULT_LOW_STOCK_THRESHOLD = 5;
@@ -270,9 +271,9 @@ export const createSaleTransaction = async (
     subtotal = total / 1.18,
     tax = total - total / 1.18,
     payments,
-    cashAmount = paymentMethod === 'efectivo' ? total : 0,
-    cardAmount = paymentMethod === 'tarjeta' ? total : 0,
-    digitalAmount = ['yape', 'plin', 'transferencia'].includes(paymentMethod) ? total : 0,
+    cashAmount = (paymentMethod === 'efectivo' || paymentMethod === 'cash') ? total : 0,
+    cardAmount = (paymentMethod === 'tarjeta' || paymentMethod === 'card') ? total : 0,
+    digitalAmount = ['yape', 'plin', 'transferencia', 'digital'].includes(paymentMethod) ? total : 0,
     cashReceived,
     changeGiven,
     customer,
@@ -283,6 +284,26 @@ export const createSaleTransaction = async (
     isQuote = documentType === 'cotizacion',
     depositInfo,
   } = params;
+
+  // Determinar montos efectivos por método de pago de forma robusta
+  let effectiveCash = cashAmount;
+  let effectiveCard = cardAmount;
+  let effectiveDigital = digitalAmount;
+  let effectiveCredit = (paymentMethod === 'fiado' || paymentMethod === 'credit') ? total : 0;
+
+  if (Array.isArray(payments) && payments.length > 0) {
+    effectiveCash = 0;
+    effectiveCard = 0;
+    effectiveDigital = 0;
+    effectiveCredit = 0;
+    for (const p of payments) {
+      const amt = p.amount || 0;
+      if (p.category === 'cash') effectiveCash += amt;
+      else if (p.category === 'card') effectiveCard += amt;
+      else if (p.category === 'digital') effectiveDigital += amt;
+      else if (p.category === 'credit') effectiveCredit += amt;
+    }
+  }
 
   if (!accountId || !branchId) {
     throw new Error('Datos requeridos faltantes: accountId y branchId son obligatorios.');
@@ -327,18 +348,30 @@ export const createSaleTransaction = async (
     // A. Validar Sesión de Caja si no es cotización
     let resolvedSessionId = params.sessionId;
     const activePointerRef = doc(db, CASH_SESSIONS_COLLECTION, `active_${branchId}`);
+    const userPointerRef = userId ? doc(db, CASH_SESSIONS_COLLECTION, `active_${accountId}_${branchId}_${userId}`) : null;
 
     if (!isQuote && !resolvedSessionId) {
-      const activePointerSnap = await tx.get(activePointerRef);
-      if (activePointerSnap.exists()) {
-        const pointerData = activePointerSnap.data();
-        if (pointerData.status === 'open' && pointerData.activeSessionId) {
-          resolvedSessionId = pointerData.activeSessionId;
+      if (userPointerRef) {
+        const userPointerSnap = await tx.get(userPointerRef);
+        if (userPointerSnap.exists()) {
+          const uData = userPointerSnap.data();
+          if (uData.status === 'open' && uData.activeSessionId) {
+            resolvedSessionId = uData.activeSessionId;
+          }
+        }
+      }
+      if (!resolvedSessionId) {
+        const activePointerSnap = await tx.get(activePointerRef);
+        if (activePointerSnap.exists()) {
+          const pointerData = activePointerSnap.data();
+          if (pointerData.status === 'open' && pointerData.activeSessionId) {
+            resolvedSessionId = pointerData.activeSessionId;
+          }
         }
       }
     }
 
-    if (!isQuote && !resolvedSessionId && cashAmount > 0) {
+    if (!isQuote && !resolvedSessionId && effectiveCash > 0) {
       throw new Error(
         'No se encontró una sesión de caja abierta en esta sucursal. Abre tu caja antes de registrar ventas en efectivo.'
       );
@@ -349,6 +382,7 @@ export const createSaleTransaction = async (
       item: SaleItemInput;
       productRef: any;
       productData: any;
+      effectiveStockBranchKey: string;
       baseUnitsToDeduct: number;
       previousStock: number;
       newStock: number;
@@ -359,13 +393,28 @@ export const createSaleTransaction = async (
     const validatedItems: ValidatedItemData[] = [];
 
     for (const item of items) {
-      const pId = item.productId;
+      let pId = item.productId;
       if (!pId) {
         throw new Error(`Ítem inválido en la venta: falta productId (${item.name || 'desconocido'})`);
       }
 
-      const productRef = doc(db, PRODUCTS_COLLECTION, pId);
-      const productSnap = await tx.get(productRef);
+      let productRef = doc(db, PRODUCTS_COLLECTION, pId);
+      let productSnap = await tx.get(productRef);
+
+      // Si no existe directamente y contiene guiones bajos (ej: ID_base_base), intentar con la clave base
+      if (!productSnap.exists() && pId.includes('_')) {
+        const parts = pId.split('_');
+        if (parts.length >= 2) {
+          const candidateBase = parts[0];
+          const fallbackRef = doc(db, PRODUCTS_COLLECTION, candidateBase);
+          const fallbackSnap = await tx.get(fallbackRef);
+          if (fallbackSnap.exists()) {
+            pId = candidateBase;
+            productRef = fallbackRef;
+            productSnap = fallbackSnap;
+          }
+        }
+      }
 
       if (!productSnap.exists()) {
         throw new Error(`El producto "${item.name || pId}" no existe en el catálogo.`);
@@ -389,8 +438,39 @@ export const createSaleTransaction = async (
 
       // Cálculo de unidades base reales a descontar
       const baseUnits = calculateBaseUnits(item);
-      const currentPhysicalStock = productData.stock?.[branchId] || 0;
-      const currentReservedStock = productData.reservedStock?.[branchId] || 0;
+      let currentPhysicalStock = 0;
+      let effectiveStockBranchKey = branchId;
+
+      if (typeof productData.stock === 'number') {
+        currentPhysicalStock = productData.stock;
+      } else if (productData.stock && typeof productData.stock === 'object') {
+        if (typeof productData.stock[branchId] === 'number') {
+          currentPhysicalStock = productData.stock[branchId];
+          effectiveStockBranchKey = branchId;
+        } else {
+          // Resolver fallback coherente con catálogo móvil y web
+          const stockKeys = Object.keys(productData.stock);
+          if (stockKeys.length === 1) {
+            effectiveStockBranchKey = stockKeys[0];
+            currentPhysicalStock = Number(productData.stock[effectiveStockBranchKey] || 0);
+          } else if (stockKeys.length > 0) {
+            const matchedKey =
+              stockKeys.find(
+                (k) =>
+                  k === branchId ||
+                  k.toLowerCase().includes('principal') ||
+                  k.toLowerCase().includes('main')
+              ) || stockKeys[0];
+            effectiveStockBranchKey = matchedKey;
+            currentPhysicalStock = Number(productData.stock[effectiveStockBranchKey] || 0);
+          }
+        }
+      }
+
+      const currentReservedStock =
+        productData.reservedStock?.[effectiveStockBranchKey] ||
+        productData.reservedStock?.[branchId] ||
+        0;
       const availableStock = currentPhysicalStock - currentReservedStock;
 
       // Validación de stock (solo si no es cotización ni depósito)
@@ -417,6 +497,7 @@ export const createSaleTransaction = async (
         item,
         productRef,
         productData,
+        effectiveStockBranchKey,
         baseUnitsToDeduct: baseUnits,
         previousStock: currentPhysicalStock,
         newStock,
@@ -488,8 +569,9 @@ export const createSaleTransaction = async (
     const enrichedItems = validatedItems.map(({ item, baseUnitsToDeduct, costPrice, margin }) => {
       totalMargin += margin;
       totalCost += costPrice * baseUnitsToDeduct;
+      const { product, ...cleanItem } = item as any;
       return {
-        ...item,
+        ...cleanItem,
         costPrice,
         margin,
         baseUnits: baseUnitsToDeduct,
@@ -519,9 +601,9 @@ export const createSaleTransaction = async (
       marginPercent: total > 0 ? Math.round((totalMargin / total) * 10000) / 100 : 0,
       paymentMethod,
       payments: payments || [],
-      cashAmount: Math.round(cashAmount * 100) / 100,
-      cardAmount: Math.round(cardAmount * 100) / 100,
-      digitalAmount: Math.round(digitalAmount * 100) / 100,
+      cashAmount: Math.round(effectiveCash * 100) / 100,
+      cardAmount: Math.round(effectiveCard * 100) / 100,
+      digitalAmount: Math.round(effectiveDigital * 100) / 100,
       cashReceived: cashReceived !== undefined ? Math.round(cashReceived * 100) / 100 : undefined,
       changeGiven: changeGiven !== undefined ? Math.round(changeGiven * 100) / 100 : undefined,
       customerId: customerId || null,
@@ -538,70 +620,76 @@ export const createSaleTransaction = async (
       depositInfo: depositInfo || null,
     };
 
-    // Limpieza de campos undefined
-    Object.keys(salePayload).forEach((k) => {
-      if (salePayload[k] === undefined) delete salePayload[k];
-    });
-
-    tx.set(saleDocRef, salePayload);
+    // Limpieza profunda y recursiva de campos undefined para Firestore
+    const cleanSalePayload = cleanFirestoreData(salePayload);
+    tx.set(saleDocRef, cleanSalePayload);
 
     // F. Si no es cotización, descontar stock físico y generar Kardex
     if (!isQuote) {
       for (const vi of validatedItems) {
-        const { item, productRef, productData, baseUnitsToDeduct, previousStock, newStock } = vi;
+        const { item, productRef, productData, baseUnitsToDeduct, previousStock, newStock, effectiveStockBranchKey } = vi;
 
         // Recalcular lowStockBranches
-        const currentStockMap = { ...(productData.stock || {}), [branchId]: newStock };
+        const currentStockMap = { ...(productData.stock || {}), [effectiveStockBranchKey]: newStock };
         const lowStockBranches = computeLowStockBranches(
           currentStockMap,
           productData.reservedStock || {},
           productData.minStock || DEFAULT_LOW_STOCK_THRESHOLD
         );
 
-        // Actualizar stock atómicamente en el producto
+        // Actualizar stock atómicamente en el producto (respetando affectedKeys de firestore.rules para cajeros)
         tx.update(productRef, {
-          [`stock.${branchId}`]: newStock,
+          [`stock.${effectiveStockBranchKey}`]: newStock,
           lowStockBranches,
-          updatedAt: serverTimestamp(),
         });
 
         // Registrar movimiento en el Kardex oficial (inventory_movements)
         const movementDocRef = doc(collection(db, INVENTORY_MOVEMENTS_COLLECTION));
-        tx.set(movementDocRef, {
+        const movementData = cleanFirestoreData({
           accountId,
-          branchId,
+          branchId: effectiveStockBranchKey,
           productId: vi.item.productId,
           productName: item.name,
           productSku: item.sku || productData.sku || '',
-          previousStock,
-          newStock,
+          quantityChanged: -baseUnitsToDeduct,
+          quantityBefore: previousStock,
+          quantityAfter: newStock,
           quantity: baseUnitsToDeduct,
+          movementType: 'sale',
           type: 'out',
-          reason: 'sale',
+          reason: `Venta ${correlative}`,
+          referenceId: saleId,
+          referenceType: 'sale',
           saleId,
           correlative,
           userId,
           userName,
+          timestamp: Date.now(),
           createdAt: serverTimestamp(),
         });
+        tx.set(movementDocRef, movementData);
       }
 
-      // G. Registrar movimiento de efectivo en caja chica si hubo cobro en efectivo
-      if (cashAmount > 0 && resolvedSessionId) {
-        const cashMovementRef = doc(collection(db, CASH_MOVEMENTS_COLLECTION));
-        tx.set(cashMovementRef, {
-          accountId,
-          branchId,
-          sessionId: resolvedSessionId,
-          type: 'income',
-          category: 'sale',
-          amount: Math.round(cashAmount * 100) / 100,
-          description: `Venta ${correlative}`,
-          saleId,
-          createdBy: userId,
-          createdByName: userName,
-          createdAt: serverTimestamp(),
-        });
+      // G. Registrar movimiento de efectivo en caja chica (solo efectivo) y actualizar sesión de caja
+      if (resolvedSessionId) {
+        if (effectiveCash > 0) {
+          const cashMovementRef = doc(collection(db, CASH_MOVEMENTS_COLLECTION));
+          const cashMovementData = cleanFirestoreData({
+            accountId,
+            branchId,
+            sessionId: resolvedSessionId,
+            type: 'income',
+            category: 'sale',
+            amount: Math.round(effectiveCash * 100) / 100,
+            description: `Venta ${correlative}`,
+            paymentMethod: 'efectivo',
+            saleId,
+            createdBy: userId,
+            createdByName: userName,
+            createdAt: serverTimestamp(),
+          });
+          tx.set(cashMovementRef, cashMovementData);
+        }
 
         // Actualizar acumuladores en la sesión específica
         const sessionRef = doc(db, CASH_SESSIONS_COLLECTION, resolvedSessionId);
@@ -609,10 +697,13 @@ export const createSaleTransaction = async (
         if (sessionSnap.exists()) {
           const sData = sessionSnap.data();
           tx.update(sessionRef, {
-            cashSales: (sData.cashSales || 0) + cashAmount,
+            cashSales: (sData.cashSales || 0) + effectiveCash,
+            cardSales: (sData.cardSales || 0) + effectiveCard,
+            digitalSales: (sData.digitalSales || 0) + effectiveDigital,
+            creditSales: (sData.creditSales || 0) + effectiveCredit,
             totalSales: (sData.totalSales || 0) + total,
             transactionCount: (sData.transactionCount || 0) + 1,
-            expectedAmount: (sData.expectedAmount || 0) + cashAmount,
+            expectedAmount: (sData.expectedAmount || 0) + effectiveCash,
             updatedAt: serverTimestamp(),
           });
         }
@@ -622,11 +713,24 @@ export const createSaleTransaction = async (
         if (pointerSnap.exists() && pointerSnap.data()?.activeSessionId === resolvedSessionId) {
           const pData = pointerSnap.data();
           tx.update(activePointerRef, {
-            cashSalesTotal: (pData.cashSalesTotal || 0) + cashAmount,
+            cashSalesTotal: (pData.cashSalesTotal || 0) + effectiveCash,
             totalSales: (pData.totalSales || 0) + total,
             transactionCount: (pData.transactionCount || 0) + 1,
             lastSaleAt: serverTimestamp(),
           });
+        }
+
+        if (userPointerRef) {
+          const uSnap = await tx.get(userPointerRef);
+          if (uSnap.exists() && uSnap.data()?.activeSessionId === resolvedSessionId) {
+            const uData = uSnap.data();
+            tx.update(userPointerRef, {
+              cashSalesTotal: (uData.cashSalesTotal || 0) + effectiveCash,
+              totalSales: (uData.totalSales || 0) + total,
+              transactionCount: (uData.transactionCount || 0) + 1,
+              lastSaleAt: serverTimestamp(),
+            });
+          }
         }
       }
 
@@ -777,11 +881,25 @@ export const cancelSaleWithReversal = async (
     let reversalCount = 0;
 
     for (const item of items) {
-      const pId = item.productId || item.id;
+      let pId = item.productId || item.id;
       if (!pId) continue;
 
-      const productRef = doc(db, PRODUCTS_COLLECTION, pId);
-      const productSnap = await tx.get(productRef);
+      let productRef = doc(db, PRODUCTS_COLLECTION, pId);
+      let productSnap = await tx.get(productRef);
+
+      if (!productSnap.exists() && pId.includes('_')) {
+        const parts = pId.split('_');
+        if (parts.length >= 2) {
+          const candidateBase = parts[0];
+          const fallbackRef = doc(db, PRODUCTS_COLLECTION, candidateBase);
+          const fallbackSnap = await tx.get(fallbackRef);
+          if (fallbackSnap.exists()) {
+            pId = candidateBase;
+            productRef = fallbackRef;
+            productSnap = fallbackSnap;
+          }
+        }
+      }
 
       if (productSnap.exists()) {
         const pData = productSnap.data();

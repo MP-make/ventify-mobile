@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import {
   View,
   Text,
@@ -42,10 +42,17 @@ import {
   MessageSquare,
   HelpCircle,
   ArrowUpRight,
+  Barcode,
+  Phone,
+  Zap,
+  ZapOff,
 } from 'lucide-react-native';
+import { CameraView, useCameraPermissions, BarcodeScanningResult } from 'expo-camera';
+import * as Haptics from 'expo-haptics';
 
 import { useAuth } from '@/context/AuthContext';
 import { useSettings } from '@/context/SettingsContext';
+import { usePermissions } from '@/hooks/usePermissions';
 import { Header } from '@/components/Header';
 import { ui, theme, formatPEN, formatDatePE } from '@/lib/theme';
 import { ScreenHeading, SectionHeading } from '@/components/ui';
@@ -66,6 +73,7 @@ import {
   askVentyAI,
   getCustomers,
   BusinessKPIContext,
+  completeOrCancelReservation,
 } from '@/services/crm-operations-service';
 
 import {
@@ -77,8 +85,8 @@ import {
 import { FinancialPnlModal } from '@/components/FinancialPnlModal';
 
 // Sub-módulos de Historial
-type HistoryTab = 'sales' | 'ai';
-type DateRange = 'today' | 'week' | 'month' | 'all';
+type HistoryTab = 'sales' | 'reservations' | 'ai';
+type DateRange = 'today' | 'week' | 'month' | 'custom' | 'all';
 type DocFilter = 'all' | 'factura' | 'boleta' | 'nota_venta';
 
 interface ChatMessage {
@@ -91,6 +99,7 @@ interface ChatMessage {
 export default function HistoryScreen() {
   const insets = useSafeAreaInsets();
   const { user, userProfile, accountId, branchId, role } = useAuth();
+  const { canViewReports, canProcessReturn } = usePermissions();
   const {
     businessSettings,
     activeBranch,
@@ -109,6 +118,9 @@ export default function HistoryScreen() {
   const [loadingSales, setLoadingSales] = useState<boolean>(true);
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [dateRange, setDateRange] = useState<DateRange>('all');
+  const [customStartDate, setCustomStartDate] = useState<string>('');
+  const [customEndDate, setCustomEndDate] = useState<string>('');
+  const [customDateModalOpen, setCustomDateModalOpen] = useState<boolean>(false);
   const [docFilter, setDocFilter] = useState<DocFilter>('all');
 
   // Modal de Detalle de Comprobante
@@ -123,6 +135,167 @@ export default function HistoryScreen() {
   // Impresión y compartir
   const [isPrinting, setIsPrinting] = useState<boolean>(false);
   const [isSharing, setIsSharing] = useState<boolean>(false);
+
+  // Escáner de tickets inline (en ventanita embebida sin modal ni navegación)
+  const [cameraPermission, requestCameraPermission] = useCameraPermissions();
+  const [inlineScannerActive, setInlineScannerActive] = useState<boolean>(false);
+  const [inlineTorchOn, setInlineTorchOn] = useState<boolean>(false);
+  const scanCooldownRef = useRef<boolean>(false);
+
+  const toggleInlineScanner = async () => {
+    if (!inlineScannerActive) {
+      if (!cameraPermission?.granted) {
+        const res = await requestCameraPermission();
+        if (!res.granted) {
+          Alert.alert('Cámara Requerida', 'Se requiere permiso de cámara para escanear tickets o comprobantes.');
+          return;
+        }
+      }
+      setInlineScannerActive(true);
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    } else {
+      setInlineScannerActive(false);
+      setInlineTorchOn(false);
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    }
+  };
+
+  const handleInlineBarcodeScanned = useCallback((code: string) => {
+    const clean = code?.trim();
+    if (!clean || scanCooldownRef.current) return;
+    scanCooldownRef.current = true;
+    setTimeout(() => {
+      scanCooldownRef.current = false;
+    }, 1200);
+
+    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    setSearchQuery(clean);
+  }, []);
+
+  // Estados del Sub-Módulo de Reservas
+  const [reservations, setReservations] = useState<any[]>([]);
+  const [loadingReservations, setLoadingReservations] = useState<boolean>(false);
+  const [reservationSearch, setReservationSearch] = useState<string>('');
+  const [reservationStatusFilter, setReservationStatusFilter] = useState<'all' | 'pending' | 'completed' | 'cancelled'>('all');
+
+  // Filtrado de Reservas por texto y estado
+  const filteredReservations = useMemo(() => {
+    const q = reservationSearch.trim().toLowerCase();
+    return reservations.filter((res) => {
+      if (reservationStatusFilter !== 'all') {
+        const status = res.status || 'pending';
+        if (status !== reservationStatusFilter) return false;
+      }
+      if (!q) return true;
+      const custName = (res.customer?.name || '').toLowerCase();
+      const custPhone = (res.customer?.phone || '').toLowerCase();
+      const notes = (res.notes || '').toLowerCase();
+      const correlative = (res.correlative || '').toLowerCase();
+      const itemsMatch =
+        Array.isArray(res.items) &&
+        res.items.some((it: any) =>
+          (it.productName || it.name || '').toLowerCase().includes(q)
+        );
+      return (
+        custName.includes(q) ||
+        custPhone.includes(q) ||
+        notes.includes(q) ||
+        correlative.includes(q) ||
+        itemsMatch
+      );
+    });
+  }, [reservations, reservationSearch, reservationStatusFilter]);
+
+  const handleCompleteReservation = async (res: any) => {
+    Alert.alert(
+      'Completar Reserva',
+      `¿Confirmas la entrega de los productos a ${res.customer?.name || 'Cliente General'}? Se descontará el stock reservado y se marcará como entregado.`,
+      [
+        { text: 'Cancelar', style: 'cancel' },
+        {
+          text: 'Confirmar Entrega',
+          onPress: async () => {
+            try {
+              const totalVal = Number(res.total || 0);
+              const depositVal = Number(res.depositAmount || 0);
+              await completeOrCancelReservation(
+                {
+                  id: res.id,
+                  accountId: res.accountId || accountId,
+                  branchId: res.branchId || branchId,
+                  type: res.type || 'reservation',
+                  items: res.items || [],
+                  total: totalVal,
+                  depositAmount: depositVal,
+                  remainingAmount: Math.max(0, totalVal - depositVal),
+                  status: 'pending',
+                  customer: res.customer || { name: 'Cliente General' },
+                  createdBy: res.createdBy || user?.uid || 'user',
+                  createdAt: res.createdAt || Date.now(),
+                },
+                'complete',
+                {
+                  uid: user?.uid || 'user',
+                  displayName: userProfile?.displayName || user?.email || 'Usuario',
+                  email: user?.email || '',
+                }
+              );
+              Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+              Alert.alert('Éxito', 'Reserva completada y entregada con éxito.');
+            } catch (err: any) {
+              Alert.alert('Error', err?.message || 'No se pudo completar la reserva.');
+            }
+          },
+        },
+      ]
+    );
+  };
+
+  const handleCancelReservation = async (res: any) => {
+    Alert.alert(
+      'Cancelar Reserva',
+      `¿Deseas cancelar esta reserva? Se liberará el stock reservado de los productos y quedará disponible para la venta.`,
+      [
+        { text: 'No cancelar', style: 'cancel' },
+        {
+          text: 'Sí, Cancelar',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              const totalVal = Number(res.total || 0);
+              const depositVal = Number(res.depositAmount || 0);
+              await completeOrCancelReservation(
+                {
+                  id: res.id,
+                  accountId: res.accountId || accountId,
+                  branchId: res.branchId || branchId,
+                  type: res.type || 'reservation',
+                  items: res.items || [],
+                  total: totalVal,
+                  depositAmount: depositVal,
+                  remainingAmount: Math.max(0, totalVal - depositVal),
+                  status: 'pending',
+                  customer: res.customer || { name: 'Cliente General' },
+                  createdBy: res.createdBy || user?.uid || 'user',
+                  createdAt: res.createdAt || Date.now(),
+                },
+                'cancel',
+                {
+                  uid: user?.uid || 'user',
+                  displayName: userProfile?.displayName || user?.email || 'Usuario',
+                  email: user?.email || '',
+                }
+              );
+              Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+              Alert.alert('Reserva Cancelada', 'El stock reservado ha sido liberado exitosamente.');
+            } catch (err: any) {
+              Alert.alert('Error', err?.message || 'No se pudo cancelar la reserva.');
+            }
+          },
+        },
+      ]
+    );
+  };
 
   // ============================================================================
   // ESTADOS DEL SUB-MÓDULO 2: ASISTENTE VENTY IA
@@ -201,6 +374,42 @@ export default function HistoryScreen() {
     };
   }, [accountId, branchId]);
 
+  // Escuchar Reservas de la Sucursal
+  useEffect(() => {
+    if (!accountId || activeTab !== 'reservations') return;
+    setLoadingReservations(true);
+
+    const q = query(
+      collection(db, 'reservations'),
+      where('accountId', '==', accountId),
+      where('branchId', '==', branchId),
+      limit(50)
+    );
+
+    const unsubscribe = onSnapshot(
+      q,
+      (snapshot) => {
+        const list: any[] = [];
+        snapshot.forEach((doc) => {
+          list.push({ id: doc.id, ...doc.data() });
+        });
+        list.sort((a, b) => {
+          const tA = a.createdAt?.toMillis ? a.createdAt.toMillis() : (a.createdAt || 0);
+          const tB = b.createdAt?.toMillis ? b.createdAt.toMillis() : (b.createdAt || 0);
+          return tB - tA;
+        });
+        setReservations(list);
+        setLoadingReservations(false);
+      },
+      (error) => {
+        console.warn('Error loading reservations:', error);
+        setLoadingReservations(false);
+      }
+    );
+
+    return () => unsubscribe();
+  }, [accountId, branchId, activeTab]);
+
   // ============================================================================
   // FILTRADO DE VENTAS POR FECHA, TIPO Y BÚSQUEDA
   // ============================================================================
@@ -217,6 +426,18 @@ export default function HistoryScreen() {
       if (dateRange === 'today' && saleDate < startOfToday) return false;
       if (dateRange === 'week' && saleDate < sevenDaysAgo) return false;
       if (dateRange === 'month' && saleDate < startOfMonth) return false;
+      if (dateRange === 'custom') {
+        if (customStartDate) {
+          const [y, m, d] = customStartDate.split('-').map(Number);
+          const startTs = new Date(y, (m || 1) - 1, d || 1, 0, 0, 0, 0).getTime();
+          if (saleDate < startTs) return false;
+        }
+        if (customEndDate) {
+          const [y, m, d] = customEndDate.split('-').map(Number);
+          const endTs = new Date(y, (m || 1) - 1, d || 1, 23, 59, 59, 999).getTime();
+          if (saleDate > endTs) return false;
+        }
+      }
 
       // 2. Filtro por Tipo de Comprobante
       if (docFilter !== 'all') {
@@ -239,7 +460,7 @@ export default function HistoryScreen() {
 
       return true;
     });
-  }, [sales, dateRange, docFilter, searchQuery]);
+  }, [sales, dateRange, customStartDate, customEndDate, docFilter, searchQuery]);
 
   // ============================================================================
   // KPIS FINANCIEROS DEL PERIODO SELECCIONADO
@@ -358,6 +579,10 @@ export default function HistoryScreen() {
 
   const handleConfirmCancelSale = async () => {
     if (!selectedSale) return;
+    if (!canProcessReturn) {
+      Alert.alert('Acceso Denegado', 'No cuentas con permisos para anular ventas ni revertir inventario.');
+      return;
+    }
     if (!cancelReason.trim()) {
       Alert.alert('Motivo Requerido', 'Indique la razón justificada de la anulación.');
       return;
@@ -524,58 +749,64 @@ export default function HistoryScreen() {
     <View style={styles.screen}>
       <Header />
 
-      <ScreenHeading
-        title={activeTab === 'sales' ? 'Ventas' : 'Venty IA'}
-        subtitle={activeTab === 'sales'
-          ? 'Comprobantes, rendimiento y actividad del negocio'
-          : 'Consulta las ventas y el movimiento de tu negocio'}
-        action={(
+      <View style={styles.compactHeaderRow}>
+        <Text style={styles.compactHeaderTitle}>
+          {activeTab === 'sales' ? 'Ventas' : activeTab === 'reservations' ? 'Reservas' : 'Venty IA'}
+        </Text>
+        {activeTab === 'sales' && canViewReports ? (
           <TouchableOpacity
-            style={styles.pnlHeaderButton}
+            style={styles.compactPnlButton}
             onPress={() => setPnlModalOpen(true)}
             accessibilityRole="button"
             accessibilityLabel="Abrir estado de resultados"
           >
-            <TrendingUp size={18} color={ui.primary} />
-            <Text style={styles.pnlHeaderButtonText}>Estado de resultados</Text>
+            <TrendingUp size={15} color={ui.primary} />
+            <Text style={styles.compactPnlButtonText}>Estado de resultados</Text>
           </TouchableOpacity>
-        )}
-      />
+        ) : null}
+      </View>
 
       {/* Navegación principal de ventas */}
-      <ScrollView
-        horizontal
-        showsHorizontalScrollIndicator={false}
-        style={styles.tabSelectorScroll}
-        contentContainerStyle={styles.tabSelector}
-      >
+      <View style={styles.tabSelectorRowCentered}>
         <TouchableOpacity
-          style={[styles.tabButton, activeTab === 'sales' && styles.tabButtonActive]}
+          style={[styles.tabButtonCentered, activeTab === 'sales' && styles.tabButtonActive]}
           onPress={() => setActiveTab('sales')}
-          accessibilityRole="button"
+          accessibilityRole="tab"
           accessibilityLabel="Comprobantes y reportes"
           accessibilityState={{ selected: activeTab === 'sales' }}
         >
-          <Receipt size={18} color={activeTab === 'sales' ? ui.primary : ui.textSecondary} />
+          <Receipt size={17} color={activeTab === 'sales' ? ui.primary : ui.textSecondary} />
           <Text style={[styles.tabButtonText, activeTab === 'sales' && styles.tabButtonTextActive]}>
             Comprobantes
           </Text>
         </TouchableOpacity>
 
         <TouchableOpacity
-          style={[styles.tabButton, activeTab === 'ai' && styles.tabButtonActive]}
+          style={[styles.tabButtonCentered, activeTab === 'reservations' && styles.tabButtonActive]}
+          onPress={() => setActiveTab('reservations')}
+          accessibilityRole="tab"
+          accessibilityLabel="Reservas activas"
+          accessibilityState={{ selected: activeTab === 'reservations' }}
+        >
+          <Calendar size={17} color={activeTab === 'reservations' ? ui.primary : ui.textSecondary} />
+          <Text style={[styles.tabButtonText, activeTab === 'reservations' && styles.tabButtonTextActive]}>
+            Reservas
+          </Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[styles.tabButtonCentered, activeTab === 'ai' && styles.tabButtonActive]}
           onPress={() => setActiveTab('ai')}
-          accessibilityRole="button"
+          accessibilityRole="tab"
           accessibilityLabel="Asistente Venty IA"
           accessibilityState={{ selected: activeTab === 'ai' }}
         >
-          <Bot size={18} color={activeTab === 'ai' ? ui.primary : ui.textSecondary} />
+          <Bot size={17} color={activeTab === 'ai' ? ui.primary : ui.textSecondary} />
           <Text style={[styles.tabButtonText, activeTab === 'ai' && styles.tabButtonTextActive]}>
             Asistente IA
           </Text>
         </TouchableOpacity>
-
-      </ScrollView>
+      </View>
 
       {/* ==================================================================== */}
       {/* SUB-MÓDULO 1: HISTORIAL DE VENTAS Y SUNAT */}
@@ -586,37 +817,65 @@ export default function HistoryScreen() {
           contentContainerStyle={{ paddingBottom: insets.bottom + 80 }}
           keyboardShouldPersistTaps="handled"
         >
-          {/* Filtros de Rango Temporal */}
-          <ScrollView
-            horizontal
-            showsHorizontalScrollIndicator={false}
-            contentContainerStyle={styles.filterChipRow}
-            style={styles.filterChipScroll}
-          >
-            {(
-              [
-                { id: 'today', label: 'Hoy' },
-                { id: 'week', label: 'Últimos 7 días' },
-                { id: 'month', label: 'Este Mes' },
-                { id: 'all', label: 'Todos' },
-              ] as const
-            ).map((item) => (
-              <TouchableOpacity
-                key={item.id}
-                style={[styles.rangeChip, dateRange === item.id && styles.rangeChipActive]}
-                onPress={() => setDateRange(item.id)}
-                accessibilityRole="button"
-                accessibilityLabel={`Filtrar por fecha: ${item.label}`}
-                accessibilityState={{ selected: dateRange === item.id }}
-              >
-                <Text style={[styles.rangeChipText, dateRange === item.id && styles.rangeChipTextActive]}>
-                  {item.label}
-                </Text>
-              </TouchableOpacity>
-            ))}
-          </ScrollView>
+          {/* Fila unificada: Resumen del período + Filtros de fecha */}
+          <View style={styles.summaryWithFiltersRow}>
+            <View style={styles.summaryTitleCol}>
+              <Text style={styles.summaryTitleText}>Resumen</Text>
+              <Text style={styles.summarySubText}>{periodKpis.salesCount} comp.</Text>
+            </View>
 
-          <SectionHeading title="Resumen del período" subtitle={`${periodKpis.salesCount} comprobantes`} />
+            <View style={styles.filterChipRowCompact}>
+              {[
+                { id: 'today', label: 'Hoy' },
+                { id: 'week', label: '7d' },
+                { id: 'month', label: 'Mes' },
+                {
+                  id: 'custom',
+                  label:
+                    dateRange === 'custom' && customStartDate && customEndDate
+                      ? `${customStartDate.slice(5)}`
+                      : 'Pers.',
+                },
+                { id: 'all', label: 'Todos' },
+              ].map((item) => (
+                <TouchableOpacity
+                  key={item.id}
+                  style={[
+                    styles.rangeChipCompact,
+                    dateRange === item.id && styles.rangeChipCompactActive,
+                  ]}
+                  onPress={() => {
+                    if (item.id === 'custom') {
+                      if (!customStartDate) {
+                        const now = new Date();
+                        const pad = (n: number) => String(n).padStart(2, '0');
+                        const endStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+                        const sevenAgo = new Date(Date.now() - 7 * 86400000);
+                        const startStr = `${sevenAgo.getFullYear()}-${pad(sevenAgo.getMonth() + 1)}-${pad(sevenAgo.getDate())}`;
+                        setCustomStartDate(startStr);
+                        setCustomEndDate(endStr);
+                      }
+                      setCustomDateModalOpen(true);
+                    } else {
+                      setDateRange(item.id as DateRange);
+                    }
+                  }}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Filtrar por fecha: ${item.label}`}
+                  accessibilityState={{ selected: dateRange === item.id }}
+                >
+                  <Text
+                    style={[
+                      styles.rangeChipTextCompact,
+                      dateRange === item.id && styles.rangeChipTextCompactActive,
+                    ]}
+                  >
+                    {item.label}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          </View>
           {/* Resumen principal y métricas de apoyo */}
           <View style={styles.kpiContainer}>
             <View style={styles.kpiGrid}>
@@ -658,12 +917,12 @@ export default function HistoryScreen() {
 
           {/* Buscador de Ventas */}
           <View style={styles.searchRow}>
-            <View style={styles.searchBox}>
+            <View style={[styles.searchBox, { flex: 1 }]}>
               <Search size={18} color={ui.textMuted} />
               <TextInput
                 style={styles.searchInput}
                 accessibilityLabel="Buscar comprobantes por número, cliente o DNI/RUC"
-                placeholder="Buscar por correlativo, cliente o DNI/RUC..."
+                placeholder="Buscar por N°, cliente o DNI/RUC..."
                 placeholderTextColor={ui.textMuted}
                 value={searchQuery}
                 onChangeText={setSearchQuery}
@@ -679,7 +938,68 @@ export default function HistoryScreen() {
                 </TouchableOpacity>
               )}
             </View>
+            <TouchableOpacity
+              style={[
+                styles.barcodeScanBtn,
+                inlineScannerActive && { backgroundColor: ui.primary, borderColor: ui.primary },
+              ]}
+              onPress={toggleInlineScanner}
+              accessibilityRole="button"
+              accessibilityLabel="Escanear ticket o comprobante"
+              activeOpacity={0.7}
+            >
+              <Barcode size={20} color={inlineScannerActive ? ui.onPrimary : ui.primary} />
+            </TouchableOpacity>
           </View>
+
+          {/* Ventanita de Lector de Código de Barras Inline (sin cambiar de página) */}
+          {inlineScannerActive && (
+            <View style={styles.inlineScannerCard}>
+              <View style={styles.inlineScannerTopBar}>
+                <View style={styles.inlineScannerTitleWrap}>
+                  <Barcode size={16} color={ui.primary} />
+                  <Text style={styles.inlineScannerTitle}>Lector de Tickets</Text>
+                </View>
+                <View style={styles.inlineScannerActions}>
+                  <TouchableOpacity
+                    style={[styles.inlineScannerActionBtn, inlineTorchOn && styles.inlineScannerActionBtnActive]}
+                    onPress={() => setInlineTorchOn((prev) => !prev)}
+                    accessibilityRole="button"
+                    accessibilityLabel="Alternar linterna"
+                  >
+                    {inlineTorchOn ? <ZapOff size={14} color={ui.onPrimary} /> : <Zap size={14} color={ui.textSecondary} />}
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.inlineScannerActionBtn}
+                    onPress={() => {
+                      setInlineScannerActive(false);
+                      setInlineTorchOn(false);
+                    }}
+                    accessibilityRole="button"
+                    accessibilityLabel="Cerrar lector"
+                  >
+                    <X size={14} color={ui.textSecondary} />
+                  </TouchableOpacity>
+                </View>
+              </View>
+
+              <View style={styles.inlineCameraBox}>
+                <CameraView
+                  style={styles.inlineCamera}
+                  facing="back"
+                  enableTorch={inlineTorchOn}
+                  barcodeScannerSettings={{
+                    barcodeTypes: ['qr', 'ean13', 'ean8', 'code128', 'code39', 'upc_a', 'upc_e'],
+                  }}
+                  onBarcodeScanned={(result) => handleInlineBarcodeScanned(result.data)}
+                />
+                <View style={styles.inlineReticle} />
+                <View style={styles.inlineScanBanner}>
+                  <Text style={styles.inlineScanBannerText}>Apunta la cámara al código del comprobante</Text>
+                </View>
+              </View>
+            </View>
+          )}
 
           {/* Filtros de Tipo de Documento */}
           <View style={styles.docFilterRow}>
@@ -772,6 +1092,210 @@ export default function HistoryScreen() {
                 </TouchableOpacity>
               );
             })
+          )}
+        </ScrollView>
+      )}
+
+      {/* ==================================================================== */}
+      {/* SUB-MÓDULO: RESERVAS Y STOCK APARTADO */}
+      {/* ==================================================================== */}
+      {activeTab === 'reservations' && (
+        <ScrollView
+          style={styles.contentContainer}
+          contentContainerStyle={{ paddingBottom: insets.bottom + 80 }}
+          keyboardShouldPersistTaps="handled"
+        >
+          <View style={styles.reservationsHeaderBanner}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.reservationsBannerTitle}>Reservas en Sucursal</Text>
+              <Text style={styles.reservationsBannerSub}>
+                {filteredReservations.length} {filteredReservations.length === 1 ? 'reserva encontrada' : 'reservas encontradas'}
+              </Text>
+            </View>
+          </View>
+
+          {/* Buscador de Reservas */}
+          <View style={[styles.searchRow, { marginTop: 10 }]}>
+            <View style={[styles.searchBox, { flex: 1 }]}>
+              <Search size={18} color={ui.textMuted} />
+              <TextInput
+                style={styles.searchInput}
+                accessibilityLabel="Buscar reservas por cliente, teléfono o producto"
+                placeholder="Buscar por cliente, teléfono o producto..."
+                placeholderTextColor={ui.textMuted}
+                value={reservationSearch}
+                onChangeText={setReservationSearch}
+              />
+              {reservationSearch.length > 0 && (
+                <TouchableOpacity
+                  onPress={() => setReservationSearch('')}
+                  style={styles.iconButton}
+                  accessibilityRole="button"
+                  accessibilityLabel="Limpiar búsqueda"
+                >
+                  <X size={16} color={ui.textMuted} />
+                </TouchableOpacity>
+              )}
+            </View>
+          </View>
+
+          {/* Filtros de estado de reserva */}
+          <View style={[styles.docFilterRow, { marginBottom: 12 }]}>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 6 }}>
+              {[
+                { id: 'all', label: 'Todas' },
+                { id: 'pending', label: 'Pendientes' },
+                { id: 'completed', label: 'Entregadas' },
+                { id: 'cancelled', label: 'Canceladas' },
+              ].map((f) => (
+                <TouchableOpacity
+                  key={f.id}
+                  style={[
+                    styles.docChip,
+                    reservationStatusFilter === f.id && styles.docChipActive,
+                  ]}
+                  onPress={() => setReservationStatusFilter(f.id as any)}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Filtrar reservas por ${f.label}`}
+                >
+                  <Text
+                    style={[
+                      styles.docChipText,
+                      reservationStatusFilter === f.id && styles.docChipTextActive,
+                    ]}
+                  >
+                    {f.label}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </ScrollView>
+          </View>
+
+          {loadingReservations ? (
+            <ActivityIndicator color={ui.primary} style={{ marginVertical: 40 }} />
+          ) : filteredReservations.length === 0 ? (
+            <View style={styles.emptyContainer}>
+              <Calendar size={44} color={ui.textMuted} />
+              <Text style={styles.emptyTitle}>
+                {reservations.length === 0 ? 'No hay reservas registradas' : 'No se encontraron reservas'}
+              </Text>
+              <Text style={styles.emptySub}>
+                {reservations.length === 0
+                  ? 'Las reservas creadas desde el POS aparecerán aquí con su estado, seña recibida y saldo pendiente.'
+                  : 'Prueba otro término de búsqueda o cambia el filtro de estado.'}
+              </Text>
+            </View>
+          ) : (
+            <View style={styles.reservationsList}>
+              {filteredReservations.map((res) => {
+                const isPending = res.status === 'pending' || !res.status;
+                const isCompleted = res.status === 'completed';
+                const isCancelled = res.status === 'cancelled';
+                const deposit = Number(res.depositAmount || 0);
+                const total = Number(res.total || 0);
+                const remaining = Math.max(0, total - deposit);
+
+                return (
+                  <View key={res.id} style={styles.reservationCard}>
+                    <View style={styles.resCardHeader}>
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.resCustomerName}>{res.customer?.name || 'Cliente General'}</Text>
+                        {res.customer?.phone ? (
+                          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4, marginTop: 2 }}>
+                            <Phone size={12} color={ui.textSecondary} />
+                            <Text style={styles.resCustomerPhone}>{res.customer.phone}</Text>
+                          </View>
+                        ) : null}
+                      </View>
+                      <View
+                        style={[
+                          styles.badge,
+                          isPending && { backgroundColor: ui.warningSoft },
+                          isCompleted && { backgroundColor: ui.primarySoft },
+                          isCancelled && { backgroundColor: ui.dangerSoft },
+                        ]}
+                      >
+                        <Text
+                          style={[
+                            styles.badgeText,
+                            isPending && { color: ui.warning },
+                            isCompleted && { color: ui.primary },
+                            isCancelled && { color: ui.danger },
+                          ]}
+                        >
+                          {isCompleted ? 'ENTREGADO' : isCancelled ? 'CANCELADO' : 'PENDIENTE'}
+                        </Text>
+                      </View>
+                    </View>
+
+                    {/* Detalle de ítems */}
+                    {Array.isArray(res.items) && res.items.length > 0 ? (
+                      <View style={styles.resItemsBox}>
+                        {res.items.map((it: any, i: number) => (
+                          <Text key={i} style={styles.resItemLine} numberOfLines={1}>
+                            • {it.quantity}x {it.productName || it.name || 'Producto'} ({formatPEN(it.price || 0)})
+                          </Text>
+                        ))}
+                      </View>
+                    ) : null}
+
+                    {/* Fila Financiera */}
+                    <View style={styles.resFinancialRow}>
+                      <View>
+                        <Text style={styles.resFinLabel}>Total</Text>
+                        <Text style={styles.resFinValue}>{formatPEN(total)}</Text>
+                      </View>
+                      <View>
+                        <Text style={styles.resFinLabel}>Adelanto</Text>
+                        <Text style={[styles.resFinValue, { color: ui.primary }]}>{formatPEN(deposit)}</Text>
+                      </View>
+                      <View>
+                        <Text style={styles.resFinLabel}>Saldo Pendiente</Text>
+                        <Text style={[styles.resFinValue, { color: remaining > 0 ? ui.danger : ui.textSecondary }]}>
+                          {formatPEN(remaining)}
+                        </Text>
+                      </View>
+                    </View>
+
+                    {res.pickupDate ? (
+                      <View style={styles.resPickupRow}>
+                        <Clock size={12} color={ui.textSecondary} />
+                        <Text style={styles.resPickupText}>
+                          Límite de recojo: {String(res.pickupDate).slice(0, 10)}
+                        </Text>
+                      </View>
+                    ) : null}
+
+                    {/* Botones de acción para reservas pendientes */}
+                    {isPending && (
+                      <View style={styles.resActionsRow}>
+                        <TouchableOpacity
+                          style={styles.resCancelBtn}
+                          onPress={() => handleCancelReservation(res)}
+                          activeOpacity={0.7}
+                          accessibilityRole="button"
+                          accessibilityLabel="Cancelar reserva"
+                        >
+                          <X size={14} color={ui.danger} />
+                          <Text style={styles.resCancelBtnText}>Cancelar</Text>
+                        </TouchableOpacity>
+
+                        <TouchableOpacity
+                          style={styles.resCompleteBtn}
+                          onPress={() => handleCompleteReservation(res)}
+                          activeOpacity={0.7}
+                          accessibilityRole="button"
+                          accessibilityLabel="Completar entrega de reserva"
+                        >
+                          <CheckCircle2 size={14} color={ui.onPrimary} />
+                          <Text style={styles.resCompleteBtnText}>Entregar / Completar</Text>
+                        </TouchableOpacity>
+                      </View>
+                    )}
+                  </View>
+                );
+              })}
+            </View>
           )}
         </ScrollView>
       )}
@@ -1043,8 +1567,8 @@ export default function HistoryScreen() {
                   </TouchableOpacity>
                 </View>
 
-                {/* Botón de Anulación si no está anulada */}
-                {selectedSale.status !== 'cancelled' && (
+                {/* Botón de Anulación si no está anulada y tiene permisos */}
+                {selectedSale.status !== 'cancelled' && canProcessReturn && (
                   <TouchableOpacity
                     style={styles.cancelSaleBtn}
                     onPress={() => {
@@ -1128,6 +1652,114 @@ export default function HistoryScreen() {
         visible={pnlModalOpen}
         onClose={() => setPnlModalOpen(false)}
       />
+
+      {/* Modal de Rango de Fechas Personalizado */}
+      <Modal visible={customDateModalOpen} transparent animationType="fade">
+        <KeyboardAvoidingView
+          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+          style={styles.modalOverlay}
+        >
+          <View style={styles.modalContent}>
+            <View style={styles.modalHeader}>
+              <View>
+                <Text style={styles.modalTitle}>Filtrar por Fecha</Text>
+                <Text style={styles.modalSub}>Selecciona un rango personalizado</Text>
+              </View>
+              <TouchableOpacity
+                onPress={() => setCustomDateModalOpen(false)}
+                style={styles.iconButton}
+                accessibilityRole="button"
+                accessibilityLabel="Cerrar selector de fecha"
+              >
+                <X size={20} color={ui.textSecondary} />
+              </TouchableOpacity>
+            </View>
+
+            {/* Accesos rápidos */}
+            <View style={styles.quickDateRow}>
+              {[
+                { label: 'Ayer', days: 1 },
+                { label: 'Últimos 15 días', days: 15 },
+                { label: 'Últimos 30 días', days: 30 },
+              ].map((shortcut) => (
+                <TouchableOpacity
+                  key={shortcut.label}
+                  style={styles.quickDateChip}
+                  onPress={() => {
+                    const pad = (n: number) => String(n).padStart(2, '0');
+                    const now = new Date();
+                    if (shortcut.days === 1) {
+                      const yesterday = new Date(Date.now() - 86400000);
+                      const yStr = `${yesterday.getFullYear()}-${pad(yesterday.getMonth() + 1)}-${pad(yesterday.getDate())}`;
+                      setCustomStartDate(yStr);
+                      setCustomEndDate(yStr);
+                    } else {
+                      const endStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+                      const past = new Date(Date.now() - shortcut.days * 86400000);
+                      const startStr = `${past.getFullYear()}-${pad(past.getMonth() + 1)}-${pad(past.getDate())}`;
+                      setCustomStartDate(startStr);
+                      setCustomEndDate(endStr);
+                    }
+                  }}
+                >
+                  <Text style={styles.quickDateChipText}>{shortcut.label}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+
+            <View style={styles.dateInputsRow}>
+              <View style={[styles.inputGroup, { flex: 1 }]}>
+                <Text style={styles.label}>Desde (AAAA-MM-DD)</Text>
+                <TextInput
+                  style={styles.input}
+                  placeholder="2026-01-01"
+                  placeholderTextColor={ui.textMuted}
+                  value={customStartDate}
+                  onChangeText={setCustomStartDate}
+                  keyboardType="numbers-and-punctuation"
+                  maxLength={10}
+                />
+              </View>
+              <View style={[styles.inputGroup, { flex: 1 }]}>
+                <Text style={styles.label}>Hasta (AAAA-MM-DD)</Text>
+                <TextInput
+                  style={styles.input}
+                  placeholder="2026-01-31"
+                  placeholderTextColor={ui.textMuted}
+                  value={customEndDate}
+                  onChangeText={setCustomEndDate}
+                  keyboardType="numbers-and-punctuation"
+                  maxLength={10}
+                />
+              </View>
+            </View>
+
+            <View style={styles.customDateActions}>
+              <TouchableOpacity
+                style={styles.cancelDateBtn}
+                onPress={() => {
+                  setCustomDateModalOpen(false);
+                }}
+              >
+                <Text style={styles.cancelDateBtnText}>Cancelar</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={styles.applyDateBtn}
+                onPress={() => {
+                  if (customStartDate && customEndDate) {
+                    setDateRange('custom');
+                  }
+                  setCustomDateModalOpen(false);
+                }}
+              >
+                <Calendar size={16} color={ui.onPrimary} />
+                <Text style={styles.applyDateBtnText}>Aplicar Filtro</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
     </View>
   );
 }
@@ -1139,6 +1771,139 @@ const styles = StyleSheet.create({
   screen: {
     flex: 1,
     backgroundColor: ui.background,
+  },
+  compactHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 20,
+    paddingTop: 8,
+    paddingBottom: 4,
+  },
+  compactHeaderTitle: {
+    fontSize: 20,
+    fontWeight: '800',
+    color: ui.text,
+  },
+  compactPnlButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    backgroundColor: ui.primarySoft,
+  },
+  compactPnlButtonText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: ui.primary,
+  },
+  summaryWithFiltersRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 8,
+    gap: 10,
+  },
+  summaryTitleCol: {
+    justifyContent: 'center',
+  },
+  summaryTitleText: {
+    fontSize: 13,
+    fontWeight: '800',
+    color: ui.text,
+  },
+  summarySubText: {
+    fontSize: 10,
+    color: ui.textSecondary,
+    fontWeight: '500',
+  },
+  filterChipScrollCompact: {
+    flex: 1,
+  },
+  filterChipRowCompact: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingRight: 6,
+  },
+  rangeChipCompact: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+    borderRadius: 12,
+    backgroundColor: ui.surface,
+    borderWidth: 1,
+    borderColor: ui.border,
+  },
+  rangeChipCompactActive: {
+    backgroundColor: ui.primarySoft,
+    borderColor: ui.primary,
+  },
+  rangeChipTextCompact: {
+    fontSize: 11,
+    color: ui.textSecondary,
+    fontWeight: '500',
+  },
+  rangeChipTextCompactActive: {
+    color: ui.primary,
+    fontWeight: '700',
+  },
+  quickDateRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  quickDateChip: {
+    flex: 1,
+    backgroundColor: ui.surfaceMuted,
+    paddingVertical: 8,
+    borderRadius: 8,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: ui.border,
+  },
+  quickDateChipText: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: ui.textSecondary,
+  },
+  dateInputsRow: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  customDateActions: {
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 6,
+  },
+  cancelDateBtn: {
+    flex: 1,
+    paddingVertical: 12,
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: ui.surfaceMuted,
+  },
+  cancelDateBtnText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: ui.textSecondary,
+  },
+  applyDateBtn: {
+    flex: 1.5,
+    flexDirection: 'row',
+    paddingVertical: 12,
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: ui.primary,
+    gap: 6,
+  },
+  applyDateBtnText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: ui.onPrimary,
   },
   pnlHeaderButton: {
     minHeight: 48,
@@ -1275,6 +2040,9 @@ const styles = StyleSheet.create({
     color: ui.textSecondary,
   },
   searchRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
     marginBottom: 10,
   },
   searchBox: {
@@ -1682,5 +2450,240 @@ const styles = StyleSheet.create({
   },
   buttonDisabled: {
     opacity: 0.6,
+  },
+  tabSelectorRowCentered: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    paddingHorizontal: 16,
+    paddingBottom: 8,
+  },
+  tabButtonCentered: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    paddingVertical: 9,
+    paddingHorizontal: 8,
+    borderRadius: theme.borderRadius.md,
+    backgroundColor: ui.surface,
+    borderWidth: 1,
+    borderColor: ui.border,
+  },
+  barcodeScanBtn: {
+    width: 48,
+    height: 48,
+    borderRadius: theme.borderRadius.md,
+    backgroundColor: ui.surface,
+    borderWidth: 1,
+    borderColor: ui.border,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  reservationsHeaderBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: ui.surface,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderRadius: theme.borderRadius.lg,
+    borderWidth: 1,
+    borderColor: ui.border,
+    marginBottom: 12,
+  },
+  reservationsBannerTitle: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    color: ui.text,
+  },
+  reservationsBannerSub: {
+    fontSize: 12,
+    color: ui.textSecondary,
+    marginTop: 2,
+  },
+  reservationsList: {
+    gap: 12,
+  },
+  reservationCard: {
+    backgroundColor: ui.surface,
+    borderRadius: theme.borderRadius.lg,
+    borderWidth: 1,
+    borderColor: ui.border,
+    padding: 14,
+    gap: 10,
+  },
+  resCardHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+  },
+  resCustomerName: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: ui.text,
+  },
+  resCustomerPhone: {
+    fontSize: 12,
+    color: ui.textSecondary,
+  },
+  resItemsBox: {
+    backgroundColor: ui.surfaceMuted,
+    borderRadius: theme.borderRadius.md,
+    padding: 10,
+    gap: 4,
+  },
+  resItemLine: {
+    fontSize: 12,
+    color: ui.text,
+  },
+  resFinancialRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingTop: 4,
+    borderTopWidth: 1,
+    borderTopColor: ui.border,
+  },
+  resFinLabel: {
+    fontSize: 11,
+    color: ui.textSecondary,
+    fontWeight: '500',
+  },
+  resFinValue: {
+    fontSize: 14,
+    fontWeight: 'bold',
+    color: ui.text,
+  },
+  resPickupRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingTop: 6,
+    borderTopWidth: 1,
+    borderTopColor: ui.border,
+  },
+  resPickupText: {
+    fontSize: 11,
+    color: ui.textSecondary,
+  },
+  resActionsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginTop: 6,
+    paddingTop: 8,
+    borderTopWidth: 1,
+    borderTopColor: ui.border,
+  },
+  resCancelBtn: {
+    flex: 1,
+    minHeight: 38,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 4,
+    backgroundColor: ui.dangerSoft,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: ui.danger,
+    paddingVertical: 6,
+  },
+  resCancelBtnText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: ui.danger,
+  },
+  resCompleteBtn: {
+    flex: 2,
+    minHeight: 38,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    backgroundColor: ui.primary,
+    borderRadius: 8,
+    paddingVertical: 6,
+  },
+  resCompleteBtnText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: ui.onPrimary,
+  },
+  inlineScannerCard: {
+    backgroundColor: ui.surface,
+    borderRadius: theme.borderRadius.lg,
+    borderWidth: 1,
+    borderColor: ui.primary,
+    overflow: 'hidden',
+    marginBottom: 12,
+  },
+  inlineScannerTopBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    backgroundColor: ui.surfaceMuted,
+  },
+  inlineScannerTitleWrap: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  inlineScannerTitle: {
+    fontSize: 13,
+    fontWeight: 'bold',
+    color: ui.text,
+  },
+  inlineScannerActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  inlineScannerActionBtn: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: ui.surface,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  inlineScannerActionBtnActive: {
+    backgroundColor: ui.primary,
+  },
+  inlineCameraBox: {
+    height: 160,
+    backgroundColor: '#000',
+    position: 'relative',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  inlineCamera: {
+    ...StyleSheet.absoluteFillObject,
+  },
+  inlineReticle: {
+    width: '75%',
+    height: 90,
+    borderRadius: 8,
+    borderWidth: 2,
+    borderColor: ui.primary,
+    borderStyle: 'dashed',
+    backgroundColor: 'rgba(255, 255, 255, 0.05)',
+  },
+  inlineScanBanner: {
+    position: 'absolute',
+    bottom: 8,
+    backgroundColor: 'rgba(0,0,0,0.65)',
+    paddingHorizontal: 10,
+    paddingVertical: 3,
+    borderRadius: 10,
+  },
+  inlineScanBannerText: {
+    fontSize: 11,
+    color: '#FFF',
+    fontWeight: '500',
   },
 });

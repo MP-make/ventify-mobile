@@ -12,6 +12,7 @@ import {
   KeyboardAvoidingView,
   Platform,
   Share,
+  Image,
 } from 'react-native';
 import * as Linking from 'expo-linking';
 import * as Haptics from 'expo-haptics';
@@ -47,7 +48,9 @@ import { lookupDocument, DocumentLookupResult } from '@/lib/dni-ruc-service';
 import { createSaleTransaction, CreateSaleTransactionParams } from '@/services/sale-service';
 import { enqueueOfflineSale } from '@/services/offline-sync-service';
 import { getCustomers } from '@/services/crm-operations-service';
+import { createQuote } from '@/services/enterprise-ops-service';
 import { buildReceiptHtml } from '@/lib/printing/escpos-builder';
+import { cleanFirestoreData } from '@/lib/firebase-utils';
 import type { Customer, CartItem, SaleDocumentType, PaymentMethod, SalePaymentSplit } from '@/types';
 
 interface CheckoutModalProps {
@@ -59,6 +62,33 @@ interface CheckoutModalProps {
 type CheckoutDocType = 'nota_venta' | 'boleta' | 'factura' | 'cotizacion';
 type ActivePaymentCategory = 'cash' | 'yape' | 'plin' | 'card' | 'transfer' | 'mixed' | 'fiado';
 
+const PAYMENT_LOGOS: Record<string, any> = {
+  yape: require('../assets/payment/yape.jpeg'),
+  plin: require('../assets/payment/plin.png'),
+  culqi: require('../assets/payment/culqi.jpeg'),
+  mastercard: require('../assets/payment/mastercard.webp'),
+};
+
+const getMethodLogo = (method: { id?: string; name?: string; kind?: string; provider?: string }) => {
+  const str = `${method.id || ''} ${method.name || ''} ${method.provider || ''}`.toLowerCase();
+  if (str.includes('yape')) return PAYMENT_LOGOS.yape;
+  if (str.includes('plin')) return PAYMENT_LOGOS.plin;
+  if (str.includes('culqi')) return PAYMENT_LOGOS.culqi;
+  if (
+    str.includes('tarjeta') ||
+    str.includes('card') ||
+    str.includes('pos') ||
+    str.includes('visa') ||
+    str.includes('mastercard') ||
+    str.includes('transferencia') ||
+    str.includes('transfer') ||
+    method.kind === 'terminal'
+  ) {
+    return PAYMENT_LOGOS.mastercard;
+  }
+  return null;
+};
+
 export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   visible,
   onClose,
@@ -67,12 +97,71 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   const insets = useSafeAreaInsets();
   const { accountId, branchId, user, userProfile } = useAuth();
   const { items, total, totalAmount, customer: cartCustomer, clearCart, setCustomer: setCartCustomer } = useCart();
-  const { posSettings, businessSettings, businessData, activeBranchName } = useSettings();
+  const { posSettings, businessSettings, businessData, activeBranchName, paymentMethods, invoicingEnabled } = useSettings();
 
   const safeTotal = totalAmount ?? total ?? 0;
 
+  // Métodos de pago configurados por el dueño en Firestore
+  const configuredMethods = useMemo(() => {
+    const list = Array.isArray(posSettings?.methods) && posSettings.methods.length > 0
+      ? posSettings.methods
+      : Array.isArray(paymentMethods) && paymentMethods.length > 0
+        ? paymentMethods
+        : [
+            { id: 'efectivo', name: 'Efectivo', kind: 'cash', enabled: true, order: 0 },
+            { id: 'yape', name: 'Yape', kind: 'digital', enabled: true, order: 1, provider: 'yape' },
+            { id: 'plin', name: 'Plin', kind: 'digital', enabled: true, order: 2, provider: 'plin' },
+            { id: 'tarjeta', name: 'Tarjeta', kind: 'terminal', enabled: true, order: 3 },
+            { id: 'transferencia', name: 'Transferencia', kind: 'digital', enabled: true, order: 4 },
+            { id: 'mixto', name: 'Mixto', kind: 'mixed', enabled: true, order: 5 },
+            { id: 'creditos', name: 'Créditos', kind: 'credit', enabled: true, order: 6 },
+          ];
+
+    return list
+      .filter((m: any) => m.enabled !== false)
+      .sort((a: any, b: any) => (a.order || 0) - (b.order || 0));
+  }, [posSettings?.methods, paymentMethods]);
+
+  const resolveCategoryFromMethod = (method: any): ActivePaymentCategory => {
+    const id = String(method?.id || '').toLowerCase();
+    const kind = String(method?.kind || '').toLowerCase();
+    const prov = String(method?.provider || '').toLowerCase();
+    if (kind === 'cash' || id === 'efectivo') return 'cash';
+    if (kind === 'credit' || id === 'creditos' || id === 'fiado') return 'fiado';
+    if (kind === 'mixed' || id === 'mixto') return 'mixed';
+    if (id === 'yape' || prov === 'yape') return 'yape';
+    if (id === 'plin' || prov === 'plin') return 'plin';
+    if (id === 'transferencia' || id.includes('transfer')) return 'transfer';
+    return 'card';
+  };
+
+  const [selectedMethodId, setSelectedMethodId] = useState<string>('efectivo');
+
   // 1. Selector de Comprobante
   const [docType, setDocType] = useState<CheckoutDocType>('nota_venta');
+
+  // Opciones de comprobante permitidas: si no está habilitada facturación en Super Admin, solo Nota de Venta y Cotización
+  const docTypeOptions = useMemo(() => {
+    if (!invoicingEnabled) {
+      return [
+        { id: 'nota_venta', label: 'Nota Venta' },
+        { id: 'cotizacion', label: 'Cotización' },
+      ];
+    }
+    return [
+      { id: 'nota_venta', label: 'Nota Venta' },
+      { id: 'boleta', label: 'Boleta 03' },
+      { id: 'factura', label: 'Factura 01' },
+      { id: 'cotizacion', label: 'Cotización' },
+    ];
+  }, [invoicingEnabled]);
+
+  // Si la cuenta no tiene habilitada facturación, forzar a nota_venta
+  useEffect(() => {
+    if (!invoicingEnabled && (docType === 'boleta' || docType === 'factura')) {
+      setDocType('nota_venta');
+    }
+  }, [invoicingEnabled, docType]);
 
   // 2. Identificación de Cliente (RENIEC / SUNAT)
   const [customerDni, setCustomerDni] = useState('');
@@ -86,6 +175,37 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   const [isSearchingDoc, setIsSearchingDoc] = useState(false);
   const [docSearchSuccess, setDocSearchSuccess] = useState<string | null>(null);
   const [docError, setDocError] = useState<string | null>(null);
+
+  // Sincronizar datos de cliente con CartContext en tiempo real (para ventas pausadas y reanudadas)
+  const syncCustomerToCart = (patch: {
+    name?: string;
+    dni?: string;
+    ruc?: string;
+    phone?: string;
+    address?: string;
+  }) => {
+    const updatedName = (patch.name !== undefined ? patch.name : customerName).trim();
+    const updatedDni = (patch.dni !== undefined ? patch.dni : customerDni).trim();
+    const updatedRuc = (patch.ruc !== undefined ? patch.ruc : customerRuc).trim();
+    const updatedPhone = (patch.phone !== undefined ? patch.phone : customerPhone).trim();
+    const updatedAddress = (patch.address !== undefined ? patch.address : customerAddress).trim();
+
+    if (updatedName || updatedDni || updatedRuc) {
+      setCartCustomer({
+        id: selectedCustomer?.id || `cust_${Date.now()}`,
+        name: updatedName || 'Cliente General',
+        dni: updatedDni || undefined,
+        ruc: updatedRuc || undefined,
+        phone: updatedPhone || undefined,
+        address: updatedAddress || undefined,
+        accountId: accountId || '',
+        totalPurchases: selectedCustomer?.totalPurchases || 0,
+        totalSpent: selectedCustomer?.totalSpent || 0,
+      });
+    } else {
+      setCartCustomer(null);
+    }
+  };
 
   // 3. Método de Pago y Parámetros
   const [paymentCategory, setPaymentCategory] = useState<ActivePaymentCategory>('cash');
@@ -129,10 +249,12 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         setCustomerName(cartCustomer.name || '');
         if (cartCustomer.ruc) {
           setCustomerRuc(cartCustomer.ruc);
-          setDocType('factura');
+          if (invoicingEnabled) setDocType('factura');
         } else if (cartCustomer.dni) {
           setCustomerDni(cartCustomer.dni);
-          setDocType('boleta');
+          if (invoicingEnabled) setDocType('boleta');
+        } else {
+          setDocType('nota_venta');
         }
         setCustomerAddress(cartCustomer.address || '');
         setCustomerPhone(cartCustomer.phone || '');
@@ -146,7 +268,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         setDocType('nota_venta');
       }
     }
-  }, [visible, safeTotal, cartCustomer]);
+  }, [visible, safeTotal, cartCustomer, invoicingEnabled]);
 
   // Consulta automática de DNI cuando alcanza 8 dígitos
   useEffect(() => {
@@ -178,6 +300,16 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         }
         setDocSearchSuccess(`${type.toUpperCase()} verificado: ${res.name}`);
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        syncCustomerToCart({
+          name: res.name,
+          address: res.address || customerAddress,
+          dni: type === 'dni' ? number : customerDni,
+          ruc: type === 'ruc' ? number : customerRuc,
+        });
+        if (invoicingEnabled) {
+          if (type === 'ruc') setDocType('factura');
+          else if (type === 'dni') setDocType('boleta');
+        }
       }
     } catch (err: any) {
       setDocError(err?.message || `No se encontró información para este ${type.toUpperCase()}`);
@@ -192,14 +324,16 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
     setCustomerName(c.name || '');
     if (c.ruc) {
       setCustomerRuc(c.ruc);
-      setDocType('factura');
+      if (invoicingEnabled) setDocType('factura');
     } else if (c.dni) {
       setCustomerDni(c.dni);
+      if (invoicingEnabled) setDocType('boleta');
     }
     setCustomerAddress(c.address || '');
     setCustomerPhone(c.phone || '');
     setShowCustomerPicker(false);
     setDocSearchSuccess(`Cliente: ${c.name}`);
+    setCartCustomer(c);
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
   };
 
@@ -247,6 +381,11 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
     if (safeTotal <= 0) return false;
     if (items.length === 0) return false;
 
+    // Cotización solo requiere total > 0 e items > 0 (sin pago obligatorio ni SUNAT estricto)
+    if (docType === 'cotizacion') {
+      return true;
+    }
+
     // Validación Factura SUNAT
     if (docType === 'factura') {
       const cleanRuc = customerRuc.trim().replace(/\D/g, '');
@@ -283,20 +422,92 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
       const netInfo = await NetInfo.fetch();
       const isOnline = Boolean(netInfo.isConnected && netInfo.isInternetReachable !== false);
 
+      // Si el comprobante elegido es Cotización, generar cotización sin cobrar ni restar inventario
+      if (docType === 'cotizacion') {
+        const quoteItems = cleanFirestoreData(
+          items.map((i) => {
+            const resolvedId = (i as any).productId || (i as any).product?.id || (i.id.includes('_') ? i.id.split('_')[0] : i.id);
+            const { product, ...cleanI } = i as any;
+            return {
+              id: resolvedId,
+              productId: resolvedId,
+              name: cleanI.name,
+              quantity: cleanI.quantity,
+              price: cleanI.price,
+              total: cleanI.lineTotal !== undefined ? cleanI.lineTotal : cleanI.price * cleanI.quantity,
+              sku: cleanI.sku || '',
+              unitOfMeasure: cleanI.unitOfMeasure || 'NIU',
+              presentation: cleanI.presentation || null,
+              variant: cleanI.variant || null,
+            };
+          })
+        );
+
+        const newQuote = await createQuote({
+          accountId,
+          branchId: branchId || 'main',
+          branchName: activeBranchName || '',
+          items: quoteItems,
+          subtotal: safeTotal,
+          tax: 0,
+          total: safeTotal,
+          customerId: selectedCustomer?.id,
+          customerName: customerName.trim() || 'Cliente General',
+          customerPhone: customerPhone.trim() || undefined,
+          customerDni: customerDni.trim() || undefined,
+          customerRuc: customerRuc.trim() || undefined,
+          customerAddress: customerAddress.trim() || undefined,
+          notes: notes.trim() || undefined,
+          validityDays: 15,
+          source: 'mobile',
+          createdBy: user?.uid,
+          createdByName: userProfile?.displayName || user?.displayName || 'Cajero POS',
+        });
+
+        const quoteNumber = newQuote.quoteNumber || parseInt(newQuote.id.slice(-5), 10) || 1001;
+        const formattedNumber = newQuote.formattedNumber || `COT-${String(quoteNumber).padStart(5, '0')}`;
+
+        const quoteResult = {
+          saleId: newQuote.id,
+          saleNumber: quoteNumber,
+          correlative: formattedNumber,
+          documentType: 'cotizacion',
+          total: safeTotal,
+          status: 'pending',
+          sunatStatus: 'not_applicable',
+        };
+
+        setSaleResult(quoteResult);
+        setIsSuccessView(true);
+        clearCart();
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+
+        if (onSaleSuccess) {
+          onSaleSuccess(quoteResult);
+        }
+        return;
+      }
+
       // Mapear items
-      const saleItems = items.map((i) => ({
-        productId: i.id,
-        name: i.name,
-        quantity: i.quantity,
-        price: i.price,
-        costPrice: i.costPrice || 0,
-        total: (i.lineTotal !== undefined ? i.lineTotal : i.price * i.quantity),
-        sku: i.sku || '',
-        unitOfMeasure: i.unitOfMeasure || 'NIU',
-        presentation: i.presentation,
-        variant: i.variant,
-        isWeightBased: i.isWeightBased,
-      }));
+      const saleItems = cleanFirestoreData(
+        items.map((i) => {
+          const resolvedId = (i as any).productId || (i as any).product?.id || (i.id.includes('_') ? i.id.split('_')[0] : i.id);
+          const { product, ...cleanI } = i as any;
+          return {
+            productId: resolvedId,
+            name: cleanI.name,
+            quantity: cleanI.quantity,
+            price: cleanI.price,
+            costPrice: cleanI.costPrice || 0,
+            total: cleanI.lineTotal !== undefined ? cleanI.lineTotal : cleanI.price * cleanI.quantity,
+            sku: cleanI.sku || '',
+            unitOfMeasure: cleanI.unitOfMeasure || 'NIU',
+            presentation: cleanI.presentation || null,
+            variant: cleanI.variant || null,
+            isWeightBased: cleanI.isWeightBased || false,
+          };
+        })
+      );
 
       // Mapear pagos
       let paymentsList: SalePaymentSplit[] = [];
@@ -384,7 +595,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         paymentMethod: mappedMethod,
         documentType: docType as SaleDocumentType,
         total: safeTotal,
-        payments: paymentsList,
+        payments: cleanFirestoreData(paymentsList),
         cashReceived: paymentCategory === 'cash' ? cashReceived : undefined,
         changeGiven: paymentCategory === 'cash' ? cashChange : undefined,
         customer: {
@@ -398,7 +609,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         customerId: selectedCustomer?.id,
         customerName: customerName.trim() || 'Cliente Varios',
         notes: notes.trim() || (paymentCategory === 'fiado' ? `Vencimiento: ${creditDays} días` : undefined),
-        isQuote: docType === 'cotizacion',
+        isQuote: false,
       };
 
       let result: any;
@@ -540,22 +751,26 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         style={styles.container}
         behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
       >
-        <View style={styles.checkoutHeading}>
-          <ScreenHeading
-            title={isSuccessView ? 'Comprobante emitido' : 'Finalizar cobro'}
-            subtitle={`${items.length} ${items.length === 1 ? 'producto' : 'productos'}`}
-            action={(
-              <TouchableOpacity
-                onPress={onClose}
-                style={styles.closeBtn}
-                activeOpacity={0.7}
-                accessibilityRole="button"
-                accessibilityLabel="Cerrar cobro"
-              >
-                <X size={20} color={ui.textSecondary} />
-              </TouchableOpacity>
-            )}
-          />
+        <View style={styles.compactCheckoutHeader}>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+            <Text style={styles.compactCheckoutTitle}>
+              {isSuccessView ? 'Comprobante emitido' : 'Finalizar cobro'}
+            </Text>
+            <View style={styles.itemsCountBadge}>
+              <Text style={styles.itemsCountBadgeText}>
+                {items.length} {items.length === 1 ? 'ítem' : 'ítems'}
+              </Text>
+            </View>
+          </View>
+          <TouchableOpacity
+            onPress={onClose}
+            style={styles.compactCloseBtn}
+            activeOpacity={0.7}
+            accessibilityRole="button"
+            accessibilityLabel="Cerrar cobro"
+          >
+            <X size={18} color={ui.textSecondary} />
+          </TouchableOpacity>
         </View>
 
         {isSuccessView ? (
@@ -572,7 +787,9 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                 <CheckCircle2 size={56} color={ui.primary} />
               </View>
 
-              <Text style={styles.successTitle}>¡Venta Registrada con Éxito!</Text>
+              <Text style={styles.successTitle}>
+                {docType === 'cotizacion' ? '¡Cotización Generada con Éxito!' : '¡Venta Registrada con Éxito!'}
+              </Text>
               <Text style={styles.successCorrelative}>
                 {saleResult?.correlative || `#${saleResult?.saleNumber || '0001'}`}
               </Text>
@@ -584,33 +801,49 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                 <View
                   style={[
                     styles.badgeSunat,
+                    docType === 'cotizacion' && { backgroundColor: ui.primarySoft, borderColor: ui.primary },
                     saleResult?.isOffline && styles.badgeSunatOffline,
                   ]}
                 >
-                  <Text style={styles.badgeSunatText}>
-                    {saleResult?.isOffline ? 'EN COLA OFFLINE' : 'SUNAT: ACEPTADO'}
+                  <Text
+                    style={[
+                      styles.badgeSunatText,
+                      docType === 'cotizacion' && { color: ui.primary },
+                    ]}
+                  >
+                    {docType === 'cotizacion'
+                      ? 'COTIZACIÓN SIN COBRO'
+                      : saleResult?.isOffline
+                      ? 'EN COLA OFFLINE'
+                      : 'SUNAT: ACEPTADO'}
                   </Text>
                 </View>
               </View>
 
               <View style={styles.successDivider} />
 
-              {/* Resumen de la Venta */}
+              {/* Resumen de la Venta / Cotización */}
               <View style={styles.summaryRow}>
-                <Text style={styles.summaryLabel}>Total Pagado:</Text>
+                <Text style={styles.summaryLabel}>
+                  {docType === 'cotizacion' ? 'Monto Cotizado:' : 'Total Pagado:'}
+                </Text>
                 <Text style={styles.summaryValueBig}>{formatPEN(safeTotal)}</Text>
               </View>
-              <View style={styles.summaryRow}>
-                <Text style={styles.summaryLabel}>Método de Pago:</Text>
-                <Text style={styles.summaryValue}>{paymentCategory.toUpperCase()}</Text>
-              </View>
-              {paymentCategory === 'cash' && cashChange > 0 ? (
-                <View style={styles.summaryRow}>
-                  <Text style={styles.summaryLabel}>Vuelto Entregado:</Text>
-                  <Text style={[styles.summaryValue, { color: ui.primary, fontWeight: '700' }]}>
-                    {formatPEN(cashChange)}
-                  </Text>
-                </View>
+              {docType !== 'cotizacion' ? (
+                <>
+                  <View style={styles.summaryRow}>
+                    <Text style={styles.summaryLabel}>Método de Pago:</Text>
+                    <Text style={styles.summaryValue}>{paymentCategory.toUpperCase()}</Text>
+                  </View>
+                  {paymentCategory === 'cash' && cashChange > 0 ? (
+                    <View style={styles.summaryRow}>
+                      <Text style={styles.summaryLabel}>Vuelto Entregado:</Text>
+                      <Text style={[styles.summaryValue, { color: ui.primary, fontWeight: '700' }]}>
+                        {formatPEN(cashChange)}
+                      </Text>
+                    </View>
+                  ) : null}
+                </>
               ) : null}
               {customerName ? (
                 <View style={styles.summaryRow}>
@@ -670,27 +903,23 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
             keyboardShouldPersistTaps="handled"
             keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
           >
-            <View style={styles.checkoutTotalCard}>
+            {/* Total a cobrar compacto */}
+            <View style={styles.checkoutTotalCardCompact}>
               <View>
-                <Text style={styles.checkoutTotalLabel}>Total a cobrar</Text>
-                <Text style={styles.checkoutTotalItems}>{items.length} {items.length === 1 ? 'producto' : 'productos'}</Text>
+                <Text style={styles.checkoutTotalLabelCompact}>Total a cobrar</Text>
+                <Text style={styles.checkoutTotalItemsCompact}>{items.length} {items.length === 1 ? 'producto' : 'productos'}</Text>
               </View>
-              <Text style={styles.checkoutTotalValue}>{formatPEN(safeTotal)}</Text>
+              <Text style={styles.checkoutTotalValueCompact}>{formatPEN(safeTotal)}</Text>
             </View>
-            {/* 1. SELECTOR DE COMPROBANTE FISCAL */}
-            <SectionHeading title="Comprobante" subtitle="Elige el documento de esta venta" />
-            <View style={styles.docTypeRow}>
-              {[
-                { id: 'nota_venta', label: 'Nota Venta' },
-                { id: 'boleta', label: 'Boleta 03' },
-                { id: 'factura', label: 'Factura 01' },
-                { id: 'cotizacion', label: 'Cotización' },
-              ].map((item) => {
+
+            {/* 1. SELECTOR DE COMPROBANTE FISCAL COMPACTO */}
+            <View style={styles.docTypeRowCompact}>
+              {docTypeOptions.map((item) => {
                 const isSelected = docType === item.id;
                 return (
                   <TouchableOpacity
                     key={item.id}
-                    style={[styles.docTypeChip, isSelected && styles.docTypeChipSelected]}
+                    style={[styles.docTypeChipCompact, isSelected && styles.docTypeChipCompactSelected]}
                     accessibilityRole="button"
                     accessibilityLabel={`Comprobante: ${item.label}`}
                     accessibilityState={{ selected: isSelected }}
@@ -702,8 +931,8 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                   >
                     <Text
                       style={[
-                        styles.docTypeChipText,
-                        isSelected && styles.docTypeChipTextSelected,
+                        styles.docTypeChipTextCompact,
+                        isSelected && styles.docTypeChipTextCompactSelected,
                       ]}
                     >
                       {item.label}
@@ -713,12 +942,12 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
               })}
             </View>
 
-            {/* 2. IDENTIFICACIÓN DEL CLIENTE (RENIEC / SUNAT) */}
-            <View style={styles.customerBox}>
+            {/* 2. IDENTIFICACIÓN DEL CLIENTE (PRIORIZADA) */}
+            <View style={styles.customerBoxCompact}>
               <View style={styles.customerBoxHeader}>
                 <View style={styles.customerHeaderLeft}>
-                  <User size={16} color={ui.text} />
-                  <Text style={styles.customerBoxTitle}>Datos del Cliente</Text>
+                  <User size={14} color={ui.text} />
+                  <Text style={styles.customerBoxTitleCompact}>Datos del Cliente</Text>
                 </View>
                 <TouchableOpacity
                   style={styles.customerDirectoryBtn}
@@ -727,7 +956,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                   accessibilityLabel={showCustomerPicker ? 'Cerrar directorio de clientes' : 'Abrir directorio de clientes'}
                   accessibilityState={{ expanded: showCustomerPicker }}
                 >
-                  <Search size={13} color={ui.primary} />
+                  <Search size={12} color={ui.primary} />
                   <Text style={styles.customerDirectoryBtnText}>Directorio</Text>
                 </TouchableOpacity>
               </View>
@@ -755,18 +984,21 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                 </View>
               ) : null}
 
-              {/* Campos dinámicos según el Comprobante */}
+              {/* FACTURA: RUC es prioridad 1 */}
               {docType === 'factura' ? (
-                <View style={styles.formGroup}>
-                  <Text style={styles.inputLabel}>
+                <View style={styles.formGroupCompact}>
+                  <Text style={styles.inputLabelCompact}>
                     RUC (11 dígitos) <Text style={styles.required}>*</Text>
                   </Text>
                   <View style={styles.inputSearchRow}>
                     <TextInput
-                      style={[styles.input, styles.inputFlex]}
+                      style={[styles.inputCompact, styles.inputFlex]}
                       accessibilityLabel="RUC, 11 dígitos"
                       value={customerRuc}
-                      onChangeText={setCustomerRuc}
+                      onChangeText={(t) => {
+                        setCustomerRuc(t);
+                        syncCustomerToCart({ ruc: t });
+                      }}
                       placeholder="20XXXXXXXXX"
                       keyboardType="numeric"
                       maxLength={11}
@@ -778,65 +1010,148 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                       </View>
                     ) : null}
                   </View>
-                  <Text style={styles.inputLabel}>Razón Social SUNAT</Text>
+                  <Text style={styles.inputLabelCompact}>Razón Social SUNAT</Text>
                   <TextInput
-                    style={styles.input}
+                    style={styles.inputCompact}
                     accessibilityLabel="Razón social SUNAT"
                     value={customerName}
-                    onChangeText={setCustomerName}
+                    onChangeText={(t) => {
+                      setCustomerName(t);
+                      syncCustomerToCart({ name: t });
+                    }}
                     placeholder="Nombre o Razón Social"
                     placeholderTextColor={ui.textMuted}
                   />
-                  <Text style={styles.inputLabel}>Dirección Fiscal</Text>
-                  <TextInput
-                    style={styles.input}
-                    accessibilityLabel="Dirección fiscal"
-                    value={customerAddress}
-                    onChangeText={setCustomerAddress}
-                    placeholder="Dirección fiscal"
-                    placeholderTextColor={ui.textMuted}
-                  />
-                </View>
-              ) : (
-                <View style={styles.formGroup}>
                   <View style={styles.rowTwoCols}>
-                    <View style={[styles.formGroup, styles.colFlex]}>
-                      <Text style={styles.inputLabel}>
-                        DNI {docType === 'boleta' && safeTotal >= 700 ? '(Obligatorio > S/700)' : '(Opcional)'}
-                      </Text>
+                    <View style={[styles.formGroupCompact, styles.colFlex]}>
+                      <Text style={styles.inputLabelCompact}>Dirección Fiscal</Text>
                       <TextInput
-                        style={styles.input}
-                        accessibilityLabel={`DNI del cliente${docType === 'boleta' && safeTotal >= 700 ? ', obligatorio para este monto' : ', opcional'}`}
-                        value={customerDni}
-                        onChangeText={setCustomerDni}
-                        placeholder="8 dígitos"
-                        keyboardType="numeric"
-                        maxLength={8}
+                        style={styles.inputCompact}
+                        value={customerAddress}
+                        onChangeText={(t) => {
+                          setCustomerAddress(t);
+                          syncCustomerToCart({ address: t });
+                        }}
+                        placeholder="Dirección fiscal"
                         placeholderTextColor={ui.textMuted}
                       />
                     </View>
-                    <View style={[styles.formGroup, styles.colFlex]}>
-                      <Text style={styles.inputLabel}>Teléfono / WhatsApp</Text>
+                    <View style={[styles.formGroupCompact, styles.colFlex]}>
+                      <Text style={styles.inputLabelCompact}>WhatsApp (Opcional)</Text>
                       <TextInput
-                        style={styles.input}
-                        accessibilityLabel="Teléfono o WhatsApp del cliente"
+                        style={styles.inputCompact}
                         value={customerPhone}
-                        onChangeText={setCustomerPhone}
+                        onChangeText={(t) => {
+                          setCustomerPhone(t);
+                          syncCustomerToCart({ phone: t });
+                        }}
                         placeholder="9XXXXXXXX"
                         keyboardType="phone-pad"
                         placeholderTextColor={ui.textMuted}
                       />
                     </View>
                   </View>
-                  <Text style={styles.inputLabel}>Nombre del Cliente</Text>
+                </View>
+              ) : docType === 'boleta' ? (
+                /* BOLETA: DNI es prioridad 1 */
+                <View style={styles.formGroupCompact}>
+                  <Text style={styles.inputLabelCompact}>
+                    DNI {safeTotal >= 700 ? '(Obligatorio > S/700)' : '(Prioridad)'}
+                  </Text>
+                  <View style={styles.inputSearchRow}>
+                    <TextInput
+                      style={[styles.inputCompact, styles.inputFlex]}
+                      value={customerDni}
+                      onChangeText={(t) => {
+                        setCustomerDni(t);
+                        syncCustomerToCart({ dni: t });
+                      }}
+                      placeholder="8 dígitos"
+                      keyboardType="numeric"
+                      maxLength={8}
+                      placeholderTextColor={ui.textMuted}
+                    />
+                    {isSearchingDoc ? (
+                      <View style={styles.searchLoader}>
+                        <ActivityIndicator size="small" color={ui.primary} />
+                      </View>
+                    ) : null}
+                  </View>
+                  <View style={styles.rowTwoCols}>
+                    <View style={[styles.formGroupCompact, { flex: 1.4 }]}>
+                      <Text style={styles.inputLabelCompact}>Nombre del Cliente</Text>
+                      <TextInput
+                        style={styles.inputCompact}
+                        value={customerName}
+                        onChangeText={(t) => {
+                          setCustomerName(t);
+                          syncCustomerToCart({ name: t });
+                        }}
+                        placeholder="Público General"
+                        placeholderTextColor={ui.textMuted}
+                      />
+                    </View>
+                    <View style={[styles.formGroupCompact, styles.colFlex]}>
+                      <Text style={styles.inputLabelCompact}>WhatsApp (Opcional)</Text>
+                      <TextInput
+                        style={styles.inputCompact}
+                        value={customerPhone}
+                        onChangeText={(t) => {
+                          setCustomerPhone(t);
+                          syncCustomerToCart({ phone: t });
+                        }}
+                        placeholder="9XXXXXXXX"
+                        keyboardType="phone-pad"
+                        placeholderTextColor={ui.textMuted}
+                      />
+                    </View>
+                  </View>
+                </View>
+              ) : (
+                /* NOTA DE VENTA Y COTIZACIÓN: Nombre es prioridad 1 */
+                <View style={styles.formGroupCompact}>
+                  <Text style={styles.inputLabelCompact}>Nombre del Cliente (Prioridad)</Text>
                   <TextInput
-                    style={styles.input}
-                    accessibilityLabel="Nombre del cliente"
+                    style={styles.inputCompact}
                     value={customerName}
-                    onChangeText={setCustomerName}
+                    onChangeText={(t) => {
+                      setCustomerName(t);
+                      syncCustomerToCart({ name: t });
+                    }}
                     placeholder="Público General"
                     placeholderTextColor={ui.textMuted}
                   />
+                  <View style={styles.rowTwoCols}>
+                    <View style={[styles.formGroupCompact, styles.colFlex]}>
+                      <Text style={styles.inputLabelCompact}>DNI (Opcional)</Text>
+                      <TextInput
+                        style={styles.inputCompact}
+                        value={customerDni}
+                        onChangeText={(t) => {
+                          setCustomerDni(t);
+                          syncCustomerToCart({ dni: t });
+                        }}
+                        placeholder="8 dígitos"
+                        keyboardType="numeric"
+                        maxLength={8}
+                        placeholderTextColor={ui.textMuted}
+                      />
+                    </View>
+                    <View style={[styles.formGroupCompact, styles.colFlex]}>
+                      <Text style={styles.inputLabelCompact}>WhatsApp (Opcional)</Text>
+                      <TextInput
+                        style={styles.inputCompact}
+                        value={customerPhone}
+                        onChangeText={(t) => {
+                          setCustomerPhone(t);
+                          syncCustomerToCart({ phone: t });
+                        }}
+                        placeholder="9XXXXXXXX"
+                        keyboardType="phone-pad"
+                        placeholderTextColor={ui.textMuted}
+                      />
+                    </View>
+                  </View>
                 </View>
               )}
 
@@ -855,44 +1170,66 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
               ) : null}
             </View>
 
-            {/* 3. MÉTODOS DE PAGO */}
-            <SectionHeading title="Cómo paga" subtitle="Selecciona el método de pago" />
-            <View style={styles.methodGrid}>
-              {[
-                { id: 'cash', label: 'Efectivo', icon: Banknote },
-                { id: 'yape', label: 'Yape', icon: Smartphone },
-                { id: 'plin', label: 'Plin', icon: Smartphone },
-                { id: 'card', label: 'Tarjeta POS', icon: CreditCard },
-                { id: 'transfer', label: 'Transferencia', icon: CreditCard },
-                { id: 'mixed', label: 'Pago Mixto', icon: Layers },
-                { id: 'fiado', label: 'Fiado (Crédito)', icon: Clock },
-              ].map((m) => {
-                const isSelected = paymentCategory === m.id;
-                const IconComponent = m.icon;
+            {/* 3. MÉTODOS DE PAGO DEL DUEÑO O AVISO DE COTIZACIÓN */}
+            {docType === 'cotizacion' ? (
+              <View style={styles.quoteNoticeCard}>
+                <View style={styles.quoteNoticeIconWrap}>
+                  <FileText size={24} color={ui.primary} />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.quoteNoticeTitle}>Modo Cotización Activo</Text>
+                  <Text style={styles.quoteNoticeSubtitle}>
+                    Esta cotización formal quedará registrada por 15 días. No cobra ningún monto en caja ni descuenta inventario físico de la tienda.
+                  </Text>
+                </View>
+              </View>
+            ) : (
+              <>
+                <View style={styles.paymentSectionHeaderRow}>
+                  <Text style={styles.paymentSectionTitle}>Método de Pago</Text>
+                  <Text style={styles.paymentSectionSub}>Configurados por el negocio</Text>
+                </View>
+                <View style={styles.methodGridCompact}>
+              {configuredMethods.map((m: any) => {
+                const cat = resolveCategoryFromMethod(m);
+                const isSelected = selectedMethodId === m.id || (paymentCategory === cat && !configuredMethods.some((x: any) => x.id === selectedMethodId));
+                const logo = getMethodLogo(m);
+
                 return (
                   <TouchableOpacity
                     key={m.id}
-                    style={[styles.methodCard, isSelected && styles.methodCardSelected]}
+                    style={[styles.methodCardCompact, isSelected && styles.methodCardCompactSelected]}
                     accessibilityRole="button"
-                    accessibilityLabel={`Método de pago: ${m.label}`}
+                    accessibilityLabel={`Método de pago: ${m.name}`}
                     accessibilityState={{ selected: isSelected }}
                     onPress={() => {
-                      setPaymentCategory(m.id as ActivePaymentCategory);
+                      setSelectedMethodId(m.id);
+                      setPaymentCategory(cat);
                       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
                     }}
                     activeOpacity={0.7}
                   >
-                    <IconComponent
-                      size={20}
-                      color={isSelected ? ui.primary : ui.textSecondary}
-                    />
+                    {logo ? (
+                      <View style={styles.methodLogoWrapper}>
+                        <Image source={logo} style={styles.methodLogoImg} resizeMode="contain" />
+                      </View>
+                    ) : cat === 'cash' ? (
+                      <Banknote size={18} color={isSelected ? ui.primary : ui.textSecondary} />
+                    ) : cat === 'mixed' ? (
+                      <Layers size={18} color={isSelected ? ui.primary : ui.textSecondary} />
+                    ) : cat === 'fiado' ? (
+                      <Clock size={18} color={isSelected ? ui.primary : ui.textSecondary} />
+                    ) : (
+                      <CreditCard size={18} color={isSelected ? ui.primary : ui.textSecondary} />
+                    )}
                     <Text
                       style={[
-                        styles.methodCardText,
-                        isSelected && styles.methodCardTextSelected,
+                        styles.methodCardTextCompact,
+                        isSelected && styles.methodCardTextCompactSelected,
                       ]}
+                      numberOfLines={1}
                     >
-                      {m.label}
+                      {m.name}
                     </Text>
                   </TouchableOpacity>
                 );
@@ -902,9 +1239,9 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
             {/* DETALLE SEGÚN MÉTODO DE PAGO */}
             {paymentCategory === 'cash' ? (
               <View style={styles.paymentDetailBox}>
-                <Text style={styles.inputLabel}>Monto Recibido</Text>
+                <Text style={styles.inputLabelCompact}>Monto Recibido</Text>
                 <TextInput
-                  style={[styles.input, styles.cashReceivedInput]}
+                  style={[styles.inputCompact, styles.cashReceivedInput]}
                   accessibilityLabel="Monto recibido en soles"
                   value={String(cashReceived || '')}
                   onChangeText={(val) => setCashReceived(parseFloat(val) || 0)}
@@ -913,7 +1250,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                   placeholderTextColor={ui.textMuted}
                 />
 
-                {/* Chips de billetes rápidos */}
+                {/* Chips de billetes rápidos (Sin billete de 200) */}
                 <View style={styles.quickBillsRow}>
                   <TouchableOpacity
                     style={styles.quickBillChip}
@@ -923,13 +1260,13 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                   >
                     <Text style={styles.quickBillText}>Exacto</Text>
                   </TouchableOpacity>
-                  {[10, 20, 50, 100, 200].map((bill) => (
-                  <TouchableOpacity
-                    key={bill}
-                    style={styles.quickBillChip}
-                    onPress={() => setCashReceived(bill)}
-                    accessibilityRole="button"
-                    accessibilityLabel={`Recibir ${formatPEN(bill)}`}
+                  {[10, 20, 50, 100].map((bill) => (
+                    <TouchableOpacity
+                      key={bill}
+                      style={styles.quickBillChip}
+                      onPress={() => setCashReceived(bill)}
+                      accessibilityRole="button"
+                      accessibilityLabel={`Recibir ${formatPEN(bill)}`}
                     >
                       <Text style={styles.quickBillText}>S/ {bill}</Text>
                     </TouchableOpacity>
@@ -1176,6 +1513,8 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                 </View>
               </View>
             ) : null}
+              </>
+            )}
 
             {/* NOTAS O COMENTARIOS */}
             <View style={styles.formGroup}>
@@ -1215,9 +1554,15 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
               ) : (
                 <>
                   <Text style={styles.confirmBtnText}>
-                    CONFIRMAR VENTA {formatPEN(safeTotal)}
+                    {docType === 'cotizacion'
+                      ? `GENERAR COTIZACIÓN ${formatPEN(safeTotal)}`
+                      : `CONFIRMAR VENTA ${formatPEN(safeTotal)}`}
                   </Text>
-                  <ArrowRight size={20} color={ui.onPrimary} />
+                  {docType === 'cotizacion' ? (
+                    <FileText size={20} color={ui.onPrimary} />
+                  ) : (
+                    <ArrowRight size={20} color={ui.onPrimary} />
+                  )}
                 </>
               )}
             </TouchableOpacity>
@@ -1880,6 +2225,220 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '700',
     color: ui.text,
+  },
+  compactCheckoutHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 18,
+    paddingTop: 10,
+    paddingBottom: 8,
+    backgroundColor: ui.surface,
+    borderBottomWidth: 1,
+    borderBottomColor: ui.border,
+  },
+  compactCheckoutTitle: {
+    fontSize: 17,
+    fontWeight: '800',
+    color: ui.text,
+  },
+  itemsCountBadge: {
+    paddingHorizontal: 7,
+    paddingVertical: 2,
+    borderRadius: 8,
+    backgroundColor: ui.primarySoft,
+  },
+  itemsCountBadgeText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: ui.primary,
+  },
+  compactCloseBtn: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: ui.surfaceMuted,
+  },
+  checkoutTotalCardCompact: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 12,
+    backgroundColor: ui.primarySoft,
+    borderWidth: 1,
+    borderColor: ui.primary,
+    marginBottom: 10,
+  },
+  checkoutTotalLabelCompact: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: ui.primary,
+  },
+  checkoutTotalItemsCompact: {
+    fontSize: 10,
+    color: ui.textSecondary,
+    fontWeight: '500',
+  },
+  checkoutTotalValueCompact: {
+    fontSize: 22,
+    fontWeight: '900',
+    color: ui.primary,
+  },
+  docTypeRowCompact: {
+    flexDirection: 'row',
+    gap: 6,
+    marginBottom: 10,
+  },
+  docTypeChipCompact: {
+    flex: 1,
+    paddingVertical: 7,
+    backgroundColor: ui.surface,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: ui.border,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  docTypeChipCompactSelected: {
+    backgroundColor: ui.primary,
+    borderColor: ui.primary,
+  },
+  docTypeChipTextCompact: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: ui.textSecondary,
+  },
+  docTypeChipTextCompactSelected: {
+    color: ui.onPrimary,
+    fontWeight: '700',
+  },
+  customerBoxCompact: {
+    backgroundColor: ui.surface,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: ui.border,
+    padding: 10,
+    marginBottom: 10,
+  },
+  customerBoxTitleCompact: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: ui.text,
+  },
+  formGroupCompact: {
+    marginBottom: 6,
+  },
+  inputLabelCompact: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: ui.textSecondary,
+    marginBottom: 3,
+  },
+  inputCompact: {
+    backgroundColor: ui.surface,
+    borderWidth: 1,
+    borderColor: ui.border,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    fontSize: 13,
+    color: ui.text,
+  },
+  paymentSectionHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    gap: 8,
+    marginBottom: 8,
+  },
+  paymentSectionTitle: {
+    fontSize: 13,
+    fontWeight: '800',
+    color: ui.text,
+  },
+  paymentSectionSub: {
+    fontSize: 11,
+    color: ui.textMuted,
+  },
+  methodGridCompact: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginBottom: 12,
+  },
+  methodCardCompact: {
+    width: '31%',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: ui.surface,
+    paddingHorizontal: 8,
+    paddingVertical: 7,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: ui.border,
+  },
+  methodCardCompactSelected: {
+    borderColor: ui.primary,
+    backgroundColor: ui.primarySoft,
+  },
+  methodLogoWrapper: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    overflow: 'hidden',
+    backgroundColor: '#fff',
+    borderWidth: 0.5,
+    borderColor: ui.border,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  methodLogoImg: {
+    width: '100%',
+    height: '100%',
+  },
+  methodCardTextCompact: {
+    flex: 1,
+    fontSize: 11,
+    fontWeight: '600',
+    color: ui.textSecondary,
+  },
+  methodCardTextCompactSelected: {
+    color: ui.primary,
+    fontWeight: '700',
+  },
+  quoteNoticeCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: ui.primarySoft,
+    borderWidth: 1,
+    borderColor: ui.primary,
+    borderRadius: 14,
+    padding: 14,
+    marginBottom: 16,
+    gap: 12,
+  },
+  quoteNoticeIconWrap: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: ui.surface,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  quoteNoticeTitle: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: ui.text,
+    marginBottom: 4,
+  },
+  quoteNoticeSubtitle: {
+    fontSize: 12,
+    lineHeight: 17,
+    color: ui.textSecondary,
   },
 });
 

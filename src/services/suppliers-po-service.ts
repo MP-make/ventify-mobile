@@ -26,6 +26,7 @@ import {
   DocumentData,
   QueryDocumentSnapshot,
 } from 'firebase/firestore';
+import { cleanFirestoreData } from '@/lib/firebase-utils';
 
 // ============================================================================
 // CONSTANTES & COLECCIONES
@@ -37,6 +38,8 @@ export const PRODUCTS_COLLECTION = 'products';
 export const INVENTORY_MOVEMENTS_COLLECTION = 'inventory_movements';
 
 export const DEFAULT_MIN_STOCK_THRESHOLD = 5;
+export const LOW_STOCK_THRESHOLD = DEFAULT_MIN_STOCK_THRESHOLD;
+export const LOW_STOCK_ANY = '__any__';
 
 // ============================================================================
 // TIPOS E INTERFACES
@@ -179,28 +182,23 @@ export const calculateWeightedAverageCost = (
 
 /**
  * Recalcula la lista de sucursales con stock en umbral de alerta
+ * Excluye stock negativo y coloca LOW_STOCK_ANY ('__any__') al inicio.
  */
 export const calculateLowStockBranches = (
   stockMap: Record<string, number> = {},
   reservedMap: Record<string, number> = {},
-  threshold: number = DEFAULT_MIN_STOCK_THRESHOLD
+  threshold: number = LOW_STOCK_THRESHOLD
 ): string[] => {
-  const result: string[] = [];
+  const branches = Object.keys(stockMap || {}).filter((branchId) => {
+    const reserved = reservedMap?.[branchId] || 0;
+    const available = (stockMap?.[branchId] || 0) - reserved;
+    return available <= threshold && available >= 0;
+  });
 
-  for (const [branchId, qty] of Object.entries(stockMap)) {
-    const reserved = reservedMap[branchId] || 0;
-    const available = (qty || 0) - reserved;
-    if (available <= threshold && available >= 0) {
-      result.push(branchId);
-    }
-  }
-
-  if (result.length > 0) {
-    result.push('__any__');
-  }
-
-  return result;
+  return branches.length > 0 ? [LOW_STOCK_ANY, ...branches] : [];
 };
+
+export const deriveLowStockBranches = calculateLowStockBranches;
 
 /**
  * Deriva el array denormalizado branchIds para búsquedas rápidas con array-contains
@@ -209,7 +207,7 @@ export const deriveBranchIds = (
   stockMap: Record<string, number> = {},
   fallback: string[] = ['main']
 ): string[] => {
-  const ids = Object.keys(stockMap);
+  const ids = Object.keys(stockMap || {});
   return ids.length > 0 ? ids : fallback;
 };
 
@@ -822,7 +820,7 @@ export const receivePurchaseOrder = async (
         pData.minStock || DEFAULT_MIN_STOCK_THRESHOLD
       );
 
-      const branchIds = deriveBranchIds(currentStockMap);
+      const branchIds = Object.keys(currentStockMap);
 
       const productUpdate: Record<string, any> = {
         [`stock.${effectiveBranchId}`]: newBranchStock,
@@ -843,6 +841,28 @@ export const receivePurchaseOrder = async (
         productUpdate[`branchPrices.${effectiveBranchId}.costPrice`] = newCostPrice;
       }
 
+      // Si packagingFactor > 1, auto-crear la presentación en productUpdate.presentations si no existía activa con quantity === factor
+      const factor = Number(item.packagingFactor) || 1;
+      if (factor > 1) {
+        const presentations: any[] = Array.isArray(pData.presentations)
+          ? pData.presentations
+          : [];
+        const exists = presentations.some((p: any) => p.active !== false && Number(p.quantity) === factor);
+        if (!exists) {
+          const unitPrice = Number(pData.suggestedPrice ?? pData.price ?? 0);
+          productUpdate.presentations = [
+            ...presentations,
+            {
+              id: `pres-x${factor}`,
+              name: item.packagingLabel || `Caja x${factor}`,
+              quantity: factor,
+              price: unitPrice > 0 ? roundToCents(unitPrice * factor) : 0,
+              active: true,
+            },
+          ];
+        }
+      }
+
       tx.update(pRef, productUpdate);
 
       // 3. Registrar movimiento en el Kardex oficial (inventory_movements)
@@ -850,26 +870,34 @@ export const receivePurchaseOrder = async (
         const movementRef = doc(collection(db, INVENTORY_MOVEMENTS_COLLECTION));
         const effectiveOrderNumber = orderData.orderNumber || orderId;
 
-        tx.set(movementRef, {
+        tx.set(movementRef, cleanFirestoreData({
           accountId: orderData.accountId,
           branchId: effectiveBranchId,
           branchName: effectiveBranchName,
           productId: item.productId,
           productName: item.productName || pData.name || 'Producto',
-          productSku: item.sku || pData.sku || '',
-          type: 'in',
-          reason: 'purchase_order',
-          quantity: incomingQty,
-          previousStock: currentBranchStock,
-          newStock: newBranchStock,
-          unitCost: incomingUnitCost,
-          referenceId: orderId,
+          productSku: item.sku || pData.sku || item.productId || '',
+          // Campos canónicos Web
+          movementType: 'add',
+          quantityBefore: currentBranchStock,
+          quantityAfter: newBranchStock,
+          quantityChanged: incomingQty,
           referenceNumber: effectiveOrderNumber,
-          notes: `Recepción de Orden de Compra ${effectiveOrderNumber}`,
           userId: userProfile?.uid || 'system',
           userName: userProfile?.displayName || userProfile?.email || 'Usuario',
+          userRole: userProfile?.role || 'user',
+          // Campos alias Mobile
+          type: 'in',
+          previousStock: currentBranchStock,
+          newStock: newBranchStock,
+          quantity: incomingQty,
+          reason: 'purchase_order',
+          unitCost: incomingUnitCost,
+          referenceId: orderId,
+          notes: `Recepción de Orden de Compra ${effectiveOrderNumber}`,
           createdAt: serverTimestamp(),
-        });
+          date: Date.now(),
+        }));
       }
 
       // Guardar cambio de costo para reportar a la UI

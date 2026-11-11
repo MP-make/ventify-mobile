@@ -328,30 +328,10 @@ export async function generatePnlReport(params: GeneratePnlReportParams): Promis
     }
   }
 
-  // 3. CONSULTA RESILIENTE DE PLANILLA (payroll_movements y payroll_settlements)
-  let payrollItems: Array<{ amount: number; description: string; date: number }> = [];
-  try {
-    const pMovementsQ = query(
-      collection(db, 'payroll_movements'),
-      where('accountId', '==', accountId)
-    );
-    const snap = await getDocs(pMovementsQ);
-    snap.docs.forEach((d) => {
-      const data = d.data() as any;
-      if (filterBranch && data.branchId && data.branchId !== filterBranch) return;
-      const t = toMillis(data.date || data.createdAt);
-      if (t >= startMs && t <= endMs) {
-        payrollItems.push({
-          amount: Math.abs(Number(data.amount) || 0),
-          description: data.notes || data.employeeName || 'Pago de Planilla',
-          date: t,
-        });
-      }
-    });
-  } catch {
-    // Colección puede no existir en algunas instancias, se ignora
-  }
-
+  // 3. CONSULTA RESILIENTE DE LIQUIDACIONES DE PLANILLA (payroll_settlements)
+  // NOTA: No se consulta la colección inexistente `payroll_movements`. Los adelantos de sueldo
+  // ya vienen incluidos en `cash_register_movements` con category === 'payroll_advance' o isEmployeeAdvance === true.
+  let settlementItems: Array<{ amount: number; description: string; date: number }> = [];
   try {
     const pSettlementsQ = query(
       collection(db, 'payroll_settlements'),
@@ -364,9 +344,9 @@ export async function generatePnlReport(params: GeneratePnlReportParams): Promis
       if (data.status === 'draft') return; // Solo liquidadas o pagadas
       const t = toMillis(data.date || data.createdAt || data.periodEnd);
       if (t >= startMs && t <= endMs) {
-        const netSal = Number(data.netSalary ?? data.total) || 0;
+        const netSal = Number(data.netSalary ?? data.netPayable ?? data.total) || 0;
         if (netSal > 0) {
-          payrollItems.push({
+          settlementItems.push({
             amount: netSal,
             description: `Liquidación Planilla: ${data.employeeName || ''}`,
             date: t,
@@ -375,7 +355,7 @@ export async function generatePnlReport(params: GeneratePnlReportParams): Promis
       }
     });
   } catch {
-    // Colección de liquidaciones opcional
+    // Colección de liquidaciones opcional y protegida por rol admin
   }
 
   // 4. MAPA DE COSTOS DE PRODUCTOS DE APOYO (si no vienen en snapshot)
@@ -594,6 +574,7 @@ export async function generatePnlReport(params: GeneratePnlReportParams): Promis
   // 6. GASTOS OPERATIVOS DE CAJA CHICA Y CATEGORIZACIÓN
   const expensesByCategory: Record<string, number> = {};
   let pettyCashExpenses = 0;
+  let cashPayrollExpenses = 0;
 
   for (const m of movementsDocs) {
     if (m.type !== 'expense') continue;
@@ -607,23 +588,33 @@ export async function generatePnlReport(params: GeneratePnlReportParams): Promis
     const amt = Math.abs(Number(m.amount) || 0);
     if (amt <= 0) continue;
 
-    pettyCashExpenses = roundToCents(pettyCashExpenses + amt);
+    const isPayrollAdvance = m.isEmployeeAdvance === true ||
+      cat === 'payroll_advance' ||
+      cat === 'payroll';
 
-    const catKey = m.expenseCategoryId || m.category || 'other';
-    const label = getExpenseCategoryLabel(catKey);
-    expensesByCategory[label] = roundToCents((expensesByCategory[label] || 0) + amt);
+    if (isPayrollAdvance) {
+      cashPayrollExpenses = roundToCents(cashPayrollExpenses + amt);
+      const label = getExpenseCategoryLabel('payroll');
+      expensesByCategory[label] = roundToCents((expensesByCategory[label] || 0) + amt);
+    } else {
+      pettyCashExpenses = roundToCents(pettyCashExpenses + amt);
+      const catKey = m.expenseCategoryId || m.category || 'other';
+      const label = getExpenseCategoryLabel(catKey);
+      expensesByCategory[label] = roundToCents((expensesByCategory[label] || 0) + amt);
+    }
   }
 
-  // 7. GASTOS DE PLANILLA
-  let payrollExpenses = 0;
-  for (const p of payrollItems) {
-    payrollExpenses = roundToCents(payrollExpenses + p.amount);
+  // 7. GASTOS DE PLANILLA (Adelantos de caja + Liquidaciones de nómina en payroll_settlements)
+  let settlementPayrollExpenses = 0;
+  for (const p of settlementItems) {
+    settlementPayrollExpenses = roundToCents(settlementPayrollExpenses + p.amount);
   }
-  if (payrollExpenses > 0) {
+  if (settlementPayrollExpenses > 0) {
     const pLabel = getExpenseCategoryLabel('payroll');
-    expensesByCategory[pLabel] = roundToCents((expensesByCategory[pLabel] || 0) + payrollExpenses);
+    expensesByCategory[pLabel] = roundToCents((expensesByCategory[pLabel] || 0) + settlementPayrollExpenses);
   }
 
+  const payrollExpenses = roundToCents(cashPayrollExpenses + settlementPayrollExpenses);
   const operatingExpenses = roundToCents(pettyCashExpenses + payrollExpenses);
 
   // Desglose ordenado de gastos con porcentajes

@@ -7,9 +7,10 @@ import {
   normalizeRole,
   Role,
 } from '@/lib/role-permissions';
+import { hasAllBranchesAccess, canAccessBranch } from '@/lib/branch-access';
 
 export function usePermissions() {
-  const { role, customPermissions } = useAuth();
+  const { role, customPermissions, branchId, allBranchesAccess } = useAuth();
 
   const canonicalRole: Role = useMemo(() => normalizeRole(role), [role]);
 
@@ -58,6 +59,29 @@ export function usePermissions() {
   const canManageCustomers = useMemo(() => hasPermission('manage_customers'), [hasPermission]);
   const canManageSettings = useMemo(() => hasPermission('manage_settings'), [hasPermission]);
 
+  // Roles específicos
+  const isOwner = useMemo(() => canonicalRole === 'owner', [canonicalRole]);
+  const isAdmin = useMemo(() => canonicalRole === 'admin', [canonicalRole]);
+  const isManager = useMemo(() => canonicalRole === 'manager', [canonicalRole]);
+  const isCashier = useMemo(() => canonicalRole === 'cashier', [canonicalRole]);
+  const isSeller = useMemo(() => canonicalRole === 'seller', [canonicalRole]);
+
+  // Acceso a sucursales
+  const hasMultiBranchAccess = useMemo(
+    () => hasAllBranchesAccess({ role: canonicalRole, branchId, allBranchesAccess }),
+    [canonicalRole, branchId, allBranchesAccess]
+  );
+
+  const checkCanAccessBranch = useCallback(
+    (targetBranchId?: string | null): boolean => {
+      return canAccessBranch(
+        { role: canonicalRole, branchId, allBranchesAccess },
+        targetBranchId
+      );
+    },
+    [canonicalRole, branchId, allBranchesAccess]
+  );
+
   // Solo owner y admin pueden supervisar todas las cajas abiertas y entrar a cajas de otras sucursales
   const canViewAllCashSessions = useMemo(
     () => canonicalRole === 'owner' || canonicalRole === 'admin',
@@ -85,5 +109,12 @@ export function usePermissions() {
     canManageCustomers,
     canManageSettings,
     canViewAllCashSessions,
+    isOwner,
+    isAdmin,
+    isManager,
+    isCashier,
+    isSeller,
+    hasAllBranchesAccess: hasMultiBranchAccess,
+    canAccessBranch: checkCanAccessBranch,
   };
 }

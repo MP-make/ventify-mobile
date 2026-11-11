@@ -31,6 +31,15 @@ import {
   roleHasPermission,
   effectivePermissions,
 } from '../role-permissions';
+import {
+  hasAllBranchesAccess,
+  canAccessBranch,
+} from '../branch-access';
+import {
+  deriveBranchIds,
+  deriveLowStockBranches,
+  LOW_STOCK_ANY,
+} from '../product-branch-ids';
 import type { Product, Sale, CashRegisterSession } from '../../types';
 
 describe('Ventify Mobile Core Libs', () => {
@@ -311,6 +320,28 @@ describe('Ventify Mobile Core Libs', () => {
       const customRevoke = { revoked: ['modify_price'] as any[] };
       expect(roleHasPermission('cashier', 'modify_price', customRevoke)).toBe(false);
     });
+
+    it('evaluates branch access parity with Web', () => {
+      expect(hasAllBranchesAccess({ role: 'owner', allBranchesAccess: false })).toBe(true);
+      expect(hasAllBranchesAccess({ role: 'admin', allBranchesAccess: undefined })).toBe(true);
+      expect(hasAllBranchesAccess({ role: 'manager', allBranchesAccess: false })).toBe(false);
+      expect(hasAllBranchesAccess({ role: 'manager', allBranchesAccess: true })).toBe(true);
+      expect(hasAllBranchesAccess({ role: 'cashier', allBranchesAccess: false })).toBe(false);
+      expect(hasAllBranchesAccess({ role: 'seller', allBranchesAccess: true })).toBe(false);
+
+      expect(canAccessBranch({ role: 'cashier', branchId: 'b1', allBranchesAccess: false }, 'b1')).toBe(true);
+      expect(canAccessBranch({ role: 'cashier', branchId: 'b1', allBranchesAccess: false }, 'b2')).toBe(false);
+      expect(canAccessBranch({ role: 'owner', branchId: 'b1', allBranchesAccess: false }, 'b2')).toBe(true);
+    });
+
+    it('derives branchIds and lowStockBranches with LOW_STOCK_ANY matching Web', () => {
+      expect(deriveBranchIds({ b1: 10, b2: 0 })).toEqual(['b1', 'b2']);
+      expect(deriveBranchIds({}, ['b_fallback'])).toEqual(['b_fallback']);
+
+      // b1 has 3 (low stock), b2 has 10 (normal), b3 has -1 (negative excluded)
+      const low = deriveLowStockBranches({ b1: 5, b2: 10, b3: -1 }, { b1: 2 });
+      expect(low).toEqual([LOW_STOCK_ANY, 'b1']);
+    });
   });
 
   describe('Firestore Sanitization Utility', () => {
@@ -379,3 +410,4 @@ describe('Ventify Mobile Core Libs', () => {
     });
   });
 });
+

@@ -26,6 +26,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SecureStore from 'expo-secure-store';
 import { auth, db } from '@/lib/firebase';
 import { UserProfile } from '@/types';
+import { hasAllBranchesAccess } from '@/lib/branch-access';
 
 export type UserRole = 'owner' | 'admin' | 'manager' | 'cashier' | 'seller';
 
@@ -232,28 +233,36 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       // 4. Si el usuario no tiene branchId fijo en su perfil (ej. owner en demo@ventify.pe),
       // resolver inmediatamente la sucursal principal de la cuenta para que el stock y caja carguen al instante
       if (resolvedAccountId && (!resolvedBranchId || resolvedBranchId === 'main')) {
-        try {
-          const branchSnap = await getDocs(
-            query(collection(db, 'branches'), where('accountId', '==', resolvedAccountId), limit(10))
-          );
-          if (!branchSnap.empty) {
-            const principalDoc =
-              branchSnap.docs.find((d) =>
-                String(d.data().name || '')
-                  .toUpperCase()
-                  .includes('PRINCIPAL')
-              ) || branchSnap.docs[0];
-            resolvedBranchId = principalDoc.id;
+        // En firestore.rules, el rol 'seller' no tiene permisos de lectura sobre colecciones directas como 'branches'
+        if (resolvedRole !== 'seller') {
+          try {
+            const branchSnap = await getDocs(
+              query(collection(db, 'branches'), where('accountId', '==', resolvedAccountId), limit(10))
+            );
+            if (!branchSnap.empty) {
+              const activeDocs = branchSnap.docs.filter((d) => d.data().isActive !== false);
+              if (activeDocs.length > 0) {
+                const principalDoc =
+                  activeDocs.find((d) =>
+                    String(d.data().name || '')
+                      .toUpperCase()
+                      .includes('PRINCIPAL')
+                  ) || activeDocs[0];
+                resolvedBranchId = principalDoc.id;
+              }
+            }
+          } catch (branchErr) {
+            console.warn('[AuthContext] Error resolving default branch:', branchErr);
           }
-        } catch (branchErr) {
-          console.warn('[AuthContext] Error resolving default branch:', branchErr);
         }
       }
 
-      // Propietarios y administradores tienen acceso global a todas las sucursales por defecto
-      if (resolvedRole === 'owner' || resolvedRole === 'admin') {
-        resolvedAllBranches = true;
-      }
+      // Propietarios y administradores SIEMPRE tienen acceso global garantizado
+      resolvedAllBranches = hasAllBranchesAccess({
+        role: resolvedRole,
+        branchId: resolvedBranchId,
+        allBranchesAccess: resolvedAllBranches,
+      });
 
       // Actualizar estado reactivo
       if (resolvedAccountId) {
@@ -314,11 +323,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
                   AsyncStorage.setItem(STORAGE_BRANCH_ID_KEY, data.branchId).catch(() => {});
                 }
 
-                if (data.allBranchesAccess !== undefined) {
-                  setAllBranchesAccess(Boolean(data.allBranchesAccess));
-                } else if (uRole === 'owner' || uRole === 'admin') {
-                  setAllBranchesAccess(true);
-                }
+                const effectiveAllBranches = hasAllBranchesAccess({
+                  role: uRole,
+                  branchId: data.branchId,
+                  allBranchesAccess: data.allBranchesAccess === true,
+                });
+                setAllBranchesAccess(effectiveAllBranches);
 
                 if (data.customPermissions) {
                   setCustomPermissions(data.customPermissions);
@@ -376,13 +386,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // 4. Cambiar sucursal activa
   const setActiveBranchId = useCallback((newBranchId: string) => {
     if (!newBranchId) return;
-    if (role === 'cashier' && !allBranchesAccess) {
-      console.warn('[AuthContext] Cajero sin acceso multitienda no puede cambiar de sucursal');
+    const canChange = hasAllBranchesAccess({ role, branchId, allBranchesAccess });
+    if (!canChange) {
+      console.warn('[AuthContext] Usuario sin acceso multisede no puede cambiar de sucursal');
       return;
     }
     setBranchIdState(newBranchId);
     AsyncStorage.setItem(STORAGE_BRANCH_ID_KEY, newBranchId).catch(() => {});
-  }, [role, allBranchesAccess]);
+  }, [role, branchId, allBranchesAccess]);
 
   // 5. Iniciar sesión con email y contraseña
   const login = useCallback(

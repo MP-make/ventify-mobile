@@ -20,10 +20,17 @@ import {
   query,
   where,
   getDocs,
+  getDoc,
   limit,
   Timestamp,
 } from 'firebase/firestore';
 import { cleanFirestoreData } from '@/lib/firebase-utils';
+import {
+  deriveBranchIds,
+  deriveLowStockBranches,
+  LOW_STOCK_THRESHOLD,
+  LOW_STOCK_ANY,
+} from '@/lib/product-branch-ids';
 
 // ============================================================================
 // CONSTANTES Y CONFIGURACIÓN
@@ -36,10 +43,10 @@ const INVENTORY_MOVEMENTS_COLLECTION = 'inventory_movements';
 const CASH_SESSIONS_COLLECTION = 'cash_register_sessions';
 const CASH_MOVEMENTS_COLLECTION = 'cash_register_movements';
 const CUSTOMERS_COLLECTION = 'customers';
-const COUNTERS_COLLECTION = 'sale_counters';
+const NOTA_COUNTERS_COLLECTION = 'nota-counters';
 const RECEIVABLES_COLLECTION = 'accounts_receivable';
 
-const DEFAULT_LOW_STOCK_THRESHOLD = 5;
+const DEFAULT_LOW_STOCK_THRESHOLD = LOW_STOCK_THRESHOLD;
 
 const APP_URL =
   process.env.EXPO_PUBLIC_APP_URL ||
@@ -116,6 +123,7 @@ export interface CreateSaleTransactionParams {
   branchId: string;
   userId: string;
   userName: string;
+  userRole?: string;
   items: SaleItemInput[];
   paymentMethod: PaymentMethod;
   documentType: SaleDocumentType;
@@ -230,21 +238,144 @@ export const computeLowStockBranches = (
   reservedStockMap: Record<string, number> = {},
   threshold: number = DEFAULT_LOW_STOCK_THRESHOLD
 ): string[] => {
-  const lowBranches: string[] = [];
+  return deriveLowStockBranches(stockMap, reservedStockMap, threshold);
+};
 
-  for (const [branchId, physical] of Object.entries(stockMap)) {
-    const reserved = reservedStockMap[branchId] || 0;
-    const available = (physical || 0) - reserved;
-    if (available <= threshold) {
-      lowBranches.push(branchId);
+/**
+ * Determina la categoría de pago canónica exigida por firestore.rules
+ */
+export const derivePaymentCategory = (
+  paymentMethod?: string,
+  payments?: PaymentSplit[]
+): 'cash' | 'card' | 'digital' | 'credit' | 'mixed' => {
+  if (Array.isArray(payments) && payments.length > 1) {
+    return 'mixed';
+  }
+  const norm = (paymentMethod || '').toLowerCase();
+  if (norm === 'mixto' || norm === 'mixed') return 'mixed';
+  if (norm === 'efectivo' || norm === 'cash') return 'cash';
+  if (norm === 'tarjeta' || norm === 'card') return 'card';
+  if (['yape', 'plin', 'transferencia', 'digital'].includes(norm)) return 'digital';
+  if (norm === 'fiado' || norm === 'credit') return 'credit';
+  if (Array.isArray(payments) && payments.length === 1 && payments[0].category) {
+    const cat = payments[0].category.toLowerCase();
+    if (['cash', 'card', 'digital', 'credit', 'mixed'].includes(cat)) {
+      return cat as 'cash' | 'card' | 'digital' | 'credit' | 'mixed';
     }
   }
+  return 'cash';
+};
 
-  if (lowBranches.length > 0) {
-    lowBranches.push('__any__');
+/**
+ * Envía la venta para su confirmación atómica en el servidor vía POST /api/sales/finalize
+ * Requerido cuando la cuenta tiene habilitada la regla de atribución de vendedores
+ * (enableSellerAttribution === true en settings/${accountId}_pos).
+ */
+export const finalizeAttributedSaleViaServer = async (
+  params: CreateSaleTransactionParams,
+  resolvedSessionId?: string
+): Promise<CreateSaleTransactionResult> => {
+  const currentUser = auth.currentUser;
+  const token = await currentUser?.getIdToken();
+  if (!token) {
+    throw new Error('Inicia sesión para registrar la venta.');
   }
 
-  return lowBranches;
+  const operationId = params.offlineId || `op_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+  const paymentCategory = derivePaymentCategory(params.paymentMethod, params.payments);
+
+  const salePayload: any = {
+    accountId: params.accountId,
+    branchId: params.branchId,
+    sessionId: resolvedSessionId || params.sessionId || '',
+    total: Math.round(params.total * 100) / 100,
+    subtotal: Math.round((params.subtotal ?? (params.total / 1.18)) * 100) / 100,
+    tax: Math.round((params.tax ?? (params.total - params.total / 1.18)) * 100) / 100,
+    paymentMethod: params.paymentMethod,
+    paymentCategory,
+    payments: params.payments || [],
+    cashAmount: params.cashAmount,
+    cardAmount: params.cardAmount,
+    digitalAmount: params.digitalAmount,
+    cashReceived: params.cashReceived,
+    changeGiven: params.changeGiven,
+    documentType: params.documentType,
+    items: params.items.map((item) => ({
+      id: item.productId,
+      productId: item.productId,
+      name: item.name,
+      sku: item.sku,
+      price: item.price,
+      quantity: item.quantity,
+      costPrice: item.costPrice,
+      minSalePrice: item.minSalePrice,
+      presentationId: item.presentationId,
+      presentationName: item.presentationName,
+      presentationQty: item.presentationQty,
+      conversionFactor: item.conversionFactor,
+      subtotal: item.subtotal,
+      total: item.total,
+    })),
+    customerId: params.customerId || params.customer?.id,
+    customerName: params.customerName || params.customer?.name,
+    customerDni: params.customer?.documentType === 'DNI' ? params.customer.documentNumber : undefined,
+    customerRuc: params.customer?.documentType === 'RUC' ? params.customer.documentNumber : undefined,
+    customerPhone: params.customer?.phone,
+    customerEmail: params.customer?.email,
+    customerAddress: params.customer?.address,
+    notes: params.notes,
+  };
+
+  const response = await fetch(`${APP_URL}/api/sales/finalize`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({
+      sale: cleanFirestoreData(salePayload),
+      operationId,
+      completion: params.depositInfo
+        ? { type: params.depositInfo.type, id: params.depositInfo.depositSaleId || '' }
+        : undefined,
+    }),
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data.error || 'No se pudo confirmar el cobro en el servidor.');
+  }
+
+  const savedSale = data.sale || {};
+  const isElectronic =
+    params.documentType === 'boleta' ||
+    params.documentType === 'factura' ||
+    savedSale.documentType === 'boleta' ||
+    savedSale.documentType === 'factura' ||
+    savedSale.documentType === '01' ||
+    savedSale.documentType === '03';
+
+  const series = resolveDocumentSeries(params.documentType);
+  const correlative = savedSale.correlative || formatCorrelative(series, data.saleNumber);
+
+  // Despacho asíncrono a SUNAT si corresponde
+  if (isElectronic) {
+    emitToSunatAsync(data.saleId, params.accountId, params.branchId).catch((sunatErr) => {
+      console.warn('[SaleService] Async SUNAT dispatch deferred or error:', sunatErr);
+    });
+  }
+
+  return {
+    saleId: data.saleId,
+    saleNumber: data.saleNumber,
+    correlative,
+    documentType: params.documentType,
+    total: savedSale.total ?? params.total,
+    status: savedSale.status || 'completed',
+    sunatStatus: isElectronic ? 'pending' : 'not_applicable',
+    sessionId: savedSale.sessionId || resolvedSessionId,
+    offlineId: params.offlineId,
+  };
 };
 
 // ============================================================================
@@ -340,6 +471,42 @@ export const createSaleTransaction = async (
       }
     } catch (checkErr) {
       console.warn('[SaleService] Error checking offline duplicate:', checkErr);
+    }
+  }
+
+  // 1.5. CHECK SERVER CHECKOUT / SELLER ATTRIBUTION POLICY
+  if (!isQuote) {
+    let enableSellerAttribution = false;
+    try {
+      const posSettingsSnap = await getDoc(doc(db, 'settings', `${accountId}_pos`));
+      if (posSettingsSnap.exists()) {
+        enableSellerAttribution = posSettingsSnap.data()?.enableSellerAttribution === true;
+      }
+    } catch (e) {
+      console.warn('[SaleService] Error checking settings for seller attribution:', e);
+    }
+
+    if (enableSellerAttribution) {
+      let resolvedSession = params.sessionId;
+      if (!resolvedSession) {
+        try {
+          if (userId) {
+            const uSnap = await getDoc(doc(db, CASH_SESSIONS_COLLECTION, `active_${accountId}_${branchId}_${userId}`));
+            if (uSnap.exists() && uSnap.data()?.status === 'open') {
+              resolvedSession = uSnap.data()?.activeSessionId;
+            }
+          }
+          if (!resolvedSession) {
+            const aSnap = await getDoc(doc(db, CASH_SESSIONS_COLLECTION, `active_${branchId}`));
+            if (aSnap.exists() && aSnap.data()?.status === 'open') {
+              resolvedSession = aSnap.data()?.activeSessionId;
+            }
+          }
+        } catch (err) {
+          console.warn('[SaleService] Error resolving active cash session for server checkout:', err);
+        }
+      }
+      return await finalizeAttributedSaleViaServer(params, resolvedSession);
     }
   }
 
@@ -506,42 +673,41 @@ export const createSaleTransaction = async (
       });
     }
 
-    // C. Obtener correlativo secuencial atómico
+    // C. Obtener correlativo secuencial atómico oficial desde nota-counters/{branchId}
     const normalizedDocType: SaleDocumentType = isQuote
       ? 'cotizacion'
       : (documentType as SaleDocumentType) || 'nota_venta';
 
     const series = resolveDocumentSeries(normalizedDocType);
-    const counterDocId = `${accountId}_${branchId}_${normalizedDocType}`;
-    const counterRef = doc(db, COUNTERS_COLLECTION, counterDocId);
+    const counterRef = doc(db, NOTA_COUNTERS_COLLECTION, branchId);
     const counterSnap = await tx.get(counterRef);
 
     let nextNumber = 1;
-    if (counterSnap.exists()) {
-      nextNumber = (counterSnap.data()?.current || 0) + 1;
+    if (!counterSnap.exists()) {
+      tx.set(counterRef, {
+        accountId,
+        branchId,
+        counter: 1,
+        updatedAt: serverTimestamp(),
+      });
+      nextNumber = 1;
+    } else {
+      const counterData = counterSnap.data();
+      nextNumber = (counterData?.counter || 0) + 1;
+      tx.update(counterRef, {
+        counter: nextNumber,
+        updatedAt: serverTimestamp(),
+      });
     }
 
     const correlative = formatCorrelative(series, nextNumber);
 
-    // Actualizar el contador secuencial
-    tx.set(
-      counterRef,
-      {
-        current: nextNumber,
-        series,
-        lastUpdated: serverTimestamp(),
-        documentType: normalizedDocType,
-        branchId,
-        accountId,
-      },
-      { merge: true }
-    );
-
-    // D. Gestionar cuenta por cobrar si es 'fiado'
+    // D. Gestionar cuenta por cobrar y deuda si es 'fiado' / crédito
     let customerRef: any = null;
     let newCustomerDebt: number | null = null;
+    const isFiado = paymentMethod === 'fiado' || paymentMethod === 'credit' || effectiveCredit > 0;
 
-    if (!isQuote && paymentMethod === 'fiado') {
+    if (!isQuote && isFiado) {
       if (!customerId) {
         throw new Error('Para ventas al fiado es obligatorio seleccionar o registrar un cliente.');
       }
@@ -549,8 +715,9 @@ export const createSaleTransaction = async (
       const custSnap = await tx.get(customerRef);
       if (custSnap.exists()) {
         const custData = (custSnap.data() as any) || {};
-        const currentDebt = custData.currentDebt || 0;
-        newCustomerDebt = currentDebt + total;
+        const currentDebt = Number(custData.currentDebt || 0);
+        const debtToAdd = effectiveCredit > 0 ? effectiveCredit : total;
+        newCustomerDebt = Math.round((currentDebt + debtToAdd) * 100) / 100;
         tx.update(customerRef, {
           currentDebt: newCustomerDebt,
           lastPurchaseDate: serverTimestamp(),
@@ -579,6 +746,7 @@ export const createSaleTransaction = async (
     });
 
     const isElectronic = normalizedDocType === 'boleta' || normalizedDocType === 'factura';
+    const paymentCategory = derivePaymentCategory(paymentMethod, payments);
 
     const salePayload: any = {
       id: saleId,
@@ -600,6 +768,7 @@ export const createSaleTransaction = async (
       totalMargin: Math.round(totalMargin * 100) / 100,
       marginPercent: total > 0 ? Math.round((totalMargin / total) * 10000) / 100 : 0,
       paymentMethod,
+      paymentCategory,
       payments: payments || [],
       cashAmount: Math.round(effectiveCash * 100) / 100,
       cardAmount: Math.round(effectiveCard * 100) / 100,
@@ -620,8 +789,17 @@ export const createSaleTransaction = async (
       depositInfo: depositInfo || null,
     };
 
+    // Asegurar que el payload de venta en cliente NUNCA incluya las claves prohibidas por firestore.rules
+    delete salePayload.attributionVersion;
+    delete salePayload.commitFingerprint;
+    delete salePayload.operationId;
+
     // Limpieza profunda y recursiva de campos undefined para Firestore
     const cleanSalePayload = cleanFirestoreData(salePayload);
+    delete cleanSalePayload.attributionVersion;
+    delete cleanSalePayload.commitFingerprint;
+    delete cleanSalePayload.operationId;
+
     tx.set(saleDocRef, cleanSalePayload);
 
     // F. Si no es cotización, descontar stock físico y generar Kardex
@@ -629,68 +807,88 @@ export const createSaleTransaction = async (
       for (const vi of validatedItems) {
         const { item, productRef, productData, baseUnitsToDeduct, previousStock, newStock, effectiveStockBranchKey } = vi;
 
-        // Recalcular lowStockBranches
-        const currentStockMap = { ...(productData.stock || {}), [effectiveStockBranchKey]: newStock };
-        const lowStockBranches = computeLowStockBranches(
-          currentStockMap,
-          productData.reservedStock || {},
-          productData.minStock || DEFAULT_LOW_STOCK_THRESHOLD
-        );
+        // Recalcular stockMap, branchIds y lowStockBranches con libreria compartida
+        const currentStockMap: Record<string, number> = {
+          ...(typeof productData.stock === 'object' ? productData.stock : {}),
+          [effectiveStockBranchKey]: newStock,
+        };
 
-        // Actualizar stock atómicamente en el producto (respetando affectedKeys de firestore.rules para cajeros)
-        tx.update(productRef, {
-          [`stock.${effectiveStockBranchKey}`]: newStock,
+        const branchIds = deriveBranchIds(currentStockMap);
+        const lowStockBranches = deriveLowStockBranches(currentStockMap, productData.reservedStock);
+
+        const productUpdate: Record<string, any> = {
+          stock: currentStockMap,
+          branchIds,
           lowStockBranches,
-        });
+        };
+
+        // Si el ítem vendido tenía variantId y el producto tiene variants, descontar también en la variante
+        const targetVariantId = (item as any).variantId || (item as any).variant?.id;
+        if (targetVariantId && Array.isArray(productData.variants)) {
+          productUpdate.variants = productData.variants.map((v: any) => {
+            if (v.id === targetVariantId) {
+              const currentVarStock = typeof v.stock === 'number'
+                ? v.stock
+                : (v.stock?.[effectiveStockBranchKey] ?? 0);
+
+              if (typeof v.stock === 'object' && v.stock !== null) {
+                return {
+                  ...v,
+                  stock: {
+                    ...v.stock,
+                    [effectiveStockBranchKey]: Math.max(0, Math.round(((v.stock[effectiveStockBranchKey] || 0) - baseUnitsToDeduct) * 10000) / 10000),
+                  },
+                };
+              } else {
+                return {
+                  ...v,
+                  stock: Math.max(0, Math.round((currentVarStock - baseUnitsToDeduct) * 10000) / 10000),
+                };
+              }
+            }
+            return v;
+          });
+        }
+
+        // NUNCA incluir updatedAt para respetar las reglas de cajero (firestore.rules línea 514)
+        tx.update(productRef, productUpdate);
 
         // Registrar movimiento en el Kardex oficial (inventory_movements)
+        // Con campos canónicos Web y alias móviles
         const movementDocRef = doc(collection(db, INVENTORY_MOVEMENTS_COLLECTION));
         const movementData = cleanFirestoreData({
+          // Campos canónicos Web
           accountId,
           branchId: effectiveStockBranchKey,
+          userId,
+          userName,
+          userRole: params.userRole || 'cashier',
           productId: vi.item.productId,
           productName: item.name,
           productSku: item.sku || productData.sku || '',
-          quantityChanged: -baseUnitsToDeduct,
+          movementType: 'sale',
           quantityBefore: previousStock,
           quantityAfter: newStock,
-          quantity: baseUnitsToDeduct,
-          movementType: 'sale',
+          quantityChanged: -baseUnitsToDeduct,
+          saleId,
+          saleAmount: Math.round(total * 100) / 100,
+          createdAt: serverTimestamp(),
+          // Alias móviles para compatibilidad total
           type: 'out',
+          previousStock,
+          newStock,
+          quantity: baseUnitsToDeduct,
           reason: `Venta ${correlative}`,
           referenceId: saleId,
           referenceType: 'sale',
-          saleId,
           correlative,
-          userId,
-          userName,
           timestamp: Date.now(),
-          createdAt: serverTimestamp(),
         });
         tx.set(movementDocRef, movementData);
       }
 
-      // G. Registrar movimiento de efectivo en caja chica (solo efectivo) y actualizar sesión de caja
+      // G. Actualizar acumuladores en la sesión de caja (SIN crear doc en cash_register_movements para no duplicar arqueo)
       if (resolvedSessionId) {
-        if (effectiveCash > 0) {
-          const cashMovementRef = doc(collection(db, CASH_MOVEMENTS_COLLECTION));
-          const cashMovementData = cleanFirestoreData({
-            accountId,
-            branchId,
-            sessionId: resolvedSessionId,
-            type: 'income',
-            category: 'sale',
-            amount: Math.round(effectiveCash * 100) / 100,
-            description: `Venta ${correlative}`,
-            paymentMethod: 'efectivo',
-            saleId,
-            createdBy: userId,
-            createdByName: userName,
-            createdAt: serverTimestamp(),
-          });
-          tx.set(cashMovementRef, cashMovementData);
-        }
-
         // Actualizar acumuladores en la sesión específica
         const sessionRef = doc(db, CASH_SESSIONS_COLLECTION, resolvedSessionId);
         const sessionSnap = await tx.get(sessionRef);
@@ -734,9 +932,10 @@ export const createSaleTransaction = async (
         }
       }
 
-      // H. Registrar cuenta por cobrar si es 'fiado'
-      if (paymentMethod === 'fiado') {
+      // H. Registrar cuenta por cobrar si es 'fiado' / crédito
+      if (isFiado && customerId) {
         const receivableRef = doc(collection(db, RECEIVABLES_COLLECTION));
+        const debtAmount = effectiveCredit > 0 ? effectiveCredit : total;
         tx.set(receivableRef, {
           accountId,
           branchId,
@@ -744,8 +943,8 @@ export const createSaleTransaction = async (
           customerName,
           saleId,
           correlative,
-          originalAmount: total,
-          currentDebt: total,
+          originalAmount: debtAmount,
+          currentDebt: debtAmount,
           status: 'pending',
           createdAt: serverTimestamp(),
         });
@@ -907,38 +1106,81 @@ export const cancelSaleWithReversal = async (
         const currentStock = pData.stock?.[branchId] || 0;
         const restoredStock = Math.round((currentStock + baseUnits) * 10000) / 10000;
 
-        const currentStockMap = { ...(pData.stock || {}), [branchId]: restoredStock };
-        const lowStockBranches = computeLowStockBranches(
-          currentStockMap,
-          pData.reservedStock || {},
-          pData.minStock || DEFAULT_LOW_STOCK_THRESHOLD
-        );
+        const restoredStockMap: Record<string, number> = {
+          ...(typeof pData.stock === 'object' ? pData.stock : {}),
+          [branchId]: restoredStock,
+        };
 
-        tx.update(productRef, {
-          [`stock.${branchId}`]: restoredStock,
+        const branchIds = deriveBranchIds(restoredStockMap);
+        const lowStockBranches = deriveLowStockBranches(restoredStockMap, pData.reservedStock);
+
+        const productUpdate: Record<string, any> = {
+          stock: restoredStockMap,
+          branchIds,
           lowStockBranches,
-          updatedAt: serverTimestamp(),
-        });
+        };
 
-        // Registrar entrada por anulación en el Kardex oficial
+        // Si la venta tenía variantId, restaurar también en la variante
+        const targetVariantId = item.variantId || item.variant?.id;
+        if (targetVariantId && Array.isArray(pData.variants)) {
+          productUpdate.variants = pData.variants.map((v: any) => {
+            if (v.id === targetVariantId) {
+              const currentVarStock = typeof v.stock === 'number'
+                ? v.stock
+                : (v.stock?.[branchId] ?? 0);
+
+              if (typeof v.stock === 'object' && v.stock !== null) {
+                return {
+                  ...v,
+                  stock: {
+                    ...v.stock,
+                    [branchId]: Math.round(((v.stock[branchId] || 0) + baseUnits) * 10000) / 10000,
+                  },
+                };
+              } else {
+                return {
+                  ...v,
+                  stock: Math.round((currentVarStock + baseUnits) * 10000) / 10000,
+                };
+              }
+            }
+            return v;
+          });
+        }
+
+        // NUNCA incluir updatedAt para respetar las reglas de cajero (firestore.rules línea 514)
+        tx.update(productRef, productUpdate);
+
+        // Registrar entrada por anulación en el Kardex oficial (inventory_movements)
+        // Con campos canónicos de Web y alias móviles
         const movementRef = doc(collection(db, INVENTORY_MOVEMENTS_COLLECTION));
         tx.set(movementRef, {
+          // Campos canónicos Web
           accountId,
           branchId,
+          userId: userProfile.uid,
+          userName: userProfile.displayName || userProfile.email || 'Usuario',
+          userRole: userProfile.role || 'cashier',
           productId: pId,
           productName: item.name,
           productSku: item.sku || pData.sku || '',
+          movementType: 'return',
+          quantityBefore: currentStock,
+          quantityAfter: restoredStock,
+          quantityChanged: baseUnits,
+          saleId,
+          createdAt: serverTimestamp(),
+          // Alias móviles para compatibilidad total
           previousStock: currentStock,
           newStock: restoredStock,
           quantity: baseUnits,
           type: 'in',
           reason: 'sale_cancellation',
-          saleId,
+          referenceId: saleId,
+          referenceType: 'sale',
           correlative: saleData.correlative || null,
           notes: reason,
-          userId: userProfile.uid,
-          userName: userProfile.displayName || userProfile.email || 'Usuario',
-          createdAt: serverTimestamp(),
+          timestamp: Date.now(),
         });
 
         reversalCount++;
@@ -979,13 +1221,19 @@ export const cancelSaleWithReversal = async (
     }
 
     // 3. Si era al fiado, revertir deuda del cliente
-    if (saleData.paymentMethod === 'fiado' && saleData.customerId) {
+    const isFiadoSale =
+      saleData.paymentMethod === 'fiado' ||
+      saleData.paymentCategory === 'credit' ||
+      (saleData.creditAmount && saleData.creditAmount > 0);
+
+    if (isFiadoSale && saleData.customerId) {
       const customerRef = doc(db, CUSTOMERS_COLLECTION, saleData.customerId);
       const custSnap = await tx.get(customerRef);
       if (custSnap.exists()) {
         const custData = custSnap.data();
-        const currentDebt = custData.currentDebt || 0;
-        const revertedDebt = Math.max(0, currentDebt - saleData.total);
+        const currentDebt = Number(custData.currentDebt || 0);
+        const creditReverted = saleData.creditAmount || saleData.total;
+        const revertedDebt = Math.max(0, Math.round((currentDebt - creditReverted) * 100) / 100);
         tx.update(customerRef, {
           currentDebt: revertedDebt,
           lastModified: serverTimestamp(),

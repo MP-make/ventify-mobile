@@ -285,19 +285,29 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
             // Si el precio no fue editado a mano, recalcular escalas de precio
             let unitPrice = item.price;
             if (!item.modifiedPrice) {
-              const dummyProduct: Product = {
-                id: item.id.split('_')[0],
-                name: item.name,
-                category: item.category || 'General',
-                sku: item.sku,
-                costPrice: item.costPrice || 0,
-                minSalePrice: item.minSalePrice || 0,
-                suggestedPrice: item.suggestedPrice || item.price,
-                stock: item.stock || {},
-                accountId: accountId || '',
-              };
+              const productToUse: Product = item.product
+                ? {
+                    ...item.product,
+                    costPrice: item.costPrice ?? item.product.costPrice,
+                    minSalePrice: item.minSalePrice ?? item.product.minSalePrice,
+                  }
+                : {
+                    id: item.productId || item.id.split('_')[0],
+                    name: item.name,
+                    category: item.category || 'General',
+                    sku: item.sku,
+                    costPrice: item.costPrice || 0,
+                    minSalePrice: item.minSalePrice || 0,
+                    suggestedPrice: item.suggestedPrice || item.price,
+                    stock: item.stock || {},
+                    accountId: accountId || '',
+                    priceTiers: (item as any).priceTiers,
+                    branchPrices: (item as any).branchPrices,
+                    presentations: (item as any).presentations,
+                  };
+
               unitPrice = resolveEffectiveUnitPrice(
-                dummyProduct,
+                productToUse,
                 activeBranch,
                 newQty,
                 item.presentation,

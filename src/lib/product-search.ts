@@ -250,26 +250,42 @@ export function filterProducts(
  */
 export function getBranchPricingConfig(
   product: Product,
-  branchId?: string
+  branchId?: string,
+  enableMinSalePrice: boolean = true
 ): BranchPriceConfig {
   const branchOverride = branchId ? product.branchPrices?.[branchId] : undefined;
   const basePrice = Number(product.suggestedPrice ?? product.price ?? 0);
   const baseCost = Number(product.costPrice ?? 0);
-  const baseMin = Number(product.minSalePrice ?? baseCost);
+
+  const rawBaseMin = (enableMinSalePrice && product.minSalePrice !== undefined && product.minSalePrice !== null && Number(product.minSalePrice) > 0)
+    ? Math.max(Number(product.minSalePrice), baseCost)
+    : baseCost;
+
+  const baseMin = (basePrice > 0 && rawBaseMin > basePrice)
+    ? baseCost
+    : rawBaseMin;
+
+  const overridePrice =
+    branchOverride?.suggestedPrice !== undefined
+      ? Number(branchOverride.suggestedPrice)
+      : basePrice;
+  const overrideCost =
+    branchOverride?.costPrice !== undefined
+      ? Number(branchOverride.costPrice)
+      : baseCost;
+
+  const rawOverrideMin = (enableMinSalePrice && branchOverride?.minSalePrice !== undefined && branchOverride.minSalePrice !== null && Number(branchOverride.minSalePrice) > 0)
+    ? Math.max(Number(branchOverride.minSalePrice), overrideCost)
+    : (branchOverride?.costPrice !== undefined ? Number(branchOverride.costPrice) : baseMin);
+
+  const overrideMin = (overridePrice > 0 && rawOverrideMin > overridePrice)
+    ? overrideCost
+    : rawOverrideMin;
 
   return {
-    suggestedPrice:
-      branchOverride?.suggestedPrice !== undefined
-        ? Number(branchOverride.suggestedPrice)
-        : basePrice,
-    costPrice:
-      branchOverride?.costPrice !== undefined
-        ? Number(branchOverride.costPrice)
-        : baseCost,
-    minSalePrice:
-      branchOverride?.minSalePrice !== undefined
-        ? Number(branchOverride.minSalePrice)
-        : baseMin,
+    suggestedPrice: overridePrice,
+    costPrice: overrideCost,
+    minSalePrice: overrideMin,
     priceTiers:
       branchOverride?.priceTiers && branchOverride.priceTiers.length > 0
         ? branchOverride.priceTiers
@@ -294,9 +310,10 @@ export function resolveEffectiveUnitPrice(
   branchId: string,
   quantity: number,
   presentation?: ProductPresentation,
-  variant?: ProductVariant
+  variant?: ProductVariant,
+  enableMinSalePrice: boolean = true
 ): number {
-  const pricing = getBranchPricingConfig(product, branchId);
+  const pricing = getBranchPricingConfig(product, branchId, enableMinSalePrice);
 
   // 1. If presentation is selected, use presentation price
   if (presentation) {

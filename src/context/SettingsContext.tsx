@@ -20,6 +20,7 @@ import {
 import NetInfo from '@react-native-community/netinfo';
 import { db } from '@/lib/firebase';
 import { useAuth } from './AuthContext';
+import { hasAllBranchesAccess } from '@/lib/branch-access';
 import {
   Branch,
   BusinessSettings,
@@ -390,15 +391,16 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         };
       });
 
-      setBranches(list);
+      const activeList = list.filter((b) => b.isActive !== false);
+      setBranches(activeList);
 
-      if (list.length > 0) {
-        if (role === 'cashier' && !allBranchesAccess && userProfile?.branchId) {
+      if (activeList.length > 0) {
+        if (!hasAllBranchesAccess({ role, allBranchesAccess, branchId }) && userProfile?.branchId) {
           if (branchId !== userProfile.branchId) {
             setBranchId(userProfile.branchId);
           }
-        } else if (branchId === 'main' || !list.some((b) => b.id === branchId)) {
-          setBranchId(list[0].id!);
+        } else if (branchId === 'main' || !activeList.some((b) => b.id === branchId)) {
+          setBranchId(activeList[0].id!);
         }
       }
     };
@@ -414,155 +416,117 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     );
 
     return () => unsubBranches();
-  }, [accountId, branchId, setBranchId]);
+  }, [accountId, branchId, setBranchId, role, allBranchesAccess, userProfile?.branchId]);
 
   // 5. Verificación y resolución determinista de la sesión activa de caja
   const checkActiveSession = useCallback(async (): Promise<ActiveCashSessionData | null> => {
-    if (!accountId) return null;
+    if (!accountId || !user?.uid) {
+      setIsCashOpen(false);
+      setActiveCashSession(null);
+      return null;
+    }
     const effectiveBranch = branchId || 'main';
 
     try {
-      // En la arquitectura multicaja de Ventify, cada operador maneja su propia caja.
-      // Si hay un usuario autenticado (cajero, vendedor, administrador, etc.):
-      if (user?.uid) {
-        // 1. Verificar puntero determinista exclusivo del operador
-        const userPtrId = `active_${accountId}_${effectiveBranch}_${user.uid}`;
-        try {
-          const ptrSnap = await getDoc(doc(db, 'cash_register_sessions', userPtrId));
-          if (ptrSnap.exists()) {
-            const ptrData = ptrSnap.data();
-            const activeSessionId = ptrData.activeSessionId || ptrData.sessionId;
+      // 1. Verificar puntero determinista exclusivo del operador
+      const userPtrId = `active_${accountId}_${effectiveBranch}_${user.uid}`;
+      try {
+        const ptrSnap = await getDoc(doc(db, 'cash_register_sessions', userPtrId));
+        if (ptrSnap.exists()) {
+          const ptrData = ptrSnap.data();
+          const activeSessionId = ptrData.activeSessionId || ptrData.sessionId;
 
-            if (activeSessionId) {
-              const sessSnap = await getDoc(doc(db, 'cash_register_sessions', activeSessionId));
-              if (sessSnap.exists() && sessSnap.data()?.status === 'open') {
-                const sData = sessSnap.data();
-                // Validar que realmente sea de este operador
-                if (!sData.startedBy || sData.startedBy === user.uid) {
-                  const sessionObj: ActiveCashSessionData = {
-                    id: activeSessionId,
-                    sessionId: activeSessionId,
-                    pointerId: userPtrId,
-                    branchId: sData.branchId || effectiveBranch,
-                    accountId,
-                    status: 'open',
-                    initialAmount: Number(sData.initialAmount ?? ptrData.initialAmount ?? 0),
-                    openTime: Number(sData.openTime ?? Date.now()),
-                    startedBy: sData.startedBy || user.uid,
-                    startedByName: sData.startedByName || user?.displayName || '',
-                    cashSales: Number(sData.cashSales ?? 0),
-                    totalSales: Number(sData.totalSales ?? 0),
-                    expectedAmount: Number(sData.expectedAmount ?? 0),
-                    isOpen: true,
-                    ...sData,
-                  };
-                  setIsCashOpen(true);
-                  setActiveCashSession(sessionObj);
-                  return sessionObj;
-                }
+          if (activeSessionId) {
+            const sessSnap = await getDoc(doc(db, 'cash_register_sessions', activeSessionId));
+            if (sessSnap.exists() && sessSnap.data()?.status === 'open') {
+              const sData = sessSnap.data();
+              // Validar que realmente sea de este operador
+              if (!sData.startedBy || sData.startedBy === user.uid) {
+                const sessionObj: ActiveCashSessionData = {
+                  id: activeSessionId,
+                  sessionId: activeSessionId,
+                  pointerId: userPtrId,
+                  branchId: sData.branchId || effectiveBranch,
+                  accountId,
+                  status: 'open',
+                  initialAmount: Number(sData.initialAmount ?? ptrData.initialAmount ?? 0),
+                  openTime: Number(sData.openTime ?? Date.now()),
+                  startedBy: sData.startedBy || user.uid,
+                  startedByName: sData.startedByName || user?.displayName || '',
+                  cashSales: Number(sData.cashSales ?? 0),
+                  totalSales: Number(sData.totalSales ?? 0),
+                  expectedAmount: Number(sData.expectedAmount ?? 0),
+                  isOpen: true,
+                  ...sData,
+                };
+                setIsCashOpen(true);
+                setActiveCashSession(sessionObj);
+                return sessionObj;
               }
             }
           }
-        } catch (ptrErr) {
-          console.warn('[SettingsContext] Error reading user pointer:', ptrErr);
         }
-
-        // 2. Fallback de operador: consultar en Firestore sesión abierta donde startedBy == user.uid
-        try {
-          const q = query(
-            collection(db, 'cash_register_sessions'),
-            where('accountId', '==', accountId),
-            where('branchId', '==', effectiveBranch),
-            where('status', '==', 'open'),
-            where('startedBy', '==', user.uid)
-          );
-          const snap = await getDocs(q);
-          if (!snap.empty) {
-            const target = snap.docs[0];
-            const data = target.data();
-            const sId = target.id;
-            const sessionObj: ActiveCashSessionData = {
-              id: sId,
-              sessionId: sId,
-              pointerId: userPtrId,
-              branchId: data.branchId || effectiveBranch,
-              accountId,
-              status: 'open',
-              initialAmount: Number(data.initialAmount ?? 0),
-              openTime: Number(data.openTime ?? data.openedAt ?? Date.now()),
-              startedBy: data.startedBy,
-              startedByName: data.startedByName || user?.displayName || '',
-              cashSales: Number(data.cashSales ?? 0),
-              totalSales: Number(data.totalSales ?? 0),
-              expectedAmount: Number(data.expectedAmount ?? data.initialAmount ?? 0),
-              isOpen: true,
-              ...data,
-            };
-
-            // Reparar puntero del operador para lecturas directas ultra-rápidas
-            try {
-              await setDoc(
-                doc(db, 'cash_register_sessions', userPtrId),
-                {
-                  activeSessionId: sId,
-                  branchId: effectiveBranch,
-                  accountId,
-                  startedBy: user.uid,
-                  status: 'open',
-                  lastUpdated: serverTimestamp(),
-                },
-                { merge: true }
-              );
-            } catch {}
-
-            setIsCashOpen(true);
-            setActiveCashSession(sessionObj);
-            return sessionObj;
-          }
-        } catch (queryErr) {
-          console.warn('[SettingsContext] Fallback query by operator failed:', queryErr);
-        }
-
-        // Si el operador no ha abierto caja en esta sucursal: CAJA CERRADA (sin fallback a la de otro usuario)
-        setIsCashOpen(false);
-        setActiveCashSession(null);
-        return null;
+      } catch (ptrErr) {
+        console.warn('[SettingsContext] Error reading user pointer:', ptrErr);
       }
 
-      // 3. Solo si no hay usuario autenticado (ej. proceso en segundo plano anónimo):
-      const branchPointerRef = doc(db, 'cash_register_sessions', `active_${effectiveBranch}`);
-      const branchPointerSnap = await getDoc(branchPointerRef);
-      if (branchPointerSnap.exists()) {
-        const pData = branchPointerSnap.data();
-        const sId = pData.activeSessionId;
-        if (sId) {
-          const sessSnap = await getDoc(doc(db, 'cash_register_sessions', sId));
-          if (sessSnap.exists() && sessSnap.data()?.status === 'open') {
-            const sData = sessSnap.data();
-            const sessionObj: ActiveCashSessionData = {
-              id: sId,
-              sessionId: sId,
-              pointerId: `active_${effectiveBranch}`,
-              branchId: sData.branchId || effectiveBranch,
-              accountId,
-              status: 'open',
-              initialAmount: Number(sData.initialAmount ?? 0),
-              openTime: Number(sData.openTime ?? Date.now()),
-              startedBy: sData.startedBy,
-              startedByName: sData.startedByName || '',
-              cashSales: Number(sData.cashSales ?? 0),
-              totalSales: Number(sData.totalSales ?? 0),
-              expectedAmount: Number(sData.expectedAmount ?? 0),
-              isOpen: true,
-              ...sData,
-            };
-            setIsCashOpen(true);
-            setActiveCashSession(sessionObj);
-            return sessionObj;
-          }
+      // 2. Fallback de operador: consultar en Firestore sesión abierta donde startedBy == user.uid
+      try {
+        const q = query(
+          collection(db, 'cash_register_sessions'),
+          where('accountId', '==', accountId),
+          where('branchId', '==', effectiveBranch),
+          where('status', '==', 'open'),
+          where('startedBy', '==', user.uid)
+        );
+        const snap = await getDocs(q);
+        if (!snap.empty) {
+          const target = snap.docs[0];
+          const data = target.data();
+          const sId = target.id;
+          const sessionObj: ActiveCashSessionData = {
+            id: sId,
+            sessionId: sId,
+            pointerId: userPtrId,
+            branchId: data.branchId || effectiveBranch,
+            accountId,
+            status: 'open',
+            initialAmount: Number(data.initialAmount ?? 0),
+            openTime: Number(data.openTime ?? data.openedAt ?? Date.now()),
+            startedBy: data.startedBy,
+            startedByName: data.startedByName || user?.displayName || '',
+            cashSales: Number(data.cashSales ?? 0),
+            totalSales: Number(data.totalSales ?? 0),
+            expectedAmount: Number(data.expectedAmount ?? data.initialAmount ?? 0),
+            isOpen: true,
+            ...data,
+          };
+
+          // Reparar puntero del operador para lecturas directas ultra-rápidas
+          try {
+            await setDoc(
+              doc(db, 'cash_register_sessions', userPtrId),
+              {
+                activeSessionId: sId,
+                branchId: effectiveBranch,
+                accountId,
+                startedBy: user.uid,
+                status: 'open',
+                lastUpdated: serverTimestamp(),
+              },
+              { merge: true }
+            );
+          } catch {}
+
+          setIsCashOpen(true);
+          setActiveCashSession(sessionObj);
+          return sessionObj;
         }
+      } catch (queryErr) {
+        console.warn('[SettingsContext] Fallback query by operator failed:', queryErr);
       }
 
+      // Si el operador no ha abierto caja en esta sucursal: CAJA CERRADA
       setIsCashOpen(false);
       setActiveCashSession(null);
       return null;
@@ -580,15 +544,17 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
   // Suscripción en tiempo real al estado de la Caja
   useEffect(() => {
-    if (!accountId) return;
+    if (!accountId || !user?.uid) {
+      setIsCashOpen(false);
+      setActiveCashSession(null);
+      return;
+    }
 
     let isSubscribed = true;
     checkActiveSession();
 
     const effectiveBranch = branchId || 'main';
-    const pointerId = user?.uid
-      ? `active_${accountId}_${effectiveBranch}_${user.uid}`
-      : `active_${accountId}_${effectiveBranch}`;
+    const pointerId = `active_${accountId}_${effectiveBranch}_${user.uid}`;
 
     const unsubPointer = onSnapshot(
       doc(db, 'cash_register_sessions', pointerId),
@@ -619,6 +585,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         doc(db, 'settings', `${accountId}_business`),
         {
           ...cleanPatch,
+          accountId,
           updatedAt: serverTimestamp(),
         },
         { merge: true }
@@ -638,6 +605,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         doc(db, 'settings', `${accountId}_pos`),
         {
           ...cleanPatch,
+          accountId,
           updatedAt: serverTimestamp(),
         },
         { merge: true }
@@ -658,6 +626,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       await setDoc(
         doc(db, 'settings', `${accountId}_pos`),
         {
+          accountId,
           methods: updated.map((m, idx) => ({
             id: m.id,
             name: m.name,

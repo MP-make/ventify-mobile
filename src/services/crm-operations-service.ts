@@ -2,8 +2,8 @@
  * Ventify Mobile - CRM, Orders & AI Operations Service
  * 
  * Gestión integral de:
- * 1. Clientes y Cuentas Corrientes (Fiados): pagos, abonos y deudas.
- * 2. Pedidos y Reservas: apartado de stock (`reservedStock`) y depósitos en caja.
+ * 1. Clientes y Cuentas Corrientes (Fiados): pagos, abonos y deudas en `reservation_deposits` y `credit_history`.
+ * 2. Pedidos y Reservas: apartado de stock (`reservedStock`) y depósitos en caja en `reservation_deposits`.
  * 3. Asistente Venty IA: integración con API de IA de Ventify con fallback autónomo
  *    basado en KPIs reales del negocio (ventas de hoy, stock crítico, arqueo y fiados).
  */
@@ -17,23 +17,24 @@ import {
   serverTimestamp,
   query,
   where,
-  orderBy,
   getDocs,
-  getDoc,
   setDoc,
   updateDoc,
-  Timestamp,
 } from 'firebase/firestore';
 
 // ============================================================================
-// CONSTANTES DE COLECCIONES
+// CONSTANTES DE COLECCIONES OFICIALES
 // ============================================================================
 
 const CUSTOMERS_COLLECTION = 'customers';
-const FIADO_PAYMENTS_COLLECTION = 'fiado_payments';
+const RESERVATION_DEPOSITS_COLLECTION = 'reservation_deposits';
+const ORDER_DEPOSITS_COLLECTION = 'order_deposits';
+const CREDIT_HISTORY_COLLECTION = 'credit_history';
 const RESERVATIONS_COLLECTION = 'reservations';
 const ORDERS_COLLECTION = 'orders';
 const PRODUCTS_COLLECTION = 'products';
+const SALES_COLLECTION = 'sales';
+const INVENTORY_MOVEMENTS_COLLECTION = 'inventory_movements';
 const CASH_MOVEMENTS_COLLECTION = 'cash_register_movements';
 const CASH_SESSIONS_COLLECTION = 'cash_register_sessions';
 
@@ -59,6 +60,7 @@ export interface CustomerData {
   currentDebt?: number;
   creditLimit?: number;
   maxCreditLimit?: number;
+  credits?: number;
   totalPurchases?: number;
   totalSpent?: number;
   lastPaymentDate?: any;
@@ -77,6 +79,18 @@ export interface RegisterFiadoPaymentParams {
   paymentMethod: 'efectivo' | 'tarjeta' | 'yape' | 'plin' | 'transferencia' | string;
   notes?: string;
   userProfile: UserProfileInfo;
+}
+
+export interface FiadoHistoryEntry {
+  id: string;
+  date: number;
+  amount: number;
+  paymentMethod: string;
+  previousDebt?: number;
+  newDebt?: number;
+  notes?: string;
+  createdByName?: string;
+  purpose?: string;
 }
 
 export interface ReservationOrderItem {
@@ -109,6 +123,18 @@ export interface CreateReservationOrderParams {
   userProfile: UserProfileInfo;
 }
 
+export interface RegisterReservationPaymentParams {
+  accountId: string;
+  branchId: string;
+  sessionId?: string;
+  reservationId: string;
+  type?: 'reservation' | 'order';
+  amount: number;
+  paymentMethod: string;
+  notes?: string;
+  userProfile: UserProfileInfo;
+}
+
 export interface ReservationOrder {
   id: string;
   number?: number;
@@ -120,6 +146,10 @@ export interface ReservationOrder {
   depositAmount: number;
   remainingAmount: number;
   status: 'pending' | 'ready' | 'completed' | 'cancelled';
+  customerName?: string;
+  customerId?: string | null;
+  customerPhone?: string;
+  customerDocument?: string;
   customer: {
     id?: string;
     name: string;
@@ -131,6 +161,7 @@ export interface ReservationOrder {
   createdAt: any;
   createdBy: string;
   createdByName?: string;
+  saleId?: string;
 }
 
 export interface BusinessKPIContext {
@@ -225,6 +256,7 @@ export const saveCustomer = async (
     address: customer.address ? customer.address.trim() : null,
     currentDebt: typeof customer.currentDebt === 'number' ? Math.round(customer.currentDebt * 100) / 100 : 0,
     creditLimit: typeof customer.creditLimit === 'number' ? Math.round(customer.creditLimit * 100) / 100 : null,
+    credits: typeof customer.credits === 'number' ? Math.round(customer.credits * 100) / 100 : 0,
     updatedAt: serverTimestamp(),
   };
 
@@ -251,7 +283,8 @@ export const saveCustomer = async (
 /**
  * Registra un abono a cuenta de deuda (fiado) de forma atómica:
  * - Reduce `currentDebt` en `customers/{customerId}`
- * - Inserta el comprobante en `fiado_payments`
+ * - Si pagó un excedente (`surplusCredit > 0`), lo suma a `customers.credits` y registra en `credit_history`.
+ * - Inserta el comprobante oficial en `reservation_deposits` (purpose: 'fiado_payment').
  * - Si el pago fue en efectivo, crea el movimiento en `cash_register_movements` y actualiza la caja activa.
  */
 export const registerFiadoPayment = async (
@@ -277,31 +310,69 @@ export const registerFiadoPayment = async (
   }
 
   const normalizedAmount = Math.round(amount * 100) / 100;
-  const paymentRef = doc(collection(db, FIADO_PAYMENTS_COLLECTION));
-  const paymentId = paymentRef.id;
+  // Guardar en la colección oficial `reservation_deposits` (NO usar la inexistente `fiado_payments` que arroja 403)
+  const depositRef = doc(collection(db, RESERVATION_DEPOSITS_COLLECTION));
+  const paymentId = depositRef.id;
   const customerRef = doc(db, CUSTOMERS_COLLECTION, customer.id);
 
   await runTransaction(db, async (tx) => {
-    // 1. Leer saldo actual del cliente
+    // 1. Leer saldo actual del cliente y sesión de caja antes de escribir
     const custSnap = await tx.get(customerRef);
     if (!custSnap.exists()) {
       throw new Error(`El cliente con ID ${customer.id} no existe.`);
     }
 
+    const isCash = paymentMethod === 'efectivo' || paymentMethod === 'cash';
+    const sessionRef = isCash && sessionId ? doc(db, CASH_SESSIONS_COLLECTION, sessionId) : null;
+    const sessionSnap = sessionRef ? await tx.get(sessionRef) : null;
+
     const cData = custSnap.data();
-    const currentDebt = cData.currentDebt || 0;
-    const newDebt = Math.max(0, Math.round((currentDebt - normalizedAmount) * 100) / 100);
+    const currentDebt = Number(cData.currentDebt) || 0;
+    const currentCredits = Number(cData.credits) || 0;
+
+    let newDebt = 0;
+    let surplusCredit = 0;
+
+    if (normalizedAmount >= currentDebt) {
+      newDebt = 0;
+      surplusCredit = Math.round((normalizedAmount - currentDebt) * 100) / 100;
+    } else {
+      newDebt = Math.round((currentDebt - normalizedAmount) * 100) / 100;
+      surplusCredit = 0;
+    }
 
     // 2. Actualizar cliente
-    tx.update(customerRef, {
+    const customerUpdates: Record<string, any> = {
       currentDebt: newDebt,
       lastPaymentDate: serverTimestamp(),
       lastPaymentAmount: normalizedAmount,
       updatedAt: serverTimestamp(),
-    });
+    };
 
-    // 3. Registrar comprobante en fiado_payments
-    tx.set(paymentRef, {
+    if (surplusCredit > 0) {
+      customerUpdates.credits = Math.round((currentCredits + surplusCredit) * 100) / 100;
+    }
+
+    tx.update(customerRef, customerUpdates);
+
+    // 3. Si hubo excedente pagado por el cliente, registrar en credit_history
+    if (surplusCredit > 0) {
+      const historyRef = doc(collection(db, CREDIT_HISTORY_COLLECTION));
+      tx.set(historyRef, {
+        id: historyRef.id,
+        accountId,
+        customerId: customer.id,
+        amount: surplusCredit,
+        type: 'add',
+        reason: `Excedente en abono de fiado (${customer.name || cData.name})`,
+        createdAt: Date.now(),
+        createdBy: userProfile.uid,
+        createdByName: userProfile.displayName || userProfile.email || 'Usuario',
+      });
+    }
+
+    // 4. Guardar comprobante oficial en reservation_deposits
+    tx.set(depositRef, {
       id: paymentId,
       accountId,
       branchId,
@@ -312,15 +383,18 @@ export const registerFiadoPayment = async (
       previousDebt: currentDebt,
       newDebt,
       paymentMethod,
+      purpose: 'fiado_payment',
+      status: 'active',
+      refundable: false,
       notes: notes || '',
       createdBy: userProfile.uid,
       createdByName: userProfile.displayName || userProfile.email || 'Usuario',
+      date: Date.now(),
       createdAt: serverTimestamp(),
     });
 
-    // 4. Si el pago es en efectivo, ingresarlo a la caja chica oficial
-    const isCash = paymentMethod === 'efectivo' || paymentMethod === 'cash';
-    if (isCash && sessionId) {
+    // 5. Si el pago es en efectivo, ingresarlo a la caja chica oficial
+    if (isCash && sessionId && sessionRef && sessionSnap) {
       const cashMovementRef = doc(collection(db, CASH_MOVEMENTS_COLLECTION));
       tx.set(cashMovementRef, {
         accountId,
@@ -337,13 +411,14 @@ export const registerFiadoPayment = async (
       });
 
       // Actualizar sesión si está abierta
-      const sessionRef = doc(db, CASH_SESSIONS_COLLECTION, sessionId);
-      const sessionSnap = await tx.get(sessionRef);
       if (sessionSnap.exists() && sessionSnap.data()?.status === 'open') {
         const sData = sessionSnap.data();
         tx.update(sessionRef, {
           totalIncome: Math.round(((sData.totalIncome || 0) + normalizedAmount) * 100) / 100,
           expectedAmount: Math.round(((sData.expectedAmount || 0) + normalizedAmount) * 100) / 100,
+          totalReservationDeposits: Math.round(((sData.totalReservationDeposits || 0) + normalizedAmount) * 100) / 100,
+          reservationDepositsCount: (sData.reservationDepositsCount || 0) + 1,
+          cashReservationDeposits: Math.round(((sData.cashReservationDeposits || 0) + normalizedAmount) * 100) / 100,
           updatedAt: serverTimestamp(),
         });
       }
@@ -351,6 +426,48 @@ export const registerFiadoPayment = async (
   });
 
   return paymentId;
+};
+
+/**
+ * Consulta el historial de abonos de fiado de un cliente desde `reservation_deposits`
+ */
+export const getCustomerFiadoHistory = async (
+  accountId: string,
+  customerId: string
+): Promise<FiadoHistoryEntry[]> => {
+  if (!accountId || !customerId) return [];
+
+  try {
+    const coll = collection(db, RESERVATION_DEPOSITS_COLLECTION);
+    const q = query(
+      coll,
+      where('accountId', '==', accountId),
+      where('customerId', '==', customerId)
+    );
+    const snapshot = await getDocs(q);
+
+    const history: FiadoHistoryEntry[] = snapshot.docs.map((d) => {
+      const data = d.data();
+      const dateVal = data.date || (data.createdAt?.seconds ? data.createdAt.seconds * 1000 : Date.now());
+      return {
+        id: d.id,
+        date: typeof dateVal === 'number' ? dateVal : Date.now(),
+        amount: Number(data.amount) || 0,
+        paymentMethod: data.paymentMethod || 'Efectivo',
+        previousDebt: data.previousDebt,
+        newDebt: data.newDebt,
+        notes: data.notes || '',
+        createdByName: data.createdByName || 'Usuario',
+        purpose: data.purpose || 'fiado_payment',
+      };
+    });
+
+    history.sort((a, b) => b.date - a.date);
+    return history;
+  } catch (err) {
+    console.error('[CRMService] Error obteniendo historial de fiados:', err);
+    return [];
+  }
 };
 
 // ============================================================================
@@ -407,8 +524,16 @@ export const getReservationsAndOrders = async (
 };
 
 /**
- * Crea una reserva o pedido incrementando de forma segura el stock comprometido
+ * Crea una reserva o pedido incrementando el stock comprometido
  * (`reservedStock.${branchId}`) en los productos para evitar sobreventas.
+ * 
+ * Reglas estrictas:
+ * - Cumple `firestore.rules` línea 973: exige en la raíz `createdBy: userProfile.uid`
+ *   y `customerName: customer.name.trim()`.
+ * - Al actualizar `reservedStock.${branchId}` en `products`, NO incluye `updatedAt`
+ *   para no violar el diff de cajeros (`affectedKeys().hasOnly(...)`).
+ * - Si `depositAmount > 0`, crea documento oficial en `reservation_deposits`
+ *   (u `order_deposits`), actualiza contadores de caja y genera movimiento de caja chica.
  */
 export const createReservationOrOrder = async (
   data: CreateReservationOrderParams
@@ -440,17 +565,27 @@ export const createReservationOrOrder = async (
   const docRef = doc(collection(db, targetColl));
   const reservationId = docRef.id;
 
-  const remainingAmount = Math.max(0, Math.round((total - depositAmount) * 100) / 100);
+  const normTotal = Math.round(total * 100) / 100;
+  const normDeposit = Math.round(depositAmount * 100) / 100;
+  const remainingAmount = Math.max(0, Math.round((normTotal - normDeposit) * 100) / 100);
+  const trimmedCustomerName = (customer?.name || 'Cliente').trim();
 
   await runTransaction(db, async (tx) => {
-    // 1. Apartar stock reservado en cada producto
+    // 0. Ejecutar TODAS las lecturas (tx.get) antes de cualquier escritura (requisito de Firestore)
+    const productReads: Array<{ it: typeof items[0]; pRef: any; pSnap: any; unitsToReserve: number }> = [];
     for (const it of items) {
       const factor = it.presentationQty || it.conversionFactor || 1;
       const unitsToReserve = Math.round(it.quantity * factor * 10000) / 10000;
-
       const pRef = doc(db, PRODUCTS_COLLECTION, it.productId);
       const pSnap = await tx.get(pRef);
+      productReads.push({ it, pRef, pSnap, unitsToReserve });
+    }
 
+    const sessionRef = normDeposit > 0 && sessionId ? doc(db, CASH_SESSIONS_COLLECTION, sessionId) : null;
+    const sSnap = sessionRef ? await tx.get(sessionRef) : null;
+
+    // 1. Apartar stock reservado en cada producto SIN enviar updatedAt (permitido para cajeros)
+    for (const { pRef, pSnap, unitsToReserve } of productReads) {
       if (pSnap.exists()) {
         const pData = pSnap.data();
         const currentReserved = pData.reservedStock?.[branchId] || 0;
@@ -458,62 +593,268 @@ export const createReservationOrOrder = async (
 
         tx.update(pRef, {
           [`reservedStock.${branchId}`]: newReserved,
-          updatedAt: serverTimestamp(),
         });
       }
     }
 
-    // 2. Guardar documento de reserva / pedido
+    // 2. Guardar documento de reserva / pedido cumpliendo las reglas obligatorias de Firestore
     tx.set(docRef, {
       id: reservationId,
       accountId,
       branchId,
       type,
       items,
-      total: Math.round(total * 100) / 100,
-      depositAmount: Math.round(depositAmount * 100) / 100,
+      total: normTotal,
+      depositAmount: normDeposit,
       remainingAmount,
       status: 'pending',
-      customer,
+      // Campos obligatorios en la raíz por firestore.rules línea 973:
+      createdBy: userProfile.uid,
+      customerName: trimmedCustomerName,
+      customerId: customer?.id || null,
+      customerPhone: customer?.phone || '',
+      customerDocument: customer?.documentNumber || '',
+      // Objeto customer completo para compatibilidad:
+      customer: {
+        id: customer?.id || null,
+        name: trimmedCustomerName,
+        phone: customer?.phone || '',
+        documentNumber: customer?.documentNumber || '',
+      },
       pickupDate: pickupDate || null,
       notes: notes || '',
-      createdBy: userProfile.uid,
       createdByName: userProfile.displayName || userProfile.email || 'Usuario',
       createdAt: serverTimestamp(),
     });
 
-    // 3. Si se pagó adelanto en efectivo, sumarlo a la caja chica
-    const isCash = paymentMethod === 'efectivo' || paymentMethod === 'cash';
-    if (depositAmount > 0 && isCash && sessionId) {
-      const mvRef = doc(collection(db, CASH_MOVEMENTS_COLLECTION));
-      tx.set(mvRef, {
-        accountId,
+    // 3. Si se pagó adelanto, registrar en reservation_deposits / order_deposits
+    if (normDeposit > 0) {
+      const depositCollName = type === 'order' ? ORDER_DEPOSITS_COLLECTION : RESERVATION_DEPOSITS_COLLECTION;
+      const depositDocRef = doc(collection(db, depositCollName));
+      const depositId = depositDocRef.id;
+
+      tx.set(depositDocRef, {
+        id: depositId,
+        reservationId,
+        orderId: type === 'order' ? reservationId : null,
+        amount: normDeposit,
+        paymentMethod,
+        customerName: trimmedCustomerName,
+        customerId: customer?.id || null,
         branchId,
-        sessionId,
-        type: 'income',
-        category: 'deposit',
-        amount: Math.round(depositAmount * 100) / 100,
-        description: `Adelanto ${type === 'order' ? 'Pedido' : 'Reserva'} #${reservationId.slice(-6)}: ${customer.name}`,
-        referenceId: reservationId,
+        accountId,
         createdBy: userProfile.uid,
         createdByName: userProfile.displayName || userProfile.email || 'Usuario',
+        date: Date.now(),
+        status: 'active',
+        purpose: type === 'order' ? 'order' : 'reservation',
+        refundable: true,
+        cashSessionId: sessionId || null,
         createdAt: serverTimestamp(),
       });
 
-      const sessionRef = doc(db, CASH_SESSIONS_COLLECTION, sessionId);
-      const sSnap = await tx.get(sessionRef);
-      if (sSnap.exists() && sSnap.data()?.status === 'open') {
-        const sData = sSnap.data();
-        tx.update(sessionRef, {
-          totalIncome: Math.round(((sData.totalIncome || 0) + depositAmount) * 100) / 100,
-          expectedAmount: Math.round(((sData.expectedAmount || 0) + depositAmount) * 100) / 100,
-          updatedAt: serverTimestamp(),
-        });
+      // Actualizar sesión de caja activa si se suministró sessionId
+      if (sessionId && sessionRef && sSnap) {
+        if (sSnap.exists() && sSnap.data()?.status === 'open') {
+          const sData = sSnap.data();
+          const isCash = paymentMethod === 'efectivo' || paymentMethod === 'cash';
+          const isCard = paymentMethod === 'tarjeta' || paymentMethod === 'card';
+          const currentTotalDeposits = Number(sData.totalReservationDeposits) || 0;
+          const currentDepositsCount = Number(sData.reservationDepositsCount) || 0;
+
+          const sessionUpdates: Record<string, any> = {
+            totalReservationDeposits: Math.round((currentTotalDeposits + normDeposit) * 100) / 100,
+            reservationDepositsCount: currentDepositsCount + 1,
+            updatedAt: serverTimestamp(),
+          };
+
+          if (isCash) {
+            const currentCashDeposits = Number(sData.cashReservationDeposits) || 0;
+            const currentExpected = Number(sData.expectedAmount) || 0;
+            const currentIncome = Number(sData.totalIncome) || 0;
+
+            sessionUpdates.cashReservationDeposits = Math.round((currentCashDeposits + normDeposit) * 100) / 100;
+            sessionUpdates.expectedAmount = Math.round((currentExpected + normDeposit) * 100) / 100;
+            sessionUpdates.totalIncome = Math.round((currentIncome + normDeposit) * 100) / 100;
+          } else if (isCard) {
+            const currentCardDeposits = Number(sData.cardReservationDeposits) || 0;
+            sessionUpdates.cardReservationDeposits = Math.round((currentCardDeposits + normDeposit) * 100) / 100;
+          } else {
+            const currentDigitalDeposits = Number(sData.digitalReservationDeposits) || 0;
+            sessionUpdates.digitalReservationDeposits = Math.round((currentDigitalDeposits + normDeposit) * 100) / 100;
+          }
+
+          tx.update(sessionRef, sessionUpdates);
+        }
+
+        // Si fue en efectivo, crear movimiento en la caja chica
+        const isCash = paymentMethod === 'efectivo' || paymentMethod === 'cash';
+        if (isCash) {
+          const mvRef = doc(collection(db, CASH_MOVEMENTS_COLLECTION));
+          tx.set(mvRef, {
+            accountId,
+            branchId,
+            sessionId,
+            type: 'income',
+            category: 'deposit',
+            amount: normDeposit,
+            description: `Adelanto ${type === 'order' ? 'Pedido' : 'Reserva'} #${reservationId.slice(-6)}: ${trimmedCustomerName}`,
+            referenceId: depositId,
+            reservationId,
+            createdBy: userProfile.uid,
+            createdByName: userProfile.displayName || userProfile.email || 'Usuario',
+            createdAt: serverTimestamp(),
+          });
+        }
       }
     }
   });
 
   return reservationId;
+};
+
+/**
+ * Registra un abono posterior en una reserva o pedido existente:
+ * - Guarda el comprobante en `reservation_deposits` (u `order_deposits`) con `status: 'active'`.
+ * - Actualiza `depositAmount` y `remainingAmount` en la reserva/pedido.
+ * - Actualiza los acumuladores en `cash_register_sessions`.
+ */
+export const registerReservationPayment = async (
+  params: RegisterReservationPaymentParams
+): Promise<string> => {
+  const {
+    accountId,
+    branchId,
+    sessionId,
+    reservationId,
+    type = 'reservation',
+    amount,
+    paymentMethod,
+    notes,
+    userProfile,
+  } = params;
+
+  if (!accountId || !branchId || !reservationId) {
+    throw new Error('Cuenta, sucursal e ID de reserva son obligatorios.');
+  }
+
+  if (typeof amount !== 'number' || amount <= 0 || isNaN(amount)) {
+    throw new Error('El monto del abono debe ser mayor a cero.');
+  }
+
+  const normalizedAmount = Math.round(amount * 100) / 100;
+  const targetColl = type === 'order' ? ORDERS_COLLECTION : RESERVATIONS_COLLECTION;
+  const resDocRef = doc(db, targetColl, reservationId);
+  const depositColl = type === 'order' ? ORDER_DEPOSITS_COLLECTION : RESERVATION_DEPOSITS_COLLECTION;
+  const depositDocRef = doc(collection(db, depositColl));
+  const depositId = depositDocRef.id;
+
+  await runTransaction(db, async (tx) => {
+    const resSnap = await tx.get(resDocRef);
+    if (!resSnap.exists()) {
+      throw new Error(`La ${type === 'order' ? 'orden' : 'reserva'} no existe.`);
+    }
+
+    const sessionRef = sessionId ? doc(db, CASH_SESSIONS_COLLECTION, sessionId) : null;
+    const sSnap = sessionRef ? await tx.get(sessionRef) : null;
+
+    const rData = resSnap.data();
+    if (rData.status === 'cancelled' || rData.status === 'completed') {
+      throw new Error(`No se pueden registrar pagos en una ${type === 'order' ? 'orden' : 'reserva'} con estado "${rData.status}".`);
+    }
+
+    const total = Number(rData.total) || 0;
+    const currentDeposit = Number(rData.depositAmount) || 0;
+    const newDeposit = Math.round((currentDeposit + normalizedAmount) * 100) / 100;
+    const newRemaining = Math.max(0, Math.round((total - newDeposit) * 100) / 100);
+    const customerName = (rData.customerName || rData.customer?.name || 'Cliente').trim();
+
+    // 1. Actualizar reserva/orden
+    tx.update(resDocRef, {
+      depositAmount: newDeposit,
+      remainingAmount: newRemaining,
+      updatedAt: serverTimestamp(),
+    });
+
+    // 2. Registrar comprobante oficial de depósito
+    tx.set(depositDocRef, {
+      id: depositId,
+      reservationId,
+      orderId: type === 'order' ? reservationId : null,
+      amount: normalizedAmount,
+      paymentMethod,
+      customerName,
+      customerId: rData.customerId || rData.customer?.id || null,
+      branchId,
+      accountId,
+      createdBy: userProfile.uid,
+      createdByName: userProfile.displayName || userProfile.email || 'Usuario',
+      date: Date.now(),
+      status: 'active',
+      purpose: 'reservation',
+      refundable: true,
+      cashSessionId: sessionId || null,
+      notes: notes || '',
+      createdAt: serverTimestamp(),
+    });
+
+    // 3. Si hay sesión de caja activa, actualizar acumuladores oficiales
+    if (sessionId && sessionRef && sSnap) {
+      if (sSnap.exists() && sSnap.data()?.status === 'open') {
+        const sData = sSnap.data();
+        const isCash = paymentMethod === 'efectivo' || paymentMethod === 'cash';
+        const isCard = paymentMethod === 'tarjeta' || paymentMethod === 'card';
+        const currentTotalDeposits = Number(sData.totalReservationDeposits) || 0;
+        const currentDepositsCount = Number(sData.reservationDepositsCount) || 0;
+
+        const sessionUpdates: Record<string, any> = {
+          totalReservationDeposits: Math.round((currentTotalDeposits + normalizedAmount) * 100) / 100,
+          reservationDepositsCount: currentDepositsCount + 1,
+          updatedAt: serverTimestamp(),
+        };
+
+        if (isCash) {
+          const currentCashDeposits = Number(sData.cashReservationDeposits) || 0;
+          const currentExpected = Number(sData.expectedAmount) || 0;
+          const currentIncome = Number(sData.totalIncome) || 0;
+
+          sessionUpdates.cashReservationDeposits = Math.round((currentCashDeposits + normalizedAmount) * 100) / 100;
+          sessionUpdates.expectedAmount = Math.round((currentExpected + normalizedAmount) * 100) / 100;
+          sessionUpdates.totalIncome = Math.round((currentIncome + normalizedAmount) * 100) / 100;
+        } else if (isCard) {
+          const currentCardDeposits = Number(sData.cardReservationDeposits) || 0;
+          sessionUpdates.cardReservationDeposits = Math.round((currentCardDeposits + normalizedAmount) * 100) / 100;
+        } else {
+          const currentDigitalDeposits = Number(sData.digitalReservationDeposits) || 0;
+          sessionUpdates.digitalReservationDeposits = Math.round((currentDigitalDeposits + normalizedAmount) * 100) / 100;
+        }
+
+        tx.update(sessionRef, sessionUpdates);
+      }
+
+      // Si fue en efectivo, crear movimiento en caja chica
+      const isCash = paymentMethod === 'efectivo' || paymentMethod === 'cash';
+      if (isCash) {
+        const mvRef = doc(collection(db, CASH_MOVEMENTS_COLLECTION));
+        tx.set(mvRef, {
+          accountId,
+          branchId,
+          sessionId,
+          type: 'income',
+          category: 'deposit',
+          amount: normalizedAmount,
+          description: `Abono ${type === 'order' ? 'Pedido' : 'Reserva'} #${reservationId.slice(-6)}: ${customerName}`,
+          referenceId: depositId,
+          reservationId,
+          createdBy: userProfile.uid,
+          createdByName: userProfile.displayName || userProfile.email || 'Usuario',
+          createdAt: serverTimestamp(),
+        });
+      }
+    }
+  });
+
+  return depositId;
 };
 
 export interface CompletePaymentParams {
@@ -525,6 +866,14 @@ export interface CompletePaymentParams {
 /**
  * Completa o cancela una reserva/pedido liberando el stock reservado (`reservedStock`)
  * y descontando el stock físico y registrando el saldo en caja si se completa.
+ * 
+ * Reglas estrictas:
+ * - Al CANCELAR: libera únicamente `reservedStock.${branchId}` sin tocar stock físico y sin `updatedAt`.
+ * - Al COMPLETAR:
+ *   - Descuenta `reservedStock` y `stock` físico, recalcula `branchIds` y `lowStockBranches` sin `updatedAt`.
+ *   - Crea el movimiento en `inventory_movements` con `movementType: 'reservation_complete'`,
+ *     `quantityBefore`, `quantityAfter`, `quantityChanged: -units`.
+ *   - Crea el registro de venta comercial en `sales`.
  */
 export const completeOrCancelReservation = async (
   item: ReservationOrder,
@@ -537,87 +886,171 @@ export const completeOrCancelReservation = async (
   const branchId = item.branchId;
 
   await runTransaction(db, async (tx) => {
-    // 1. Liberar stock reservado en cada producto y descontar stock físico si es entrega
+    // 0. Ejecutar TODAS las lecturas (tx.get) antes de cualquier escritura
+    const productReads: Array<{ it: typeof item.items[0]; pRef: any; pSnap: any; unitsToRelease: number }> = [];
     for (const it of item.items) {
       const factor = it.presentationQty || it.conversionFactor || 1;
       const unitsToRelease = Math.round(it.quantity * factor * 10000) / 10000;
-
       const pRef = doc(db, PRODUCTS_COLLECTION, it.productId);
       const pSnap = await tx.get(pRef);
+      productReads.push({ it, pRef, pSnap, unitsToRelease });
+    }
 
+    const finalAmount = paymentInfo?.amount ?? 0;
+    const sessionRef =
+      action === 'complete' && finalAmount > 0 && paymentInfo?.sessionId
+        ? doc(db, CASH_SESSIONS_COLLECTION, paymentInfo.sessionId)
+        : null;
+    const sSnap = sessionRef ? await tx.get(sessionRef) : null;
+
+    // 1. Liberar stock reservado en cada producto y descontar stock físico si es entrega
+    for (const { it, pRef, pSnap, unitsToRelease } of productReads) {
       if (pSnap.exists()) {
         const pData = pSnap.data();
         const currentReserved = pData.reservedStock?.[branchId] || 0;
         const newReserved = Math.max(0, Math.round((currentReserved - unitsToRelease) * 10000) / 10000);
 
-        const updates: Record<string, any> = {
-          [`reservedStock.${branchId}`]: newReserved,
-          updatedAt: serverTimestamp(),
-        };
-
-        if (action === 'complete') {
+        if (action === 'cancel') {
+          // AL CANCELAR: Solo libera stock reservado, SIN tocar stock físico y SIN updatedAt
+          tx.update(pRef, {
+            [`reservedStock.${branchId}`]: newReserved,
+          });
+        } else {
+          // AL COMPLETAR: Descuenta reservedStock y stock físico, recalcula branchIds y lowStockBranches SIN updatedAt
           const currentStock = pData.stock?.[branchId] || 0;
           const newStock = Math.max(0, Math.round((currentStock - unitsToRelease) * 10000) / 10000);
-          updates[`stock.${branchId}`] = newStock;
-        }
 
-        tx.update(pRef, updates);
+          const stockMap = { ...(pData.stock || {}), [branchId]: newStock };
+          const reservedMap = { ...(pData.reservedStock || {}), [branchId]: newReserved };
+
+          const lowBranches: string[] = [];
+          const threshold = pData.minStock || 5;
+          for (const [bId, rawPhys] of Object.entries(stockMap)) {
+            const phys = Number(rawPhys) || 0;
+            const res = Number((reservedMap as Record<string, any>)[bId]) || 0;
+            const avail = phys - res;
+            if (avail <= threshold && avail >= 0) {
+              lowBranches.push(bId);
+            }
+          }
+          const lowStockBranches = lowBranches.length > 0 ? ['__any__', ...lowBranches] : [];
+          const branchIds = Object.keys(stockMap);
+
+          tx.update(pRef, {
+            [`reservedStock.${branchId}`]: newReserved,
+            [`stock.${branchId}`]: newStock,
+            lowStockBranches,
+            branchIds,
+          });
+
+          // Registrar movimiento en el Kardex oficial (inventory_movements)
+          const movementDocRef = doc(collection(db, INVENTORY_MOVEMENTS_COLLECTION));
+          tx.set(movementDocRef, {
+            accountId: item.accountId,
+            branchId,
+            productId: it.productId,
+            productName: it.productName,
+            productSku: it.sku || pData.sku || '',
+            quantityChanged: -unitsToRelease,
+            quantityBefore: currentStock,
+            quantityAfter: newStock,
+            quantity: unitsToRelease,
+            movementType: 'reservation_complete',
+            type: 'out',
+            previousStock: currentStock,
+            newStock,
+            reason: `Entrega de ${item.type === 'order' ? 'pedido' : 'reserva'} #${item.id.slice(-6)}`,
+            referenceId: item.id,
+            referenceType: item.type === 'order' ? 'order' : 'reservation',
+            reservationId: item.id,
+            userId: userProfile.uid,
+            userName: userProfile.displayName || userProfile.email || 'Usuario',
+            timestamp: Date.now(),
+            createdAt: serverTimestamp(),
+          });
+        }
       }
     }
 
-    // 2. Si se cancela la reserva o se completa
     const newStatus = action === 'complete' ? 'completed' : 'cancelled';
-    const finalAmount = paymentInfo?.amount ?? 0;
     const finalMethod = paymentInfo?.paymentMethod || 'efectivo';
+    let saleId: string | null = null;
 
-    // 3. Registrar el ingreso del saldo en caja si se completa con monto pendiente
-    if (action === 'complete' && finalAmount > 0 && paymentInfo?.sessionId) {
-      const sessId = paymentInfo.sessionId;
-      const isCash = finalMethod === 'efectivo' || finalMethod === 'cash';
+    // 2. Si se completa, registrar la venta comercial oficial en `sales`
+    if (action === 'complete') {
+      const saleDocRef = doc(collection(db, SALES_COLLECTION));
+      saleId = saleDocRef.id;
 
-      if (isCash) {
-        const mvRef = doc(collection(db, CASH_MOVEMENTS_COLLECTION));
-        tx.set(mvRef, {
-          accountId: item.accountId,
-          branchId,
-          sessionId: sessId,
-          type: 'income',
-          category: 'sale',
-          amount: Math.round(finalAmount * 100) / 100,
-          description: `Cobro saldo ${item.type === 'order' ? 'Pedido' : 'Reserva'} #${item.id.slice(-6)}: ${item.customer?.name || 'Cliente'}`,
-          referenceId: item.id,
-          createdBy: userProfile.uid,
-          createdByName: userProfile.displayName || userProfile.email || 'Usuario',
-          createdAt: serverTimestamp(),
-        });
-      }
+      const totalAmount = item.total || 0;
+      let paymentCategory = 'cash';
+      const lowerMethod = finalMethod.toLowerCase();
+      if (lowerMethod.includes('tarjeta') || lowerMethod.includes('card')) paymentCategory = 'card';
+      else if (['yape', 'plin', 'transferencia', 'digital'].some((d) => lowerMethod.includes(d))) paymentCategory = 'digital';
+      else if (lowerMethod.includes('fiado') || lowerMethod.includes('credit')) paymentCategory = 'credit';
 
-      const sessionRef = doc(db, CASH_SESSIONS_COLLECTION, sessId);
-      const sSnap = await tx.get(sessionRef);
-      if (sSnap.exists() && sSnap.data()?.status === 'open') {
-        const sData = sSnap.data();
-        const sessUpdates: Record<string, any> = {
-          totalSales: Math.round(((sData.totalSales || 0) + (item.total || finalAmount)) * 100) / 100,
-          transactionCount: (sData.transactionCount || 0) + 1,
-          updatedAt: serverTimestamp(),
-        };
+      tx.set(saleDocRef, {
+        id: saleId,
+        saleNumber: parseInt(Date.now().toString().slice(-6), 10),
+        correlative: `RES-${item.id.slice(-6).toUpperCase()}`,
+        documentType: 'nota_venta',
+        accountId: item.accountId,
+        branchId,
+        userId: userProfile.uid,
+        userName: userProfile.displayName || userProfile.email || 'Usuario',
+        date: Date.now(),
+        createdAt: serverTimestamp(),
+        items: item.items.map((it) => ({
+          id: it.productId,
+          productId: it.productId,
+          name: it.productName,
+          price: it.price,
+          quantity: it.quantity,
+          sku: it.sku || '',
+          lineTotal: Math.round(it.price * it.quantity * 100) / 100,
+        })),
+        subtotal: Math.round((totalAmount / 1.18) * 100) / 100,
+        tax: Math.round((totalAmount - totalAmount / 1.18) * 100) / 100,
+        total: Math.round(totalAmount * 100) / 100,
+        paymentMethod: finalMethod,
+        paymentCategory,
+        status: 'completed',
+        isReservationCompletion: true,
+        reservationId: item.id,
+        customerId: item.customer?.id || null,
+        customerName: item.customer?.name || null,
+        customerPhone: item.customer?.phone || null,
+        sessionId: paymentInfo?.sessionId || null,
+      });
 
-        if (isCash) {
-          sessUpdates.totalIncome = Math.round(((sData.totalIncome || 0) + finalAmount) * 100) / 100;
-          sessUpdates.expectedAmount = Math.round(((sData.expectedAmount || 0) + finalAmount) * 100) / 100;
-          sessUpdates.cashSales = Math.round(((sData.cashSales || 0) + finalAmount) * 100) / 100;
-        } else if (finalMethod === 'tarjeta' || finalMethod === 'card') {
-          sessUpdates.cardSales = Math.round(((sData.cardSales || 0) + finalAmount) * 100) / 100;
-        } else {
-          sessUpdates.digitalSales = Math.round(((sData.digitalSales || 0) + finalAmount) * 100) / 100;
+      // 3. Actualizar acumuladores en sesión de caja si se completa con monto pendiente
+      if (finalAmount > 0 && paymentInfo?.sessionId && sessionRef && sSnap) {
+        const isCash = lowerMethod.includes('efectivo') || lowerMethod === 'cash';
+
+        if (sSnap.exists() && sSnap.data()?.status === 'open') {
+          const sData = sSnap.data();
+          const sessUpdates: Record<string, any> = {
+            totalSales: Math.round(((sData.totalSales || 0) + totalAmount) * 100) / 100,
+            transactionCount: (sData.transactionCount || 0) + 1,
+            updatedAt: serverTimestamp(),
+          };
+
+          if (isCash) {
+            sessUpdates.totalIncome = Math.round(((sData.totalIncome || 0) + finalAmount) * 100) / 100;
+            sessUpdates.expectedAmount = Math.round(((sData.expectedAmount || 0) + finalAmount) * 100) / 100;
+            sessUpdates.cashSales = Math.round(((sData.cashSales || 0) + finalAmount) * 100) / 100;
+          } else if (lowerMethod.includes('tarjeta') || lowerMethod === 'card') {
+            sessUpdates.cardSales = Math.round(((sData.cardSales || 0) + finalAmount) * 100) / 100;
+          } else {
+            sessUpdates.digitalSales = Math.round(((sData.digitalSales || 0) + finalAmount) * 100) / 100;
+          }
+
+          tx.update(sessionRef, sessUpdates);
         }
-
-        tx.update(sessionRef, sessUpdates);
       }
     }
 
-    // 4. Actualizar documento de reserva
-    tx.update(docRef, {
+    // 4. Actualizar documento de reserva / orden
+    const reservationUpdates: Record<string, any> = {
       status: newStatus,
       completedOrCancelledBy: userProfile.uid,
       completedOrCancelledAt: serverTimestamp(),
@@ -626,7 +1059,11 @@ export const completeOrCancelReservation = async (
       finalPaymentMethod: action === 'complete' ? finalMethod : null,
       finalPaymentAmount: action === 'complete' ? finalAmount : null,
       updatedAt: serverTimestamp(),
-    });
+    };
+    if (saleId) {
+      reservationUpdates.saleId = saleId;
+    }
+    tx.update(docRef, reservationUpdates);
   });
 };
 
@@ -722,4 +1159,16 @@ export const askVentyAI = async (
 
   // Fallback inteligente en vivo
   return generateLocalAIResponse(prompt, contextSummary);
+};
+
+export default {
+  getCustomers,
+  saveCustomer,
+  registerFiadoPayment,
+  getCustomerFiadoHistory,
+  getReservationsAndOrders,
+  createReservationOrOrder,
+  registerReservationPayment,
+  completeOrCancelReservation,
+  askVentyAI,
 };

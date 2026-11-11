@@ -15,6 +15,7 @@ import {
   KeyboardAvoidingView,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import * as Haptics from 'expo-haptics';
 import {
   Wallet,
   Users,
@@ -89,12 +90,12 @@ import {
 } from '@/services/thermal-printer-service';
 
 import { lookupDocument } from '@/lib/dni-ruc-service';
+import { isValidDNI } from '@/lib/invoicing/types';
 import { usePermissions } from '@/hooks/usePermissions';
-
-// Sub-módulos disponibles
-type OperationsTab = 'cash' | 'crm' | 'orders';
-
 import { PayrollUsersModal } from '@/components/PayrollUsersModal';
+import { ReservationReceiptModal } from '@/components/ReservationReceiptModal';
+
+type OperationsTab = 'cash' | 'crm' | 'orders';
 
 export default function OperationsScreen() {
   const insets = useSafeAreaInsets();
@@ -228,6 +229,26 @@ export default function OperationsScreen() {
   const [orderNotes, setOrderNotes] = useState<string>('');
   const [orderItems, setOrderItems] = useState<ReservationOrderItem[]>([]);
   const [isSavingReservation, setIsSavingReservation] = useState<boolean>(false);
+  const [isSearchingOrderDni, setIsSearchingOrderDni] = useState<boolean>(false);
+  const [createdOrderTicket, setCreatedOrderTicket] = useState<any | null>(null);
+  const [orderTicketModalOpen, setOrderTicketModalOpen] = useState<boolean>(false);
+
+  // DNI auto-lookup cuando alcanza 8 dígitos
+  useEffect(() => {
+    const cleanDoc = orderCustomerDoc.trim().replace(/\D/g, '');
+    if (cleanDoc.length === 8 && isValidDNI(cleanDoc)) {
+      setIsSearchingOrderDni(true);
+      lookupDocument('dni', cleanDoc)
+        .then((res) => {
+          if (res && res.name) {
+            setOrderCustomerName(res.name);
+            Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+          }
+        })
+        .catch(() => {})
+        .finally(() => setIsSearchingOrderDni(false));
+    }
+  }, [orderCustomerDoc]);
 
   // Búsqueda de producto para agregar a la reserva
   const [productCatalog, setProductCatalog] = useState<any[]>([]);
@@ -865,7 +886,7 @@ export default function OperationsScreen() {
     setIsSavingReservation(true);
     try {
       const sessId = activeCashSession?.sessionId || activeCashSession?.id;
-      await createReservationOrOrder({
+      const reservationId = await createReservationOrOrder({
         accountId,
         branchId,
         sessionId: sessId,
@@ -889,6 +910,33 @@ export default function OperationsScreen() {
         },
       });
 
+      const newResObj = {
+        id: reservationId,
+        accountId,
+        branchId,
+        type: orderType,
+        items: orderItems.map((it) => ({
+          productId: it.productId,
+          productName: it.productName,
+          quantity: it.quantity,
+          price: it.price,
+        })),
+        total: reservationOrderTotal,
+        depositAmount: depositVal,
+        remainingAmount: Math.max(0, reservationOrderTotal - depositVal),
+        depositPaymentMethod: depositVal > 0 ? orderPaymentMethod : undefined,
+        status: 'pending',
+        customer: {
+          name: orderCustomerName.trim(),
+          phone: orderCustomerPhone.trim() || undefined,
+          documentNumber: orderCustomerDoc.trim() || undefined,
+        },
+        pickupDate: orderPickupDate.trim() || undefined,
+        notes: orderNotes.trim() || undefined,
+        createdAt: Date.now(),
+      };
+
+      setCreatedOrderTicket(newResObj);
       setNewReservationModalVisible(false);
       setOrderCustomerName('');
       setOrderCustomerPhone('');
@@ -899,11 +947,7 @@ export default function OperationsScreen() {
       setOrderItems([]);
       loadReservationsData();
       refreshCashStatus();
-
-      Alert.alert(
-        'Reserva Creada',
-        `Se creó el ${orderType === 'order' ? 'pedido' : 'reserva'} con retención de stock reservado en inventario.`
-      );
+      setOrderTicketModalOpen(true);
     } catch (err: any) {
       Alert.alert('Error', err?.message || 'No se pudo guardar la reserva.');
     } finally {
@@ -915,27 +959,52 @@ export default function OperationsScreen() {
     item: ReservationOrder,
     action: 'complete' | 'cancel'
   ) => {
+    const remaining = Number(item.remainingAmount || 0);
     Alert.alert(
       action === 'complete' ? '¿Marcar como Entregado?' : '¿Cancelar Reserva?',
       action === 'complete'
-        ? 'El pedido pasará a estado completado y se liberará el stock reservado.'
+        ? (remaining > 0
+            ? `La reserva tiene un saldo pendiente de ${formatPEN(remaining)}. ¿Deseas cobrarlo y registrar la entrega?`
+            : 'El pedido pasará a estado completado y se liberará el stock reservado.')
         : 'La reserva será anulada y el stock retenido volverá al inventario disponible.',
       [
         { text: 'Volver', style: 'cancel' },
         {
-          text: action === 'complete' ? 'Sí, Entregar' : 'Sí, Cancelar',
+          text: action === 'complete' ? (remaining > 0 ? 'Sí, Cobrar y Entregar' : 'Sí, Entregar') : 'Sí, Cancelar',
           style: action === 'cancel' ? 'destructive' : 'default',
           onPress: async () => {
             if (!user) return;
             try {
-              await completeOrCancelReservation(item, action, {
-                uid: user.uid,
-                displayName: userProfile?.displayName || user.email || 'Operador',
-                email: user.email,
-                role,
-              });
+              const sessId = activeCashSession?.sessionId || activeCashSession?.id;
+              await completeOrCancelReservation(
+                item,
+                action,
+                {
+                  uid: user.uid,
+                  displayName: userProfile?.displayName || user.email || 'Operador',
+                  email: user.email,
+                  role,
+                },
+                action === 'complete' && remaining > 0
+                  ? {
+                      paymentMethod: 'efectivo',
+                      amount: remaining,
+                      sessionId: sessId,
+                    }
+                  : undefined
+              );
               loadReservationsData();
-              Alert.alert('Éxito', action === 'complete' ? 'Pedido entregado con éxito.' : 'Reserva cancelada.');
+              refreshCashStatus();
+              if (action === 'complete') {
+                setCreatedOrderTicket({
+                  ...item,
+                  status: 'completed',
+                  depositAmount: item.total,
+                  remainingAmount: 0,
+                });
+                setOrderTicketModalOpen(true);
+              }
+              Alert.alert('Éxito', action === 'complete' ? 'Pedido entregado y comprobante listo.' : 'Reserva cancelada.');
             } catch (err: any) {
               Alert.alert('Error', err?.message || 'No se pudo actualizar el estado.');
             }
@@ -1964,30 +2033,54 @@ export default function OperationsScreen() {
                         </View>
                       </View>
 
-                      {/* Acciones de Entrega o Cancelación */}
-                      {isPending && (
-                        <View style={styles.resActionRow}>
-                          <TouchableOpacity
-                            style={[styles.resActionButton, { borderColor: ui.danger }]}
-                            onPress={() => handleCompleteOrCancelOrder(item, 'cancel')}
-                          >
-                            <XCircle size={16} color={ui.danger} />
-                            <Text style={[styles.resActionText, { color: ui.danger }]}>
-                              Cancelar Reserva
-                            </Text>
-                          </TouchableOpacity>
+                      {/* Acciones de Entrega, Cobro o Comprobante */}
+                      <View style={[styles.resActionRow, { marginTop: 12, flexWrap: 'wrap', gap: 8 }]}>
+                        <TouchableOpacity
+                          style={[
+                            styles.resActionButton,
+                            { borderColor: ui.border, backgroundColor: ui.surface, flex: 1, minWidth: 100 },
+                          ]}
+                          onPress={() => {
+                            setCreatedOrderTicket(item);
+                            setOrderTicketModalOpen(true);
+                          }}
+                          activeOpacity={0.7}
+                        >
+                          <FileText size={15} color={ui.primary} />
+                          <Text style={[styles.resActionText, { color: ui.primary, fontWeight: '700' }]}>
+                            Ver Ticket
+                          </Text>
+                        </TouchableOpacity>
 
+                        {isPending && (
                           <TouchableOpacity
-                            style={[styles.resActionButton, { backgroundColor: ui.primary, borderColor: ui.primary }]}
-                            onPress={() => handleCompleteOrCancelOrder(item, 'complete')}
+                            style={[styles.resActionButton, { borderColor: ui.danger, flex: 1, minWidth: 90 }]}
+                            onPress={() => handleCompleteOrCancelOrder(item, 'cancel')}
+                            activeOpacity={0.7}
                           >
-                            <CheckCircle2 size={16} color={ui.onPrimary} />
-                            <Text style={[styles.resActionText, { color: ui.onPrimary, fontWeight: 'bold' }]}>
-                              Marcar Entregado
+                            <XCircle size={15} color={ui.danger} />
+                            <Text style={[styles.resActionText, { color: ui.danger }]}>
+                              Cancelar
                             </Text>
                           </TouchableOpacity>
-                        </View>
-                      )}
+                        )}
+
+                        {isPending && (
+                          <TouchableOpacity
+                            style={[
+                              styles.resActionButton,
+                              { backgroundColor: ui.primary, borderColor: ui.primary, flex: 1.2, minWidth: 110 },
+                            ]}
+                            onPress={() => handleCompleteOrCancelOrder(item, 'complete')}
+                            activeOpacity={0.7}
+                          >
+                            <CheckCircle2 size={15} color={ui.onPrimary} />
+                            <Text style={[styles.resActionText, { color: ui.onPrimary, fontWeight: 'bold' }]}>
+                              {item.remainingAmount && item.remainingAmount > 0 ? 'Cobrar y Entregar' : 'Entregar'}
+                            </Text>
+                          </TouchableOpacity>
+                        )}
+                      </View>
                     </View>
                   );
                 })}
@@ -2511,6 +2604,41 @@ export default function OperationsScreen() {
               </View>
 
               {/* Datos del Cliente */}
+              <View style={{ flexDirection: 'row', gap: 10 }}>
+                <View style={[styles.inputGroup, { flex: 1 }]}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <Text style={styles.label}>DNI / Doc (opcional)</Text>
+                    {isSearchingOrderDni && (
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 2 }}>
+                        <ActivityIndicator size="small" color={ui.primary} style={{ transform: [{ scale: 0.7 }] }} />
+                        <Text style={{ fontSize: 10, color: ui.primary }}>RENIEC...</Text>
+                      </View>
+                    )}
+                  </View>
+                  <TextInput
+                    style={styles.input}
+                    placeholder="8 dígitos"
+                    placeholderTextColor={ui.textMuted}
+                    keyboardType="numeric"
+                    maxLength={8}
+                    value={orderCustomerDoc}
+                    onChangeText={setOrderCustomerDoc}
+                  />
+                </View>
+
+                <View style={[styles.inputGroup, { flex: 1 }]}>
+                  <Text style={styles.label}>Teléfono</Text>
+                  <TextInput
+                    style={styles.input}
+                    placeholder="987654321"
+                    placeholderTextColor={ui.textMuted}
+                    keyboardType="phone-pad"
+                    value={orderCustomerPhone}
+                    onChangeText={setOrderCustomerPhone}
+                  />
+                </View>
+              </View>
+
               <View style={styles.inputGroup}>
                 <Text style={styles.label}>Nombre del Cliente</Text>
                 <TextInput
@@ -2519,18 +2647,6 @@ export default function OperationsScreen() {
                   placeholderTextColor={ui.textMuted}
                   value={orderCustomerName}
                   onChangeText={setOrderCustomerName}
-                />
-              </View>
-
-              <View style={styles.inputGroup}>
-                <Text style={styles.label}>Teléfono de Contacto</Text>
-                <TextInput
-                  style={styles.input}
-                  placeholder="987654321"
-                  placeholderTextColor={ui.textMuted}
-                  keyboardType="phone-pad"
-                  value={orderCustomerPhone}
-                  onChangeText={setOrderCustomerPhone}
                 />
               </View>
 
@@ -2652,6 +2768,13 @@ export default function OperationsScreen() {
       <PayrollUsersModal
         visible={payrollModalOpen}
         onClose={() => setPayrollModalOpen(false)}
+      />
+
+      <ReservationReceiptModal
+        visible={orderTicketModalOpen}
+        onClose={() => setOrderTicketModalOpen(false)}
+        reservation={createdOrderTicket}
+        business={businessSettings}
       />
     </View>
   );

@@ -65,6 +65,9 @@ import { CompanionScannerModal } from '@/components/CompanionScannerModal';
 import { QuotesManagerModal } from '@/components/QuotesManagerModal';
 import { InlineFilterBar } from '@/components/InlineFilterBar';
 import { createReservationOrOrder } from '@/services/crm-operations-service';
+import { lookupDocument } from '@/lib/dni-ruc-service';
+import { isValidDNI } from '@/lib/invoicing/types';
+import { ReservationReceiptModal } from '@/components/ReservationReceiptModal';
 import {
   catalogBrand,
   catalogSizes,
@@ -89,7 +92,7 @@ const normalizeStr = (str: string = '') =>
 export default function PosCounterScreen() {
   const insets = useSafeAreaInsets();
   const { branchId, accountId, user, userProfile } = useAuth();
-  const { posSettings, activeCashSession } = useSettings();
+  const { posSettings, activeCashSession, businessSettings } = useSettings();
   const { canModifyPrice } = usePermissions();
   const { products, categories, loading: productsLoading, findByBarcode, getProductStock } = useProducts();
   const {
@@ -137,6 +140,26 @@ export default function PosCounterScreen() {
   const [resDays, setResDays] = useState('7');
   const [resNotes, setResNotes] = useState('');
   const [isSavingRes, setIsSavingRes] = useState(false);
+  const [isSearchingDni, setIsSearchingDni] = useState(false);
+  const [createdResTicket, setCreatedResTicket] = useState<any | null>(null);
+  const [resTicketModalOpen, setResTicketModalOpen] = useState(false);
+
+  // Detección automática de DNI al ingresar 8 dígitos
+  React.useEffect(() => {
+    const cleanDni = resCustomerDoc.trim().replace(/\D/g, '');
+    if (cleanDni.length === 8 && isValidDNI(cleanDni)) {
+      setIsSearchingDni(true);
+      lookupDocument('dni', cleanDni)
+        .then((res) => {
+          if (res && res.name) {
+            setResCustomerName(res.name);
+            Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+          }
+        })
+        .catch(() => {})
+        .finally(() => setIsSearchingDni(false));
+    }
+  }, [resCustomerDoc]);
 
   // 2. Modales Especiales
   const [checkoutModalOpen, setCheckoutModalOpen] = useState(false);
@@ -370,7 +393,7 @@ export default function PosCounterScreen() {
       const pad = (n: number) => String(n).padStart(2, '0');
       const pickupDateStr = `${pickupDate.getFullYear()}-${pad(pickupDate.getMonth() + 1)}-${pad(pickupDate.getDate())}`;
 
-      await createReservationOrOrder({
+      const reservationId = await createReservationOrOrder({
         accountId: accountId || 'default',
         branchId: branchId || 'main',
         sessionId: activeCashSession?.sessionId || (activeCashSession as any)?.id,
@@ -401,10 +424,34 @@ export default function PosCounterScreen() {
       });
 
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-      Alert.alert(
-        '¡Reserva Creada!',
-        `Se reservaron los productos exitosamente para ${resCustomerName.trim()}. Vence en ${days} días.`
-      );
+
+      const newResObj = {
+        id: reservationId,
+        accountId: accountId || 'default',
+        branchId: branchId || 'main',
+        type: 'reservation',
+        items: items.map((it) => ({
+          productId: it.id,
+          productName: it.name,
+          quantity: it.quantity,
+          price: it.price,
+        })),
+        total: safeTotal,
+        depositAmount: depositNum,
+        remainingAmount: Math.max(0, safeTotal - depositNum),
+        depositPaymentMethod: depositNum > 0 ? resDepositMethod : undefined,
+        status: 'pending',
+        customer: {
+          name: resCustomerName.trim(),
+          phone: resCustomerPhone.trim() || undefined,
+          documentNumber: resCustomerDoc.trim() || undefined,
+        },
+        pickupDate: pickupDateStr,
+        notes: resNotes.trim() || undefined,
+        createdAt: Date.now(),
+      };
+
+      setCreatedResTicket(newResObj);
       setReservationModalOpen(false);
       setCartDrawerOpen(false);
       clearCart();
@@ -413,6 +460,7 @@ export default function PosCounterScreen() {
       setResCustomerDoc('');
       setResDepositStr('');
       setResNotes('');
+      setResTicketModalOpen(true);
     } catch (err: any) {
       Alert.alert('Error al Reservar', err?.message || 'No se pudo crear la reserva.');
     } finally {
@@ -1101,7 +1149,15 @@ export default function PosCounterScreen() {
                   />
                 </View>
                 <View style={{ flex: 1 }}>
-                  <Text style={styles.inputLabel}>DNI (opcional)</Text>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <Text style={styles.inputLabel}>DNI (opcional)</Text>
+                    {isSearchingDni && (
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 2 }}>
+                        <ActivityIndicator size="small" color={ui.primary} style={{ transform: [{ scale: 0.7 }] }} />
+                        <Text style={{ fontSize: 10, color: ui.primary }}>RENIEC...</Text>
+                      </View>
+                    )}
+                  </View>
                   <TextInput
                     style={styles.formInput}
                     value={resCustomerDoc}
@@ -1382,6 +1438,16 @@ export default function PosCounterScreen() {
       <QuotesManagerModal
         visible={quotesModalOpen}
         onClose={() => setQuotesModalOpen(false)}
+      />
+
+      <ReservationReceiptModal
+        visible={resTicketModalOpen}
+        onClose={() => {
+          setResTicketModalOpen(false);
+          setCreatedResTicket(null);
+        }}
+        reservation={createdResTicket}
+        business={businessSettings}
       />
     </View>
   );

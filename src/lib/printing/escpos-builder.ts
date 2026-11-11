@@ -652,3 +652,185 @@ export function buildReceiptHtml(
 </html>
   `.trim();
 }
+
+/**
+ * Genera el HTML de impresión para un Comprobante de Reserva térmica (80mm/58mm).
+ * Coincide exactamente con el comprobante de reserva de la versión web de Ventify.
+ */
+export function buildReservationReceiptHtml(
+  reservation: any,
+  business: Partial<BusinessSettings & Branch> = {}
+): string {
+  const isDelivered = reservation.status === 'completed' || reservation.status === 'delivered';
+  const isCancelled = reservation.status === 'cancelled';
+  const total = Number(reservation.total || 0);
+  const deposit = Number(reservation.depositAmount || 0);
+  const remaining = Math.max(0, total - deposit);
+  const resNumber = reservation.reservationNumber
+    ? String(reservation.reservationNumber).padStart(6, '0')
+    : String(reservation.id || 'N/A').slice(-6).toUpperCase();
+  const businessName = business.businessName || business.name || 'VENTIFY POS';
+  const businessRuc = business.ruc || '20123456789';
+  const businessAddress = business.address || business.commercialAddress || '';
+  const businessPhone = business.phone || '';
+  const customerName = reservation.customer?.name || reservation.customerName || 'Cliente General';
+  const customerDoc = reservation.customer?.documentNumber || reservation.customer?.dni || reservation.customerDni || '';
+  const customerPhone = reservation.customer?.phone || reservation.customerPhone || '';
+
+  const createdDate = reservation.createdAt
+    ? (typeof reservation.createdAt?.toDate === 'function' ? reservation.createdAt.toDate() : new Date(reservation.createdAt))
+    : (reservation.date ? new Date(reservation.date) : new Date());
+
+  const formattedDate = formatDatePE(createdDate);
+  const formattedTime = createdDate.toLocaleTimeString('es-PE', { hour: '2-digit', minute: '2-digit' });
+  const expiryDate = reservation.expiryDate
+    ? (typeof reservation.expiryDate?.toDate === 'function' ? reservation.expiryDate.toDate() : new Date(reservation.expiryDate))
+    : (reservation.pickupDate ? new Date(reservation.pickupDate) : null);
+
+  const itemsRows = (reservation.items || [])
+    .map((item: any) => {
+      const qty = Number(item.quantity) || 1;
+      const price = Number(item.price || item.unitPrice || 0);
+      const lineTotal = Number(item.total || (qty * price));
+      const name = item.productName || item.name || 'Producto';
+      return `
+        <tr>
+          <td style="text-align: left; padding: 4px 0;">
+            <div style="font-weight: bold;">${name}</div>
+            <div style="font-size: 11px; color: #555;">${qty} x S/ ${price.toFixed(2)}</div>
+          </td>
+          <td style="text-align: right; vertical-align: top; padding: 4px 0; font-weight: bold;">
+            S/ ${lineTotal.toFixed(2)}
+          </td>
+        </tr>
+      `;
+    })
+    .join('');
+
+  return `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Reserva #${resNumber}</title>
+  <style>
+    @page {
+      size: 80mm auto;
+      margin: 0;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+      font-size: 13px;
+      line-height: 1.35;
+      color: #000;
+      background: #fff;
+      margin: 0;
+      padding: 16px 12px;
+      max-width: 300px;
+      margin: 0 auto;
+    }
+    .center { text-align: center; }
+    .bold { font-weight: bold; }
+    .divider { border-top: 1px dashed #000; margin: 8px 0; }
+    .divider-double { border-top: 2px solid #000; margin: 8px 0; }
+    .row { display: flex; justify-content: space-between; margin: 3px 0; }
+    .table-items { width: 100%; border-collapse: collapse; margin: 8px 0; }
+    .title { font-size: 16px; font-weight: 800; letter-spacing: 0.5px; }
+    .badge-status {
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-weight: bold;
+      font-size: 12px;
+      margin-top: 4px;
+    }
+  </style>
+</head>
+<body>
+  <div class="center">
+    <div class="title">${businessName}</div>
+    ${businessAddress ? `<div style="font-size: 11px; color: #444;">${businessAddress}</div>` : ''}
+    <div style="font-size: 11px; color: #444;">RUC: ${businessRuc}</div>
+    ${businessPhone ? `<div style="font-size: 11px; color: #444;">Tel: ${businessPhone}</div>` : ''}
+    <div class="divider"></div>
+    <div class="bold" style="font-size: 14px; color: #1e40af;">COMPROBANTE DE RESERVA</div>
+    <div class="bold" style="font-size: 15px; margin-top: 2px;">#${resNumber}</div>
+    <div>
+      <span class="badge-status" style="background: ${isDelivered ? '#dcfce7; color: #15803d;' : isCancelled ? '#fee2e2; color: #b91c1c;' : '#fef3c7; color: #b45309;'}">
+        ${isDelivered ? 'ENTREGADO / COMPLETADO' : isCancelled ? 'CANCELADO' : 'PENDIENTE'}
+      </span>
+    </div>
+  </div>
+
+  <div class="divider"></div>
+  <div class="row"><span>Fecha:</span><span>${formattedDate} ${formattedTime}</span></div>
+  ${expiryDate ? `<div class="row"><span>Válida hasta:</span><span class="bold" style="color: #b91c1c;">${formatDatePE(expiryDate)}</span></div>` : ''}
+  ${reservation.reservationDays ? `<div class="row"><span>Vigencia:</span><span>${reservation.reservationDays} días</span></div>` : ''}
+
+  <div class="divider"></div>
+  <div style="margin: 4px 0;">
+    <div class="bold">CLIENTE:</div>
+    <div>${customerName.toUpperCase()}</div>
+    ${customerDoc ? `<div>DOC / DNI: ${customerDoc}</div>` : ''}
+    ${customerPhone ? `<div>Teléfono: ${customerPhone}</div>` : ''}
+  </div>
+
+  <div class="divider"></div>
+  <table class="table-items">
+    <thead>
+      <tr style="border-bottom: 1px dashed #000;">
+        <th style="text-align: left; padding-bottom: 4px;">PRODUCTO</th>
+        <th style="text-align: right; padding-bottom: 4px;">TOTAL</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${itemsRows}
+    </tbody>
+  </table>
+
+  <div class="divider"></div>
+  <div class="row" style="font-size: 15px; font-weight: 800; margin: 4px 0;">
+    <span>TOTAL RESERVA:</span>
+    <span>${formatPEN(total)}</span>
+  </div>
+
+  <div class="divider"></div>
+  <div class="center bold" style="margin-bottom: 4px;">ESTADO FINANCIERO</div>
+  <div class="row" style="color: #15803d; font-weight: 600;">
+    <span>✓ Adelanto / Seña:</span>
+    <span>${formatPEN(deposit)}</span>
+  </div>
+  ${reservation.depositPaymentMethod || reservation.paymentMethod ? `
+    <div class="row" style="font-size: 11px; color: #555;">
+      <span>Método de adelanto:</span>
+      <span>${(reservation.depositPaymentMethod || reservation.paymentMethod || 'Efectivo').toUpperCase()}</span>
+    </div>
+  ` : ''}
+
+  <div class="row" style="font-size: 14px; font-weight: 800; margin-top: 4px; color: ${remaining > 0 ? '#b91c1c' : '#15803d'};">
+    <span>${remaining > 0 ? '⏳ Saldo Pendiente:' : '✓ Saldo Cancelado:'}</span>
+    <span>${formatPEN(remaining)}</span>
+  </div>
+  ${remaining > 0 && !isDelivered ? `
+    <div class="center" style="font-size: 11px; color: #b45309; margin-top: 4px;">
+      (A pagar al momento de recoger los productos)
+    </div>
+  ` : ''}
+
+  ${reservation.notes ? `
+    <div class="divider"></div>
+    <div style="font-size: 11px; color: #444;">
+      <span class="bold">Observaciones:</span> ${reservation.notes}
+    </div>
+  ` : ''}
+
+  <div class="divider-double"></div>
+  <div class="center" style="font-size: 11px;">
+    <div>Conserve este comprobante para recoger sus productos.</div>
+    <div class="bold" style="margin-top: 6px;">¡Gracias por su preferencia!</div>
+  </div>
+</body>
+</html>
+  `.trim();
+}
+

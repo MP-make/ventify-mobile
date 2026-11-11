@@ -516,20 +516,28 @@ export const createReservationOrOrder = async (
   return reservationId;
 };
 
+export interface CompletePaymentParams {
+  paymentMethod: string;
+  amount: number;
+  sessionId?: string;
+}
+
 /**
  * Completa o cancela una reserva/pedido liberando el stock reservado (`reservedStock`)
+ * y descontando el stock físico y registrando el saldo en caja si se completa.
  */
 export const completeOrCancelReservation = async (
   item: ReservationOrder,
   action: 'complete' | 'cancel',
-  userProfile: UserProfileInfo
+  userProfile: UserProfileInfo,
+  paymentInfo?: CompletePaymentParams
 ): Promise<void> => {
   const targetColl = item.type === 'order' ? ORDERS_COLLECTION : RESERVATIONS_COLLECTION;
   const docRef = doc(db, targetColl, item.id);
   const branchId = item.branchId;
 
   await runTransaction(db, async (tx) => {
-    // 1. Liberar stock reservado en cada producto
+    // 1. Liberar stock reservado en cada producto y descontar stock físico si es entrega
     for (const it of item.items) {
       const factor = it.presentationQty || it.conversionFactor || 1;
       const unitsToRelease = Math.round(it.quantity * factor * 10000) / 10000;
@@ -542,19 +550,81 @@ export const completeOrCancelReservation = async (
         const currentReserved = pData.reservedStock?.[branchId] || 0;
         const newReserved = Math.max(0, Math.round((currentReserved - unitsToRelease) * 10000) / 10000);
 
-        tx.update(pRef, {
+        const updates: Record<string, any> = {
           [`reservedStock.${branchId}`]: newReserved,
           updatedAt: serverTimestamp(),
-        });
+        };
+
+        if (action === 'complete') {
+          const currentStock = pData.stock?.[branchId] || 0;
+          const newStock = Math.max(0, Math.round((currentStock - unitsToRelease) * 10000) / 10000);
+          updates[`stock.${branchId}`] = newStock;
+        }
+
+        tx.update(pRef, updates);
       }
     }
 
-    // 2. Actualizar estado
+    // 2. Si se cancela la reserva o se completa
     const newStatus = action === 'complete' ? 'completed' : 'cancelled';
+    const finalAmount = paymentInfo?.amount ?? 0;
+    const finalMethod = paymentInfo?.paymentMethod || 'efectivo';
+
+    // 3. Registrar el ingreso del saldo en caja si se completa con monto pendiente
+    if (action === 'complete' && finalAmount > 0 && paymentInfo?.sessionId) {
+      const sessId = paymentInfo.sessionId;
+      const isCash = finalMethod === 'efectivo' || finalMethod === 'cash';
+
+      if (isCash) {
+        const mvRef = doc(collection(db, CASH_MOVEMENTS_COLLECTION));
+        tx.set(mvRef, {
+          accountId: item.accountId,
+          branchId,
+          sessionId: sessId,
+          type: 'income',
+          category: 'sale',
+          amount: Math.round(finalAmount * 100) / 100,
+          description: `Cobro saldo ${item.type === 'order' ? 'Pedido' : 'Reserva'} #${item.id.slice(-6)}: ${item.customer?.name || 'Cliente'}`,
+          referenceId: item.id,
+          createdBy: userProfile.uid,
+          createdByName: userProfile.displayName || userProfile.email || 'Usuario',
+          createdAt: serverTimestamp(),
+        });
+      }
+
+      const sessionRef = doc(db, CASH_SESSIONS_COLLECTION, sessId);
+      const sSnap = await tx.get(sessionRef);
+      if (sSnap.exists() && sSnap.data()?.status === 'open') {
+        const sData = sSnap.data();
+        const sessUpdates: Record<string, any> = {
+          totalSales: Math.round(((sData.totalSales || 0) + (item.total || finalAmount)) * 100) / 100,
+          transactionCount: (sData.transactionCount || 0) + 1,
+          updatedAt: serverTimestamp(),
+        };
+
+        if (isCash) {
+          sessUpdates.totalIncome = Math.round(((sData.totalIncome || 0) + finalAmount) * 100) / 100;
+          sessUpdates.expectedAmount = Math.round(((sData.expectedAmount || 0) + finalAmount) * 100) / 100;
+          sessUpdates.cashSales = Math.round(((sData.cashSales || 0) + finalAmount) * 100) / 100;
+        } else if (finalMethod === 'tarjeta' || finalMethod === 'card') {
+          sessUpdates.cardSales = Math.round(((sData.cardSales || 0) + finalAmount) * 100) / 100;
+        } else {
+          sessUpdates.digitalSales = Math.round(((sData.digitalSales || 0) + finalAmount) * 100) / 100;
+        }
+
+        tx.update(sessionRef, sessUpdates);
+      }
+    }
+
+    // 4. Actualizar documento de reserva
     tx.update(docRef, {
       status: newStatus,
       completedOrCancelledBy: userProfile.uid,
       completedOrCancelledAt: serverTimestamp(),
+      deliveredAt: action === 'complete' ? serverTimestamp() : null,
+      remainingAmount: action === 'complete' ? 0 : item.remainingAmount,
+      finalPaymentMethod: action === 'complete' ? finalMethod : null,
+      finalPaymentAmount: action === 'complete' ? finalAmount : null,
       updatedAt: serverTimestamp(),
     });
   });

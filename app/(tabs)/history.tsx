@@ -13,6 +13,7 @@ import {
   Platform,
   ActivityIndicator,
   KeyboardAvoidingView,
+  Image,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
@@ -83,6 +84,7 @@ import {
   shareTicketWhatsApp,
 } from '@/services/thermal-printer-service';
 import { FinancialPnlModal } from '@/components/FinancialPnlModal';
+import { ReservationReceiptModal } from '@/components/ReservationReceiptModal';
 
 // Sub-módulos de Historial
 type HistoryTab = 'sales' | 'reservations' | 'ai';
@@ -178,6 +180,17 @@ export default function HistoryScreen() {
   const [reservationSearch, setReservationSearch] = useState<string>('');
   const [reservationStatusFilter, setReservationStatusFilter] = useState<'all' | 'pending' | 'completed' | 'cancelled'>('all');
 
+  // Modal de Comprobante / Ticket de Reserva
+  const [receiptReservation, setReceiptReservation] = useState<any | null>(null);
+  const [receiptModalVisible, setReceiptModalVisible] = useState(false);
+
+  // Modal de Cobro de Saldo Pendiente de Reserva
+  const [paymentModalVisible, setPaymentModalVisible] = useState(false);
+  const [reservationToPay, setReservationToPay] = useState<any | null>(null);
+  const [payMethod, setPayMethod] = useState<'efectivo' | 'yape' | 'plin' | 'tarjeta' | 'transferencia'>('efectivo');
+  const [payCashReceived, setPayCashReceived] = useState<string>('');
+  const [isCompletingPayment, setIsCompletingPayment] = useState(false);
+
   // Filtrado de Reservas por texto y estado
   const filteredReservations = useMemo(() => {
     const q = reservationSearch.trim().toLowerCase();
@@ -206,10 +219,76 @@ export default function HistoryScreen() {
     });
   }, [reservations, reservationSearch, reservationStatusFilter]);
 
+  const handleOpenPayReservation = (res: any) => {
+    setReservationToPay(res);
+    const totalVal = Number(res.total || 0);
+    const depositVal = Number(res.depositAmount || 0);
+    const remaining = Math.max(0, totalVal - depositVal);
+    setPayCashReceived(remaining.toFixed(2));
+    setPayMethod('efectivo');
+    setPaymentModalVisible(true);
+  };
+
+  const handleConfirmCompletePayment = async () => {
+    if (!reservationToPay) return;
+    const totalVal = Number(reservationToPay.total || 0);
+    const depositVal = Number(reservationToPay.depositAmount || 0);
+    const remaining = Math.max(0, totalVal - depositVal);
+
+    setIsCompletingPayment(true);
+    try {
+      const sessId = activeCashSession?.sessionId || activeCashSession?.id;
+      await completeOrCancelReservation(
+        {
+          id: reservationToPay.id,
+          accountId: reservationToPay.accountId || accountId,
+          branchId: reservationToPay.branchId || branchId,
+          type: reservationToPay.type || 'reservation',
+          items: reservationToPay.items || [],
+          total: totalVal,
+          depositAmount: depositVal,
+          remainingAmount: remaining,
+          status: 'pending',
+          customer: reservationToPay.customer || { name: 'Cliente General' },
+          createdBy: reservationToPay.createdBy || user?.uid || 'user',
+          createdAt: reservationToPay.createdAt || Date.now(),
+        },
+        'complete',
+        {
+          uid: user?.uid || 'user',
+          displayName: userProfile?.displayName || user?.email || 'Usuario',
+          email: user?.email || '',
+        },
+        {
+          paymentMethod: payMethod,
+          amount: remaining,
+          sessionId: sessId,
+        }
+      );
+
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      setPaymentModalVisible(false);
+      refreshCashStatus();
+
+      // Abrir comprobante final entregado
+      setReceiptReservation({
+        ...reservationToPay,
+        status: 'completed',
+        depositAmount: totalVal,
+        remainingAmount: 0,
+      });
+      setReceiptModalVisible(true);
+    } catch (err: any) {
+      Alert.alert('Error al Cobrar', err?.message || 'No se pudo completar el cobro y entrega.');
+    } finally {
+      setIsCompletingPayment(false);
+    }
+  };
+
   const handleCompleteReservation = async (res: any) => {
     Alert.alert(
-      'Completar Reserva',
-      `¿Confirmas la entrega de los productos a ${res.customer?.name || 'Cliente General'}? Se descontará el stock reservado y se marcará como entregado.`,
+      'Confirmar Entrega',
+      `¿Confirmas la entrega de los productos a ${res.customer?.name || 'Cliente General'}? Se descontará el inventario físico y se marcará como entregado.`,
       [
         { text: 'Cancelar', style: 'cancel' },
         {
@@ -218,6 +297,7 @@ export default function HistoryScreen() {
             try {
               const totalVal = Number(res.total || 0);
               const depositVal = Number(res.depositAmount || 0);
+              const sessId = activeCashSession?.sessionId || activeCashSession?.id;
               await completeOrCancelReservation(
                 {
                   id: res.id,
@@ -227,7 +307,7 @@ export default function HistoryScreen() {
                   items: res.items || [],
                   total: totalVal,
                   depositAmount: depositVal,
-                  remainingAmount: Math.max(0, totalVal - depositVal),
+                  remainingAmount: 0,
                   status: 'pending',
                   customer: res.customer || { name: 'Cliente General' },
                   createdBy: res.createdBy || user?.uid || 'user',
@@ -238,12 +318,18 @@ export default function HistoryScreen() {
                   uid: user?.uid || 'user',
                   displayName: userProfile?.displayName || user?.email || 'Usuario',
                   email: user?.email || '',
+                },
+                {
+                  paymentMethod: 'efectivo',
+                  amount: 0,
+                  sessionId: sessId,
                 }
               );
               Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-              Alert.alert('Éxito', 'Reserva completada y entregada con éxito.');
+              setReceiptReservation({ ...res, status: 'completed' });
+              setReceiptModalVisible(true);
             } catch (err: any) {
-              Alert.alert('Error', err?.message || 'No se pudo completar la reserva.');
+              Alert.alert('Error', err?.message || 'No se pudo completar la entrega.');
             }
           },
         },
@@ -801,7 +887,11 @@ export default function HistoryScreen() {
           accessibilityLabel="Asistente Venty IA"
           accessibilityState={{ selected: activeTab === 'ai' }}
         >
-          <Bot size={17} color={activeTab === 'ai' ? ui.primary : ui.textSecondary} />
+          <Image
+            source={require('../../assets/venty-icon.webp')}
+            style={{ width: 18, height: 18 }}
+            resizeMode="contain"
+          />
           <Text style={[styles.tabButtonText, activeTab === 'ai' && styles.tabButtonTextActive]}>
             Asistente IA
           </Text>
@@ -1266,9 +1356,49 @@ export default function HistoryScreen() {
                       </View>
                     ) : null}
 
-                    {/* Botones de acción para reservas pendientes */}
-                    {isPending && (
-                      <View style={styles.resActionsRow}>
+                    {/* Botones de acción para reservas */}
+                    <View style={styles.resActionsRow}>
+                      <TouchableOpacity
+                        style={styles.resViewTicketBtn}
+                        onPress={() => {
+                          setReceiptReservation(res);
+                          setReceiptModalVisible(true);
+                        }}
+                        activeOpacity={0.7}
+                        accessibilityRole="button"
+                        accessibilityLabel="Ver comprobante o ticket de reserva"
+                      >
+                        <FileText size={14} color={ui.primary} />
+                        <Text style={styles.resViewTicketBtnText}>Ver Ticket</Text>
+                      </TouchableOpacity>
+
+                      {isPending && remaining > 0 && (
+                        <TouchableOpacity
+                          style={styles.resCompleteBtn}
+                          onPress={() => handleOpenPayReservation(res)}
+                          activeOpacity={0.7}
+                          accessibilityRole="button"
+                          accessibilityLabel="Cobrar saldo y entregar productos"
+                        >
+                          <CreditCard size={14} color={ui.onPrimary} />
+                          <Text style={styles.resCompleteBtnText}>Cobrar y Entregar</Text>
+                        </TouchableOpacity>
+                      )}
+
+                      {isPending && remaining === 0 && (
+                        <TouchableOpacity
+                          style={styles.resCompleteBtn}
+                          onPress={() => handleCompleteReservation(res)}
+                          activeOpacity={0.7}
+                          accessibilityRole="button"
+                          accessibilityLabel="Entregar productos"
+                        >
+                          <CheckCircle2 size={14} color={ui.onPrimary} />
+                          <Text style={styles.resCompleteBtnText}>Entregar</Text>
+                        </TouchableOpacity>
+                      )}
+
+                      {isPending && (
                         <TouchableOpacity
                           style={styles.resCancelBtn}
                           onPress={() => handleCancelReservation(res)}
@@ -1279,19 +1409,8 @@ export default function HistoryScreen() {
                           <X size={14} color={ui.danger} />
                           <Text style={styles.resCancelBtnText}>Cancelar</Text>
                         </TouchableOpacity>
-
-                        <TouchableOpacity
-                          style={styles.resCompleteBtn}
-                          onPress={() => handleCompleteReservation(res)}
-                          activeOpacity={0.7}
-                          accessibilityRole="button"
-                          accessibilityLabel="Completar entrega de reserva"
-                        >
-                          <CheckCircle2 size={14} color={ui.onPrimary} />
-                          <Text style={styles.resCompleteBtnText}>Entregar / Completar</Text>
-                        </TouchableOpacity>
-                      </View>
-                    )}
+                      )}
+                    </View>
                   </View>
                 );
               })}
@@ -1328,7 +1447,11 @@ export default function HistoryScreen() {
                 >
                   {isAi && (
                     <View style={styles.aiAvatar}>
-                      <Bot size={16} color={ui.onPrimary} />
+                      <Image
+                        source={require('../../assets/venty-icon.webp')}
+                        style={{ width: 28, height: 28 }}
+                        resizeMode="contain"
+                      />
                     </View>
                   )}
                   <View
@@ -1352,6 +1475,11 @@ export default function HistoryScreen() {
 
             {isAiLoading && (
               <View style={styles.aiTypingBox}>
+                <Image
+                  source={require('../../assets/venty-icon.webp')}
+                  style={{ width: 18, height: 18, marginRight: 6 }}
+                  resizeMode="contain"
+                />
                 <ActivityIndicator size="small" color={ui.primary} />
                 <Text style={styles.aiTypingText}>Venty IA está analizando los datos...</Text>
               </View>
@@ -1757,6 +1885,131 @@ export default function HistoryScreen() {
                 <Text style={styles.applyDateBtnText}>Aplicar Filtro</Text>
               </TouchableOpacity>
             </View>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
+      {/* Modal de Comprobante / Ticket de Reserva */}
+      <ReservationReceiptModal
+        visible={receiptModalVisible}
+        onClose={() => {
+          setReceiptModalVisible(false);
+          setReceiptReservation(null);
+        }}
+        reservation={receiptReservation}
+        business={{ ...businessSettings, ...activeBranch }}
+      />
+
+      {/* Modal para Cobrar Saldo Pendiente de Reserva */}
+      <Modal visible={paymentModalVisible} transparent animationType="fade">
+        <KeyboardAvoidingView
+          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+          style={styles.modalOverlay}
+        >
+          <View style={styles.modalContent}>
+            <View style={styles.modalHeader}>
+              <View>
+                <Text style={styles.modalTitle}>Cobrar Saldo y Entregar</Text>
+                <Text style={styles.modalSub}>
+                  {reservationToPay?.customer?.name || 'Cliente General'} · #{String(reservationToPay?.id || '').slice(-6).toUpperCase()}
+                </Text>
+              </View>
+              <TouchableOpacity
+                onPress={() => setPaymentModalVisible(false)}
+                style={styles.iconButton}
+                accessibilityRole="button"
+                accessibilityLabel="Cerrar cobro de reserva"
+              >
+                <X size={20} color={ui.textSecondary} />
+              </TouchableOpacity>
+            </View>
+
+            {reservationToPay && (
+              <View style={{ marginVertical: 12 }}>
+                <View style={{ backgroundColor: '#F8FAFC', borderRadius: 8, padding: 12, marginBottom: 14 }}>
+                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 4 }}>
+                    <Text style={{ fontSize: 13, color: '#64748B' }}>Total de la Reserva:</Text>
+                    <Text style={{ fontSize: 13, fontWeight: '700', color: '#0F172A' }}>{formatPEN(reservationToPay.total)}</Text>
+                  </View>
+                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 4 }}>
+                    <Text style={{ fontSize: 13, color: '#15803D' }}>Adelanto / Seña pagada:</Text>
+                    <Text style={{ fontSize: 13, fontWeight: '700', color: '#15803D' }}>- {formatPEN(reservationToPay.depositAmount || 0)}</Text>
+                  </View>
+                  <View style={{ height: 1, backgroundColor: '#E2E8F0', marginVertical: 6 }} />
+                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <Text style={{ fontSize: 15, fontWeight: '800', color: ui.danger }}>SALDO A COBRAR:</Text>
+                    <Text style={{ fontSize: 18, fontWeight: '800', color: ui.danger }}>
+                      {formatPEN(Math.max(0, Number(reservationToPay.total || 0) - Number(reservationToPay.depositAmount || 0)))}
+                    </Text>
+                  </View>
+                </View>
+
+                {/* Métodos de Pago */}
+                <Text style={styles.label}>Método de Pago para el Saldo</Text>
+                <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginVertical: 8 }}>
+                  {(['efectivo', 'yape', 'plin', 'tarjeta', 'transferencia'] as const).map((m) => (
+                    <TouchableOpacity
+                      key={m}
+                      style={[
+                        {
+                          paddingHorizontal: 12,
+                          paddingVertical: 8,
+                          borderRadius: 8,
+                          borderWidth: 1,
+                          borderColor: payMethod === m ? ui.primary : ui.border,
+                          backgroundColor: payMethod === m ? ui.primarySoft : ui.surface,
+                        },
+                      ]}
+                      onPress={() => setPayMethod(m)}
+                    >
+                      <Text
+                        style={{
+                          fontSize: 12.5,
+                          fontWeight: '700',
+                          color: payMethod === m ? ui.primary : ui.textSecondary,
+                          textTransform: 'capitalize',
+                        }}
+                      >
+                        {m}
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+
+                {/* Si es efectivo, cálculo de vuelto */}
+                {payMethod === 'efectivo' && (
+                  <View style={styles.inputGroup}>
+                    <Text style={styles.label}>Monto Recibido en Efectivo (S/)</Text>
+                    <TextInput
+                      style={styles.input}
+                      value={payCashReceived}
+                      onChangeText={setPayCashReceived}
+                      keyboardType="decimal-pad"
+                      placeholder="0.00"
+                    />
+                    {parseFloat(payCashReceived) > Math.max(0, Number(reservationToPay.total || 0) - Number(reservationToPay.depositAmount || 0)) ? (
+                      <Text style={{ fontSize: 12, fontWeight: '700', color: ui.success, marginTop: 4 }}>
+                        Vuelto: {formatPEN(parseFloat(payCashReceived) - Math.max(0, Number(reservationToPay.total || 0) - Number(reservationToPay.depositAmount || 0)))}
+                      </Text>
+                    ) : null}
+                  </View>
+                )}
+
+                <TouchableOpacity
+                  style={[styles.applyDateBtn, { marginTop: 14 }]}
+                  onPress={handleConfirmCompletePayment}
+                  disabled={isCompletingPayment}
+                >
+                  {isCompletingPayment ? (
+                    <ActivityIndicator size="small" color={ui.onPrimary} />
+                  ) : (
+                    <>
+                      <CheckCircle2 size={16} color={ui.onPrimary} />
+                      <Text style={styles.applyDateBtnText}>Confirmar Cobro y Entregar</Text>
+                    </>
+                  )}
+                </TouchableOpacity>
+              </View>
+            )}
           </View>
         </KeyboardAvoidingView>
       </Modal>
@@ -2192,13 +2445,14 @@ const styles = StyleSheet.create({
     justifyContent: 'flex-end',
   },
   aiAvatar: {
-    width: 28,
-    height: 28,
-    borderRadius: 14,
-    backgroundColor: ui.primary,
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: '#EEF2FF',
     alignItems: 'center',
     justifyContent: 'center',
     marginRight: 8,
+    overflow: 'hidden',
   },
   chatBubble: {
     maxWidth: '82%',
@@ -2572,11 +2826,30 @@ const styles = StyleSheet.create({
   resActionsRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 10,
+    gap: 8,
     marginTop: 6,
     paddingTop: 8,
     borderTopWidth: 1,
     borderTopColor: ui.border,
+  },
+  resViewTicketBtn: {
+    flex: 1.2,
+    minHeight: 38,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 4,
+    backgroundColor: ui.primarySoft,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: ui.primary,
+    paddingVertical: 6,
+    paddingHorizontal: 8,
+  },
+  resViewTicketBtnText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: ui.primary,
   },
   resCancelBtn: {
     flex: 1,

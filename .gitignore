@@ -18,6 +18,7 @@ android/local.properties
 ios/Pods/
 ios/build/
 *.apk
+!releases/*.apk
 *.aab
 *.ipa
 *.jks

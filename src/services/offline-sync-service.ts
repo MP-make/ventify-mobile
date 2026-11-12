@@ -9,8 +9,8 @@
 
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo, { NetInfoState } from '@react-native-community/netinfo';
-import { db } from '@/lib/firebase';
-import { collection, query, where, limit, getDocs } from 'firebase/firestore';
+import { db, auth } from '@/lib/firebase';
+import { collection, query, where, limit, getDocs, getDoc, doc } from 'firebase/firestore';
 import {
   createSaleTransaction,
   CreateSaleTransactionParams,
@@ -66,6 +66,23 @@ export interface SyncProcessResult {
   retried: number;
   errors: Array<{ offlineId: string; reason: string }>;
 }
+
+export const offlineSaleBelongsToIdentity = (
+  payload: Pick<CreateSaleTransactionParams, 'accountId' | 'userId'>,
+  userId: string,
+  accountId: string,
+): boolean => payload.userId === userId && payload.accountId === accountId;
+
+export const resolveOfflineSyncAccountId = (
+  claimAccountId: unknown,
+  profileAccountId: unknown,
+  ownedAccountId: unknown,
+): string | null => {
+  const claim = typeof claimAccountId === 'string' ? claimAccountId : '';
+  const profile = typeof profileAccountId === 'string' ? profileAccountId : '';
+  const owned = typeof ownedAccountId === 'string' ? ownedAccountId : '';
+  return profile || claim || owned || null;
+};
 
 // ============================================================================
 // HELPERS DE SANITIZACIÓN Y CLASIFICACIÓN DE ERRORES
@@ -341,7 +358,7 @@ class OfflineSyncService {
   /**
    * Procesa la cola de ventas offline pendientes con candado de sincronización y deduplicación
    */
-  public async processOfflineQueue(): Promise<SyncProcessResult> {
+  public async processOfflineQueue(accountIdOverride?: string): Promise<SyncProcessResult> {
     const summary: SyncProcessResult = {
       total: 0,
       processed: 0,
@@ -358,23 +375,50 @@ class OfflineSyncService {
       return summary;
     }
 
-    // 2. Control de concurrencia con Mutex Lock
-    if (this.isProcessingInMemory) {
-      console.log('[OfflineSync] Proceso de sincronización ya en curso en memoria.');
-      return summary;
-    }
-
+    // 2. Control de concurrencia con Mutex Lock exclusivo en memoria
     const lockAcquired = await this.acquireLock();
     if (!lockAcquired) {
-      console.log('[OfflineSync] Candado de sincronización ocupado por otro hilo.');
+      console.log('[OfflineSync] Candado de sincronización ocupado por otro proceso.');
       return summary;
     }
-
-    this.isProcessingInMemory = true;
 
     try {
       const queue = await this.getOfflineQueue();
       summary.total = queue.length;
+
+      const currentUser = auth.currentUser;
+      if (!currentUser) return summary;
+
+      let currentAccountId = accountIdOverride || '';
+      if (!currentAccountId) {
+        let claimAccountId: string | null = null;
+        try {
+          const tokenResult = await currentUser.getIdTokenResult();
+          if (auth.currentUser?.uid !== currentUser.uid) return summary;
+          claimAccountId = typeof tokenResult.claims.accountId === 'string'
+            ? tokenResult.claims.accountId
+            : null;
+        } catch {
+          // Match AuthContext: an unavailable claims read may still resolve from profile/ownership.
+        }
+        const userSnapshot = await getDoc(doc(db, 'users', currentUser.uid));
+        if (auth.currentUser?.uid !== currentUser.uid) return summary;
+        const profileAccountId = userSnapshot.exists() && typeof userSnapshot.data()?.accountId === 'string'
+          ? userSnapshot.data()?.accountId
+          : null;
+        let ownedAccountId: string | null = null;
+        if (!profileAccountId && !claimAccountId) {
+          const ownedAccounts = await getDocs(query(
+            collection(db, 'accounts'),
+            where('ownerId', '==', currentUser.uid),
+            limit(1),
+          ));
+          if (ownedAccounts.docs[0]) ownedAccountId = ownedAccounts.docs[0].id;
+        }
+        if (auth.currentUser?.uid !== currentUser.uid) return summary;
+        currentAccountId = resolveOfflineSyncAccountId(claimAccountId, profileAccountId, ownedAccountId) || '';
+      }
+      if (!currentAccountId) return summary;
 
       if (queue.length === 0) {
         return summary;
@@ -386,6 +430,10 @@ class OfflineSyncService {
       const quarantinedToAdd: QuarantinedOfflineSale[] = [];
 
       for (const item of queue) {
+        if (!offlineSaleBelongsToIdentity(item.salePayload, currentUser.uid, currentAccountId)) {
+          nextQueue.push(item);
+          continue;
+        }
         summary.processed++;
 
         try {
@@ -393,6 +441,8 @@ class OfflineSyncService {
           // Verifica si la venta ya fue registrada previamente en el servidor
           const existingQ = query(
             collection(db, 'sales'),
+            where('accountId', '==', item.salePayload.accountId),
+            where('userId', '==', item.salePayload.userId),
             where('offlineId', '==', item.offlineId),
             limit(1)
           );
@@ -469,7 +519,6 @@ class OfflineSyncService {
       );
       return summary;
     } finally {
-      this.isProcessingInMemory = false;
       await this.releaseLock();
     }
   }
@@ -504,26 +553,15 @@ class OfflineSyncService {
   // ============================================================================
 
   private async acquireLock(): Promise<boolean> {
-    try {
-      const now = Date.now();
-      const rawLock = await AsyncStorage.getItem(OFFLINE_SYNC_LOCK_KEY);
-      if (rawLock) {
-        const lockTime = parseInt(rawLock, 10);
-        if (now - lockTime < SYNC_LOCK_TTL_MS) {
-          return false;
-        }
-      }
-      await AsyncStorage.setItem(OFFLINE_SYNC_LOCK_KEY, now.toString());
-      return true;
-    } catch (_) {
-      return true;
+    if (this.isProcessingInMemory) {
+      return false;
     }
+    this.isProcessingInMemory = true;
+    return true;
   }
 
   private async releaseLock(): Promise<void> {
-    try {
-      await AsyncStorage.removeItem(OFFLINE_SYNC_LOCK_KEY);
-    } catch (_) {}
+    this.isProcessingInMemory = false;
   }
 }
 
@@ -533,8 +571,8 @@ export const offlineSyncService = new OfflineSyncService();
 export const enqueueOfflineSale = (payload: CreateSaleTransactionParams) =>
   offlineSyncService.enqueueOfflineSale(payload);
 
-export const processOfflineQueue = () =>
-  offlineSyncService.processOfflineQueue();
+export const processOfflineQueue = (accountIdOverride?: string) =>
+  offlineSyncService.processOfflineQueue(accountIdOverride);
 
 export const getOfflineQueue = () =>
   offlineSyncService.getOfflineQueue();

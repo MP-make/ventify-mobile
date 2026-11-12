@@ -9,8 +9,8 @@ import {
   KeyboardAvoidingView,
   ScrollView,
   Platform,
-  Image,
 } from 'react-native';
+import { Image } from 'expo-image';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   Mail,
@@ -111,7 +111,7 @@ export default function LoginScreen() {
               <Image
                 source={require('../../assets/brand/ventify-logo.png')}
                 style={styles.logoCircularImage}
-                resizeMode="cover"
+                contentFit="cover"
                 accessibilityIgnoresInvertColors
               />
             </View>

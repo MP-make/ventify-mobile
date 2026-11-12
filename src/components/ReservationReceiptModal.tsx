@@ -25,7 +25,7 @@ interface ReservationReceiptModalProps {
   business?: any;
 }
 
-export const ReservationReceiptModal: React.FC<ReservationReceiptModalProps> = ({
+export const ReservationReceiptModal: React.FC<ReservationReceiptModalProps> = React.memo(({
   visible,
   onClose,
   reservation,
@@ -36,7 +36,7 @@ export const ReservationReceiptModal: React.FC<ReservationReceiptModalProps> = (
   const [isPrinting, setIsPrinting] = useState(false);
   const [isSharing, setIsSharing] = useState(false);
 
-  if (!reservation) return null;
+  if (!visible || !reservation) return null;
 
   const isDelivered = reservation.status === 'completed' || reservation.status === 'delivered';
   const isCancelled = reservation.status === 'cancelled';
@@ -312,7 +312,7 @@ export const ReservationReceiptModal: React.FC<ReservationReceiptModalProps> = (
       </View>
     </Modal>
   );
-};
+});
 
 const styles = StyleSheet.create({
   overlay: {

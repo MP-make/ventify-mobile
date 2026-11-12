@@ -1,4 +1,4 @@
-import React, { useState, useRef, useCallback } from 'react';
+import React, { useState, useRef, useCallback, useEffect } from 'react';
 import {
   Modal,
   View,
@@ -9,6 +9,7 @@ import {
   ActivityIndicator,
   Platform,
   KeyboardAvoidingView,
+  AppState,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
@@ -36,7 +37,39 @@ export interface BarcodeScannerModalProps {
   title?: string;
 }
 
-export const BarcodeScannerModal: React.FC<BarcodeScannerModalProps> = ({
+const BARCODE_SCANNER_CONFIG: any = {
+  barcodeTypes: [
+    'ean13',
+    'ean8',
+    'code128',
+    'code39',
+    'upc_a',
+    'upc_e',
+    'qr',
+  ],
+};
+
+interface FeedbackBannerProps {
+  feedback: string | null;
+}
+
+const FeedbackBanner = React.memo<FeedbackBannerProps>(({ feedback }) => {
+  if (feedback) {
+    return (
+      <View style={styles.feedbackBadge}>
+        <Check size={14} color={ui.primary} />
+        <Text style={styles.feedbackText}>{feedback}</Text>
+      </View>
+    );
+  }
+  return (
+    <Text style={styles.reticleHint}>
+      Centra el código de barras dentro del marco
+    </Text>
+  );
+});
+
+export const BarcodeScannerModal: React.FC<BarcodeScannerModalProps> = React.memo(({
   visible,
   onClose,
   onScan,
@@ -44,6 +77,14 @@ export const BarcodeScannerModal: React.FC<BarcodeScannerModalProps> = ({
 }) => {
   const insets = useSafeAreaInsets();
   const [permission, requestPermission] = useCameraPermissions();
+  const [isAppActive, setIsAppActive] = useState<boolean>(true);
+
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (state) => {
+      setIsAppActive(state === 'active');
+    });
+    return () => sub.remove();
+  }, []);
 
   const [torch, setTorch] = useState<boolean>(false);
   const [continuousMode, setContinuousMode] = useState<boolean>(true);
@@ -152,24 +193,19 @@ export const BarcodeScannerModal: React.FC<BarcodeScannerModalProps> = ({
               <Text style={styles.permissionButtonText}>Conceder Acceso</Text>
             </TouchableOpacity>
           </View>
-        ) : (
+        ) : isAppActive ? (
           <CameraView
             style={StyleSheet.absoluteFillObject}
             facing="back"
             enableTorch={torch}
-            barcodeScannerSettings={{
-              barcodeTypes: [
-                'ean13',
-                'ean8',
-                'code128',
-                'code39',
-                'upc_a',
-                'upc_e',
-                'qr',
-              ],
-            }}
+            barcodeScannerSettings={BARCODE_SCANNER_CONFIG}
             onBarcodeScanned={handleBarcodeScanned}
           />
+        ) : (
+          <View style={styles.centerContainer}>
+            <ActivityIndicator size="large" color={ui.primary} />
+            <Text style={styles.permissionText}>Cámara en pausa</Text>
+          </View>
         )}
 
         {/* Overlay con Recuadro de Enfoque */}
@@ -232,16 +268,7 @@ export const BarcodeScannerModal: React.FC<BarcodeScannerModalProps> = ({
               </View>
 
               {/* Feedback de Escaneo Exitoso */}
-              {lastScannedFeedback ? (
-                <View style={styles.feedbackBadge}>
-                  <Check size={14} color={ui.primary} />
-                  <Text style={styles.feedbackText}>{lastScannedFeedback}</Text>
-                </View>
-              ) : (
-                <Text style={styles.reticleHint}>
-                  Centra el código de barras dentro del marco
-                </Text>
-              )}
+              <FeedbackBanner feedback={lastScannedFeedback} />
             </View>
 
             {/* Barra Inferior de Controles */}
@@ -353,7 +380,7 @@ export const BarcodeScannerModal: React.FC<BarcodeScannerModalProps> = ({
       </View>
     </Modal>
   );
-};
+});
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#000000' },

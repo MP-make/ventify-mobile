@@ -64,7 +64,58 @@ export interface FinancialPnlModalProps {
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
-export const FinancialPnlModal: React.FC<FinancialPnlModalProps> = ({
+interface ProductRankItemRowProps {
+  prod: TopProductMetric;
+  idx: number;
+}
+
+const ProductRankItemRow = React.memo<ProductRankItemRowProps>(({ prod, idx }) => {
+  const rankColor =
+    idx === 0 ? ui.warning : idx === 1 ? ui.textMuted : idx === 2 ? ui.warning : ui.textMuted;
+  const isProdProfitable = prod.profit >= 0;
+
+  return (
+    <View style={styles.productRankItem}>
+      <View style={[styles.rankBadge, { borderColor: rankColor }]}>
+        <Text style={[styles.rankBadgeText, { color: rankColor }]}>
+          #{idx + 1}
+        </Text>
+      </View>
+
+      <View style={styles.productRankInfo}>
+        <Text style={styles.productRankName} numberOfLines={1}>
+          {prod.productName}
+        </Text>
+        <View style={styles.productRankSubRow}>
+          <Text style={styles.productRankQuantity}>
+            {prod.quantitySold} unid. vendidas
+          </Text>
+          <Text style={styles.productRankBullet}>•</Text>
+          <Text style={styles.productRankRevenue}>
+            Venta: {formatPEN(prod.revenue)}
+          </Text>
+        </View>
+      </View>
+
+      <View style={styles.productRankProfitCol}>
+        <Text
+          style={[
+            styles.productRankProfitValue,
+            { color: isProdProfitable ? ui.success : ui.danger },
+          ]}
+        >
+          {isProdProfitable ? '+' : ''}
+          {formatPEN(prod.profit)}
+        </Text>
+        <Text style={styles.productRankMarginText}>
+          Margen: {prod.marginPercent.toFixed(1)}%
+        </Text>
+      </View>
+    </View>
+  );
+});
+
+export const FinancialPnlModal: React.FC<FinancialPnlModalProps> = React.memo(({
   visible,
   onClose,
   initialPeriod = 'today',
@@ -82,8 +133,9 @@ export const FinancialPnlModal: React.FC<FinancialPnlModalProps> = ({
   const [productRankingSort, setProductRankingSort] = useState<'profit' | 'revenue'>('profit');
   const [showExpenseDetails, setShowExpenseDetails] = useState(false);
 
-  // Mapa de productos indexado por ID para lookup instantáneo de costos
+  // Mapa de productos indexado por ID para lookup instantáneo de costos (solo cuando el modal es visible)
   const productsMap = useMemo(() => {
+    if (!visible) return new Map();
     const map = new Map();
     if (Array.isArray(products)) {
       products.forEach((p) => {
@@ -91,7 +143,7 @@ export const FinancialPnlModal: React.FC<FinancialPnlModalProps> = ({
       });
     }
     return map;
-  }, [products]);
+  }, [visible, products]);
 
   // Nombre de empresa y sucursal resueltos
   const businessName =
@@ -161,7 +213,7 @@ export const FinancialPnlModal: React.FC<FinancialPnlModalProps> = ({
 
   // Lista de métodos de pago ordenada para la barra de proporción
   const paymentMethodsBarList = useMemo(() => {
-    if (!report || report.paymentBreakdown.total <= 0) return [];
+    if (!report?.detailsAvailable || !report.paymentBreakdown || report.paymentBreakdown.total <= 0) return [];
     return [
       { key: 'cash', label: 'Efectivo', color: ui.success, ...report.paymentBreakdown.cash },
       { key: 'yape', label: 'Yape', color: ui.accent, ...report.paymentBreakdown.yape },
@@ -173,13 +225,16 @@ export const FinancialPnlModal: React.FC<FinancialPnlModalProps> = ({
     ].filter((m) => m.amount > 0);
   }, [report]);
 
-  // Lista de productos para el ranking según el criterio seleccionado
+  // Lista de productos para el ranking según el criterio seleccionado (truncado a top 50)
   const topProductsList: TopProductMetric[] = useMemo(() => {
     if (!report) return [];
-    return productRankingSort === 'profit'
-      ? report.topProductsByProfit
-      : report.topProductsByRevenue;
+    const list = productRankingSort === 'profit'
+      ? report.topProductsByProfit || []
+      : report.topProductsByRevenue || [];
+    return list.slice(0, 50);
   }, [report, productRankingSort]);
+
+  if (!visible) return null;
 
   return (
     <Modal
@@ -364,7 +419,7 @@ export const FinancialPnlModal: React.FC<FinancialPnlModalProps> = ({
                         {formatPEN(report.netRevenue)}
                       </Text>
                       <Text style={styles.heroMetricColSub}>
-                        {report.transactionCount} transacciones
+                        {report.transactionCount !== undefined ? `${report.transactionCount} transacciones` : 'Total consolidado del servidor'}
                       </Text>
                     </View>
 
@@ -390,7 +445,7 @@ export const FinancialPnlModal: React.FC<FinancialPnlModalProps> = ({
                       <Text style={[styles.heroMetricColValue, { color: ui.warning }]}>
                         {formatPEN(report.operatingExpenses)}
                       </Text>
-                      <Text style={styles.heroMetricColSub}>Caja + Planilla</Text>
+                      <Text style={styles.heroMetricColSub}>Total consolidado del servidor</Text>
                     </View>
                   </View>
                 </View>
@@ -410,7 +465,7 @@ export const FinancialPnlModal: React.FC<FinancialPnlModalProps> = ({
                     <View style={styles.waterfallRow}>
                       <View style={styles.waterfallLabelCol}>
                         <Text style={styles.waterfallSign}>+</Text>
-                        <Text style={styles.waterfallLabel}>Ventas Brutas Totales</Text>
+                          <Text style={styles.waterfallLabel}>Ventas cerradas y fiados emitidos</Text>
                       </View>
                       <Text style={styles.waterfallValue}>{formatPEN(report.grossSales)}</Text>
                     </View>
@@ -476,6 +531,7 @@ export const FinancialPnlModal: React.FC<FinancialPnlModalProps> = ({
                     {/* Línea 6: Gastos Operativos */}
                     <TouchableOpacity
                       onPress={() => {
+                        if (!report.detailsAvailable) return;
                         Haptics.selectionAsync();
                         setShowExpenseDetails(!showExpenseDetails);
                       }}
@@ -486,16 +542,15 @@ export const FinancialPnlModal: React.FC<FinancialPnlModalProps> = ({
                         <Text style={[styles.waterfallSign, { color: ui.danger }]}>-</Text>
                         <View>
                           <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                            <Text style={styles.waterfallLabel}>Gastos Operativos</Text>
-                            {showExpenseDetails ? (
+                            <Text style={styles.waterfallLabel}>Gastos operativos y castigos de fiado</Text>
+                            {report.detailsAvailable && (showExpenseDetails ? (
                               <ChevronUp size={14} color={ui.textMuted} style={{ marginLeft: 4 }} />
                             ) : (
                               <ChevronDown size={14} color={ui.textMuted} style={{ marginLeft: 4 }} />
-                            )}
+                            ))}
                           </View>
                           <Text style={styles.waterfallSubLabel}>
-                            Caja chica: {formatPEN(report.pettyCashExpenses)} • Planilla:{' '}
-                            {formatPEN(report.payrollExpenses)}
+                            {report.detailsAvailable ? `Gastos operativos: ${formatPEN(report.operatingExpenses)}` : 'Gasto total consolidado'}
                           </Text>
                         </View>
                       </View>
@@ -505,18 +560,18 @@ export const FinancialPnlModal: React.FC<FinancialPnlModalProps> = ({
                     </TouchableOpacity>
 
                     {/* Acordeón de desglose de gastos */}
-                    {showExpenseDetails && (
+                    {showExpenseDetails && report.detailsAvailable && (
                       <View style={styles.expenseBreakdownBox}>
                         <Text style={styles.expenseBreakdownBoxTitle}>
-                          Desglose de Gastos Operativos ({report.expenseBreakdown.length}{' '}
+                          Desglose de Gastos Operativos ({report.expenseBreakdown?.length || 0}{' '}
                           categorías):
                         </Text>
-                        {report.expenseBreakdown.length === 0 ? (
+                        {(report.expenseBreakdown?.length || 0) === 0 ? (
                           <Text style={styles.emptyExpenseText}>
                             No se registraron gastos operativos en este período.
                           </Text>
                         ) : (
-                          report.expenseBreakdown.map((exp, idx) => (
+                          (report.expenseBreakdown || []).map((exp, idx) => (
                             <View key={idx} style={styles.expenseDetailRow}>
                               <View style={styles.expenseDetailLeft}>
                                 <Text style={styles.expenseDetailName}>{exp.label}</Text>
@@ -600,6 +655,38 @@ export const FinancialPnlModal: React.FC<FinancialPnlModalProps> = ({
                   </View>
                 </View>
 
+                <View style={styles.sectionCard}>
+                  <View style={styles.sectionHeader}>
+                    <Text style={styles.sectionTitle}>Componentes del período</Text>
+                    <Text style={styles.sectionHeaderHint}>Valores consolidados</Text>
+                  </View>
+                  <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 12 }}>
+                    {[
+                      ['Ventas cerradas', report.salesClosed],
+                      ['Fiados emitidos', report.fiadosIssued],
+                      ['Devoluciones', report.returns],
+                      ['Castigos de fiado', report.badDebt],
+                      ['Gastos de caja', report.cashOperatingExpenses],
+                      ['Comisiones de terminal', report.terminalCommissions],
+                      ['Adelantos a empleados', report.employeeAdvances],
+                    ].map(([label, amount]) => (
+                      <View key={String(label)} style={{ minWidth: '44%', flexGrow: 1, paddingVertical: 4 }}>
+                        <Text style={styles.heroMetricColLabel}>{label}</Text>
+                        <Text style={styles.heroMetricColValue}>{formatPEN(Number(amount))}</Text>
+                      </View>
+                    ))}
+                  </View>
+                  <Text style={styles.heroMetricColSub}>
+                    Los adelantos a empleados se muestran aparte y no se suman a los gastos operativos del P&amp;L.
+                  </Text>
+                  {!report.detailsAvailable && (
+                    <Text style={[styles.heroMetricColSub, { marginTop: 8 }]}>
+                      Este reporte no incluye un desglose por método de pago, categoría de gasto o producto.
+                    </Text>
+                  )}
+                </View>
+
+                {report.detailsAvailable && <>
                 {/* 3. DESGLOSE POR MÉTODO DE PAGO */}
                 <View style={styles.sectionCard}>
                   <View style={styles.sectionHeader}>
@@ -608,7 +695,7 @@ export const FinancialPnlModal: React.FC<FinancialPnlModalProps> = ({
                       <Text style={styles.sectionTitle}>Cobranza por Método de Pago</Text>
                     </View>
                     <Text style={styles.sectionHeaderHint}>
-                      Total: {formatPEN(report.paymentBreakdown.total)}
+                      Total: {formatPEN(report.paymentBreakdown?.total || 0)}
                     </Text>
                   </View>
 
@@ -715,51 +802,13 @@ export const FinancialPnlModal: React.FC<FinancialPnlModalProps> = ({
                     </Text>
                   ) : (
                     <View style={styles.productListContainer}>
-                      {topProductsList.map((prod, idx) => {
-                        const rankColor =
-                          idx === 0 ? ui.warning : idx === 1 ? ui.textMuted : idx === 2 ? ui.warning : ui.textMuted;
-                        const isProdProfitable = prod.profit >= 0;
-
-                        return (
-                          <View key={prod.productId || idx} style={styles.productRankItem}>
-                            <View style={[styles.rankBadge, { borderColor: rankColor }]}>
-                              <Text style={[styles.rankBadgeText, { color: rankColor }]}>
-                                #{idx + 1}
-                              </Text>
-                            </View>
-
-                            <View style={styles.productRankInfo}>
-                              <Text style={styles.productRankName} numberOfLines={1}>
-                                {prod.productName}
-                              </Text>
-                              <View style={styles.productRankSubRow}>
-                                <Text style={styles.productRankQuantity}>
-                                  {prod.quantitySold} unid. vendidas
-                                </Text>
-                                <Text style={styles.productRankBullet}>•</Text>
-                                <Text style={styles.productRankRevenue}>
-                                  Venta: {formatPEN(prod.revenue)}
-                                </Text>
-                              </View>
-                            </View>
-
-                            <View style={styles.productRankProfitCol}>
-                              <Text
-                                style={[
-                                  styles.productRankProfitValue,
-                                  { color: isProdProfitable ? ui.success : ui.danger },
-                                ]}
-                              >
-                                {isProdProfitable ? '+' : ''}
-                                {formatPEN(prod.profit)}
-                              </Text>
-                              <Text style={styles.productRankMarginText}>
-                                Margen: {prod.marginPercent.toFixed(1)}%
-                              </Text>
-                            </View>
-                          </View>
-                        );
-                      })}
+                      {topProductsList.map((prod, idx) => (
+                        <ProductRankItemRow
+                          key={prod.productId || idx}
+                          prod={prod}
+                          idx={idx}
+                        />
+                      ))}
                     </View>
                   )}
                 </View>
@@ -772,17 +821,17 @@ export const FinancialPnlModal: React.FC<FinancialPnlModalProps> = ({
                       <Text style={styles.sectionTitle}>Rendimiento de Vendedores</Text>
                     </View>
                     <Text style={styles.sectionHeaderHint}>
-                      {report.sellerPerformance.length} registrados
+                      {(report.sellerPerformance || []).length} registrados
                     </Text>
                   </View>
 
-                  {report.sellerPerformance.length === 0 ? (
+                  {(report.sellerPerformance || []).length === 0 ? (
                     <Text style={styles.emptyText}>
                       No se encontraron registros de vendedores en este período.
                     </Text>
                   ) : (
                     <View style={styles.sellerListContainer}>
-                      {report.sellerPerformance.map((seller, idx) => (
+                      {(report.sellerPerformance || []).map((seller, idx) => (
                         <View key={seller.sellerId || idx} style={styles.sellerItemCard}>
                           <View style={styles.sellerItemLeft}>
                             <View style={styles.sellerAvatarBadge}>
@@ -814,6 +863,7 @@ export const FinancialPnlModal: React.FC<FinancialPnlModalProps> = ({
                     </View>
                   )}
                 </View>
+                </>}
               </>
             )}
           </ScrollView>
@@ -847,7 +897,7 @@ export const FinancialPnlModal: React.FC<FinancialPnlModalProps> = ({
       </View>
     </Modal>
   );
-};
+});
 
 // ============================================================================
 // ESTILOS NATIVOS DARK THEME

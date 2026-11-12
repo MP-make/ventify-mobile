@@ -1,4 +1,6 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import { normalizePresentation, presentationFactor } from '@/lib/presentation-parity';
+import { catalogAttributeUpdate, catalogSizeInput } from '@/lib/product-attributes';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import {
   View,
   Text,
@@ -12,8 +14,8 @@ import {
   Platform,
   ActivityIndicator,
   useWindowDimensions,
-  Image,
 } from 'react-native';
+import { Image } from 'expo-image';
 import {
   X,
   Camera,
@@ -44,7 +46,8 @@ import { DEFAULT_CATALOG_BRANDS, DEFAULT_CATALOG_SIZES } from '@/lib/catalog-fil
 export interface ProductPresentation {
   id: string;
   name: string;
-  factor: number;
+  conversionFactor: number;
+  factor?: number;
   price: number;
   barcode?: string;
 }
@@ -58,6 +61,7 @@ export interface ProductFormData {
   sku: string;
   brand?: string;
   sizeLabel?: string;
+  sizes?: string[];
   unitOfMeasure: 'NIU' | 'KGM' | 'LTR' | 'BX' | string;
   price: number;
   minSalePrice: number;
@@ -119,7 +123,11 @@ const UNITS: { code: 'NIU' | 'KGM' | 'LTR' | 'BX'; label: string; desc: string }
   { code: 'BX', label: 'Caja (BX)', desc: 'Embalaje por caja' },
 ];
 
-export const ProductFormModal: React.FC<ProductFormModalProps> = ({
+const BARCODE_SCANNER_CONFIG: any = {
+  barcodeTypes: ['ean13', 'ean8', 'qr', 'code128', 'code39', 'upc_a', 'upc_e'],
+};
+
+export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
   visible,
   onClose,
   product,
@@ -132,6 +140,7 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = ({
   const { canManageProducts, canViewMargins } = usePermissions();
   const enableCatalogFilters = !!posSettings?.enableCatalogFilters;
   const compactLayout = windowWidth < 380;
+  const lastScanTimestampRef = useRef<number>(0);
   const [name, setName] = useState('');
   const [category, setCategory] = useState('Abarrotes');
   const [barcode, setBarcode] = useState('');
@@ -189,7 +198,7 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = ({
         setBarcode(product.barcode || '');
         setSku(product.sku || '');
         setBrand(product.brand || '');
-        setSizeLabel(product.sizeLabel || (Array.isArray(product.sizes) ? product.sizes[0] : ''));
+        setSizeLabel(catalogSizeInput(product));
         const existingExtras = Array.isArray(product.barcodes)
           ? product.barcodes.filter((b: string) => b && b !== product.barcode)
           : [];
@@ -224,14 +233,9 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = ({
         setImageUrl(product.imageUrl || product.thumbUrl || undefined);
 
         if (product.stock && typeof product.stock === 'object') {
-          const map: Record<string, number> = {};
-          if (branches && branches.length > 0) {
-            branches.forEach((b) => {
-              const bId = b.id || 'main';
-              map[bId] = product.stock[bId] !== undefined ? product.stock[bId] : 0;
-            });
-          }
-          setStockByBranch(map);
+          // Mantener solo sucursales asignadas. La ausencia de una clave no es
+          // equivalente a stock cero ni debe adscribir el producto a esa sede.
+          setStockByBranch({ ...product.stock });
         } else {
           setStockByBranch({ [branchId]: typeof product.stock === 'number' ? product.stock : 0 });
         }
@@ -254,16 +258,9 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = ({
         setPresentations([]);
         setImageUrl(undefined);
 
-        const initialMap: Record<string, number> = {};
-        if (branches && branches.length > 0) {
-          branches.forEach((b) => {
-            const bId = b.id || 'main';
-            initialMap[bId] = 0;
-          });
-        } else {
-          initialMap[branchId] = 0;
-        }
-        setStockByBranch(initialMap);
+        // Asignar el producto nuevo solo a la sucursal activa. Las demás se
+        // agregan cuando el usuario ingresa stock explícitamente.
+        setStockByBranch(branchId ? { [branchId]: 0 } : {});
       }
       setScannerActive(false);
       setPresModalOpen(false);
@@ -303,7 +300,11 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = ({
     setScannerActive(true);
   };
 
-  const handleBarcodeScanned = ({ data }: { data: string }) => {
+  const handleBarcodeScanned = useCallback(({ data }: { data: string }) => {
+    const now = Date.now();
+    if (now - lastScanTimestampRef.current < 1000) return;
+    lastScanTimestampRef.current = now;
+
     if (data) {
       const clean = data.trim();
       if (scanningTarget === 'main') {
@@ -316,9 +317,9 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = ({
         });
       }
       setScannerActive(false);
-      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
     }
-  };
+  }, [scanningTarget]);
 
   const handleAddExtraBarcode = () => {
     setExtraBarcodes((prev) => [...prev, '']);
@@ -356,7 +357,7 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = ({
     const newPres: ProductPresentation = {
       id: `pres_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
       name: presName.trim(),
-      factor: factorNum,
+      conversionFactor: factorNum,
       price: priceNum,
       barcode: presBarcode.trim() || undefined,
     };
@@ -400,8 +401,7 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = ({
       barcode: barcode.trim(),
       barcodes: cleanExtraBarcodes,
       sku: sku.trim() || barcode.trim() || `SKU-${Date.now().toString().slice(-6)}`,
-      brand: enableCatalogFilters ? (brand.trim() || undefined) : undefined,
-      sizeLabel: enableCatalogFilters ? (sizeLabel.trim() || undefined) : undefined,
+      ...catalogAttributeUpdate(product, enableCatalogFilters, brand, sizeLabel),
       unitOfMeasure,
       price: priceVal,
       minSalePrice: minPriceVal > 0 ? minPriceVal : priceVal,
@@ -410,9 +410,9 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = ({
         ? (stockByBranch[branchId] ?? parseFloat(stockStr) ?? 0)
         : parseFloat(stockStr) || 0,
       minStock: parseFloat(minStockStr) || 3,
-      presentations,
+      presentations: presentations.map(normalizePresentation),
       imageUrl: imageUrl || product?.imageUrl || '',
-      stockByBranch: branches && branches.length > 1 ? stockByBranch : undefined,
+      stockByBranch: { ...stockByBranch },
     };
 
     if (!canManageProducts) {
@@ -433,6 +433,8 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = ({
       setIsSaving(false);
     }
   };
+
+  if (!visible) return null;
 
   return (
     <Modal visible={visible} animationType="slide" transparent={false} onRequestClose={onClose}>
@@ -471,9 +473,7 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = ({
           <View style={styles.scannerWrapper}>
             <CameraView
               style={styles.cameraView}
-              barcodeScannerSettings={{
-                barcodeTypes: ['ean13', 'ean8', 'qr', 'code128', 'code39', 'upc_a', 'upc_e'],
-              }}
+              barcodeScannerSettings={BARCODE_SCANNER_CONFIG}
               onBarcodeScanned={handleBarcodeScanned}
             >
               <View style={styles.cameraOverlay}>
@@ -520,7 +520,7 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = ({
                 activeOpacity={0.7}
               >
                 {imageUrl ? (
-                  <Image source={{ uri: imageUrl }} style={styles.attachedThumbnail} />
+                  <Image source={{ uri: imageUrl }} style={styles.attachedThumbnail} contentFit="cover" />
                 ) : (
                   <Camera size={18} color={ui.primary} />
                 )}
@@ -764,13 +764,13 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = ({
                 <View style={[styles.formGroup, styles.colFlex, compactLayout && styles.colFlexCompact]}>
                   <View style={styles.labelRow}>
                     <Ruler size={13} color={ui.primary} />
-                    <Text style={styles.label}>Medida / Talla (Opcional)</Text>
+                    <Text style={styles.label}>Medidas / Tallas (Opcional)</Text>
                   </View>
                   <TextInput
                     style={styles.input}
                     value={sizeLabel}
                     onChangeText={setSizeLabel}
-                    placeholder="Ej. 750 ml, 1 L, Pack"
+                    placeholder="Separa con comas: S, M, L"
                     placeholderTextColor={ui.textMuted}
                   />
                   {/* Chips rápidos de medidas */}
@@ -988,7 +988,7 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = ({
                   <View style={styles.presItemInfo}>
                     <Text style={styles.presItemName}>{p.name}</Text>
                     <Text style={styles.presItemDetails}>
-                      Factor: {p.factor} unidades | Precio: S/ {p.price.toFixed(2)}
+                      Factor: {presentationFactor(p)} unidades | Precio: S/ {p.price.toFixed(2)}
                       {p.barcode ? ` | Código: ${p.barcode}` : ''}
                     </Text>
                   </View>
@@ -1145,7 +1145,7 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = ({
       </KeyboardAvoidingView>
     </Modal>
   );
-};
+});
 
 const styles = StyleSheet.create({
   keyboardContainer: {

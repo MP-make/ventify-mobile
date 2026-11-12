@@ -1,3 +1,4 @@
+import { subscribeLiveDocument } from '@/lib/live-document';
 import React, {
   createContext,
   useContext,
@@ -5,6 +6,7 @@ import React, {
   useEffect,
   useCallback,
   useMemo,
+  useRef,
 } from 'react';
 import {
   doc,
@@ -122,6 +124,9 @@ export const DEFAULT_BUSINESS_SETTINGS: BusinessSettings = {
 };
 
 export interface SettingsContextType {
+  configurationReady: boolean;
+  configurationError: string | null;
+  refreshConfiguration: () => void;
   primaryColor: string;
   businessName: string;
   businessSettings: BusinessSettings;
@@ -146,6 +151,9 @@ export interface SettingsContextType {
 }
 
 const SettingsContext = createContext<SettingsContextType>({
+  configurationReady: false,
+  configurationError: null,
+  refreshConfiguration: () => {},
   primaryColor: '#10B981',
   businessName: 'Ventify POS',
   businessSettings: DEFAULT_BUSINESS_SETTINGS,
@@ -171,6 +179,17 @@ const SettingsContext = createContext<SettingsContextType>({
 
 export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const { accountId, branchId, setBranchId, user, userProfile, role, allBranchesAccess } = useAuth();
+  const configurationScope = `${user?.uid || ''}:${accountId || ''}`;
+  const [configuration, setConfiguration] = useState({ scope: configurationScope, pos: false, account: false, posError: null as string | null, accountError: null as string | null });
+  const configurationReady = configuration.scope === configurationScope && configuration.pos && configuration.account && !configuration.posError && !configuration.accountError;
+  const configurationError = configuration.scope === configurationScope ? configuration.posError || configuration.accountError : null;
+  const [configurationTick, setConfigurationTick] = useState(0);
+  const refreshConfiguration = useCallback(() => {
+    setConfiguration({ scope: configurationScope, pos: false, account: false, posError: null, accountError: null });
+    setConfigurationTick(value => value + 1);
+  }, [configurationScope]);
+
+
 
   const [primaryColor, setPrimaryColor] = useState<string>('#10B981');
   const [businessSettings, setBusinessSettings] = useState<BusinessSettings>(DEFAULT_BUSINESS_SETTINGS);
@@ -182,6 +201,10 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const [allPaymentMethods, setAllPaymentMethods] = useState<PosPaymentMethodConfig[]>(DEFAULT_PAYMENT_METHODS);
   const [isOnline, setIsOnline] = useState<boolean>(true);
   const [offlineQueueCount, setOfflineQueueCount] = useState<number>(0);
+  const branchIdRef = useRef(branchId);
+  branchIdRef.current = branchId;
+  const activeCashSessionRef = useRef<ActiveCashSessionData | null>(activeCashSession);
+  activeCashSessionRef.current = activeCashSession;
 
   // 1. Refrescar el contador de ventas offline en cola local
   const refreshOfflineCount = useCallback(async (): Promise<number> => {
@@ -198,24 +221,27 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   // 2. Monitoreo reactivo de conectividad de red con NetInfo
   useEffect(() => {
     let wasOffline = false;
+    let isMounted = true;
 
-    // Estado inicial
+    // Estado inicial protegido contra desmontaje
     NetInfo.fetch().then((state) => {
+      if (!isMounted) return;
       const online = Boolean(state.isConnected && state.isInternetReachable !== false);
       setIsOnline(online);
       refreshOfflineCount();
     });
 
     const unsubscribeNet = NetInfo.addEventListener((state) => {
+      if (!isMounted) return;
       const online = Boolean(state.isConnected && state.isInternetReachable !== false);
       setIsOnline(online);
 
       // Si se recupera la conexión, disparar la cola offline de inmediato
       if (online && wasOffline) {
         console.log('[SettingsContext] Red restablecida. Sincronizando cola offline...');
-        processOfflineQueue()
+        processOfflineQueue(accountId || undefined)
           .then(() => {
-            refreshOfflineCount();
+            if (isMounted) refreshOfflineCount();
           })
           .catch((err) => {
             console.warn('[SettingsContext] Error procesando cola offline al volver conexión:', err);
@@ -227,11 +253,12 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     });
 
     return () => {
+      isMounted = false;
       unsubscribeNet();
     };
-  }, [refreshOfflineCount]);
+  }, [accountId, refreshOfflineCount]);
 
-  // 3. Suscripción a ajustes del negocio y POS en Firestore (con carga inmediata RPC)
+  // 3. Cada listener entrega el valor inicial y las actualizaciones sin duplicar lecturas.
   useEffect(() => {
     if (!accountId) return;
 
@@ -245,8 +272,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         }
       }
     };
-    getDoc(appearanceRef).then(applyAppearance).catch(() => {});
-    const unsubAppearance = onSnapshot(
+    const unsubAppearance = subscribeLiveDocument(
       appearanceRef,
       applyAppearance,
       (err) => console.warn('[SettingsContext] appearance snapshot error:', err)
@@ -273,10 +299,11 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
           updatedAt: data.updatedAt,
           ...data,
         });
+      } else {
+        setBusinessSettings({ ...DEFAULT_BUSINESS_SETTINGS, accountId });
       }
     };
-    getDoc(businessRef).then(applyBusiness).catch(() => {});
-    const unsubBusiness = onSnapshot(
+    const unsubBusiness = subscribeLiveDocument(
       businessRef,
       applyBusiness,
       (err) => console.warn('[SettingsContext] business snapshot error:', err)
@@ -285,6 +312,9 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     // 3.3. Configuración del POS (métodos de pago habilitados, Yape/Plin, pie de ticket, comprobante por defecto)
     const posRef = doc(db, 'settings', `${accountId}_pos`);
     const applyPos = (snap: any) => {
+      if (snap.exists() || snap.metadata?.fromCache === false) {
+        setConfiguration(previous => ({ ...(previous.scope === configurationScope ? previous : { scope: configurationScope, pos: false, account: false, posError: null, accountError: null }), pos: true, posError: null }));
+      }
       if (snap.exists()) {
         const data = snap.data();
 
@@ -328,18 +358,26 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         } else {
           setAllPaymentMethods(DEFAULT_PAYMENT_METHODS);
         }
+      } else {
+        setPosSettings({ ...DEFAULT_POS_SETTINGS, id: `${accountId}_pos`, accountId });
+        setAllPaymentMethods(DEFAULT_PAYMENT_METHODS);
       }
     };
-    getDoc(posRef).then(applyPos).catch(() => {});
-    const unsubPos = onSnapshot(
+    const unsubPos = subscribeLiveDocument(
       posRef,
       applyPos,
-      (err) => console.warn('[SettingsContext] pos snapshot error:', err)
+      (err) => {
+        console.warn('[SettingsContext] pos snapshot error:', err);
+        setConfiguration(previous => ({ ...(previous.scope === configurationScope ? previous : { scope: configurationScope, pos: false, account: false, posError: null, accountError: null }), pos: false, posError: 'No se pudo cargar la configuración de pagos. Comprueba la conexión y pulsa Reintentar.' }));
+      }
     );
 
     // 3.4. Estado de la cuenta y permisos de facturación electrónica (Super Admin)
     const accountRef = doc(db, 'accounts', accountId);
     const applyAccount = (snap: any) => {
+      if (snap.exists() || snap.metadata?.fromCache === false) {
+        setConfiguration(previous => ({ ...(previous.scope === configurationScope ? previous : { scope: configurationScope, pos: false, account: false, posError: null, accountError: null }), account: true, accountError: null }));
+      }
       if (snap.exists()) {
         const data = snap.data();
         setInvoicingEnabled(Boolean(data.invoicingEnabled));
@@ -347,11 +385,13 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         setInvoicingEnabled(false);
       }
     };
-    getDoc(accountRef).then(applyAccount).catch(() => {});
-    const unsubAccount = onSnapshot(
+    const unsubAccount = subscribeLiveDocument(
       accountRef,
       applyAccount,
-      (err) => console.warn('[SettingsContext] account snapshot error:', err)
+      (err) => {
+        console.warn('[SettingsContext] account snapshot error:', err);
+        setConfiguration(previous => ({ ...(previous.scope === configurationScope ? previous : { scope: configurationScope, pos: false, account: false, posError: null, accountError: null }), account: false, accountError: 'No se pudo verificar la configuración de comprobantes. Comprueba la conexión y pulsa Reintentar.' }));
+      }
     );
 
     return () => {
@@ -360,9 +400,9 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       unsubPos();
       unsubAccount();
     };
-  }, [accountId]);
+  }, [accountId, configurationScope, configurationTick]);
 
-  // 4. Suscripción a sucursales de la cuenta (con carga inmediata RPC)
+  // 4. Suscripción a sucursales de la cuenta
   useEffect(() => {
     if (!accountId) return;
 
@@ -394,20 +434,17 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       const activeList = list.filter((b) => b.isActive !== false);
       setBranches(activeList);
 
+      const currentBranchId = branchIdRef.current;
       if (activeList.length > 0) {
-        if (!hasAllBranchesAccess({ role, allBranchesAccess, branchId }) && userProfile?.branchId) {
-          if (branchId !== userProfile.branchId) {
+        if (!hasAllBranchesAccess({ role, allBranchesAccess, branchId: currentBranchId }) && userProfile?.branchId) {
+          if (currentBranchId !== userProfile.branchId) {
             setBranchId(userProfile.branchId);
           }
-        } else if (branchId === 'main' || !activeList.some((b) => b.id === branchId)) {
+        } else if (currentBranchId === 'main' || !activeList.some((b) => b.id === currentBranchId)) {
           setBranchId(activeList[0].id!);
         }
       }
     };
-
-    getDocs(branchesQ)
-      .then(applyBranchesSnap)
-      .catch((err) => console.warn('[SettingsContext] initial branches getDocs warning:', err));
 
     const unsubBranches = onSnapshot(
       branchesQ,
@@ -416,7 +453,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     );
 
     return () => unsubBranches();
-  }, [accountId, branchId, setBranchId, role, allBranchesAccess, userProfile?.branchId]);
+  }, [accountId, setBranchId, role, allBranchesAccess, userProfile?.branchId]);
 
   // 5. Verificación y resolución determinista de la sesión activa de caja
   const checkActiveSession = useCallback(async (): Promise<ActiveCashSessionData | null> => {
@@ -558,8 +595,18 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
     const unsubPointer = onSnapshot(
       doc(db, 'cash_register_sessions', pointerId),
-      () => {
-        if (isSubscribed) {
+      (snap) => {
+        if (!isSubscribed) return;
+        const data = snap.exists() ? snap.data() : null;
+        const nextSessionId = data?.activeSessionId || data?.sessionId || null;
+        const currentSessionId = activeCashSessionRef.current?.id || null;
+
+        if (!nextSessionId || data?.status === 'closed') {
+          if (activeCashSessionRef.current) {
+            setIsCashOpen(false);
+            setActiveCashSession(null);
+          }
+        } else if (nextSessionId !== currentSessionId) {
           checkActiveSession();
         }
       },
@@ -661,12 +708,19 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     [activeBranch, businessSettings.businessName]
   );
 
+  const scopedBusinessSettings = useMemo(() => businessSettings.accountId === accountId
+    ? businessSettings
+    : { ...DEFAULT_BUSINESS_SETTINGS, accountId: accountId || '' }, [accountId, businessSettings]);
+
   const contextValue = useMemo(
     () => ({
+      configurationReady,
+      configurationError,
+      refreshConfiguration,
       primaryColor,
-      businessName: businessSettings.businessName || 'Ventify POS',
-      businessSettings,
-      businessData: businessSettings,
+      businessName: scopedBusinessSettings.businessName || 'Ventify POS',
+      businessSettings: scopedBusinessSettings,
+      businessData: scopedBusinessSettings,
       posSettings,
       branches,
       activeBranchName,
@@ -686,8 +740,11 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       refreshCashStatus,
     }),
     [
+      configurationReady,
+      configurationError,
+      refreshConfiguration,
       primaryColor,
-      businessSettings,
+      scopedBusinessSettings,
       posSettings,
       branches,
       activeBranchName,

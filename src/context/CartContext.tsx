@@ -7,7 +7,7 @@ import React, {
   useMemo,
   useRef,
 } from 'react';
-import AsyncStorage from '@react-native-async-storage/async-storage';
+import { cartKVStorage } from '@/lib/native-kv-storage';
 import * as Haptics from 'expo-haptics';
 import {
   CartItem,
@@ -19,11 +19,19 @@ import {
 } from '@/types';
 import { resolveEffectiveUnitPrice } from '@/lib/product-search';
 import { useAuth } from './AuthContext';
+import { cartStorageKeys, canResumeCart } from '@/lib/cart-scope';
+import { normalizePresentation, presentationFactor } from '@/lib/presentation-parity';
 
 declare module '@/types' {
   interface CartItem {
     notes?: string;
     product?: Product;
+  }
+  interface PausedSale {
+    sourceSaleRequestId?: string | null;
+    sourceQuoteId?: string | null;
+    shippingAmount?: number;
+    discountAmount?: number;
   }
 }
 
@@ -42,6 +50,9 @@ export interface CartContextType {
   customer: Customer | null;
   discount: number;
   notes: string;
+  saleRequestId: string | null;
+  sourceQuoteId: string | null;
+  shippingAmount: number;
   subtotal: number;
   discountAmount: number;
   taxAmount: number;
@@ -54,6 +65,9 @@ export interface CartContextType {
   setCustomer: (customer: Customer | null) => void;
   setDiscount: (discount: number) => void;
   setNotes: (notes: string) => void;
+  setSaleRequestId: (requestId: string | null) => void;
+  setSourceQuoteId: (quoteId: string | null) => void;
+  setShippingAmount: (amount: number) => void;
   addItem: (product: Product, options?: AddItemOptions) => void;
   updateQuantity: (cartItemId: string, newQty: number) => void;
   updateItemPrice: (cartItemId: string, newPrice: number) => boolean;
@@ -65,14 +79,15 @@ export interface CartContextType {
   getItemQuantity: (productId: string) => number;
 }
 
-const CART_STORAGE_KEY = '@ventify_pos_cart';
-const PAUSED_SALES_STORAGE_KEY = '@ventify_paused_sales';
 
 const CartContext = createContext<CartContextType>({
   items: [],
   customer: null,
   discount: 0,
   notes: '',
+  saleRequestId: null,
+  sourceQuoteId: null,
+  shippingAmount: 0,
   subtotal: 0,
   discountAmount: 0,
   taxAmount: 0,
@@ -85,6 +100,9 @@ const CartContext = createContext<CartContextType>({
   setCustomer: () => {},
   setDiscount: () => {},
   setNotes: () => {},
+  setSaleRequestId: () => {},
+  setSourceQuoteId: () => {},
+  setShippingAmount: () => {},
   addItem: () => {},
   updateQuantity: () => {},
   updateItemPrice: () => false,
@@ -97,68 +115,118 @@ const CartContext = createContext<CartContextType>({
 });
 
 export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const { branchId, accountId } = useAuth();
+  const { branchId, accountId, user } = useAuth();
+  const storageKeys = useMemo(() => cartStorageKeys(accountId || "", branchId, user?.uid || ""), [accountId, branchId, user?.uid]);
 
   const [items, setItems] = useState<CartItem[]>([]);
   const [customer, setCustomer] = useState<Customer | null>(null);
   const [discount, setDiscount] = useState<number>(0);
   const [notes, setNotes] = useState<string>('');
+  const [saleRequestId, setSaleRequestId] = useState<string | null>(null);
+  const [sourceQuoteId, setSourceQuoteId] = useState<string | null>(null);
+  const [shippingAmount, setShippingAmountState] = useState(0);
+  const setShippingAmount = useCallback((amount: number) => {
+    setShippingAmountState(Number.isFinite(amount) ? Math.max(0, Math.round(amount * 100) / 100) : 0);
+  }, []);
   const [pausedSales, setPausedSales] = useState<PausedSale[]>([]);
 
   const isRestored = useRef<boolean>(false);
 
   // 1. Restaurar carrito y ventas en pausa desde AsyncStorage al iniciar
   useEffect(() => {
+    let alive = true;
+    isRestored.current = false;
+    setItems([]); setCustomer(null); setDiscount(0); setNotes(''); setSaleRequestId(null); setSourceQuoteId(null); setShippingAmountState(0); setPausedSales([]);
     async function restoreCartData() {
       try {
         const [savedCartRaw, savedPausedRaw] = await Promise.all([
-          AsyncStorage.getItem(CART_STORAGE_KEY),
-          AsyncStorage.getItem(PAUSED_SALES_STORAGE_KEY),
+          cartKVStorage.getItem(storageKeys.cart),
+          cartKVStorage.getItem(storageKeys.paused),
         ]);
 
+        if (!alive) return;
         if (savedCartRaw) {
           const parsed = JSON.parse(savedCartRaw);
-          if (Array.isArray(parsed.items)) setItems(parsed.items);
+          if (Array.isArray(parsed.items)) setItems(parsed.items.map((item: CartItem) => ({
+            ...item,
+            presentation: item.presentation ? normalizePresentation(item.presentation) : item.presentation,
+            presentationQty: item.presentationQty || item.conversionFactor || presentationFactor(item.presentation),
+          })));
           if (parsed.customer) setCustomer(parsed.customer);
           if (typeof parsed.discount === 'number') setDiscount(parsed.discount);
           if (typeof parsed.notes === 'string') setNotes(parsed.notes);
+          if (typeof parsed.saleRequestId === 'string') setSaleRequestId(parsed.saleRequestId);
+          if (typeof parsed.sourceQuoteId === 'string') setSourceQuoteId(parsed.sourceQuoteId);
+          if (typeof parsed.shippingAmount === 'number') setShippingAmount(parsed.shippingAmount);
         }
 
         if (savedPausedRaw) {
           const parsedPaused = JSON.parse(savedPausedRaw);
-          if (Array.isArray(parsedPaused)) setPausedSales(parsedPaused);
+          if (Array.isArray(parsedPaused)) setPausedSales(parsedPaused
+            .filter(sale => canResumeCart(sale, accountId || "", branchId))
+            .map((sale: PausedSale) => ({
+              ...sale,
+              items: sale.items.map((item) => ({
+                ...item,
+                presentation: item.presentation ? normalizePresentation(item.presentation) : item.presentation,
+                presentationQty: item.presentationQty || item.conversionFactor || presentationFactor(item.presentation),
+              })),
+            })));
         }
       } catch (err) {
         console.warn('[CartContext] Error restoring cart from storage:', err);
       } finally {
-        isRestored.current = true;
+        if (alive) isRestored.current = true;
       }
     }
 
-    restoreCartData();
-  }, []);
+    if (accountId && user) void restoreCartData();
+    return () => { alive = false; };
+  }, [storageKeys.cart, storageKeys.paused, accountId, branchId, user?.uid, setShippingAmount]);
 
-  // 2. Persistir carrito actual reactivamente cuando cambie
+  // 2. Persistir carrito actual reactivamente con debounce (350ms) y payload ligero
   useEffect(() => {
     if (!isRestored.current) return;
 
-    const payload = JSON.stringify({
-      items,
-      customer,
-      discount,
-      notes,
-    });
+    const timer = setTimeout(() => {
+      // Omitir objeto pesado item.product en la serialización para máxima velocidad MMKV
+      const lightweightItems = items.map((item) => {
+        if (!item.product) return item;
+        const { product, ...rest } = item;
+        return rest;
+      });
 
-    AsyncStorage.setItem(CART_STORAGE_KEY, payload).catch((err) => {
-      console.warn('[CartContext] Error saving cart to storage:', err);
-    });
-  }, [items, customer, discount, notes]);
+      const payload = JSON.stringify({
+        items: lightweightItems,
+        customer,
+        discount,
+        notes,
+        saleRequestId,
+        sourceQuoteId,
+        shippingAmount,
+      });
+
+      cartKVStorage.setItem(storageKeys.cart, payload).catch((err) => {
+        console.warn('[CartContext] Error saving cart to storage:', err);
+      });
+    }, 350);
+
+    return () => clearTimeout(timer);
+  }, [items, customer, discount, notes, saleRequestId, sourceQuoteId, shippingAmount, storageKeys.cart]);
 
   // 3. Persistir lista de ventas en pausa cuando cambie
   const persistPausedSales = useCallback(async (list: PausedSale[]) => {
     setPausedSales(list);
-    await AsyncStorage.setItem(PAUSED_SALES_STORAGE_KEY, JSON.stringify(list)).catch(() => {});
-  }, []);
+    const lightweightList = list.map((sale) => ({
+      ...sale,
+      items: sale.items.map((item) => {
+        if (!item.product) return item;
+        const { product, ...rest } = item;
+        return rest;
+      }),
+    }));
+    await cartKVStorage.setItem(storageKeys.paused, JSON.stringify(lightweightList)).catch(() => {});
+  }, [storageKeys.paused]);
 
   // 4. Agregar producto al carrito resolviendo reglas de precios
   const addItem = useCallback(
@@ -258,7 +326,7 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
           stepDecimal: product.stepDecimal,
           presentationId: presentation?.id,
           presentationName: presentation?.name,
-          presentationQty: presentation?.conversionFactor ?? presentation?.quantity,
+          presentationQty: presentationFactor(presentation),
           variantId: variant?.id,
           variantName: variant?.name,
           lineTotal: Math.round(quantityToAdd * initialPrice * 100) / 100,
@@ -372,8 +440,11 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setCustomer(null);
     setDiscount(0);
     setNotes('');
-    AsyncStorage.removeItem(CART_STORAGE_KEY).catch(() => {});
-  }, []);
+    setSaleRequestId(null);
+    setSourceQuoteId(null);
+    setShippingAmountState(0);
+    cartKVStorage.removeItem(storageKeys.cart).catch(() => {});
+  }, [storageKeys.cart]);
 
   // 9. Ventas en Pausa (Hold Carts)
   const pauseCurrentSale = useCallback(
@@ -389,7 +460,7 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
         (sum, item) => sum + item.price * item.quantity,
         0
       );
-      const currentTotal = Math.max(0, currentSubtotal - discount);
+      const currentTotal = Math.max(0, currentSubtotal - discount) + shippingAmount;
 
       const newPausedSale: PausedSale = {
         id: pausedId,
@@ -401,6 +472,10 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
         branchId,
         accountId: accountId || undefined,
         total: Math.round(currentTotal * 100) / 100,
+        sourceSaleRequestId: saleRequestId,
+        sourceQuoteId,
+        shippingAmount,
+        discountAmount: discount,
       };
 
       const updatedList = [newPausedSale, ...pausedSales];
@@ -412,20 +487,23 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       return pausedId;
     },
-    [items, customer, discount, notes, branchId, accountId, pausedSales, persistPausedSales, clearCart]
+    [items, customer, discount, notes, saleRequestId, sourceQuoteId, shippingAmount, branchId, accountId, pausedSales, persistPausedSales, clearCart]
   );
 
   // 10. Reanudar una venta en pausa
   const resumePausedSale = useCallback(
     async (pausedId: string): Promise<boolean> => {
       const target = pausedSales.find((s) => s.id === pausedId);
-      if (!target) return false;
+      if (!target || !canResumeCart(target, accountId || "", branchId)) return false;
 
       // Cargar en carrito activo
       setItems(target.items);
       setCustomer(target.customer || null);
       setNotes(target.note || '');
-      setDiscount(0);
+      setDiscount(target.discountAmount || 0);
+      setSaleRequestId(target.sourceSaleRequestId || null);
+      setSourceQuoteId(target.sourceQuoteId || null);
+      setShippingAmount(target.shippingAmount || 0);
 
       // Remover de lista de pausadas
       const filtered = pausedSales.filter((s) => s.id !== pausedId);
@@ -434,7 +512,7 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
       return true;
     },
-    [pausedSales, persistPausedSales]
+    [pausedSales, persistPausedSales, accountId, branchId, setShippingAmount]
   );
 
   // 11. Eliminar venta en pausa
@@ -466,13 +544,13 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
       );
 
       const dAmount = Math.min(calculatedSubtotal, Math.max(0, discount));
-      const calculatedTotal = Math.max(0, calculatedSubtotal - dAmount);
+      const calculatedItemsTotal = Math.max(0, calculatedSubtotal - dAmount);
 
       // En el sistema de facturación peruano (precios con IGV incluido):
       // Base imponible = Total / 1.18
       // IGV (18%) = Total - Base imponible
-      const net = Math.round((calculatedTotal / 1.18) * 100) / 100;
-      const tax = Math.round((calculatedTotal - net) * 100) / 100;
+      const net = Math.round((calculatedItemsTotal / 1.18) * 100) / 100;
+      const tax = Math.round((calculatedItemsTotal - net) * 100) / 100;
 
       const count = items.reduce((sum, item) => sum + item.quantity, 0);
 
@@ -481,10 +559,10 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
         discountAmount: Math.round(dAmount * 100) / 100,
         taxAmount: tax,
         netAmount: net,
-        total: Math.round(calculatedTotal * 100) / 100,
+        total: Math.round((calculatedItemsTotal + shippingAmount) * 100) / 100,
         totalItemsCount: Math.round(count * 1000) / 1000,
       };
-    }, [items, discount]);
+    }, [items, discount, shippingAmount]);
 
   const contextValue = useMemo(
     () => ({
@@ -492,6 +570,9 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
       customer,
       discount,
       notes,
+      saleRequestId,
+      sourceQuoteId,
+      shippingAmount,
       subtotal,
       discountAmount,
       taxAmount,
@@ -504,6 +585,9 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setCustomer,
       setDiscount,
       setNotes,
+      setSaleRequestId,
+      setSourceQuoteId,
+      setShippingAmount,
       addItem,
       updateQuantity,
       updateItemPrice,
@@ -519,6 +603,10 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
       customer,
       discount,
       notes,
+      saleRequestId,
+      sourceQuoteId,
+      shippingAmount,
+      setShippingAmount,
       subtotal,
       discountAmount,
       taxAmount,

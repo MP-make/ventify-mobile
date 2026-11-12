@@ -1,4 +1,5 @@
-import React, { useState, useRef, useMemo, useCallback } from 'react';
+import { reservationCartLines } from '@/lib/presentation-parity';
+import React, { useState, useRef, useMemo, useCallback, useEffect } from 'react';
 import {
   View,
   Text,
@@ -63,19 +64,20 @@ import { WeightQuantityModal } from '@/components/WeightQuantityModal';
 import { CheckoutModal } from '@/components/CheckoutModal';
 import { CompanionScannerModal } from '@/components/CompanionScannerModal';
 import { QuotesManagerModal } from '@/components/QuotesManagerModal';
-import { InlineFilterBar } from '@/components/InlineFilterBar';
+import { InlineFilterBar, FilterGroup } from '@/components/InlineFilterBar';
 import { createReservationOrOrder } from '@/services/crm-operations-service';
 import { lookupDocument } from '@/lib/dni-ruc-service';
 import { isValidDNI } from '@/lib/invoicing/types';
 import { ReservationReceiptModal } from '@/components/ReservationReceiptModal';
 import {
-  catalogBrand,
-  catalogSizes,
   DEFAULT_CATALOG_BRANDS,
   DEFAULT_CATALOG_SIZES,
   mergeCatalogOptions,
-  normalizeCatalogLabel,
+  buildCatalogProductIndex,
+  filterCatalogIndex,
+  getCatalogCategoryCounts,
 } from '@/lib/catalog-filters';
+import { useDebouncedValue } from '@/hooks/use-debounced-value';
 import type { Product, CartItem, PausedSale, ProductPresentation } from '@/types';
 
 export const triggerScanHaptic = () => {
@@ -89,12 +91,195 @@ const normalizeStr = (str: string = '') =>
     .replace(/[\u0300-\u036f]/g, '')
     .trim();
 
+interface PosProductCardProps {
+  item: Product;
+  stock: number;
+  onSelect: (product: Product) => void;
+}
+
+const PosProductCard = React.memo<PosProductCardProps>(({ item, stock, onSelect }) => {
+  const minStock = (item as any).minStock || 3;
+  const isOutOfStock = stock <= 0;
+  const isLowStock = stock > 0 && stock <= minStock;
+  const price = Number(item.suggestedPrice ?? item.price ?? 0);
+
+  return (
+    <TouchableOpacity
+      style={styles.productCard}
+      onPress={() => onSelect(item)}
+      accessibilityRole="button"
+      accessibilityLabel={`Agregar ${item.name}, ${formatPEN(price)}${isOutOfStock ? ', agotado' : `, stock ${stock}`}`}
+      activeOpacity={0.7}
+    >
+      <View style={styles.productInfo}>
+        <Text style={styles.productName} numberOfLines={1}>
+          {item.name}
+        </Text>
+        <View style={styles.productMetaRow}>
+          <Text style={styles.productSku}>{item.sku || item.barcode || 'General'}</Text>
+          <View
+            style={[
+              styles.stockBadge,
+              isOutOfStock && styles.stockBadgeRed,
+              isLowStock && styles.stockBadgeAmber,
+              !isOutOfStock && !isLowStock && styles.stockBadgeGreen,
+            ]}
+          >
+            <Text
+              style={[
+                styles.stockBadgeText,
+                isOutOfStock && styles.stockBadgeTextRed,
+                isLowStock && styles.stockBadgeTextAmber,
+                !isOutOfStock && !isLowStock && styles.stockBadgeTextGreen,
+              ]}
+            >
+              {isOutOfStock ? 'Agotado' : isLowStock ? `Bajo: ${stock}` : `Stock: ${stock}`}
+            </Text>
+          </View>
+        </View>
+      </View>
+
+      <View style={styles.productPriceCol}>
+        <Text style={styles.productPrice}>{formatPEN(price)}</Text>
+        <View style={styles.addPlusBtn}>
+          <Plus size={16} color={ui.onPrimary} />
+        </View>
+      </View>
+    </TouchableOpacity>
+  );
+});
+
+interface CartItemRowProps {
+  item: CartItem;
+  isEditingPrice: boolean;
+  newPriceStr: string;
+  canModifyPrice: boolean;
+  onUpdateQuantity: (id: string, qty: number) => void;
+  onRemoveItem: (id: string) => void;
+  onStartEditPrice: (item: CartItem) => void;
+  onChangeNewPrice: (val: string) => void;
+  onSavePrice: (item: CartItem) => void;
+}
+
+const CartItemRow = React.memo<CartItemRowProps>(({
+  item,
+  isEditingPrice,
+  newPriceStr,
+  canModifyPrice,
+  onUpdateQuantity,
+  onRemoveItem,
+  onStartEditPrice,
+  onChangeNewPrice,
+  onSavePrice,
+}) => {
+  const itemPrice = item.price;
+  const itemSubtotal = item.lineTotal !== undefined ? item.lineTotal : itemPrice * item.quantity;
+
+  return (
+    <View style={styles.drawerCartItem}>
+      <View style={styles.drawerCartItemTop}>
+        <View style={{ flex: 1 }}>
+          <Text style={styles.drawerCartItemName}>{item.name}</Text>
+          {item.presentation ? (
+            <Text style={styles.drawerCartItemSub}>
+              Pres: {item.presentation.name} (x{item.presentation.conversionFactor})
+            </Text>
+          ) : item.variant ? (
+            <Text style={styles.drawerCartItemSub}>Var: {item.variant.name}</Text>
+          ) : null}
+        </View>
+        <Text style={styles.drawerCartItemSubtotal}>{formatPEN(itemSubtotal)}</Text>
+      </View>
+
+      {/* Fila de Controles de Cantidad y Precio */}
+      <View style={styles.drawerCartItemControls}>
+        {/* Selector de Cantidad */}
+        <View style={styles.qtyControlRow}>
+          <TouchableOpacity
+            style={styles.qtyBtn}
+            onPress={() => onUpdateQuantity(item.id, item.quantity - 1)}
+            accessibilityRole="button"
+            accessibilityLabel={`Reducir cantidad de ${item.name}`}
+          >
+            <Minus size={15} color={ui.text} />
+          </TouchableOpacity>
+          <Text style={styles.qtyNumberText}>{item.quantity}</Text>
+          <TouchableOpacity
+            style={styles.qtyBtn}
+            onPress={() => onUpdateQuantity(item.id, item.quantity + 1)}
+            accessibilityRole="button"
+            accessibilityLabel={`Aumentar cantidad de ${item.name}`}
+          >
+            <Plus size={15} color={ui.text} />
+          </TouchableOpacity>
+        </View>
+
+        {/* Editor de Precio Unitario */}
+        {isEditingPrice ? (
+          <View style={styles.editPriceInputRow}>
+            <TextInput
+              style={styles.editPriceInput}
+              value={newPriceStr}
+              onChangeText={onChangeNewPrice}
+              keyboardType="decimal-pad"
+              placeholder="0.00"
+              autoFocus
+            />
+            <TouchableOpacity
+              style={styles.savePriceBtn}
+              onPress={() => onSavePrice(item)}
+            >
+              <Text style={styles.savePriceBtnText}>OK</Text>
+            </TouchableOpacity>
+          </View>
+        ) : canModifyPrice ? (
+          <TouchableOpacity
+            style={styles.unitPriceBadge}
+            accessibilityRole="button"
+            accessibilityLabel={`Editar precio de ${item.name}, ${formatPEN(itemPrice)} por ${item.unitOfMeasure || 'unidad'}`}
+            onPress={() => onStartEditPrice(item)}
+          >
+            <Text style={styles.unitPriceBadgeText}>
+              {formatPEN(itemPrice)} / {item.unitOfMeasure || 'und'}
+            </Text>
+            <Edit3 size={12} color={ui.textSecondary} style={{ marginLeft: 4 }} />
+          </TouchableOpacity>
+        ) : (
+          <View style={styles.unitPriceBadge}>
+            <Text style={styles.unitPriceBadgeText}>
+              {formatPEN(itemPrice)} / {item.unitOfMeasure || 'und'}
+            </Text>
+          </View>
+        )}
+
+        {/* Eliminar Ítem */}
+        <TouchableOpacity
+          style={styles.deleteItemBtn}
+          onPress={() => onRemoveItem(item.id)}
+          accessibilityRole="button"
+          accessibilityLabel={`Quitar ${item.name} del carrito`}
+        >
+          <Trash2 size={16} color={ui.danger} />
+        </TouchableOpacity>
+      </View>
+    </View>
+  );
+});
+
 export default function PosCounterScreen() {
   const insets = useSafeAreaInsets();
   const { branchId, accountId, user, userProfile } = useAuth();
+  const scanScope = `${user?.uid}:${accountId}:${branchId}`;
+  const scanScopeRef = useRef(scanScope);
+  const scanLookupInFlight = useRef(false);
+  scanScopeRef.current = scanScope;
+  useEffect(() => {
+    scanScopeRef.current = scanScope;
+    return () => { scanScopeRef.current = ''; };
+  }, [scanScope]);
   const { posSettings, activeCashSession, businessSettings } = useSettings();
   const { canModifyPrice } = usePermissions();
-  const { products, categories, loading: productsLoading, findByBarcode, getProductStock } = useProducts();
+  const { products, categories, loading: productsLoading, refreshing, catalogComplete, error: productsError, refreshProducts, findByBarcode, findByBarcodeRemote, getProductStock } = useProducts();
   const {
     items,
     customer,
@@ -144,20 +329,23 @@ export default function PosCounterScreen() {
   const [createdResTicket, setCreatedResTicket] = useState<any | null>(null);
   const [resTicketModalOpen, setResTicketModalOpen] = useState(false);
 
-  // Detección automática de DNI al ingresar 8 dígitos
+  // Detección automática de DNI al ingresar 8 dígitos con debounce de 250ms
   React.useEffect(() => {
     const cleanDni = resCustomerDoc.trim().replace(/\D/g, '');
     if (cleanDni.length === 8 && isValidDNI(cleanDni)) {
-      setIsSearchingDni(true);
-      lookupDocument('dni', cleanDni)
-        .then((res) => {
-          if (res && res.name) {
-            setResCustomerName(res.name);
-            Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-          }
-        })
-        .catch(() => {})
-        .finally(() => setIsSearchingDni(false));
+      const timer = setTimeout(() => {
+        setIsSearchingDni(true);
+        lookupDocument('dni', cleanDni)
+          .then((res) => {
+            if (res && res.name) {
+              setResCustomerName(res.name);
+              Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+            }
+          })
+          .catch(() => {})
+          .finally(() => setIsSearchingDni(false));
+      }, 250);
+      return () => clearTimeout(timer);
     }
   }, [resCustomerDoc]);
 
@@ -203,9 +391,10 @@ export default function PosCounterScreen() {
 
   // Manejo centralizado al escanear un código
   const handleBarcodeDetected = useCallback(
-    (code: string) => {
+    async (code: string) => {
+      const requestScope = scanScope;
       const cleanCode = code.trim();
-      if (!cleanCode || scanCooldownRef.current) return;
+      if (!cleanCode || scanCooldownRef.current || scanLookupInFlight.current) return;
 
       scanCooldownRef.current = true;
       setTimeout(() => {
@@ -213,7 +402,16 @@ export default function PosCounterScreen() {
         lastScannedCodeRef.current = '';
       }, 1200);
 
-      const match = findByBarcode(cleanCode);
+      let match = findByBarcode(cleanCode);
+      if (!match) {
+        scanLookupInFlight.current = true;
+        try { match = await findByBarcodeRemote(cleanCode); }
+        catch {
+          if (scanScopeRef.current === requestScope) Alert.alert('No se pudo consultar el catálogo', 'Comprueba tu conexión y vuelve a escanear.');
+          return;
+        } finally { scanLookupInFlight.current = false; }
+      }
+      if (scanScopeRef.current !== requestScope) return;
       if (!match) {
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
         Alert.alert('Código no Encontrado', `No se encontró producto con código o SKU: ${cleanCode}`);
@@ -271,7 +469,7 @@ export default function PosCounterScreen() {
       triggerScanHaptic();
       addItem(product, { quantity: 1 });
     },
-    [findByBarcode, addItem]
+    [findByBarcode, findByBarcodeRemote, addItem, scanScope]
   );
 
   // Escaneo desde la cámara embebida
@@ -283,86 +481,67 @@ export default function PosCounterScreen() {
   };
 
   const enableCatalogFilters = !!posSettings?.enableCatalogFilters;
+  const debouncedSearchQuery = useDebouncedValue(searchQuery, 150);
+  const catalogIndex = useMemo(() => buildCatalogProductIndex(products), [products]);
 
   // Marcas únicas del catálogo (incluye atributos y marcas predeterminadas como en la web)
   const availableBrands = useMemo(() => {
-    const extracted = products.map(catalogBrand).filter(Boolean);
-    return ['Todas', ...mergeCatalogOptions(DEFAULT_CATALOG_BRANDS, extracted)];
-  }, [products]);
+    return ['Todas', ...mergeCatalogOptions(DEFAULT_CATALOG_BRANDS, catalogIndex.brands)];
+  }, [catalogIndex]);
 
   // Tallas / Medidas únicas del catálogo
   const availableSizes = useMemo(() => {
-    const extracted = products.flatMap(catalogSizes).filter(Boolean);
-    return ['Todas', ...mergeCatalogOptions(DEFAULT_CATALOG_SIZES, extracted)];
-  }, [products]);
+    return ['Todas', ...mergeCatalogOptions(DEFAULT_CATALOG_SIZES, catalogIndex.sizes)];
+  }, [catalogIndex]);
 
   // Filtrado de productos por categoría, marca, talla y texto (insensible a tildes)
-  const filteredProducts = useMemo(() => {
-    const q = normalizeCatalogLabel(searchQuery);
-    return products.filter((p) => {
-      // 1. Filtro Categoría
-      const matchCat =
-        selectedCategory === 'Todas' ||
-        (selectedCategory === 'Sin Categoría'
-          ? !p.category
-          : normalizeCatalogLabel(p.category) === normalizeCatalogLabel(selectedCategory));
-      if (!matchCat) return false;
-
-      // 2. Filtro Marca
-      if (selectedBrand !== 'Todas') {
-        const pBrand = normalizeCatalogLabel(catalogBrand(p));
-        if (pBrand !== normalizeCatalogLabel(selectedBrand)) {
-          return false;
-        }
-      }
-
-      // 3. Filtro Talla / Medida
-      if (selectedSize !== 'Todas') {
-        const pSizes = catalogSizes(p).map(normalizeCatalogLabel);
-        if (!pSizes.includes(normalizeCatalogLabel(selectedSize))) {
-          return false;
-        }
-      }
-
-      // 4. Texto libre (nombre, sku, código o marca)
-      if (!q) return true;
-
-      const normName = normalizeCatalogLabel(p.name);
-      const normBarcode = normalizeCatalogLabel(p.barcode || '');
-      const normSku = normalizeCatalogLabel(p.sku || '');
-      const normBrand = normalizeCatalogLabel(catalogBrand(p));
-      return (
-        normName.includes(q) ||
-        normBarcode.includes(q) ||
-        normSku.includes(q) ||
-        normBrand.includes(q)
-      );
-    });
-  }, [products, searchQuery, selectedCategory, selectedBrand, selectedSize]);
+  const filteredProducts = useMemo(() => filterCatalogIndex(catalogIndex, {
+    query: debouncedSearchQuery,
+    category: selectedCategory,
+    brand: selectedBrand,
+    size: selectedSize,
+  }), [catalogIndex, debouncedSearchQuery, selectedCategory, selectedBrand, selectedSize]);
 
   // Lista de categorías con conteo de productos
   const categoryListWithCounts = useMemo(() => {
-    const rawCategories = ['Todas', ...categories.filter((c) => c !== 'Todas' && c !== 'Todos')];
-    return rawCategories.map((cat) => {
-      const count =
-        cat === 'Todas'
-          ? products.length
-          : cat === 'Sin Categoría'
-          ? products.filter((p) => !p.category).length
-          : products.filter((p) => p.category === cat).length;
-      return { name: cat, count };
-    });
-  }, [categories, products]);
+    return getCatalogCategoryCounts(categories, catalogIndex).map((option) => ({
+      ...option,
+      count: catalogComplete ? option.count : undefined,
+    }));
+  }, [categories, catalogIndex, catalogComplete]);
 
-  // Categorías filtradas por el buscador del selector (insensible a tildes e iniciales)
-  const filteredCategoriesList = useMemo(() => {
-    const q = normalizeStr(categorySearchQuery);
-    if (!q) return categoryListWithCounts;
-    return categoryListWithCounts.filter((c) => {
-      const norm = normalizeStr(c.name);
-      return norm.includes(q) || norm.startsWith(q);
-    });
-  }, [categoryListWithCounts, categorySearchQuery]);
+  const brandOptions = useMemo(() => availableBrands.map((b) => ({ name: b })), [availableBrands]);
+  const sizeOptions = useMemo(() => availableSizes.map((s) => ({ name: s })), [availableSizes]);
+
+  const posFilterGroups: FilterGroup[] = useMemo(() => [
+    {
+      id: 'category',
+      label: 'Categorías',
+      selectedValue: selectedCategory,
+      options: categoryListWithCounts,
+      onSelect: (cat) => setSelectedCategory(cat),
+      onClear: () => setSelectedCategory('Todas'),
+      icon: 'category',
+    },
+    {
+      id: 'brand',
+      label: 'Marcas',
+      selectedValue: selectedBrand,
+      options: brandOptions,
+      onSelect: (b: string) => setSelectedBrand(b),
+      onClear: () => setSelectedBrand('Todas'),
+      icon: 'brand' as const,
+    },
+    {
+      id: 'size',
+      label: 'Medidas',
+      selectedValue: selectedSize,
+      options: sizeOptions,
+      onSelect: (s: string) => setSelectedSize(s),
+      onClear: () => setSelectedSize('Todas'),
+      icon: 'size' as const,
+    },
+  ], [selectedCategory, categoryListWithCounts, selectedBrand, brandOptions, selectedSize, sizeOptions]);
 
   // Confirmar y Guardar Reserva desde POS
   const handleConfirmReservation = async () => {
@@ -386,6 +565,7 @@ export default function PosCounterScreen() {
     }
 
     try {
+      if (!accountId || !branchId) throw new Error('No se pudo determinar la cuenta y sucursal.');
       setIsSavingRes(true);
       const days = parseInt(resDays, 10) || 7;
       const pickupDate = new Date();
@@ -394,18 +574,11 @@ export default function PosCounterScreen() {
       const pickupDateStr = `${pickupDate.getFullYear()}-${pad(pickupDate.getMonth() + 1)}-${pad(pickupDate.getDate())}`;
 
       const reservationId = await createReservationOrOrder({
-        accountId: accountId || 'default',
-        branchId: branchId || 'main',
+        accountId: accountId!,
+        branchId,
         sessionId: activeCashSession?.sessionId || (activeCashSession as any)?.id,
         type: 'reservation',
-        items: items.map((it) => ({
-          productId: it.id,
-          productName: it.name,
-          quantity: it.quantity,
-          price: it.price,
-          sku: it.sku || '',
-          presentationQty: it.presentation?.conversionFactor || 1,
-        })),
+        items: reservationCartLines(items),
         total: safeTotal,
         depositAmount: depositNum,
         paymentMethod: depositNum > 0 ? resDepositMethod : 'cash',
@@ -427,8 +600,8 @@ export default function PosCounterScreen() {
 
       const newResObj = {
         id: reservationId,
-        accountId: accountId || 'default',
-        branchId: branchId || 'main',
+        accountId: accountId!,
+        branchId,
         type: 'reservation',
         items: items.map((it) => ({
           productId: it.id,
@@ -469,7 +642,7 @@ export default function PosCounterScreen() {
   };
 
   // Selección manual de producto desde el catálogo
-  const handleProductSelect = (product: Product) => {
+  const handleProductSelect = useCallback((product: Product) => {
     const hasPresentations = Array.isArray(product.presentations) && product.presentations.length > 0;
     const hasVariants = Array.isArray(product.variants) && product.variants.length > 0;
     const isWeighable =
@@ -486,7 +659,30 @@ export default function PosCounterScreen() {
       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
       addItem(product, { quantity: 1 });
     }
-  };
+  }, [addItem]);
+
+  const keyExtractor = useCallback((item: Product) => item.id, []);
+  const getItemType = useCallback(() => 'product', []);
+  const renderPosItem = useCallback(({ item }: { item: Product }) => (
+    <PosProductCard
+      item={item}
+      stock={getProductStock(item)}
+      onSelect={handleProductSelect}
+    />
+  ), [getProductStock, handleProductSelect]);
+
+  const handleUpdateCartQty = useCallback((id: string, qty: number) => {
+    updateQuantity(id, qty);
+  }, [updateQuantity]);
+
+  const handleRemoveCartItem = useCallback((id: string) => {
+    removeItem(id);
+  }, [removeItem]);
+
+  const handleStartEditPrice = useCallback((cartItem: CartItem) => {
+    setEditingPriceItemId(cartItem.id);
+    setNewPriceStr(String(cartItem.price));
+  }, []);
 
   // Confirmar Venta Rápida (concepto libre)
   const handleConfirmQuickSale = () => {
@@ -602,7 +798,7 @@ export default function PosCounterScreen() {
           {/* Contador compacto de productos en la fila superior */}
           <View style={styles.searchCountBadge}>
             <Text style={styles.searchCountBadgeNumber}>
-              {productsLoading ? '…' : filteredProducts.length}
+              {!catalogComplete ? '…' : filteredProducts.length}
             </Text>
             <Text style={styles.searchCountBadgeLabel}>prod.</Text>
           </View>
@@ -674,35 +870,7 @@ export default function PosCounterScreen() {
 
         {/* 2. SELECTORES DE CATEGORÍA, MARCA Y MEDIDA (INLINE BUSCADOR) */}
         <InlineFilterBar
-          groups={[
-            {
-              id: 'category',
-              label: 'Categorías',
-              selectedValue: selectedCategory,
-              options: categoryListWithCounts,
-              onSelect: (cat) => setSelectedCategory(cat),
-              onClear: () => setSelectedCategory('Todas'),
-              icon: 'category',
-            },
-            {
-              id: 'brand',
-              label: 'Marcas',
-              selectedValue: selectedBrand,
-              options: availableBrands.map((b) => ({ name: b })),
-              onSelect: (b: string) => setSelectedBrand(b),
-              onClear: () => setSelectedBrand('Todas'),
-              icon: 'brand' as const,
-            },
-            {
-              id: 'size',
-              label: 'Medidas',
-              selectedValue: selectedSize,
-              options: availableSizes.map((s) => ({ name: s })),
-              onSelect: (s: string) => setSelectedSize(s),
-              onClear: () => setSelectedSize('Todas'),
-              icon: 'size' as const,
-            },
-          ]}
+          groups={posFilterGroups}
           rightElement={
             pausedSales.length > 0 ? (
               <TouchableOpacity
@@ -721,6 +889,21 @@ export default function PosCounterScreen() {
 
       {/* 4. CATÁLOGO VISUAL DE PRODUCTOS (FLASHLIST DE ALTO RENDIMIENTO) */}
       <View style={styles.catalogArea}>
+        {(refreshing || productsError) && (
+          <View style={styles.catalogSyncNotice}>
+            <View style={styles.catalogSyncCopy}>
+              {refreshing ? <ActivityIndicator size="small" color={ui.primary} /> : null}
+              <Text style={styles.catalogSyncText}>
+                {productsError ? productsError : 'Sincronizando catálogo…'}
+              </Text>
+            </View>
+            {productsError ? (
+              <TouchableOpacity onPress={refreshProducts} accessibilityRole="button" accessibilityLabel="Reintentar sincronización del catálogo">
+                <Text style={styles.catalogRetryText}>Reintentar</Text>
+              </TouchableOpacity>
+            ) : null}
+          </View>
+        )}
         {productsLoading ? (
           <View style={styles.loadingBox}>
             <ActivityIndicator size="large" color={ui.primary} />
@@ -742,61 +925,10 @@ export default function PosCounterScreen() {
           <FlashList
             data={filteredProducts}
             estimatedItemSize={76}
-            keyExtractor={(item) => item.id}
+            keyExtractor={keyExtractor}
+            getItemType={getItemType}
             contentContainerStyle={styles.listContent}
-            renderItem={({ item }) => {
-              const stock = getProductStock(item);
-              const minStock = (item as any).minStock || 3;
-              const isOutOfStock = stock <= 0;
-              const isLowStock = stock > 0 && stock <= minStock;
-
-              const price = Number(item.suggestedPrice ?? item.price ?? 0);
-
-              return (
-                <TouchableOpacity
-                  style={styles.productCard}
-                  onPress={() => handleProductSelect(item)}
-                  accessibilityRole="button"
-                  accessibilityLabel={`Agregar ${item.name}, ${formatPEN(price)}${isOutOfStock ? ', agotado' : `, stock ${stock}`}`}
-                  activeOpacity={0.7}
-                >
-                  <View style={styles.productInfo}>
-                    <Text style={styles.productName} numberOfLines={1}>
-                      {item.name}
-                    </Text>
-                    <View style={styles.productMetaRow}>
-                      <Text style={styles.productSku}>{item.sku || item.barcode || 'General'}</Text>
-                      <View
-                        style={[
-                          styles.stockBadge,
-                          isOutOfStock && styles.stockBadgeRed,
-                          isLowStock && styles.stockBadgeAmber,
-                          !isOutOfStock && !isLowStock && styles.stockBadgeGreen,
-                        ]}
-                      >
-                        <Text
-                          style={[
-                            styles.stockBadgeText,
-                            isOutOfStock && styles.stockBadgeTextRed,
-                            isLowStock && styles.stockBadgeTextAmber,
-                            !isOutOfStock && !isLowStock && styles.stockBadgeTextGreen,
-                          ]}
-                        >
-                          {isOutOfStock ? 'Agotado' : isLowStock ? `Bajo: ${stock}` : `Stock: ${stock}`}
-                        </Text>
-                      </View>
-                    </View>
-                  </View>
-
-                  <View style={styles.productPriceCol}>
-                    <Text style={styles.productPrice}>{formatPEN(price)}</Text>
-                    <View style={styles.addPlusBtn}>
-                      <Plus size={16} color={ui.onPrimary} />
-                    </View>
-                  </View>
-                </TouchableOpacity>
-              );
-            }}
+            renderItem={renderPosItem}
           />
         )}
       </View>
@@ -842,613 +974,553 @@ export default function PosCounterScreen() {
       </View>
 
       {/* DRAWER / MODAL DEL DETALLE DEL CARRITO */}
-      <Modal
-        visible={cartDrawerOpen}
-        animationType="slide"
-        transparent
-        onRequestClose={() => setCartDrawerOpen(false)}
-      >
-        <View style={styles.drawerBackdrop}>
-          <Pressable style={styles.drawerDismissArea} onPress={() => setCartDrawerOpen(false)} />
-          <View style={styles.drawerSheet}>
-            {/* Header del Carrito */}
-            <View style={styles.drawerHeader}>
-              <View style={styles.drawerHeaderTitleRow}>
-                <ShoppingBag size={20} color={ui.text} />
-                  <Text style={styles.drawerTitle}>Tu venta</Text>
-              </View>
-              <View style={{ flexDirection: 'row', gap: 10, alignItems: 'center' }}>
-                {items.length > 0 ? (
+      {cartDrawerOpen && (
+        <Modal
+          visible={cartDrawerOpen}
+          animationType="slide"
+          transparent
+          onRequestClose={() => setCartDrawerOpen(false)}
+        >
+          <View style={styles.drawerBackdrop}>
+            <Pressable style={styles.drawerDismissArea} onPress={() => setCartDrawerOpen(false)} />
+            <View style={styles.drawerSheet}>
+              {/* Header del Carrito */}
+              <View style={styles.drawerHeader}>
+                <View style={styles.drawerHeaderTitleRow}>
+                  <ShoppingBag size={20} color={ui.text} />
+                    <Text style={styles.drawerTitle}>Tu venta</Text>
+                </View>
+                <View style={{ flexDirection: 'row', gap: 10, alignItems: 'center' }}>
+                  {items.length > 0 ? (
+                    <TouchableOpacity
+                      style={styles.drawerIconButton}
+                      accessibilityRole="button"
+                      accessibilityLabel="Vaciar carrito"
+                      onPress={() => {
+                        Alert.alert('Vaciar Carrito', '¿Deseas eliminar todos los productos agregados?', [
+                          { text: 'Cancelar', style: 'cancel' },
+                          { text: 'Vaciar', style: 'destructive', onPress: clearCart },
+                        ]);
+                      }}
+                    >
+                      <Trash2 size={18} color={ui.danger} />
+                    </TouchableOpacity>
+                  ) : null}
                   <TouchableOpacity
-                    style={styles.drawerIconButton}
+                    onPress={() => setCartDrawerOpen(false)}
                     accessibilityRole="button"
-                    accessibilityLabel="Vaciar carrito"
-                    onPress={() => {
-                      Alert.alert('Vaciar Carrito', '¿Deseas eliminar todos los productos agregados?', [
-                        { text: 'Cancelar', style: 'cancel' },
-                        { text: 'Vaciar', style: 'destructive', onPress: clearCart },
-                      ]);
-                    }}
+                    accessibilityLabel="Cerrar detalle de venta"
+                    style={styles.drawerIconButton}
                   >
-                    <Trash2 size={18} color={ui.danger} />
+                    <X size={22} color={ui.textSecondary} />
                   </TouchableOpacity>
-                ) : null}
+                </View>
+              </View>
+
+              {/* Lista de Ítems en Carrito */}
+              <ScrollView style={styles.drawerItemsList}>
+                {items.length === 0 ? (
+                  <View style={styles.drawerEmptyBox}>
+                    <ShoppingBag size={36} color={ui.border} />
+                    <Text style={styles.drawerEmptyText}>El carrito está vacío</Text>
+                  </View>
+                ) : (
+                  items.map((item) => (
+                    <CartItemRow
+                      key={item.id}
+                      item={item}
+                      isEditingPrice={editingPriceItemId === item.id}
+                      newPriceStr={newPriceStr}
+                      canModifyPrice={canModifyPrice}
+                      onUpdateQuantity={handleUpdateCartQty}
+                      onRemoveItem={handleRemoveCartItem}
+                      onStartEditPrice={handleStartEditPrice}
+                      onChangeNewPrice={setNewPriceStr}
+                      onSavePrice={handleSaveItemPrice}
+                    />
+                  ))
+                )}
+              </ScrollView>
+
+              {/* Footer del Carrito */}
+              <View style={styles.drawerFooter}>
+                <View style={styles.drawerFooterRow}>
+                  <TouchableOpacity
+                    style={styles.pauseSaleFooterBtn}
+                    onPress={handlePauseCurrentSale}
+                  >
+                    <Pause size={15} color={ui.textSecondary} />
+                    <Text style={styles.pauseSaleFooterText}>Pausar</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.reserveFooterBtn}
+                    onPress={() => {
+                      if (items.length === 0) {
+                        Alert.alert('Carrito Vacío', 'Agrega productos al carrito para crear una reserva.');
+                        return;
+                      }
+                      setReservationModalOpen(true);
+                    }}
+                    accessibilityRole="button"
+                    accessibilityLabel="Reservar productos del carrito"
+                  >
+                    <CalendarClock size={15} color={ui.accent} />
+                    <Text style={styles.reserveFooterText}>Reservar</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[styles.checkoutBtn, (safeCount === 0 || safeTotal <= 0) && styles.checkoutBtnDisabled]}
+                    onPress={() => {
+                      setCartDrawerOpen(false);
+                      setCheckoutModalOpen(true);
+                    }}
+                    disabled={safeCount === 0 || safeTotal <= 0}
+                  >
+                    <Text style={styles.checkoutBtnText} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.8}>Cobrar · {formatPEN(safeTotal)}</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            </View>
+          </View>
+        </Modal>
+      )}
+
+      {/* MODAL DE MONTO LIBRE (ÍTEM SIN CATALOGAR) */}
+      {quickSaleModalOpen && (
+        <Modal
+          visible={quickSaleModalOpen}
+          animationType="fade"
+          transparent
+          onRequestClose={() => setQuickSaleModalOpen(false)}
+        >
+          <View style={styles.subModalOverlay}>
+            <View style={styles.subModalCard}>
+              <View style={styles.subModalHeader}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                  <Plus size={18} color={ui.primary} />
+                  <Text style={styles.subModalTitle}>Monto Libre (Ítem no catalogado)</Text>
+                </View>
+                <TouchableOpacity onPress={() => setQuickSaleModalOpen(false)}>
+                  <X size={20} color={ui.textSecondary} />
+                </TouchableOpacity>
+              </View>
+
+              <Text style={styles.inputLabel}>Concepto o Descripción</Text>
+              <TextInput
+                style={styles.formInput}
+                value={quickConcept}
+                onChangeText={setQuickConcept}
+                placeholder="Ej. Servicio, Fotocopia, Varios..."
+                placeholderTextColor={ui.textMuted}
+              />
+
+              <Text style={styles.inputLabel}>Importe en Soles (S/)</Text>
+              <TextInput
+                style={[styles.formInput, styles.quickAmountHighlight]}
+                value={quickAmountStr}
+                onChangeText={setQuickAmountStr}
+                placeholder="0.00"
+                keyboardType="decimal-pad"
+                placeholderTextColor={ui.textMuted}
+                autoFocus
+              />
+
+              <View style={styles.subModalActions}>
                 <TouchableOpacity
-                  onPress={() => setCartDrawerOpen(false)}
-                  accessibilityRole="button"
-                  accessibilityLabel="Cerrar detalle de venta"
-                  style={styles.drawerIconButton}
+                  style={styles.subModalCancelBtn}
+                  onPress={() => setQuickSaleModalOpen(false)}
                 >
-                  <X size={22} color={ui.textSecondary} />
+                  <Text style={styles.subModalCancelText}>Cancelar</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.subModalConfirmBtn}
+                  onPress={handleConfirmQuickSale}
+                >
+                  <Plus size={16} color={ui.onPrimary} />
+                  <Text style={styles.subModalConfirmText}>Agregar al Carrito</Text>
                 </TouchableOpacity>
               </View>
             </View>
+          </View>
+        </Modal>
+      )}
 
-            {/* Lista de Ítems en Carrito */}
-            <ScrollView style={styles.drawerItemsList}>
-              {items.length === 0 ? (
-                <View style={styles.drawerEmptyBox}>
-                  <ShoppingBag size={36} color={ui.border} />
-                  <Text style={styles.drawerEmptyText}>El carrito está vacío</Text>
+      {/* MODAL DE RESERVA DE PRODUCTOS */}
+      {reservationModalOpen && (
+        <Modal
+          visible={reservationModalOpen}
+          animationType="fade"
+          transparent
+          onRequestClose={() => setReservationModalOpen(false)}
+        >
+          <KeyboardAvoidingView
+            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+            style={styles.subModalOverlay}
+          >
+            <View style={styles.subModalCard}>
+              <View style={styles.subModalHeader}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                  <CalendarClock size={18} color={ui.accent} />
+                  <Text style={styles.subModalTitle}>Crear Reserva</Text>
+                </View>
+                <TouchableOpacity onPress={() => setReservationModalOpen(false)}>
+                  <X size={20} color={ui.textSecondary} />
+                </TouchableOpacity>
+              </View>
+
+              <ScrollView style={{ maxHeight: 420 }} showsVerticalScrollIndicator={false}>
+                {/* Resumen de items a reservar */}
+                <View style={styles.resSummaryCard}>
+                  <Text style={styles.resSummaryTitle}>
+                    {items.length} {items.length === 1 ? 'producto' : 'productos'} · Total: {formatPEN(safeTotal)}
+                  </Text>
+                  <Text style={styles.resSummarySub}>
+                    El stock se apartará automáticamente de la sucursal actual.
+                  </Text>
+                </View>
+
+                <Text style={styles.inputLabel}>
+                  Nombre del Cliente <Text style={{ color: ui.danger }}>*</Text>
+                </Text>
+                <TextInput
+                  style={styles.formInput}
+                  value={resCustomerName}
+                  onChangeText={setResCustomerName}
+                  placeholder="Ej. Juan Pérez"
+                  placeholderTextColor={ui.textMuted}
+                />
+
+                <View style={{ flexDirection: 'row', gap: 10 }}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.inputLabel}>Teléfono / WhatsApp</Text>
+                    <TextInput
+                      style={styles.formInput}
+                      value={resCustomerPhone}
+                      onChangeText={setResCustomerPhone}
+                      placeholder="999 999 999"
+                      keyboardType="phone-pad"
+                      placeholderTextColor={ui.textMuted}
+                    />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+                      <Text style={styles.inputLabel}>DNI (opcional)</Text>
+                      {isSearchingDni && (
+                        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 2 }}>
+                          <ActivityIndicator size="small" color={ui.primary} style={{ transform: [{ scale: 0.7 }] }} />
+                          <Text style={{ fontSize: 10, color: ui.primary }}>RENIEC...</Text>
+                        </View>
+                      )}
+                    </View>
+                    <TextInput
+                      style={styles.formInput}
+                      value={resCustomerDoc}
+                      onChangeText={setResCustomerDoc}
+                      placeholder="8 dígitos"
+                      keyboardType="numeric"
+                      maxLength={8}
+                      placeholderTextColor={ui.textMuted}
+                    />
+                  </View>
+                </View>
+
+                <View style={{ flexDirection: 'row', gap: 10 }}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.inputLabel}>Adelanto / Seña (S/)</Text>
+                    <TextInput
+                      style={[styles.formInput, { fontWeight: '700', color: ui.primary }]}
+                      value={resDepositStr}
+                      onChangeText={setResDepositStr}
+                      placeholder="0.00"
+                      keyboardType="decimal-pad"
+                      placeholderTextColor={ui.textMuted}
+                    />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.inputLabel}>Días límite</Text>
+                    <TextInput
+                      style={styles.formInput}
+                      value={resDays}
+                      onChangeText={setResDays}
+                      placeholder="7"
+                      keyboardType="numeric"
+                      placeholderTextColor={ui.textMuted}
+                    />
+                  </View>
+                </View>
+
+                {/* Si hay adelanto, método de pago */}
+                {parseFloat(resDepositStr) > 0 && (
+                  <View style={{ marginTop: 8 }}>
+                    <Text style={styles.inputLabel}>Método del Adelanto</Text>
+                    <View style={styles.resMethodRow}>
+                      {(['cash', 'yape', 'plin', 'card'] as const).map((m) => (
+                        <TouchableOpacity
+                          key={m}
+                          style={[
+                            styles.resMethodChip,
+                            resDepositMethod === m && styles.resMethodChipActive,
+                          ]}
+                          onPress={() => setResDepositMethod(m)}
+                        >
+                          <Text
+                            style={[
+                              styles.resMethodChipText,
+                              resDepositMethod === m && styles.resMethodChipTextActive,
+                            ]}
+                          >
+                            {m === 'cash' ? 'Efectivo' : m === 'card' ? 'Tarjeta' : m.toUpperCase()}
+                          </Text>
+                        </TouchableOpacity>
+                      ))}
+                    </View>
+                  </View>
+                )}
+
+                <Text style={styles.inputLabel}>Notas / Observaciones</Text>
+                <TextInput
+                  style={[styles.formInput, { height: 60, textAlignVertical: 'top' }]}
+                  value={resNotes}
+                  onChangeText={setResNotes}
+                  placeholder="Ej. Recoge el fin de semana..."
+                  placeholderTextColor={ui.textMuted}
+                  multiline
+                />
+              </ScrollView>
+
+              <View style={styles.subModalActions}>
+                <TouchableOpacity
+                  style={styles.subModalCancelBtn}
+                  onPress={() => setReservationModalOpen(false)}
+                  disabled={isSavingRes}
+                >
+                  <Text style={styles.subModalCancelText}>Cancelar</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.subModalConfirmBtn, isSavingRes && { opacity: 0.6 }]}
+                  onPress={handleConfirmReservation}
+                  disabled={isSavingRes}
+                >
+                  {isSavingRes ? (
+                    <ActivityIndicator size="small" color={ui.onPrimary} />
+                  ) : (
+                    <>
+                      <CalendarClock size={16} color={ui.onPrimary} />
+                      <Text style={styles.subModalConfirmText}>Confirmar Reserva</Text>
+                    </>
+                  )}
+                </TouchableOpacity>
+              </View>
+            </View>
+          </KeyboardAvoidingView>
+        </Modal>
+      )}
+
+      {/* MODAL DE CUENTAS EN PAUSA */}
+      {pausedModalOpen && (
+        <Modal
+          visible={pausedModalOpen}
+          animationType="fade"
+          transparent
+          onRequestClose={() => setPausedModalOpen(false)}
+        >
+          <View style={styles.subModalOverlay}>
+            <View style={styles.subModalCard}>
+              <View style={styles.subModalHeader}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                  <Clock size={18} color={ui.primary} />
+                  <Text style={styles.subModalTitle}>Ventas en Pausa ({pausedSales.length})</Text>
+                </View>
+                <TouchableOpacity onPress={() => setPausedModalOpen(false)}>
+                  <X size={20} color={ui.textSecondary} />
+                </TouchableOpacity>
+              </View>
+
+              {pausedSales.length === 0 ? (
+                <View style={{ paddingVertical: 24, alignItems: 'center' }}>
+                  <Text style={{ color: ui.textSecondary, fontSize: 13 }}>No hay ventas en espera actualmente.</Text>
                 </View>
               ) : (
-                items.map((item) => {
-                  const itemPrice = item.price;
-                  const itemSubtotal = item.lineTotal !== undefined ? item.lineTotal : itemPrice * item.quantity;
-                  const isEditingPrice = editingPriceItemId === item.id;
-
-                  return (
-                    <View key={item.id} style={styles.drawerCartItem}>
-                      <View style={styles.drawerCartItemTop}>
-                        <View style={{ flex: 1 }}>
-                          <Text style={styles.drawerCartItemName}>{item.name}</Text>
-                          {item.presentation ? (
-                            <Text style={styles.drawerCartItemSub}>
-                              Pres: {item.presentation.name} (x{item.presentation.conversionFactor})
-                            </Text>
-                          ) : item.variant ? (
-                            <Text style={styles.drawerCartItemSub}>Var: {item.variant.name}</Text>
-                          ) : null}
-                        </View>
-                        <Text style={styles.drawerCartItemSubtotal}>{formatPEN(itemSubtotal)}</Text>
-                      </View>
-
-                      {/* Fila de Controles de Cantidad y Precio */}
-                      <View style={styles.drawerCartItemControls}>
-                        {/* Selector de Cantidad */}
-                        <View style={styles.qtyControlRow}>
-                          <TouchableOpacity
-                            style={styles.qtyBtn}
-                            onPress={() => updateQuantity(item.id, item.quantity - 1)}
-                            accessibilityRole="button"
-                            accessibilityLabel={`Reducir cantidad de ${item.name}`}
-                          >
-                            <Minus size={15} color={ui.text} />
-                          </TouchableOpacity>
-                          <Text style={styles.qtyNumberText}>{item.quantity}</Text>
-                          <TouchableOpacity
-                            style={styles.qtyBtn}
-                            onPress={() => updateQuantity(item.id, item.quantity + 1)}
-                            accessibilityRole="button"
-                            accessibilityLabel={`Aumentar cantidad de ${item.name}`}
-                          >
-                            <Plus size={15} color={ui.text} />
-                          </TouchableOpacity>
-                        </View>
-
-                        {/* Editor de Precio Unitario */}
-                        {isEditingPrice ? (
-                          <View style={styles.editPriceInputRow}>
-                            <TextInput
-                              style={styles.editPriceInput}
-                              value={newPriceStr}
-                              onChangeText={setNewPriceStr}
-                              keyboardType="decimal-pad"
-                              placeholder="0.00"
-                              autoFocus
-                            />
-                            <TouchableOpacity
-                              style={styles.savePriceBtn}
-                              onPress={() => handleSaveItemPrice(item)}
-                            >
-                              <Text style={styles.savePriceBtnText}>OK</Text>
-                            </TouchableOpacity>
-                          </View>
-                        ) : canModifyPrice ? (
-                          <TouchableOpacity
-                            style={styles.unitPriceBadge}
-                            accessibilityRole="button"
-                            accessibilityLabel={`Editar precio de ${item.name}, ${formatPEN(itemPrice)} por ${item.unitOfMeasure || 'unidad'}`}
-                            onPress={() => {
-                              setEditingPriceItemId(item.id);
-                              setNewPriceStr(String(item.price));
-                            }}
-                          >
-                            <Text style={styles.unitPriceBadgeText}>
-                              {formatPEN(itemPrice)} / {item.unitOfMeasure || 'und'}
-                            </Text>
-                            <Edit3 size={12} color={ui.textSecondary} style={{ marginLeft: 4 }} />
-                          </TouchableOpacity>
-                        ) : (
-                          <View style={styles.unitPriceBadge}>
-                            <Text style={styles.unitPriceBadgeText}>
-                              {formatPEN(itemPrice)} / {item.unitOfMeasure || 'und'}
+                <ScrollView style={{ maxHeight: 300 }}>
+                  {pausedSales.map((ps) => (
+                    <View key={ps.id} style={styles.pausedItemCard}>
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.pausedItemTitle}>{ps.label}</Text>
+                        {Boolean(ps.customer?.name) && (
+                          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4, marginTop: 2, marginBottom: 2 }}>
+                            <User size={12} color={ui.primary} />
+                            <Text style={{ fontSize: 12, color: ui.text, fontWeight: '600' }} numberOfLines={1}>
+                              {ps.customer?.name}
                             </Text>
                           </View>
                         )}
-
-                        {/* Eliminar Ítem */}
+                        <Text style={styles.pausedItemDetails}>
+                          {ps.items?.length || 0} ítems | Total: {formatPEN(ps.total || 0)}
+                        </Text>
+                      </View>
+                      <View style={{ flexDirection: 'row', gap: 6 }}>
                         <TouchableOpacity
-                          style={styles.deleteItemBtn}
-                          onPress={() => removeItem(item.id)}
-                          accessibilityRole="button"
-                          accessibilityLabel={`Quitar ${item.name} del carrito`}
+                          style={styles.pausedResumeBtn}
+                          onPress={() => handleResumePausedSale(ps.id)}
                         >
-                          <Trash2 size={16} color={ui.danger} />
+                          <Play size={14} color={ui.onPrimary} />
+                          <Text style={styles.pausedResumeBtnText}>Recuperar</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity
+                          style={styles.pausedDeleteBtn}
+                          onPress={() => deletePausedSale(ps.id)}
+                        >
+                          <Trash2 size={14} color={ui.danger} />
                         </TouchableOpacity>
                       </View>
                     </View>
-                  );
-                })
-              )}
-            </ScrollView>
-
-            {/* Footer del Carrito */}
-            <View style={styles.drawerFooter}>
-              <View style={styles.drawerFooterRow}>
-                <TouchableOpacity
-                  style={styles.pauseSaleFooterBtn}
-                  onPress={handlePauseCurrentSale}
-                >
-                  <Pause size={15} color={ui.textSecondary} />
-                  <Text style={styles.pauseSaleFooterText}>Pausar</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={styles.reserveFooterBtn}
-                  onPress={() => {
-                    if (items.length === 0) {
-                      Alert.alert('Carrito Vacío', 'Agrega productos al carrito para crear una reserva.');
-                      return;
-                    }
-                    setReservationModalOpen(true);
-                  }}
-                  accessibilityRole="button"
-                  accessibilityLabel="Reservar productos del carrito"
-                >
-                  <CalendarClock size={15} color={ui.accent} />
-                  <Text style={styles.reserveFooterText}>Reservar</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={[styles.checkoutBtn, (safeCount === 0 || safeTotal <= 0) && styles.checkoutBtnDisabled]}
-                  onPress={() => {
-                    setCartDrawerOpen(false);
-                    setCheckoutModalOpen(true);
-                  }}
-                  disabled={safeCount === 0 || safeTotal <= 0}
-                >
-                  <Text style={styles.checkoutBtnText} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.8}>Cobrar · {formatPEN(safeTotal)}</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-          </View>
-        </View>
-      </Modal>
-
-      {/* MODAL DE MONTO LIBRE (ÍTEM SIN CATALOGAR) */}
-      <Modal
-        visible={quickSaleModalOpen}
-        animationType="fade"
-        transparent
-        onRequestClose={() => setQuickSaleModalOpen(false)}
-      >
-        <View style={styles.subModalOverlay}>
-          <View style={styles.subModalCard}>
-            <View style={styles.subModalHeader}>
-              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-                <Plus size={18} color={ui.primary} />
-                <Text style={styles.subModalTitle}>Monto Libre (Ítem no catalogado)</Text>
-              </View>
-              <TouchableOpacity onPress={() => setQuickSaleModalOpen(false)}>
-                <X size={20} color={ui.textSecondary} />
-              </TouchableOpacity>
-            </View>
-
-            <Text style={styles.inputLabel}>Concepto o Descripción</Text>
-            <TextInput
-              style={styles.formInput}
-              value={quickConcept}
-              onChangeText={setQuickConcept}
-              placeholder="Ej. Servicio, Fotocopia, Varios..."
-              placeholderTextColor={ui.textMuted}
-            />
-
-            <Text style={styles.inputLabel}>Importe en Soles (S/)</Text>
-            <TextInput
-              style={[styles.formInput, styles.quickAmountHighlight]}
-              value={quickAmountStr}
-              onChangeText={setQuickAmountStr}
-              placeholder="0.00"
-              keyboardType="decimal-pad"
-              placeholderTextColor={ui.textMuted}
-              autoFocus
-            />
-
-            <View style={styles.subModalActions}>
-              <TouchableOpacity
-                style={styles.subModalCancelBtn}
-                onPress={() => setQuickSaleModalOpen(false)}
-              >
-                <Text style={styles.subModalCancelText}>Cancelar</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={styles.subModalConfirmBtn}
-                onPress={handleConfirmQuickSale}
-              >
-                <Plus size={16} color={ui.onPrimary} />
-                <Text style={styles.subModalConfirmText}>Agregar al Carrito</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        </View>
-      </Modal>
-
-      {/* MODAL DE RESERVA DE PRODUCTOS */}
-      <Modal
-        visible={reservationModalOpen}
-        animationType="fade"
-        transparent
-        onRequestClose={() => setReservationModalOpen(false)}
-      >
-        <KeyboardAvoidingView
-          behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-          style={styles.subModalOverlay}
-        >
-          <View style={styles.subModalCard}>
-            <View style={styles.subModalHeader}>
-              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-                <CalendarClock size={18} color={ui.accent} />
-                <Text style={styles.subModalTitle}>Crear Reserva</Text>
-              </View>
-              <TouchableOpacity onPress={() => setReservationModalOpen(false)}>
-                <X size={20} color={ui.textSecondary} />
-              </TouchableOpacity>
-            </View>
-
-            <ScrollView style={{ maxHeight: 420 }} showsVerticalScrollIndicator={false}>
-              {/* Resumen de items a reservar */}
-              <View style={styles.resSummaryCard}>
-                <Text style={styles.resSummaryTitle}>
-                  {items.length} {items.length === 1 ? 'producto' : 'productos'} · Total: {formatPEN(safeTotal)}
-                </Text>
-                <Text style={styles.resSummarySub}>
-                  El stock se apartará automáticamente de la sucursal actual.
-                </Text>
-              </View>
-
-              <Text style={styles.inputLabel}>
-                Nombre del Cliente <Text style={{ color: ui.danger }}>*</Text>
-              </Text>
-              <TextInput
-                style={styles.formInput}
-                value={resCustomerName}
-                onChangeText={setResCustomerName}
-                placeholder="Ej. Juan Pérez"
-                placeholderTextColor={ui.textMuted}
-              />
-
-              <View style={{ flexDirection: 'row', gap: 10 }}>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.inputLabel}>Teléfono / WhatsApp</Text>
-                  <TextInput
-                    style={styles.formInput}
-                    value={resCustomerPhone}
-                    onChangeText={setResCustomerPhone}
-                    placeholder="999 999 999"
-                    keyboardType="phone-pad"
-                    placeholderTextColor={ui.textMuted}
-                  />
-                </View>
-                <View style={{ flex: 1 }}>
-                  <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
-                    <Text style={styles.inputLabel}>DNI (opcional)</Text>
-                    {isSearchingDni && (
-                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 2 }}>
-                        <ActivityIndicator size="small" color={ui.primary} style={{ transform: [{ scale: 0.7 }] }} />
-                        <Text style={{ fontSize: 10, color: ui.primary }}>RENIEC...</Text>
-                      </View>
-                    )}
-                  </View>
-                  <TextInput
-                    style={styles.formInput}
-                    value={resCustomerDoc}
-                    onChangeText={setResCustomerDoc}
-                    placeholder="8 dígitos"
-                    keyboardType="numeric"
-                    maxLength={8}
-                    placeholderTextColor={ui.textMuted}
-                  />
-                </View>
-              </View>
-
-              <View style={{ flexDirection: 'row', gap: 10 }}>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.inputLabel}>Adelanto / Seña (S/)</Text>
-                  <TextInput
-                    style={[styles.formInput, { fontWeight: '700', color: ui.primary }]}
-                    value={resDepositStr}
-                    onChangeText={setResDepositStr}
-                    placeholder="0.00"
-                    keyboardType="decimal-pad"
-                    placeholderTextColor={ui.textMuted}
-                  />
-                </View>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.inputLabel}>Días límite</Text>
-                  <TextInput
-                    style={styles.formInput}
-                    value={resDays}
-                    onChangeText={setResDays}
-                    placeholder="7"
-                    keyboardType="numeric"
-                    placeholderTextColor={ui.textMuted}
-                  />
-                </View>
-              </View>
-
-              {/* Si hay adelanto, método de pago */}
-              {parseFloat(resDepositStr) > 0 && (
-                <View style={{ marginTop: 8 }}>
-                  <Text style={styles.inputLabel}>Método del Adelanto</Text>
-                  <View style={styles.resMethodRow}>
-                    {(['cash', 'yape', 'plin', 'card'] as const).map((m) => (
-                      <TouchableOpacity
-                        key={m}
-                        style={[
-                          styles.resMethodChip,
-                          resDepositMethod === m && styles.resMethodChipActive,
-                        ]}
-                        onPress={() => setResDepositMethod(m)}
-                      >
-                        <Text
-                          style={[
-                            styles.resMethodChipText,
-                            resDepositMethod === m && styles.resMethodChipTextActive,
-                          ]}
-                        >
-                          {m === 'cash' ? 'Efectivo' : m === 'card' ? 'Tarjeta' : m.toUpperCase()}
-                        </Text>
-                      </TouchableOpacity>
-                    ))}
-                  </View>
-                </View>
+                  ))}
+                </ScrollView>
               )}
 
-              <Text style={styles.inputLabel}>Notas / Observaciones</Text>
-              <TextInput
-                style={[styles.formInput, { height: 60, textAlignVertical: 'top' }]}
-                value={resNotes}
-                onChangeText={setResNotes}
-                placeholder="Ej. Recoge el fin de semana..."
-                placeholderTextColor={ui.textMuted}
-                multiline
-              />
-            </ScrollView>
-
-            <View style={styles.subModalActions}>
               <TouchableOpacity
-                style={styles.subModalCancelBtn}
-                onPress={() => setReservationModalOpen(false)}
-                disabled={isSavingRes}
+                style={styles.pauseCurrentActionBtn}
+                onPress={() => {
+                  setPausedModalOpen(false);
+                  handlePauseCurrentSale();
+                }}
               >
-                <Text style={styles.subModalCancelText}>Cancelar</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[styles.subModalConfirmBtn, isSavingRes && { opacity: 0.6 }]}
-                onPress={handleConfirmReservation}
-                disabled={isSavingRes}
-              >
-                {isSavingRes ? (
-                  <ActivityIndicator size="small" color={ui.onPrimary} />
-                ) : (
-                  <>
-                    <CalendarClock size={16} color={ui.onPrimary} />
-                    <Text style={styles.subModalConfirmText}>Confirmar Reserva</Text>
-                  </>
-                )}
+                <Pause size={16} color={ui.text} />
+                <Text style={styles.pauseCurrentActionText}>Pausar Carrito Actual</Text>
               </TouchableOpacity>
             </View>
           </View>
-        </KeyboardAvoidingView>
-      </Modal>
-
-      {/* MODAL DE CUENTAS EN PAUSA */}
-      <Modal
-        visible={pausedModalOpen}
-        animationType="fade"
-        transparent
-        onRequestClose={() => setPausedModalOpen(false)}
-      >
-        <View style={styles.subModalOverlay}>
-          <View style={styles.subModalCard}>
-            <View style={styles.subModalHeader}>
-              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-                <Clock size={18} color={ui.primary} />
-                <Text style={styles.subModalTitle}>Ventas en Pausa ({pausedSales.length})</Text>
-              </View>
-              <TouchableOpacity onPress={() => setPausedModalOpen(false)}>
-                <X size={20} color={ui.textSecondary} />
-              </TouchableOpacity>
-            </View>
-
-            {pausedSales.length === 0 ? (
-              <View style={{ paddingVertical: 24, alignItems: 'center' }}>
-                <Text style={{ color: ui.textSecondary, fontSize: 13 }}>No hay ventas en espera actualmente.</Text>
-              </View>
-            ) : (
-              <ScrollView style={{ maxHeight: 300 }}>
-                {pausedSales.map((ps) => (
-                  <View key={ps.id} style={styles.pausedItemCard}>
-                    <View style={{ flex: 1 }}>
-                      <Text style={styles.pausedItemTitle}>{ps.label}</Text>
-                      {Boolean(ps.customer?.name) && (
-                        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4, marginTop: 2, marginBottom: 2 }}>
-                          <User size={12} color={ui.primary} />
-                          <Text style={{ fontSize: 12, color: ui.text, fontWeight: '600' }} numberOfLines={1}>
-                            {ps.customer?.name}
-                          </Text>
-                        </View>
-                      )}
-                      <Text style={styles.pausedItemDetails}>
-                        {ps.items?.length || 0} ítems | Total: {formatPEN(ps.total || 0)}
-                      </Text>
-                    </View>
-                    <View style={{ flexDirection: 'row', gap: 6 }}>
-                      <TouchableOpacity
-                        style={styles.pausedResumeBtn}
-                        onPress={() => handleResumePausedSale(ps.id)}
-                      >
-                        <Play size={14} color={ui.onPrimary} />
-                        <Text style={styles.pausedResumeBtnText}>Recuperar</Text>
-                      </TouchableOpacity>
-                      <TouchableOpacity
-                        style={styles.pausedDeleteBtn}
-                        onPress={() => deletePausedSale(ps.id)}
-                      >
-                        <Trash2 size={14} color={ui.danger} />
-                      </TouchableOpacity>
-                    </View>
-                  </View>
-                ))}
-              </ScrollView>
-            )}
-
-            <TouchableOpacity
-              style={styles.pauseCurrentActionBtn}
-              onPress={() => {
-                setPausedModalOpen(false);
-                handlePauseCurrentSale();
-              }}
-            >
-              <Pause size={16} color={ui.text} />
-              <Text style={styles.pauseCurrentActionText}>Pausar Carrito Actual</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-      </Modal>
+        </Modal>
+      )}
 
       {/* SELECTOR RÁPIDO PARA PRODUCTO POR PESO */}
-      <Modal
-        visible={weightSelectorOpen}
-        animationType="fade"
-        transparent
-        onRequestClose={() => setWeightSelectorOpen(false)}
-      >
-        <View style={styles.subModalOverlay}>
-          <View style={styles.subModalCard}>
-            <View style={styles.subModalHeader}>
-              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-                <Scale size={18} color={ui.accent} />
-                <Text style={styles.subModalTitle}>Productos Pesables</Text>
+      {weightSelectorOpen && (
+        <Modal
+          visible={weightSelectorOpen}
+          animationType="fade"
+          transparent
+          onRequestClose={() => setWeightSelectorOpen(false)}
+        >
+          <View style={styles.subModalOverlay}>
+            <View style={styles.subModalCard}>
+              <View style={styles.subModalHeader}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                  <Scale size={18} color={ui.accent} />
+                  <Text style={styles.subModalTitle}>Productos Pesables</Text>
+                </View>
+                <TouchableOpacity onPress={() => setWeightSelectorOpen(false)}>
+                  <X size={20} color={ui.textSecondary} />
+                </TouchableOpacity>
               </View>
-              <TouchableOpacity onPress={() => setWeightSelectorOpen(false)}>
-                <X size={20} color={ui.textSecondary} />
-              </TouchableOpacity>
-            </View>
 
-            <ScrollView style={{ maxHeight: 320 }}>
-              {products
-                .filter(
-                  (p) =>
-                    p.allowDecimals ||
-                    p.unitOfMeasure === 'kg' ||
-                    p.unitOfMeasure === 'KGM' ||
-                    (p as any).unit === 'kg'
-                )
-                .map((p) => (
-                  <TouchableOpacity
-                    key={p.id}
-                    style={styles.weightItemRow}
-                    onPress={() => {
-                      setWeightSelectorOpen(false);
-                      setWeightModalProduct(p);
-                    }}
-                  >
-                    <Text style={styles.weightItemName}>{p.name}</Text>
-                    <Text style={styles.weightItemPrice}>
-                      {formatPEN(p.suggestedPrice ?? p.price ?? 0)} / kg
-                    </Text>
-                  </TouchableOpacity>
-                ))}
-            </ScrollView>
+              <ScrollView style={{ maxHeight: 320 }}>
+                {products
+                  .filter(
+                    (p) =>
+                      p.allowDecimals ||
+                      p.unitOfMeasure === 'kg' ||
+                      p.unitOfMeasure === 'KGM' ||
+                      (p as any).unit === 'kg'
+                  )
+                  .map((p) => (
+                    <TouchableOpacity
+                      key={p.id}
+                      style={styles.weightItemRow}
+                      onPress={() => {
+                        setWeightSelectorOpen(false);
+                        setWeightModalProduct(p);
+                      }}
+                    >
+                      <Text style={styles.weightItemName}>{p.name}</Text>
+                      <Text style={styles.weightItemPrice}>
+                        {formatPEN(p.suggestedPrice ?? p.price ?? 0)} / kg
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
+              </ScrollView>
+            </View>
           </View>
-        </View>
-      </Modal>
+        </Modal>
+      )}
 
       {/* MODALES EXTERNOS */}
-      <BarcodeScannerModal
-        visible={fullscreenScannerOpen}
-        onClose={() => setFullscreenScannerOpen(false)}
-        onScan={(code) => {
-          setFullscreenScannerOpen(false);
-          handleBarcodeDetected(code);
-        }}
-      />
+      {fullscreenScannerOpen && (
+        <BarcodeScannerModal
+          visible={fullscreenScannerOpen}
+          onClose={() => setFullscreenScannerOpen(false)}
+          onScan={(code) => {
+            setFullscreenScannerOpen(false);
+            handleBarcodeDetected(code);
+          }}
+        />
+      )}
 
-      <PresentationVariantModal
-        visible={Boolean(variantModalProduct)}
-        product={variantModalProduct}
-        onClose={() => setVariantModalProduct(null)}
-        onConfirm={(prod, opts) => {
-          setVariantModalProduct(null);
-          triggerScanHaptic();
-          addItem(prod, {
-            presentation: opts.presentation,
-            variant: opts.variant,
-            quantity: opts.quantity,
-            customPrice: opts.presentation?.price ?? opts.variant?.price,
-          });
-        }}
-      />
+      {variantModalProduct !== null && (
+        <PresentationVariantModal
+          visible={Boolean(variantModalProduct)}
+          product={variantModalProduct}
+          onClose={() => setVariantModalProduct(null)}
+          onConfirm={(prod, opts) => {
+            setVariantModalProduct(null);
+            triggerScanHaptic();
+            addItem(prod, {
+              presentation: opts.presentation,
+              variant: opts.variant,
+              quantity: opts.quantity,
+              customPrice: opts.presentation?.price ?? opts.variant?.price,
+            });
+          }}
+        />
+      )}
 
-      <WeightQuantityModal
-        visible={Boolean(weightModalProduct)}
-        product={weightModalProduct}
-        onClose={() => setWeightModalProduct(null)}
-        onConfirm={(prod, qty, customPrice) => {
-          setWeightModalProduct(null);
-          triggerScanHaptic();
-          addItem(prod, {
-            quantity: qty,
-            customPrice,
-            isWeightBased: true,
-          });
-        }}
-      />
+      {weightModalProduct !== null && (
+        <WeightQuantityModal
+          visible={Boolean(weightModalProduct)}
+          product={weightModalProduct}
+          onClose={() => setWeightModalProduct(null)}
+          onConfirm={(prod, qty, customPrice) => {
+            setWeightModalProduct(null);
+            triggerScanHaptic();
+            addItem(prod, {
+              quantity: qty,
+              customPrice,
+              isWeightBased: true,
+            });
+          }}
+        />
+      )}
 
-      <CheckoutModal
-        visible={checkoutModalOpen}
-        onClose={() => setCheckoutModalOpen(false)}
-      />
+      {checkoutModalOpen && (
+        <CheckoutModal
+          visible={checkoutModalOpen}
+          onClose={() => setCheckoutModalOpen(false)}
+        />
+      )}
 
-      <CompanionScannerModal
-        visible={companionScannerOpen}
-        onClose={() => setCompanionScannerOpen(false)}
-      />
+      {companionScannerOpen && (
+        <CompanionScannerModal
+          visible={companionScannerOpen}
+          onClose={() => setCompanionScannerOpen(false)}
+        />
+      )}
 
-      <QuotesManagerModal
-        visible={quotesModalOpen}
-        onClose={() => setQuotesModalOpen(false)}
-      />
+      {quotesModalOpen && (
+        <QuotesManagerModal
+          visible={quotesModalOpen}
+          onClose={() => setQuotesModalOpen(false)}
+        />
+      )}
 
-      <ReservationReceiptModal
-        visible={resTicketModalOpen}
-        onClose={() => {
-          setResTicketModalOpen(false);
-          setCreatedResTicket(null);
-        }}
-        reservation={createdResTicket}
-        business={businessSettings}
-      />
+      {resTicketModalOpen && (
+        <ReservationReceiptModal
+          visible={resTicketModalOpen}
+          onClose={() => {
+            setResTicketModalOpen(false);
+            setCreatedResTicket(null);
+          }}
+          reservation={createdResTicket}
+          business={businessSettings}
+        />
+      )}
     </View>
   );
 }
@@ -1830,6 +1902,22 @@ const styles = StyleSheet.create({
     flex: 1,
     paddingTop: 4,
   },
+  catalogSyncNotice: {
+    minHeight: 38,
+    marginHorizontal: 14,
+    marginBottom: 4,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    borderRadius: 9,
+    backgroundColor: ui.primarySoft,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  catalogSyncCopy: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 8 },
+  catalogSyncText: { flex: 1, color: ui.textSecondary, fontSize: 11, fontWeight: '600' },
+  catalogRetryText: { color: ui.primary, fontSize: 11, fontWeight: '800' },
   listContent: {
     paddingHorizontal: 20,
     paddingTop: 2,

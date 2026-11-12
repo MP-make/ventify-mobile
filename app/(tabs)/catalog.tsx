@@ -39,11 +39,12 @@ import {
   Barcode,
 } from 'lucide-react-native';
 import * as Haptics from 'expo-haptics';
+import { useFocusEffect } from 'expo-router';
+import { Image } from 'expo-image';
 
 import { useProducts } from '@/context/ProductsContext';
 import { useAuth } from '@/context/AuthContext';
 import { useSettings } from '@/context/SettingsContext';
-import { useCart } from '@/context/CartContext';
 import { usePermissions } from '@/hooks/usePermissions';
 import { formatPEN, formatDatePE } from '@/lib/theme';
 import { ui } from '@/lib/theme';
@@ -53,6 +54,11 @@ import {
   getProductKardex,
   getStockTransfers,
   createStockTransfer,
+  approveStockTransfer,
+  rejectStockTransfer,
+  cancelStockTransfer,
+  sendStockTransfer,
+  completeStockTransfer,
   saveProduct,
   StockTransfer,
 } from '@/services/inventory-kardex-service';
@@ -60,16 +66,17 @@ import { ProductFormModal, ProductFormData } from '@/components/ProductFormModal
 import { collection, query, where, getDocs, limit as fsLimit } from 'firebase/firestore';
 import { db } from '@/lib/firebase';
 import { SuppliersPurchaseModal } from '@/components/SuppliersPurchaseModal';
-import { InlineFilterBar } from '@/components/InlineFilterBar';
+import { InlineFilterBar, FilterGroup } from '@/components/InlineFilterBar';
 import { BarcodeScannerModal } from '@/components/BarcodeScannerModal';
 import {
-  catalogBrand,
-  catalogSizes,
   DEFAULT_CATALOG_BRANDS,
   DEFAULT_CATALOG_SIZES,
   mergeCatalogOptions,
-  normalizeCatalogLabel,
+  buildCatalogProductIndex,
+  filterCatalogIndex,
+  getCatalogCategoryCounts,
 } from '@/lib/catalog-filters';
+import { useDebouncedValue } from '@/hooks/use-debounced-value';
 import type { Product } from '@/types';
 
 type ActiveTab = 'inventory' | 'kardex' | 'transfers';
@@ -82,6 +89,129 @@ const KARDEX_REASONS = [
   'Consumo interno',
 ];
 
+interface InventoryProductCardProps {
+  item: Product;
+  stock: number;
+  canViewMargins: boolean;
+  canManageProducts: boolean;
+  canManageInventoryAdjustments: boolean;
+  onEditProduct: (product: Product) => void;
+  onOpenStockModal: (product: Product) => void;
+}
+
+const InventoryProductCard = React.memo<InventoryProductCardProps>(({
+  item,
+  stock,
+  canViewMargins,
+  canManageProducts,
+  canManageInventoryAdjustments,
+  onEditProduct,
+  onOpenStockModal,
+}) => {
+  const minStock = (item as any).minStock || 3;
+  const isOut = stock <= 0;
+  const isLow = stock > 0 && stock <= minStock;
+
+  const price = Number(item.suggestedPrice ?? item.price ?? 0);
+  const cost = Number(item.costPrice ?? 0);
+  const marginPct = cost > 0 ? ((price - cost) / cost) * 100 : 100;
+
+  return (
+    <View style={styles.inventoryCard}>
+      <View style={styles.inventoryCardHeader}>
+        <View style={styles.productMark}>
+          {item.imageUrl ? (
+            <Image
+              source={{ uri: item.imageUrl }}
+              style={styles.productThumbnail}
+              contentFit="cover"
+              cachePolicy="memory-disk"
+              recyclingKey={item.id}
+            />
+          ) : (
+            <Package size={19} color={ui.primary} />
+          )}
+        </View>
+        <View style={styles.productIdentity}>
+          <Text style={styles.inventoryCardName} numberOfLines={2}>{item.name}</Text>
+          <View style={styles.productMetaRow}>
+            <Text style={styles.productCategory} numberOfLines={1}>{item.category || 'General'}</Text>
+            <Text style={styles.metaSeparator}>·</Text>
+            <Text style={styles.inventoryCardSku} numberOfLines={1}>{item.sku || item.barcode || 'Sin SKU'}</Text>
+          </View>
+        </View>
+        <View
+          style={[
+            styles.stockStatusBadge,
+            isOut && styles.stockStatusBadgeRed,
+            isLow && styles.stockStatusBadgeAmber,
+            !isOut && !isLow && styles.stockStatusBadgeGreen,
+          ]}
+        >
+          <Text
+            style={[
+              styles.stockStatusText,
+              isOut && styles.stockStatusTextRed,
+              isLow && styles.stockStatusTextAmber,
+              !isOut && !isLow && styles.stockStatusTextGreen,
+            ]}
+          >
+            {isOut ? 'Agotado' : `Stock: ${stock} ${item.unitOfMeasure || 'und'}`}
+          </Text>
+        </View>
+      </View>
+
+      <View style={styles.productFinancialRow}>
+        <View style={styles.salePriceBlock}>
+          <Text style={styles.metricLabel}>Precio de venta</Text>
+          <Text style={styles.salePriceValue}>{formatPEN(price)}</Text>
+        </View>
+        {canViewMargins && (
+          <View style={styles.secondaryFinancials}>
+            <View style={styles.secondaryMetric}>
+              <Text style={styles.metricLabel}>Costo</Text>
+              <Text style={styles.metricValue}>{formatPEN(cost)}</Text>
+            </View>
+            <View style={styles.secondaryMetric}>
+              <Text style={styles.metricLabel}>Margen</Text>
+              <Text style={[styles.metricValue, marginPct < 15 ? styles.kpiWarning : styles.kpiSuccess]}>{marginPct.toFixed(0)}%</Text>
+            </View>
+          </View>
+        )}
+      </View>
+
+      {(canManageProducts || canManageInventoryAdjustments) && (
+        <View style={styles.inventoryActionsRow}>
+          {canManageProducts && (
+            <TouchableOpacity
+              style={styles.actionBtnEdit}
+              onPress={() => onEditProduct(item)}
+              activeOpacity={0.7}
+              accessibilityRole="button"
+              accessibilityLabel={`Editar ${item.name}`}
+            >
+              <Edit3 size={15} color={ui.primary} />
+              <Text style={styles.actionBtnEditText}>Editar producto</Text>
+            </TouchableOpacity>
+          )}
+          {canManageInventoryAdjustments && (
+            <TouchableOpacity
+              style={styles.actionBtnStock}
+              onPress={() => onOpenStockModal(item)}
+              activeOpacity={0.7}
+              accessibilityRole="button"
+              accessibilityLabel={`Ajustar stock de ${item.name}`}
+            >
+              <Zap size={15} color={ui.warning} />
+              <Text style={styles.actionBtnStockText}>Ajustar stock</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      )}
+    </View>
+  );
+});
+
 export default function CatalogInventoryScreen() {
   const { accountId, branchId, user, userProfile } = useAuth();
   const {
@@ -89,20 +219,24 @@ export default function CatalogInventoryScreen() {
     canManageInventoryAdjustments,
     canViewMargins,
     canRequestTransfer,
+    canApproveTransfer,
+    canManageTransfers,
+    canAccessBranch,
     hasPermission,
   } = usePermissions();
   const {
     products,
     categories,
     loading: productsLoading,
+    refreshing,
+    catalogComplete,
+    error: productsError,
     refreshProducts,
     getProductStock,
+    getProductAvailableStock,
     upsertProduct,
   } = useProducts();
-  const { branches, activeBranchName, posSettings } = useSettings();
-  const { addItem } = useCart();
-
-  const enableCatalogFilters = !!posSettings?.enableCatalogFilters;
+  const { branches, activeBranchName } = useSettings();
 
   // Sub-pestaña activa
   const [activeTab, setActiveTab] = useState<ActiveTab>('inventory');
@@ -114,32 +248,59 @@ export default function CatalogInventoryScreen() {
   const [selectedCategory, setSelectedCategory] = useState('Todas');
   const [selectedBrand, setSelectedBrand] = useState('Todas');
   const [selectedSize, setSelectedSize] = useState('Todas');
+  const debouncedSearchQuery = useDebouncedValue(searchQuery, 150);
+  const catalogIndex = useMemo(() => buildCatalogProductIndex(products), [products]);
 
   // Marcas únicas del catálogo (incluye atributos y marcas predeterminadas como en la web)
   const availableBrands = useMemo(() => {
-    const extracted = products.map(catalogBrand).filter(Boolean);
-    return ['Todas', ...mergeCatalogOptions(DEFAULT_CATALOG_BRANDS, extracted)];
-  }, [products]);
+    return ['Todas', ...mergeCatalogOptions(DEFAULT_CATALOG_BRANDS, catalogIndex.brands)];
+  }, [catalogIndex]);
 
   // Tallas / Medidas únicas del catálogo
   const availableSizes = useMemo(() => {
-    const extracted = products.flatMap(catalogSizes).filter(Boolean);
-    return ['Todas', ...mergeCatalogOptions(DEFAULT_CATALOG_SIZES, extracted)];
-  }, [products]);
+    return ['Todas', ...mergeCatalogOptions(DEFAULT_CATALOG_SIZES, catalogIndex.sizes)];
+  }, [catalogIndex]);
 
   // Conteo de categorías
   const categoryListWithCounts = useMemo(() => {
-    const rawCategories = ['Todas', ...categories.filter((c) => c !== 'Todas' && c !== 'Todos')];
-    return rawCategories.map((cat) => {
-      const count =
-        cat === 'Todas'
-          ? products.length
-          : cat === 'Sin Categoría'
-          ? products.filter((p) => !p.category).length
-          : products.filter((p) => p.category === cat).length;
-      return { name: cat, count };
-    });
-  }, [categories, products]);
+    return getCatalogCategoryCounts(categories, catalogIndex).map((option) => ({
+      ...option,
+      count: catalogComplete ? option.count : undefined,
+    }));
+  }, [categories, catalogIndex, catalogComplete]);
+
+  const brandOptions = useMemo(() => availableBrands.map((b) => ({ name: b })), [availableBrands]);
+  const sizeOptions = useMemo(() => availableSizes.map((s) => ({ name: s })), [availableSizes]);
+
+  const catalogFilterGroups: FilterGroup[] = useMemo(() => [
+    {
+      id: 'category',
+      label: 'Categorías',
+      selectedValue: selectedCategory,
+      options: categoryListWithCounts,
+      onSelect: (cat) => setSelectedCategory(cat),
+      onClear: () => setSelectedCategory('Todas'),
+      icon: 'category',
+    },
+    {
+      id: 'brand',
+      label: 'Marcas',
+      selectedValue: selectedBrand,
+      options: brandOptions,
+      onSelect: (b: string) => setSelectedBrand(b),
+      onClear: () => setSelectedBrand('Todas'),
+      icon: 'brand' as const,
+    },
+    {
+      id: 'size',
+      label: 'Medidas',
+      selectedValue: selectedSize,
+      options: sizeOptions,
+      onSelect: (s: string) => setSelectedSize(s),
+      onClear: () => setSelectedSize('Todas'),
+      icon: 'size' as const,
+    },
+  ], [selectedCategory, categoryListWithCounts, selectedBrand, brandOptions, selectedSize, sizeOptions]);
 
   // Modal de Producto (Crear / Editar)
   const [productModalOpen, setProductModalOpen] = useState(false);
@@ -175,6 +336,7 @@ export default function CatalogInventoryScreen() {
         docMap.forEach((d) => {
           const data = d.data();
           upsertProduct({
+            ...data,
             id: d.id,
             name: data.name || 'Sin nombre',
             category: data.category || 'General',
@@ -225,6 +387,7 @@ export default function CatalogInventoryScreen() {
   // Sub-pestaña Transferencias
   const [transfersList, setTransfersList] = useState<StockTransfer[]>([]);
   const [transfersLoading, setTransfersLoading] = useState(false);
+  const [transferActionId, setTransferActionId] = useState<string | null>(null);
   const [newTransferModalOpen, setNewTransferModalOpen] = useState(false);
   const [destinationBranchId, setDestinationBranchId] = useState('');
   const [transferProductId, setTransferProductId] = useState('');
@@ -238,24 +401,11 @@ export default function CatalogInventoryScreen() {
   // Búsqueda y escáner en modal de transferencias
   const [transferSearchText, setTransferSearchText] = useState('');
   const [transferScannerOpen, setTransferScannerOpen] = useState(false);
+  const debouncedTransferSearchText = useDebouncedValue(transferSearchText, 150);
 
   const filteredTransferProducts = useMemo(() => {
-    const q = transferSearchText.trim().toLowerCase();
-    if (!q) return products.slice(0, 30);
-    return products
-      .filter((p) => {
-        const name = (p.name || '').toLowerCase();
-        const sku = (p.sku || '').toLowerCase();
-        const barcode = (p.barcode || '').toLowerCase();
-        return (
-          name.includes(q) ||
-          sku.includes(q) ||
-          barcode === q ||
-          barcode.includes(q)
-        );
-      })
-      .slice(0, 30);
-  }, [products, transferSearchText]);
+    return filterCatalogIndex(catalogIndex, { query: debouncedTransferSearchText }).slice(0, 30);
+  }, [catalogIndex, debouncedTransferSearchText]);
 
   const handleTransferBarcodeScanned = (code: string) => {
     setTransferScannerOpen(false);
@@ -306,55 +456,19 @@ export default function CatalogInventoryScreen() {
   }, [products, getProductStock]);
 
   // Filtrado de Inventario
-  const filteredProducts = useMemo(() => {
-    const q = searchQuery.trim().toLowerCase();
-    return products.filter((p) => {
+  const filteredProducts = useMemo(() => filterCatalogIndex(catalogIndex, {
+    query: debouncedSearchQuery,
+    category: selectedCategory,
+    brand: selectedBrand,
+    size: selectedSize,
+    include: (p) => {
       const stock = getProductStock(p);
       const minStock = (p as any).minStock || 3;
-
       if (statusFilter === 'low' && (stock <= 0 || stock > minStock)) return false;
       if (statusFilter === 'out' && stock > 0) return false;
-
-      const matchCat =
-        selectedCategory === 'Todas' ||
-        (selectedCategory === 'Sin Categoría' ? !p.category : p.category === selectedCategory);
-      if (!matchCat) return false;
-
-      if (selectedBrand !== 'Todas') {
-        const pBrand = normalizeCatalogLabel(catalogBrand(p));
-        if (pBrand !== normalizeCatalogLabel(selectedBrand)) {
-          return false;
-        }
-      }
-
-      if (selectedSize !== 'Todas') {
-        const pSizes = catalogSizes(p).map(normalizeCatalogLabel);
-        if (!pSizes.includes(normalizeCatalogLabel(selectedSize))) {
-          return false;
-        }
-      }
-
-      if (!q) return true;
-      const nameMatch = p.name?.toLowerCase().includes(q);
-      const skuMatch = p.sku?.toLowerCase().includes(q);
-      const barcodeMatch = p.barcode?.toLowerCase().includes(q);
-      const extraBarcodeMatch =
-        Array.isArray((p as any).barcodes) &&
-        (p as any).barcodes.some((b: string) => String(b).toLowerCase().includes(q));
-      const brandMatch = p.brand?.toLowerCase().includes(q);
-      const sizeMatch = p.sizeLabel?.toLowerCase().includes(q);
-      return nameMatch || skuMatch || barcodeMatch || extraBarcodeMatch || brandMatch || sizeMatch;
-    });
-  }, [
-    products,
-    searchQuery,
-    statusFilter,
-    selectedCategory,
-    selectedBrand,
-    selectedSize,
-    enableCatalogFilters,
-    getProductStock,
-  ]);
+      return true;
+    },
+  }), [catalogIndex, debouncedSearchQuery, selectedCategory, selectedBrand, selectedSize, statusFilter, getProductStock]);
 
   // Carga de Kardex
   const loadKardex = useCallback(async () => {
@@ -384,16 +498,64 @@ export default function CatalogInventoryScreen() {
     }
   }, [accountId, branchId]);
 
-  useEffect(() => {
-    if (activeTab === 'kardex') {
-      loadKardex();
-    } else if (activeTab === 'transfers') {
-      loadTransfers();
+  const runTransferAction = useCallback(async (
+    transfer: StockTransfer,
+    action: 'approve' | 'reject' | 'cancel' | 'send' | 'receive'
+  ) => {
+    const sourceId = transfer.sourceBranchId || (transfer as any).fromBranchId;
+    const destinationId = transfer.destinationBranchId || (transfer as any).toBranchId;
+    const allowed = action === 'approve' || action === 'reject'
+      ? canApproveTransfer && canAccessBranch(destinationId)
+      : action === 'cancel'
+      ? (canManageTransfers || (canRequestTransfer && transfer.requestedBy === user?.uid && transfer.status === 'pending')) && canAccessBranch(sourceId)
+      : action === 'send'
+      ? canManageTransfers && canAccessBranch(sourceId)
+      : canManageTransfers && canAccessBranch(destinationId);
+    if (!allowed) {
+      Alert.alert('Acceso denegado', 'No tienes permiso para realizar esta acción en la sucursal correspondiente.');
+      return;
     }
-  }, [activeTab, loadKardex, loadTransfers]);
+    const profile = {
+      uid: user?.uid || 'user_pos',
+      displayName: userProfile?.displayName || user?.displayName || user?.email || 'Usuario',
+      email: user?.email || undefined,
+      role: userProfile?.role,
+    };
+    const actionLabels = { approve: 'aprobar', reject: 'rechazar', cancel: 'cancelar', send: 'marcar como enviada', receive: 'confirmar recepción de' };
+    Alert.alert('Confirmar acción', `¿Deseas ${actionLabels[action]} la transferencia ${transfer.transferNumber || transfer.id}?`, [
+      { text: 'Volver', style: 'cancel' },
+      { text: 'Confirmar', style: action === 'reject' || action === 'cancel' ? 'destructive' : 'default', onPress: async () => {
+        setTransferActionId(transfer.id || null);
+        try {
+          if (action === 'approve') await approveStockTransfer(transfer.id!, profile);
+          if (action === 'reject') await rejectStockTransfer(transfer.id!, profile);
+          if (action === 'cancel') await cancelStockTransfer(transfer.id!, profile);
+          if (action === 'send') await sendStockTransfer(transfer.id!, profile);
+          if (action === 'receive') await completeStockTransfer(transfer.id!, profile);
+          await loadTransfers();
+          refreshProducts();
+          Alert.alert('Transferencia actualizada', 'El cambio quedó registrado.');
+        } catch (err: any) {
+          Alert.alert('No se pudo actualizar', err?.message || 'Intenta nuevamente.');
+        } finally {
+          setTransferActionId(null);
+        }
+      } },
+    ]);
+  }, [canApproveTransfer, canManageTransfers, canRequestTransfer, canAccessBranch, loadTransfers, refreshProducts, user, userProfile]);
+
+  useFocusEffect(
+    useCallback(() => {
+      if (activeTab === 'kardex') {
+        loadKardex();
+      } else if (activeTab === 'transfers') {
+        loadTransfers();
+      }
+    }, [activeTab, loadKardex, loadTransfers])
+  );
 
   // Abrir Modal de Ajuste de Stock
-  const openStockModal = (product: Product) => {
+  const openStockModal = useCallback((product: Product) => {
     setAdjustingProduct(product);
     setAdjustMode('add');
     setAdjustAmountStr('');
@@ -401,7 +563,45 @@ export default function CatalogInventoryScreen() {
     setAdjustNotes('');
     setStockModalOpen(true);
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-  };
+  }, []);
+
+  const handleEditProduct = useCallback((product: Product) => {
+    setEditingProduct(product);
+    setProductModalOpen(true);
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+  }, []);
+
+  const renderCatalogItem = useCallback(({ item }: { item: Product }) => (
+    <InventoryProductCard
+      item={item}
+      stock={getProductStock(item)}
+      canViewMargins={canViewMargins}
+      canManageProducts={canManageProducts}
+      canManageInventoryAdjustments={canManageInventoryAdjustments}
+      onEditProduct={handleEditProduct}
+      onOpenStockModal={openStockModal}
+    />
+  ), [
+    getProductStock,
+    canViewMargins,
+    canManageProducts,
+    canManageInventoryAdjustments,
+    handleEditProduct,
+    openStockModal,
+  ]);
+
+  const catalogKeyExtractor = useCallback((item: Product) => item.id, []);
+  const getCatalogItemType = useCallback(() => 'inventory_product', []);
+
+  const kardexKeyExtractor = useCallback((item: any) => (
+    item.id || `${item.productId || 'kardex'}_${item.createdAt || ''}_${item.quantityChanged ?? item.quantity ?? ''}`
+  ), []);
+  const getKardexItemType = useCallback(() => 'kardex', []);
+
+  const transfersKeyExtractor = useCallback((item: StockTransfer) => (
+    item.id || `trf_${item.transferNumber}`
+  ), []);
+  const getTransferItemType = useCallback(() => 'transfer', []);
 
   // Confirmar Ajuste de Stock
   const handleConfirmStockAdjustment = async () => {
@@ -464,9 +664,9 @@ export default function CatalogInventoryScreen() {
     if (!accountId) return;
 
     const stockMap: Record<string, number> = { ...(editingProduct?.stock || {}) };
-    if (formData.stockByBranch && Object.keys(formData.stockByBranch).length > 0) {
+    if (formData.stockByBranch) {
       Object.assign(stockMap, formData.stockByBranch);
-    } else {
+    } else if (!formData.id) {
       stockMap[branchId] = formData.stock;
     }
 
@@ -479,7 +679,7 @@ export default function CatalogInventoryScreen() {
       sku: formData.sku,
       brand: formData.brand,
       sizeLabel: formData.sizeLabel,
-      sizes: formData.sizeLabel ? [formData.sizeLabel] : [],
+      sizes: formData.sizes || [],
       unitOfMeasure: formData.unitOfMeasure as any,
       price: formData.price,
       suggestedPrice: formData.price,
@@ -503,6 +703,7 @@ export default function CatalogInventoryScreen() {
     );
 
     const fullProduct: Product = {
+      ...(editingProduct || {}),
       id: savedId || formData.id || `prod_${Date.now()}`,
       name: formData.name,
       category: formData.category,
@@ -511,7 +712,7 @@ export default function CatalogInventoryScreen() {
       sku: formData.sku,
       brand: formData.brand,
       sizeLabel: formData.sizeLabel,
-      sizes: formData.sizeLabel ? [formData.sizeLabel] : [],
+      sizes: formData.sizes || [],
       unitOfMeasure: formData.unitOfMeasure as any,
       price: formData.price,
       suggestedPrice: formData.price,
@@ -552,7 +753,7 @@ export default function CatalogInventoryScreen() {
     const selectedProd = products.find((p) => p.id === transferProductId);
     if (!selectedProd) return;
 
-    const currentOriginStock = getProductStock(selectedProd);
+    const currentOriginStock = getProductAvailableStock(selectedProd);
     if (qty > currentOriginStock) {
       Alert.alert(
         'Stock Insuficiente',
@@ -621,13 +822,27 @@ export default function CatalogInventoryScreen() {
         ) : null}
       </View>
 
+      {activeTab === 'inventory' && (refreshing || productsError) ? (
+        <View style={styles.catalogSyncNotice}>
+          <View style={styles.catalogSyncCopy}>
+            {refreshing ? <ActivityIndicator size="small" color={ui.primary} /> : null}
+            <Text style={styles.catalogSyncText}>{productsError || 'Sincronizando catálogo…'}</Text>
+          </View>
+          {productsError ? (
+            <TouchableOpacity onPress={refreshProducts} accessibilityRole="button" accessibilityLabel="Reintentar sincronización del catálogo">
+              <Text style={styles.catalogRetryText}>Reintentar</Text>
+            </TouchableOpacity>
+          ) : null}
+        </View>
+      ) : null}
+
       {activeTab === 'inventory' && (
         <View style={styles.kpiContainer}>
           <View style={styles.inventorySummary}>
             {canViewMargins && (
               <View style={styles.valuationRow}>
                 <Text style={styles.valuationLabel}>Valor del inventario</Text>
-                <Text style={styles.valuationAmount}>{formatPEN(kpis.valuation)}</Text>
+                <Text style={styles.valuationAmount}>{catalogComplete ? formatPEN(kpis.valuation) : 'Sincronizando…'}</Text>
               </View>
             )}
             <View style={styles.inventoryCounts}>
@@ -641,10 +856,11 @@ export default function CatalogInventoryScreen() {
                   Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
                 }}
                 accessibilityRole="button"
-                accessibilityLabel={`Todos los productos (${kpis.totalSkus})`}
+                accessibilityLabel={catalogComplete ? `Todos los productos (${kpis.totalSkus})` : 'Sincronizando catálogo'}
+                disabled={!catalogComplete}
               >
                 <Text style={[styles.inventoryCount, statusFilter === 'all' && styles.kpiCountTextActive]}>
-                  <Text style={styles.inventoryCountValue}>{kpis.totalSkus}</Text> productos
+                  <Text style={styles.inventoryCountValue}>{catalogComplete ? kpis.totalSkus : '…'}</Text> productos
                 </Text>
               </TouchableOpacity>
 
@@ -658,10 +874,11 @@ export default function CatalogInventoryScreen() {
                   Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
                 }}
                 accessibilityRole="button"
-                accessibilityLabel={`Stock bajo (${kpis.lowStockCount})`}
+                accessibilityLabel={catalogComplete ? `Stock bajo (${kpis.lowStockCount})` : 'Sincronizando catálogo'}
+                disabled={!catalogComplete}
               >
                 <Text style={[styles.inventoryCount, styles.kpiWarning, statusFilter === 'low' && styles.kpiCountTextActiveWarning]}>
-                  <Text style={styles.inventoryCountValue}>{kpis.lowStockCount}</Text> stock bajo
+                  <Text style={styles.inventoryCountValue}>{catalogComplete ? kpis.lowStockCount : '…'}</Text> stock bajo
                 </Text>
               </TouchableOpacity>
 
@@ -675,10 +892,11 @@ export default function CatalogInventoryScreen() {
                   Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
                 }}
                 accessibilityRole="button"
-                accessibilityLabel={`Agotados (${kpis.outOfStockCount})`}
+                accessibilityLabel={catalogComplete ? `Agotados (${kpis.outOfStockCount})` : 'Sincronizando catálogo'}
+                disabled={!catalogComplete}
               >
                 <Text style={[styles.inventoryCount, styles.kpiDanger, statusFilter === 'out' && styles.kpiCountTextActiveDanger]}>
-                  <Text style={styles.inventoryCountValue}>{kpis.outOfStockCount}</Text> agotados
+                  <Text style={styles.inventoryCountValue}>{catalogComplete ? kpis.outOfStockCount : '…'}</Text> agotados
                 </Text>
               </TouchableOpacity>
             </View>
@@ -809,42 +1027,14 @@ export default function CatalogInventoryScreen() {
 
           {/* Selectores de Categoría, Marca y Medida (Inline con buscador sin scroll horizontal) */}
           <InlineFilterBar
-            groups={[
-              {
-                id: 'category',
-                label: 'Categorías',
-                selectedValue: selectedCategory,
-                options: categoryListWithCounts,
-                onSelect: (cat) => setSelectedCategory(cat),
-                onClear: () => setSelectedCategory('Todas'),
-                icon: 'category',
-              },
-              {
-                id: 'brand',
-                label: 'Marcas',
-                selectedValue: selectedBrand,
-                options: availableBrands.map((b) => ({ name: b })),
-                onSelect: (b: string) => setSelectedBrand(b),
-                onClear: () => setSelectedBrand('Todas'),
-                icon: 'brand' as const,
-              },
-              {
-                id: 'size',
-                label: 'Medidas',
-                selectedValue: selectedSize,
-                options: availableSizes.map((s) => ({ name: s })),
-                onSelect: (s: string) => setSelectedSize(s),
-                onClear: () => setSelectedSize('Todas'),
-                icon: 'size' as const,
-              },
-            ]}
+            groups={catalogFilterGroups}
           />
 
           {/* Lista de Productos con FlashList */}
           <View style={{ flex: 1, marginTop: 8 }}>
             {!productsLoading && filteredProducts.length > 0 && (
               <View style={styles.listSectionHeading}>
-                <SectionHeading title="Productos" subtitle={`${filteredProducts.length} en este catálogo`} />
+                <SectionHeading title="Productos" subtitle={catalogComplete ? `${filteredProducts.length} en este catálogo` : 'Sincronizando catálogo…'} />
               </View>
             )}
             {productsLoading ? (
@@ -923,107 +1113,10 @@ export default function CatalogInventoryScreen() {
               <FlashList
                 data={filteredProducts}
                 estimatedItemSize={92}
-                keyExtractor={(item) => item.id}
-                contentContainerStyle={{ paddingHorizontal: 14, paddingBottom: 30 }}
-                renderItem={({ item }) => {
-                  const stock = getProductStock(item);
-                  const minStock = (item as any).minStock || 3;
-                  const isOut = stock <= 0;
-                  const isLow = stock > 0 && stock <= minStock;
-
-                  const price = Number(item.suggestedPrice ?? item.price ?? 0);
-                  const cost = Number(item.costPrice ?? 0);
-                  const marginPct = cost > 0 ? ((price - cost) / cost) * 100 : 100;
-
-                  return (
-                    <View style={styles.inventoryCard}>
-                      <View style={styles.inventoryCardHeader}>
-                        <View style={styles.productMark}>
-                          <Package size={19} color={ui.primary} />
-                        </View>
-                        <View style={styles.productIdentity}>
-                          <Text style={styles.inventoryCardName} numberOfLines={2}>{item.name}</Text>
-                          <View style={styles.productMetaRow}>
-                            <Text style={styles.productCategory} numberOfLines={1}>{item.category || 'General'}</Text>
-                            <Text style={styles.metaSeparator}>·</Text>
-                            <Text style={styles.inventoryCardSku} numberOfLines={1}>{item.sku || item.barcode || 'Sin SKU'}</Text>
-                          </View>
-                        </View>
-                        <View
-                          style={[
-                            styles.stockStatusBadge,
-                            isOut && styles.stockStatusBadgeRed,
-                            isLow && styles.stockStatusBadgeAmber,
-                            !isOut && !isLow && styles.stockStatusBadgeGreen,
-                          ]}
-                        >
-                          <Text
-                            style={[
-                              styles.stockStatusText,
-                              isOut && styles.stockStatusTextRed,
-                              isLow && styles.stockStatusTextAmber,
-                              !isOut && !isLow && styles.stockStatusTextGreen,
-                            ]}
-                          >
-                            {isOut ? 'Agotado' : `Stock: ${stock} ${item.unitOfMeasure || 'und'}`}
-                          </Text>
-                        </View>
-                      </View>
-
-                      <View style={styles.productFinancialRow}>
-                        <View style={styles.salePriceBlock}>
-                          <Text style={styles.metricLabel}>Precio de venta</Text>
-                          <Text style={styles.salePriceValue}>{formatPEN(price)}</Text>
-                        </View>
-                        {canViewMargins && (
-                          <View style={styles.secondaryFinancials}>
-                            <View style={styles.secondaryMetric}>
-                              <Text style={styles.metricLabel}>Costo</Text>
-                              <Text style={styles.metricValue}>{formatPEN(cost)}</Text>
-                            </View>
-                            <View style={styles.secondaryMetric}>
-                              <Text style={styles.metricLabel}>Margen</Text>
-                              <Text style={[styles.metricValue, marginPct < 15 ? styles.kpiWarning : styles.kpiSuccess]}>{marginPct.toFixed(0)}%</Text>
-                            </View>
-                          </View>
-                        )}
-                      </View>
-
-                      {(canManageProducts || canManageInventoryAdjustments) && (
-                        <View style={styles.inventoryActionsRow}>
-                          {canManageProducts && (
-                            <TouchableOpacity
-                              style={styles.actionBtnEdit}
-                              onPress={() => {
-                                setEditingProduct(item);
-                                setProductModalOpen(true);
-                                Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-                              }}
-                              activeOpacity={0.7}
-                              accessibilityRole="button"
-                              accessibilityLabel={`Editar ${item.name}`}
-                            >
-                              <Edit3 size={15} color={ui.primary} />
-                              <Text style={styles.actionBtnEditText}>Editar producto</Text>
-                            </TouchableOpacity>
-                          )}
-                          {canManageInventoryAdjustments && (
-                            <TouchableOpacity
-                              style={styles.actionBtnStock}
-                              onPress={() => openStockModal(item)}
-                              activeOpacity={0.7}
-                              accessibilityRole="button"
-                              accessibilityLabel={`Ajustar stock de ${item.name}`}
-                            >
-                              <Zap size={15} color={ui.warning} />
-                              <Text style={styles.actionBtnStockText}>Ajustar stock</Text>
-                            </TouchableOpacity>
-                          )}
-                        </View>
-                      )}
-                    </View>
-                  );
-                }}
+                keyExtractor={catalogKeyExtractor}
+                getItemType={getCatalogItemType}
+                contentContainerStyle={styles.catalogListContent}
+                renderItem={renderCatalogItem}
               />
             )}
           </View>
@@ -1058,8 +1151,9 @@ export default function CatalogInventoryScreen() {
             <FlashList
               data={kardexList}
               estimatedItemSize={88}
-              keyExtractor={(item, index) => item.id || `kardex_${index}`}
-              contentContainerStyle={{ paddingBottom: 30 }}
+              keyExtractor={kardexKeyExtractor}
+              getItemType={getKardexItemType}
+              contentContainerStyle={styles.listPaddingBottom}
               renderItem={({ item }) => {
                 const rawQty = item.quantityChanged !== undefined
                   ? Number(item.quantityChanged)
@@ -1192,8 +1286,9 @@ export default function CatalogInventoryScreen() {
             <FlashList
               data={transfersList}
               estimatedItemSize={96}
-              keyExtractor={(item) => item.id || `trf_${item.transferNumber}`}
-              contentContainerStyle={{ paddingBottom: 30 }}
+              keyExtractor={transfersKeyExtractor}
+              getItemType={getTransferItemType}
+              contentContainerStyle={styles.listPaddingBottom}
               renderItem={({ item }) => {
                 const totalUnits = (item.items || []).reduce(
                   (acc, it) => acc + (it.quantity || 0),
@@ -1212,6 +1307,12 @@ export default function CatalogInventoryScreen() {
                             ? 'COMPLETADA'
                             : item.status === 'in_transit'
                             ? 'EN TRÁNSITO'
+                            : item.status === 'rejected'
+                            ? 'RECHAZADA'
+                            : item.status === 'cancelled'
+                            ? 'CANCELADA'
+                            : item.status === 'approved'
+                            ? 'APROBADA'
                             : 'PENDIENTE'}
                         </Text>
                       </View>
@@ -1229,9 +1330,30 @@ export default function CatalogInventoryScreen() {
                         {totalUnits} unidades transferidas
                       </Text>
                       <Text style={styles.transferDateText}>
-                        {formatDatePE(item.sentAt || item.requestedAt)}
+                        {formatDatePE(item.sentAt || item.shippedAt || item.requestedAt)}
                       </Text>
                     </View>
+                    {(() => {
+                      const sourceId = item.sourceBranchId || (item as any).fromBranchId;
+                      const destinationId = item.destinationBranchId || (item as any).toBranchId;
+                      const actions: Array<{ label: string; action: 'approve' | 'reject' | 'cancel' | 'send' | 'receive' }> = [];
+                      if (item.status === 'pending' && canApproveTransfer && canAccessBranch(destinationId)) {
+                        actions.push({ label: 'Aprobar', action: 'approve' }, { label: 'Rechazar', action: 'reject' });
+                      }
+                      const canCancel = (canManageTransfers && (item.status === 'pending' || item.status === 'approved')) ||
+                        (canRequestTransfer && item.requestedBy === user?.uid && item.status === 'pending');
+                      if (canCancel && canAccessBranch(sourceId)) {
+                        actions.push({ label: 'Cancelar', action: 'cancel' });
+                      }
+                      if (item.status === 'approved' && canManageTransfers && canAccessBranch(sourceId)) actions.push({ label: 'Marcar enviada', action: 'send' });
+                      if ((item.status === 'approved' || item.status === 'in_transit') && canManageTransfers && canAccessBranch(destinationId)) actions.push({ label: 'Recibir', action: 'receive' });
+                      if (!actions.length) return null;
+                      return <View style={styles.transferActionsRow}>{actions.map(({ label, action }) => (
+                        <TouchableOpacity key={action} onPress={() => runTransferAction(item, action)} disabled={transferActionId === item.id} style={styles.transferActionButton} accessibilityRole="button">
+                          {transferActionId === item.id ? <ActivityIndicator size="small" color={ui.primary} /> : <Text style={styles.transferActionText}>{label}</Text>}
+                        </TouchableOpacity>
+                      ))}</View>;
+                    })()}
                   </View>
                 );
               }}
@@ -1241,12 +1363,13 @@ export default function CatalogInventoryScreen() {
       ) : null}
 
       {/* MODAL 1: AJUSTE RÁPIDO DE STOCK */}
-      <Modal
-        visible={stockModalOpen}
-        animationType="fade"
-        transparent
-        onRequestClose={() => setStockModalOpen(false)}
-      >
+      {stockModalOpen && (
+        <Modal
+          visible={stockModalOpen}
+          animationType="fade"
+          transparent
+          onRequestClose={() => setStockModalOpen(false)}
+        >
         <View style={styles.subModalOverlay}>
           <View style={styles.subModalCard}>
             <View style={styles.subModalHeader}>
@@ -1350,14 +1473,16 @@ export default function CatalogInventoryScreen() {
           </View>
         </View>
       </Modal>
+      )}
 
       {/* MODAL 2: NUEVA TRANSFERENCIA */}
-      <Modal
-        visible={newTransferModalOpen}
-        animationType="slide"
-        transparent
-        onRequestClose={() => setNewTransferModalOpen(false)}
-      >
+      {newTransferModalOpen && (
+        <Modal
+          visible={newTransferModalOpen}
+          animationType="slide"
+          transparent
+          onRequestClose={() => setNewTransferModalOpen(false)}
+        >
         <KeyboardAvoidingView
           style={styles.subModalOverlay}
           behavior={Platform.OS === 'ios' ? 'padding' : undefined}
@@ -1521,42 +1646,51 @@ export default function CatalogInventoryScreen() {
           </View>
         </KeyboardAvoidingView>
       </Modal>
+      )}
 
       {/* MODAL 3: CREAR / EDITAR PRODUCTO */}
-      <ProductFormModal
-        visible={productModalOpen}
-        product={editingProduct}
-        onClose={() => setProductModalOpen(false)}
-        onSave={handleSaveProduct}
-        branchId={branchId}
-      />
+      {productModalOpen && (
+        <ProductFormModal
+          visible={productModalOpen}
+          product={editingProduct}
+          onClose={() => setProductModalOpen(false)}
+          onSave={handleSaveProduct}
+          branchId={branchId}
+        />
+      )}
 
       {/* MODAL 4: PROVEEDORES Y ÓRDENES DE COMPRA */}
-      <SuppliersPurchaseModal
-        visible={suppliersModalOpen}
-        onClose={() => setSuppliersModalOpen(false)}
-        onStockUpdated={refreshProducts}
-      />
+      {suppliersModalOpen && (
+        <SuppliersPurchaseModal
+          visible={suppliersModalOpen}
+          onClose={() => setSuppliersModalOpen(false)}
+          onStockUpdated={refreshProducts}
+        />
+      )}
 
       {/* MODAL 5: ESCÁNER DE CÓDIGO DE BARRAS EN INVENTARIO */}
-      <BarcodeScannerModal
-        visible={catalogScannerOpen}
-        onClose={() => setCatalogScannerOpen(false)}
-        onScan={(code) => {
-          setCatalogScannerOpen(false);
-          setSearchQuery(code);
-          Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-        }}
-        title="Escanear en Inventario"
-      />
+      {catalogScannerOpen && (
+        <BarcodeScannerModal
+          visible={catalogScannerOpen}
+          onClose={() => setCatalogScannerOpen(false)}
+          onScan={(code) => {
+            setCatalogScannerOpen(false);
+            setSearchQuery(code);
+            Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+          }}
+          title="Escanear en Inventario"
+        />
+      )}
 
       {/* MODAL 6: ESCÁNER DE CÓDIGO DE BARRAS PARA TRANSFERENCIAS */}
-      <BarcodeScannerModal
-        visible={transferScannerOpen}
-        onClose={() => setTransferScannerOpen(false)}
-        onScan={handleTransferBarcodeScanned}
-        title="Escanear Producto a Transferir"
-      />
+      {transferScannerOpen && (
+        <BarcodeScannerModal
+          visible={transferScannerOpen}
+          onClose={() => setTransferScannerOpen(false)}
+          onScan={handleTransferBarcodeScanned}
+          title="Escanear Producto a Transferir"
+        />
+      )}
     </View>
   );
 }
@@ -1827,6 +1961,22 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     padding: 40,
   },
+  catalogSyncNotice: {
+    minHeight: 38,
+    marginHorizontal: 14,
+    marginTop: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    borderRadius: 9,
+    backgroundColor: ui.primarySoft,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  catalogSyncCopy: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 8 },
+  catalogSyncText: { flex: 1, color: ui.textSecondary, fontSize: 11, fontWeight: '600' },
+  catalogRetryText: { color: ui.primary, fontSize: 11, fontWeight: '800' },
   centerLoadingText: {
     fontSize: 13,
     color: ui.textSecondary,
@@ -2222,6 +2372,9 @@ const styles = StyleSheet.create({
     fontSize: 11,
     color: ui.textSecondary,
   },
+  transferActionsRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 10 },
+  transferActionButton: { paddingHorizontal: 10, paddingVertical: 7, borderRadius: 7, backgroundColor: ui.background },
+  transferActionText: { fontSize: 11, fontWeight: '700', color: ui.primary },
   subModalOverlay: {
     flex: 1,
     backgroundColor: 'rgba(0,0,0,0.5)',
@@ -2404,5 +2557,17 @@ const styles = StyleSheet.create({
     fontSize: 11,
     color: ui.primary,
     fontWeight: '700',
+  },
+  catalogListContent: {
+    paddingHorizontal: 14,
+    paddingBottom: 30,
+  },
+  listPaddingBottom: {
+    paddingBottom: 30,
+  },
+  productThumbnail: {
+    width: 48,
+    height: 48,
+    borderRadius: 14,
   },
 });

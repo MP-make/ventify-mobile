@@ -1,13 +1,27 @@
-import React from 'react';
-import { Image, StyleSheet, Text, View } from 'react-native';
+import React, { useMemo } from 'react';
+import { StyleSheet, Text, View } from 'react-native';
+import { Image } from 'expo-image';
 import { ui } from '@/lib/theme';
 
 /** The original Ventify mark, shared with the web product. */
 export function BrandLogo({ size = 40, wordmark = true }: { size?: number; wordmark?: boolean }) {
+  const logoStyle = useMemo(() => ({ width: size, height: size }), [size]);
+  const isLarge = size > 50;
+
   return (
     <View style={styles.brand} accessibilityLabel="Ventify" accessible>
-      <Image source={require('../../../assets/brand/ventify-logo.png')} style={{ width: size, height: size }} resizeMode="contain" accessibilityIgnoresInvertColors />
-      {wordmark && <Text style={[styles.wordmark, { fontSize: size > 50 ? 34 : 24 }]}>ventify<Text style={styles.wordmarkDot}>.</Text></Text>}
+      <Image
+        source={require('../../../assets/brand/ventify-logo.png')}
+        style={logoStyle}
+        contentFit="contain"
+        cachePolicy="memory-disk"
+        accessibilityIgnoresInvertColors
+      />
+      {wordmark && (
+        <Text style={[styles.wordmark, isLarge ? styles.wordmarkLg : styles.wordmarkSm]}>
+          ventify<Text style={styles.wordmarkDot}>.</Text>
+        </Text>
+      )}
     </View>
   );
 }
@@ -39,6 +53,8 @@ export function SectionHeading({ title, subtitle, action }: HeadingProps) {
 const styles = StyleSheet.create({
   brand: { flexDirection: 'row', alignItems: 'center', gap: 9 },
   wordmark: { fontWeight: '800', letterSpacing: -1, color: ui.text },
+  wordmarkSm: { fontSize: 24 },
+  wordmarkLg: { fontSize: 34 },
   wordmarkDot: { color: ui.primary },
   heading: { flexDirection: 'row', alignItems: 'center', gap: 12, paddingHorizontal: 20, paddingTop: 24, paddingBottom: 20, flexWrap: 'wrap' },
   headingCopy: { flex: 1, minWidth: 150 },

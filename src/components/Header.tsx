@@ -9,7 +9,7 @@ import { BrandLogo } from '@/components/ui';
 
 export interface HeaderProps { title?: string; showBranchSelector?: boolean }
 
-export const Header: React.FC<HeaderProps> = ({ title, showBranchSelector = true }) => {
+export const Header: React.FC<HeaderProps> = React.memo(({ title, showBranchSelector = true }) => {
   const insets = useSafeAreaInsets();
   const { lockTerminal, branchId, setActiveBranchId, allBranchesAccess, role } = useAuth();
   const { businessName, activeBranchName, branches, isCashOpen, isOnline, offlineQueueCount } = useSettings();
@@ -67,31 +67,33 @@ export const Header: React.FC<HeaderProps> = ({ title, showBranchSelector = true
           <View style={styles.notice}><CloudOff size={13} color={ui.warning} /><Text style={styles.noticeText}>{offlineQueueCount} pendientes de sincronizar</Text></View>
         ) : null}
       </View>
-      <Modal visible={branchModalVisible} transparent animationType="fade" onRequestClose={() => setBranchModalVisible(false)}>
-        <TouchableOpacity style={styles.overlay} activeOpacity={1} onPress={() => setBranchModalVisible(false)}>
-          <View style={[styles.sheet, { paddingBottom: Math.max(insets.bottom, 20) }]} onStartShouldSetResponder={() => true}>
-            <View style={styles.sheetHeader}>
-              <View style={styles.copy}><Text style={styles.sheetTitle}>Tus sucursales</Text><Text style={styles.sheetSubtitle}>Elige dónde vas a trabajar.</Text></View>
-              <TouchableOpacity style={styles.sheetCloseButton} onPress={() => setBranchModalVisible(false)} accessibilityRole="button" accessibilityLabel="Cerrar selección de sucursal"><X size={20} color={ui.textSecondary} /></TouchableOpacity>
+      {branchModalVisible && (
+        <Modal visible={branchModalVisible} transparent animationType="fade" onRequestClose={() => setBranchModalVisible(false)}>
+          <TouchableOpacity style={styles.overlay} activeOpacity={1} onPress={() => setBranchModalVisible(false)}>
+            <View style={[styles.sheet, { paddingBottom: Math.max(insets.bottom, 20) }]} onStartShouldSetResponder={() => true}>
+              <View style={styles.sheetHeader}>
+                <View style={styles.copy}><Text style={styles.sheetTitle}>Tus sucursales</Text><Text style={styles.sheetSubtitle}>Elige dónde vas a trabajar.</Text></View>
+                <TouchableOpacity style={styles.sheetCloseButton} onPress={() => setBranchModalVisible(false)} accessibilityRole="button" accessibilityLabel="Cerrar selección de sucursal"><X size={20} color={ui.textSecondary} /></TouchableOpacity>
+              </View>
+              <ScrollView showsVerticalScrollIndicator={false}>
+                {branches.map(b => {
+                  const selected = b.id === branchId;
+                  return (
+                    <TouchableOpacity key={b.id || b.name} onPress={() => b.id && handleSelectBranch(b.id)} style={[styles.branchCard, selected && styles.selectedBranch]} accessibilityRole="button" accessibilityState={{ selected }} accessibilityLabel={`${b.name}${selected ? ', sucursal activa' : ''}`}>
+                      <View style={[styles.storeIcon, selected && { backgroundColor: ui.primarySoft }]}><Store size={21} color={selected ? ui.primary : ui.textSecondary} /></View>
+                      <View style={styles.copy}><Text style={[styles.branchTitle, selected && { color: ui.primary }]}>{b.name}</Text>{b.address ? <View style={styles.addressRow}><MapPin size={12} color={ui.textMuted} /><Text style={styles.address} numberOfLines={2}>{b.address}</Text></View> : null}</View>
+                      {selected && <Check size={20} color={ui.primary} />}
+                    </TouchableOpacity>
+                  );
+                })}
+              </ScrollView>
             </View>
-            <ScrollView showsVerticalScrollIndicator={false}>
-              {branches.map(b => {
-                const selected = b.id === branchId;
-                return (
-                  <TouchableOpacity key={b.id || b.name} onPress={() => b.id && handleSelectBranch(b.id)} style={[styles.branchCard, selected && styles.selectedBranch]} accessibilityRole="button" accessibilityState={{ selected }} accessibilityLabel={`${b.name}${selected ? ', sucursal activa' : ''}`}>
-                    <View style={[styles.storeIcon, selected && { backgroundColor: ui.primarySoft }]}><Store size={21} color={selected ? ui.primary : ui.textSecondary} /></View>
-                    <View style={styles.copy}><Text style={[styles.branchTitle, selected && { color: ui.primary }]}>{b.name}</Text>{b.address ? <View style={styles.addressRow}><MapPin size={12} color={ui.textMuted} /><Text style={styles.address} numberOfLines={2}>{b.address}</Text></View> : null}</View>
-                    {selected && <Check size={20} color={ui.primary} />}
-                  </TouchableOpacity>
-                );
-              })}
-            </ScrollView>
-          </View>
-        </TouchableOpacity>
-      </Modal>
+          </TouchableOpacity>
+        </Modal>
+      )}
     </>
   );
-};
+});
 const styles = StyleSheet.create({
   container: { backgroundColor: ui.surface, paddingHorizontal: 14, paddingBottom: 6, borderBottomWidth: 1, borderBottomColor: ui.border },
   singleBarRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8, minHeight: 38 },

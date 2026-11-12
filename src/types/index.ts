@@ -202,6 +202,8 @@ export interface CartItem {
   presentationId?: string;
   presentationName?: string;
   presentationQty?: number;
+  /** Historical alias retained when restoring saved carts. */
+  conversionFactor?: number;
   unitOfMeasure?: string;
   allowDecimals?: boolean;
   stepDecimal?: number;

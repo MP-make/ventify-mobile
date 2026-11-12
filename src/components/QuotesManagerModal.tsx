@@ -26,6 +26,7 @@ import {
   Share,
   Platform,
 } from 'react-native';
+import { FlashList } from '@shopify/flash-list';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   X,
@@ -76,7 +77,106 @@ export interface QuotesManagerModalProps {
   onLoadQuoteToPos?: (quote: Quote) => void;
 }
 
-export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = ({
+// Helper de badges de estado
+const getStatusBadge = (status: QuoteStatus, expiryDate?: number) => {
+  const isExpired = expiryDate ? Date.now() > expiryDate : false;
+
+  if (status === 'converted') {
+    return {
+      label: 'Convertida en Venta',
+      bg: ui.primarySoft,
+      text: ui.primary,
+      border: 'rgba(59, 130, 246, 0.3)',
+    };
+  }
+  if (status === 'accepted') {
+    return {
+      label: 'Aceptada',
+      bg: ui.primarySoft,
+      text: ui.primary,
+      border: 'rgba(16, 185, 129, 0.3)',
+    };
+  }
+  if (status === 'rejected') {
+    return {
+      label: 'Rechazada',
+      bg: ui.dangerSoft,
+      text: ui.danger,
+      border: 'rgba(239, 68, 68, 0.3)',
+    };
+  }
+  if (isExpired) {
+    return {
+      label: 'Vencida',
+      bg: ui.warningSoft,
+      text: ui.warning,
+      border: 'rgba(245, 158, 11, 0.4)',
+    };
+  }
+  return {
+    label: 'Pendiente',
+    bg: ui.warningSoft,
+    text: ui.warning,
+    border: 'rgba(245, 158, 11, 0.3)',
+  };
+};
+
+interface QuoteCardItemProps {
+  quote: Quote;
+  onSelect: (quote: Quote) => void;
+}
+
+const QuoteCardItem = React.memo<QuoteCardItemProps>(({ quote, onSelect }) => {
+  const badge = getStatusBadge(quote.status, quote.expiryDate);
+  return (
+    <TouchableOpacity
+      style={styles.quoteCard}
+      onPress={() => onSelect(quote)}
+      activeOpacity={0.75}
+    >
+      <View style={styles.cardHeader}>
+        <View style={styles.cardHeaderLeft}>
+          <Text style={styles.cardNumber}>{quote.formattedNumber}</Text>
+          <Text style={styles.cardCustomerName} numberOfLines={1}>
+            {quote.customerName}
+          </Text>
+        </View>
+
+        <View
+          style={[
+            styles.statusBadge,
+            { backgroundColor: badge.bg, borderColor: badge.border },
+          ]}
+        >
+          <Text style={[styles.statusBadgeText, { color: badge.text }]}>
+            {badge.label}
+          </Text>
+        </View>
+      </View>
+
+      <View style={styles.cardBody}>
+        <View style={styles.cardInfoCol}>
+          <Text style={styles.cardItemCountText}>
+            {quote.items.length} {quote.items.length === 1 ? 'producto' : 'productos'}
+          </Text>
+          <Text style={styles.cardDateText}>
+            Emisión: {formatDatePE(quote.date)}
+          </Text>
+        </View>
+
+        <View style={styles.cardPriceCol}>
+          <Text style={styles.cardTotalAmount}>{formatPEN(quote.total)}</Text>
+          <View style={styles.cardDetailsArrow}>
+            <Text style={styles.cardDetailsText}>Ver Detalle</Text>
+            <ChevronRight size={14} color={ui.primary} />
+          </View>
+        </View>
+      </View>
+    </TouchableOpacity>
+  );
+});
+
+export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(({
   visible,
   isOpen,
   onClose,
@@ -87,7 +187,7 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = ({
 
   const { accountId, branchId } = useAuth();
   const { businessSettings, activeBranchName } = useSettings();
-  const { clearCart, addItem, setCustomer, setNotes } = useCart();
+  const { clearCart, addItem, setCustomer, setNotes, setSourceQuoteId, setSaleRequestId, setDiscount, setShippingAmount } = useCart();
 
   // Estados de lista y filtros
   const [quotes, setQuotes] = useState<Quote[]>([]);
@@ -110,11 +210,12 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = ({
         setQuotes(data);
         setLoading(false);
 
-        // Si hay una seleccionada, refrescar sus datos
-        if (selectedQuote) {
-          const fresh = data.find((q) => q.id === selectedQuote.id);
-          if (fresh) setSelectedQuote(fresh);
-        }
+        // Si hay una seleccionada, refrescar sus datos sin depender de stale closure
+        setSelectedQuote((curr) => {
+          if (!curr) return null;
+          const fresh = data.find((q) => q.id === curr.id);
+          return fresh || curr;
+        });
       },
       branchId,
       (err) => {
@@ -163,54 +264,17 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = ({
     return { totalCount, pendingCount, pendingAmount };
   }, [quotes]);
 
-  // Helper de badges de estado
-  const getStatusBadge = (status: QuoteStatus, expiryDate?: number) => {
-    const isExpired = expiryDate ? Date.now() > expiryDate : false;
-
-    if (status === 'converted') {
-      return {
-        label: 'Convertida en Venta',
-        bg: ui.primarySoft,
-        text: ui.primary,
-        border: 'rgba(59, 130, 246, 0.3)',
-      };
-    }
-    if (status === 'accepted') {
-      return {
-        label: 'Aceptada',
-        bg: ui.primarySoft,
-        text: ui.primary,
-        border: 'rgba(16, 185, 129, 0.3)',
-      };
-    }
-    if (status === 'rejected') {
-      return {
-        label: 'Rechazada',
-        bg: ui.dangerSoft,
-        text: ui.danger,
-        border: 'rgba(239, 68, 68, 0.3)',
-      };
-    }
-    if (isExpired) {
-      return {
-        label: 'Vencida',
-        bg: ui.warningSoft,
-        text: ui.warning,
-        border: 'rgba(245, 158, 11, 0.4)',
-      };
-    }
-    return {
-      label: 'Pendiente',
-      bg: ui.warningSoft,
-      text: ui.warning,
-      border: 'rgba(245, 158, 11, 0.3)',
-    };
-  };
-
   // 3. ACCIÓN: Cargar al Carrito POS / Convertir a Venta
   const handleLoadQuoteToPos = useCallback(
     async (quote: Quote) => {
       try {
+        const lineTotal = quote.items.reduce((sum, item) => sum + Number(item.price || 0) * Number(item.quantity || 0), 0);
+        const shipping = Math.max(0, Number(quote.shippingAmount) || 0);
+        const residualDiscount = lineTotal - (Number(quote.total || 0) - shipping);
+        if (quote.items.some((item) => !item.id) || residualDiscount < -0.02) {
+          Alert.alert('Cotización no disponible para POS', 'Los productos o el total de esta cotización no coinciden con el catálogo. Actualiza la cotización antes de cobrarla.');
+          return;
+        }
         setIsProcessing(true);
         Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
 
@@ -218,9 +282,9 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = ({
         clearCart();
 
         // 2. Establecer cliente si existe
-        if (quote.customerName && quote.customerName !== 'Cliente General') {
+        if (quote.customerId && quote.customerName && quote.customerName !== 'Cliente General') {
           const clientObj: Customer = {
-            id: quote.customerId || `cust_${Date.now()}`,
+            id: quote.customerId,
             name: quote.customerName,
             dni: quote.customerDni || undefined,
             ruc: quote.customerRuc || undefined,
@@ -232,12 +296,12 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = ({
             accountId: quote.accountId || accountId || '',
           };
           setCustomer(clientObj);
-        }
+        } else setCustomer(null);
 
         // 3. Cargar ítems al carrito resolviendo presentaciones/variantes
         quote.items.forEach((item) => {
           const productStub: Product = {
-            id: item.id || `prod_${Date.now()}`,
+            id: item.id,
             name: item.name,
             category: item.category || 'General',
             sku: item.sku || item.id,
@@ -271,6 +335,11 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = ({
           });
         });
 
+        setSourceQuoteId(quote.id);
+        setSaleRequestId(null);
+        setDiscount(Math.max(0, Math.round(residualDiscount * 100) / 100));
+        setShippingAmount(shipping);
+
         // 4. Copiar notas
         if (quote.notes) {
           setNotes(`Cotización ${quote.formattedNumber}: ${quote.notes}`);
@@ -278,11 +347,7 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = ({
           setNotes(`Cotización ${quote.formattedNumber}`);
         }
 
-        // 5. Marcar estado como aceptada si estaba pendiente
-        if (quote.status === 'pending') {
-          await updateQuoteStatus(quote.id, 'accepted');
-        }
-
+        // La cotización solo cambia a convertida dentro de la transacción real de cobro.
         // 6. Callback opcional de navegación/control
         if (onLoadQuoteToPos) {
           onLoadQuoteToPos(quote);
@@ -305,7 +370,7 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = ({
         setIsProcessing(false);
       }
     },
-    [clearCart, setCustomer, addItem, setNotes, accountId, onLoadQuoteToPos, onClose]
+    [clearCart, setCustomer, addItem, setNotes, setSourceQuoteId, setSaleRequestId, setDiscount, setShippingAmount, accountId, onLoadQuoteToPos, onClose]
   );
 
   // 4. ACCIÓN: Compartir Cotización PDF por WhatsApp
@@ -826,71 +891,29 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = ({
                 </Text>
               </View>
             ) : (
-              <ScrollView
-                style={styles.listScroll}
-                contentContainerStyle={[styles.listScrollContent, { paddingBottom: insets.bottom + 20 }]}
-              >
-                {filteredQuotes.map((quote) => {
-                  const badge = getStatusBadge(quote.status, quote.expiryDate);
-                  return (
-                    <TouchableOpacity
-                      key={quote.id}
-                      style={styles.quoteCard}
-                      onPress={() => {
-                        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
-                        setSelectedQuote(quote);
-                      }}
-                      activeOpacity={0.75}
-                    >
-                      <View style={styles.cardHeader}>
-                        <View style={styles.cardHeaderLeft}>
-                          <Text style={styles.cardNumber}>{quote.formattedNumber}</Text>
-                          <Text style={styles.cardCustomerName} numberOfLines={1}>
-                            {quote.customerName}
-                          </Text>
-                        </View>
-
-                        <View
-                          style={[
-                            styles.statusBadge,
-                            { backgroundColor: badge.bg, borderColor: badge.border },
-                          ]}
-                        >
-                          <Text style={[styles.statusBadgeText, { color: badge.text }]}>
-                            {badge.label}
-                          </Text>
-                        </View>
-                      </View>
-
-                      <View style={styles.cardBody}>
-                        <View style={styles.cardInfoCol}>
-                          <Text style={styles.cardItemCountText}>
-                            {quote.items.length} {quote.items.length === 1 ? 'producto' : 'productos'}
-                          </Text>
-                          <Text style={styles.cardDateText}>
-                            Emisión: {formatDatePE(quote.date)}
-                          </Text>
-                        </View>
-
-                        <View style={styles.cardPriceCol}>
-                          <Text style={styles.cardTotalAmount}>{formatPEN(quote.total)}</Text>
-                          <View style={styles.cardDetailsArrow}>
-                            <Text style={styles.cardDetailsText}>Ver Detalle</Text>
-                            <ChevronRight size={14} color={ui.primary} />
-                          </View>
-                        </View>
-                      </View>
-                    </TouchableOpacity>
-                  );
-                })}
-              </ScrollView>
+              <FlashList
+                data={filteredQuotes}
+                renderItem={({ item }) => (
+                  <QuoteCardItem
+                    quote={item}
+                    onSelect={(quote) => {
+                      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
+                      setSelectedQuote(quote);
+                    }}
+                  />
+                )}
+                keyExtractor={(item) => item.id}
+                estimatedItemSize={115}
+                contentContainerStyle={[styles.listScrollContent, { paddingBottom: insets.bottom + 20 }] as any}
+                showsVerticalScrollIndicator={false}
+              />
             )}
           </View>
         )}
       </View>
     </Modal>
   );
-};
+});
 
 // ============================================================================
 // ESTILOS NATIVOS VENTIFY

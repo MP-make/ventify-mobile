@@ -26,7 +26,15 @@ import {
   Animated,
   Easing,
   Alert,
+  AppState,
 } from 'react-native';
+import AnimatedReanimated, {
+  useSharedValue,
+  useAnimatedStyle,
+  withRepeat,
+  withTiming,
+  Easing as ReanimatedEasing,
+} from 'react-native-reanimated';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   CameraView,
@@ -82,7 +90,47 @@ export interface CompanionScannerModalProps {
   onSessionConnected?: (session: CompanionSessionData) => void;
 }
 
-export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = ({
+const BARCODE_SCANNER_CONFIG: any = {
+  barcodeTypes: [
+    'ean13',
+    'ean8',
+    'code128',
+    'code39',
+    'upc_a',
+    'upc_e',
+    'qr',
+  ],
+};
+
+interface ScannedHistoryCardItemProps {
+  item: ScannedCodeHistoryItem;
+}
+
+const ScannedHistoryCardItem = React.memo<ScannedHistoryCardItemProps>(({ item }) => (
+  <View style={styles.historyCardItem}>
+    <View style={styles.historyCardTop}>
+      <Text style={styles.historyCardCode} numberOfLines={1}>
+        {item.code}
+      </Text>
+      <View
+        style={[
+          styles.historyStatusDot,
+          item.status === 'rejected' && styles.historyStatusDotRejected,
+        ]}
+      />
+    </View>
+    <Text style={styles.historyCardName} numberOfLines={1}>
+      {item.productName || 'Producto'}
+    </Text>
+    {item.productPrice !== undefined && (
+      <Text style={styles.historyCardPrice}>
+        {formatPEN(item.productPrice)}
+      </Text>
+    )}
+  </View>
+));
+
+export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React.memo(({
   visible,
   onClose,
   initialSessionId,
@@ -91,6 +139,14 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = ({
   const insets = useSafeAreaInsets();
   const [permission, requestPermission] = useCameraPermissions();
   const { findByBarcode } = useProducts();
+
+  const [isAppActive, setIsAppActive] = useState<boolean>(true);
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (state) => {
+      setIsAppActive(state === 'active');
+    });
+    return () => sub.remove();
+  }, []);
 
   // Estados de vinculación y sesión
   const [session, setSession] = useState<CompanionSessionData | null>(null);
@@ -120,63 +176,50 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = ({
   const isScanBusyRef = useRef<boolean>(false);
 
   // ============================================================================
-  // ANIMACIONES: LÁSER Y PULSO DE VINCULACIÓN
+  // ANIMACIONES: LÁSER Y PULSO DE VINCULACIÓN (REANIMATED UI-THREAD)
   // ============================================================================
 
-  const laserAnim = useRef(new Animated.Value(0)).current;
-  const pulseAnim = useRef(new Animated.Value(1)).current;
+  const laserProgress = useSharedValue(0);
+  const pulseScale = useSharedValue(1);
   const bannerOpacityAnim = useRef(new Animated.Value(0)).current;
   const bannerTranslateAnim = useRef(new Animated.Value(-15)).current;
 
-  // Animación del láser escaneador (sube y baja continuamente)
+  // Animación del láser escaneador (sube y baja continuamente en hilo UI nativo)
   useEffect(() => {
     if (!visible) return;
-
-    const laserLoop = Animated.loop(
-      Animated.sequence([
-        Animated.timing(laserAnim, {
-          toValue: 1,
-          duration: 1500,
-          easing: Easing.inOut(Easing.quad),
-          useNativeDriver: true,
-        }),
-        Animated.timing(laserAnim, {
-          toValue: 0,
-          duration: 1500,
-          easing: Easing.inOut(Easing.quad),
-          useNativeDriver: true,
-        }),
-      ])
+    laserProgress.value = 0;
+    laserProgress.value = withRepeat(
+      withTiming(1, { duration: 1500, easing: ReanimatedEasing.inOut(ReanimatedEasing.quad) }),
+      -1,
+      true
     );
+  }, [visible, laserProgress]);
 
-    laserLoop.start();
-    return () => laserLoop.stop();
-  }, [visible, laserAnim]);
+  const laserAnimatedStyle = useAnimatedStyle(() => {
+    const maxTravel = session ? 140 : 200;
+    return {
+      transform: [{ translateY: 10 + laserProgress.value * maxTravel }],
+    };
+  });
 
   // Animación de pulso verde para el indicador "VINCULADO A PC MOSTRADOR"
   useEffect(() => {
     if (!visible || !session) return;
-
-    const pulseLoop = Animated.loop(
-      Animated.sequence([
-        Animated.timing(pulseAnim, {
-          toValue: 1.4,
-          duration: 800,
-          easing: Easing.out(Easing.ease),
-          useNativeDriver: true,
-        }),
-        Animated.timing(pulseAnim, {
-          toValue: 1.0,
-          duration: 800,
-          easing: Easing.in(Easing.ease),
-          useNativeDriver: true,
-        }),
-      ])
+    pulseScale.value = 1;
+    pulseScale.value = withRepeat(
+      withTiming(1.4, { duration: 800, easing: ReanimatedEasing.out(ReanimatedEasing.ease) }),
+      -1,
+      true
     );
+  }, [visible, session, pulseScale]);
 
-    pulseLoop.start();
-    return () => pulseLoop.stop();
-  }, [visible, session, pulseAnim]);
+  const pulseAnimatedStyle = useAnimatedStyle(() => {
+    const opacity = 0.8 - ((pulseScale.value - 1) / 0.4) * 0.8;
+    return {
+      transform: [{ scale: pulseScale.value }],
+      opacity,
+    };
+  });
 
   // Efecto visual para mostrar el HUD del producto recién detectado
   const showDetectedBanner = useCallback(() => {
@@ -236,8 +279,24 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = ({
           return;
         }
 
-        // Actualizar datos de sesión si cambió el propósito o la respuesta de la PC
-        setSession((prev) => (prev ? { ...prev, ...updatedSession } : updatedSession));
+        // Actualizar datos de sesión si cambió el propósito o la respuesta de la PC (ignorar heartbeats puros)
+        setSession((prev) => {
+          if (!prev) return updatedSession;
+          if (
+            prev.purpose === updatedSession.purpose &&
+            prev.branchId === updatedSession.branchId &&
+            prev.cashSessionId === updatedSession.cashSessionId &&
+            prev.status === updatedSession.status &&
+            prev.paired === updatedSession.paired &&
+            prev.scan?.id === updatedSession.scan?.id &&
+            prev.scan?.result === updatedSession.scan?.result &&
+            prev.scan?.message === updatedSession.scan?.message &&
+            prev.revoked === updatedSession.revoked
+          ) {
+            return prev;
+          }
+          return { ...prev, ...updatedSession };
+        });
 
         // Actualizar estado del historial cuando la PC procesa la lectura
         const lastScan = updatedSession.scan;
@@ -547,23 +606,20 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = ({
           /* VISTA PRINCIPAL DE CÁMARA NATIVA (EXPO-CAMERA) */
           /* ================================================================= */
           <View style={StyleSheet.absoluteFillObject}>
-            <CameraView
-              style={StyleSheet.absoluteFillObject}
-              facing="back"
-              enableTorch={torch}
-              barcodeScannerSettings={{
-                barcodeTypes: [
-                  'ean13',
-                  'ean8',
-                  'code128',
-                  'code39',
-                  'upc_a',
-                  'upc_e',
-                  'qr',
-                ],
-              }}
-              onBarcodeScanned={handleBarcodeScanned}
-            />
+            {isAppActive ? (
+              <CameraView
+                style={StyleSheet.absoluteFillObject}
+                facing="back"
+                enableTorch={torch}
+                barcodeScannerSettings={BARCODE_SCANNER_CONFIG}
+                onBarcodeScanned={handleBarcodeScanned}
+              />
+            ) : (
+              <View style={styles.centerContainer}>
+                <ActivityIndicator size="large" color={ui.primary} />
+                <Text style={styles.loadingText}>Cámara en pausa</Text>
+              </View>
+            )}
 
             {/* =============================================================== */}
             {/* OVERLAY NATIVO ESMERALDA: ESTADO 1 vs ESTADO 2 */}
@@ -591,16 +647,10 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = ({
                   <View style={styles.headerSessionInfo}>
                     {/* Indicador Verde Pulsante */}
                     <View style={styles.pulseContainer}>
-                      <Animated.View
+                      <AnimatedReanimated.View
                         style={[
                           styles.pulseRing,
-                          {
-                            transform: [{ scale: pulseAnim }],
-                            opacity: pulseAnim.interpolate({
-                              inputRange: [1, 1.4],
-                              outputRange: [0.8, 0],
-                            }),
-                          },
+                          pulseAnimatedStyle,
                         ]}
                       />
                       <View style={styles.pulseDot} />
@@ -705,19 +755,10 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = ({
                   <View style={styles.reticleCrosshair} />
 
                   {/* Haz de Luz Láser Verde Animado */}
-                  <Animated.View
+                  <AnimatedReanimated.View
                     style={[
                       styles.animatedLaserBeam,
-                      {
-                        transform: [
-                          {
-                            translateY: laserAnim.interpolate({
-                              inputRange: [0, 1],
-                              outputRange: [10, session ? 150 : 210],
-                            }),
-                          },
-                        ],
-                      },
+                      laserAnimatedStyle,
                     ]}
                   />
                 </View>
@@ -896,27 +937,7 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = ({
                         contentContainerStyle={styles.historyScrollContent}
                       >
                         {scannedHistory.slice(0, 15).map((item) => (
-                          <View key={item.id} style={styles.historyCardItem}>
-                            <View style={styles.historyCardTop}>
-                              <Text style={styles.historyCardCode} numberOfLines={1}>
-                                {item.code}
-                              </Text>
-                              <View
-                                style={[
-                                  styles.historyStatusDot,
-                                  item.status === 'rejected' && styles.historyStatusDotRejected,
-                                ]}
-                              />
-                            </View>
-                            <Text style={styles.historyCardName} numberOfLines={1}>
-                              {item.productName || 'Producto'}
-                            </Text>
-                            {item.productPrice !== undefined && (
-                              <Text style={styles.historyCardPrice}>
-                                {formatPEN(item.productPrice)}
-                              </Text>
-                            )}
-                          </View>
+                          <ScannedHistoryCardItem key={item.id} item={item} />
                         ))}
                       </ScrollView>
                     ) : (
@@ -1062,7 +1083,7 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = ({
       </View>
     </Modal>
   );
-};
+});
 
 // ============================================================================
 // ESTILOS NATIVOS DARK ESMERALDA DE VENTIFY
@@ -1248,11 +1269,6 @@ const styles = StyleSheet.create({
     borderWidth: 1.5,
     borderColor: '#10B981',
     maxWidth: '90%',
-    shadowColor: '#10B981',
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.35,
-    shadowRadius: 10,
-    elevation: 8,
     zIndex: 10,
   },
   hudBadgeIcon: {

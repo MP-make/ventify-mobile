@@ -24,6 +24,7 @@ import {
   Platform,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { FlashList } from '@shopify/flash-list';
 import {
   X,
   Users,
@@ -53,6 +54,7 @@ import * as Haptics from 'expo-haptics';
 import { useAuth } from '@/context/AuthContext';
 import { useSettings } from '@/context/SettingsContext';
 import { useCart } from '@/context/CartContext';
+import { useProducts } from '@/context/ProductsContext';
 import { ui, theme, formatPEN, formatDatePE } from '@/lib/theme';
 import { ScreenHeading, SectionHeading } from '@/components/ui';
 import {
@@ -66,7 +68,6 @@ import {
   subscribeToSaleRequests,
   registerPayrollPayment,
   resolveSaleRequest,
-  markSaleRequestAsConverted,
   createSaleRequest,
 } from '@/services/enterprise-ops-service';
 import type { Product, Customer } from '@/types';
@@ -80,7 +81,243 @@ export interface PayrollUsersModalProps {
 
 type SubTab = 'team' | 'payroll' | 'requests';
 
-export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = ({
+interface TeamMemberCardItemProps {
+  member: TeamMember;
+}
+
+const TeamMemberCardItem = React.memo<TeamMemberCardItemProps>(({ member }) => (
+  <View style={styles.memberCard}>
+    <View style={styles.memberAvatar}>
+      <Text style={styles.memberAvatarText}>
+        {member.name.charAt(0).toUpperCase()}
+      </Text>
+    </View>
+
+    <View style={styles.memberInfoCol}>
+      <View style={styles.memberNameRow}>
+        <Text style={styles.memberNameText} numberOfLines={1}>
+          {member.name}
+        </Text>
+        {member.isActive ? (
+          <View style={styles.activeDot} />
+        ) : (
+          <Text style={styles.inactiveTag}>Inactivo</Text>
+        )}
+      </View>
+
+      <Text style={styles.memberRoleBadge}>{member.roleLabel}</Text>
+
+      {member.email ? (
+        <View style={styles.memberMetaRow}>
+          <Mail size={12} color={ui.textMuted} />
+          <Text style={styles.memberMetaText} numberOfLines={1}>
+            {member.email}
+          </Text>
+        </View>
+      ) : null}
+
+      {member.phone ? (
+        <View style={styles.memberMetaRow}>
+          <Phone size={12} color={ui.textMuted} />
+          <Text style={styles.memberMetaText}>{member.phone}</Text>
+        </View>
+      ) : null}
+
+      {member.branchName ? (
+        <View style={styles.memberMetaRow}>
+          <Building2 size={12} color={ui.textMuted} />
+          <Text style={styles.memberMetaText}>Sede: {member.branchName}</Text>
+        </View>
+      ) : null}
+    </View>
+
+    {member.baseSalary ? (
+      <View style={styles.salaryCol}>
+        <Text style={styles.salaryLabel}>Sueldo Base</Text>
+        <Text style={styles.salaryValue}>{formatPEN(member.baseSalary)}</Text>
+      </View>
+    ) : null}
+  </View>
+));
+
+interface PayrollMovementCardItemProps {
+  mov: PayrollMovement;
+}
+
+const PayrollMovementCardItem = React.memo<PayrollMovementCardItemProps>(({ mov }) => (
+  <View style={styles.movementCard}>
+    <View style={styles.movementHeader}>
+      <View>
+        <Text style={styles.movementEmployeeName}>{mov.employeeName}</Text>
+        <Text style={styles.movementDateText}>{formatDatePE(mov.date)}</Text>
+      </View>
+
+      <View
+        style={[
+          styles.conceptBadge,
+          mov.conceptType === 'advance' && { backgroundColor: ui.warningSoft, borderColor: ui.warning },
+          mov.conceptType === 'salary' && { backgroundColor: ui.primarySoft, borderColor: ui.primary },
+          mov.conceptType === 'commission' && { backgroundColor: ui.primarySoft, borderColor: ui.primary },
+        ]}
+      >
+        <Text
+          style={[
+            styles.conceptBadgeText,
+            mov.conceptType === 'advance' && { color: ui.warning },
+            mov.conceptType === 'salary' && { color: ui.primary },
+            mov.conceptType === 'commission' && { color: ui.primary },
+          ]}
+        >
+          {mov.conceptLabel}
+        </Text>
+      </View>
+    </View>
+
+    <View style={styles.movementBody}>
+      <View style={styles.movementMetaCol}>
+        <Text style={styles.movementMethodText}>Método: {mov.paymentMethod}</Text>
+        {mov.deductFromCashDrawer ? (
+          <Text style={styles.cashDeductedTag}>• Descontado de Caja Chica</Text>
+        ) : null}
+        {mov.notes ? (
+          <Text style={styles.movementNotesText} numberOfLines={2}>
+            "{mov.notes}"
+          </Text>
+        ) : null}
+      </View>
+
+      <Text style={styles.movementAmountText}>{formatPEN(mov.amount)}</Text>
+    </View>
+  </View>
+));
+
+interface SaleRequestCardItemProps {
+  req: SaleRequest;
+  isSubmitting: boolean;
+  onApprove: (req: SaleRequest) => void;
+  onReject: (req: SaleRequest) => void;
+  onLoadPos: (req: SaleRequest) => void;
+}
+
+const SaleRequestCardItem = React.memo<SaleRequestCardItemProps>(({
+  req,
+  isSubmitting,
+  onApprove,
+  onReject,
+  onLoadPos,
+}) => {
+  const isPending = req.status === 'pending';
+  const isApproved = req.status === 'approved';
+  return (
+    <View style={styles.requestCard}>
+      {/* Cabecera de la solicitud */}
+      <View style={styles.requestCardHeader}>
+        <View>
+          <Text style={styles.requestNumText}>{req.requestNumber}</Text>
+          <Text style={styles.requestSellerText}>Vendedor: {req.sellerName}</Text>
+          <Text style={styles.requestDateText}>{formatDatePE(req.createdAt)}</Text>
+        </View>
+
+        <View
+          style={[
+            styles.statusBadge,
+            req.status === 'pending' && { backgroundColor: ui.warningSoft, borderColor: ui.warning },
+            req.status === 'approved' && { backgroundColor: ui.primarySoft, borderColor: ui.primary },
+            req.status === 'converted' && { backgroundColor: ui.primarySoft, borderColor: ui.primary },
+            req.status === 'rejected' && { backgroundColor: ui.dangerSoft, borderColor: ui.danger },
+          ]}
+        >
+          <Text
+            style={[
+              styles.statusBadgeText,
+              req.status === 'pending' && { color: ui.warning },
+              req.status === 'approved' && { color: ui.primary },
+              req.status === 'converted' && { color: ui.primary },
+              req.status === 'rejected' && { color: ui.danger },
+            ]}
+          >
+            {req.status === 'pending'
+              ? 'Pendiente'
+              : req.status === 'approved'
+              ? 'Aprobada'
+              : req.status === 'converted'
+              ? 'En POS'
+              : 'Rechazada'}
+          </Text>
+        </View>
+      </View>
+
+      <View style={styles.divider} />
+
+      {/* Cliente y Motivo */}
+      <Text style={styles.requestClientText}>Cliente: {req.customerName}</Text>
+      {req.reason ? (
+        <Text style={styles.requestReasonText}>Motivo: "{req.reason}"</Text>
+      ) : null}
+
+      {/* Productos */}
+      <View style={styles.requestItemsBox}>
+        {req.items.map((it, idx) => (
+          <View key={idx} style={styles.requestItemRow}>
+            <Text style={styles.requestItemName}>
+              {it.quantity}x {it.productName}
+            </Text>
+            <View style={styles.requestItemPriceCol}>
+              <Text style={styles.requestOriginalPrice}>{formatPEN(it.originalPrice)}</Text>
+              <Text style={styles.requestDiscountedPrice}>{formatPEN(it.requestedPrice)}</Text>
+            </View>
+          </View>
+        ))}
+      </View>
+
+      {/* Totales */}
+      <View style={styles.requestTotalsRow}>
+        <Text style={styles.requestDiscountText}>
+          Ahorro: -{formatPEN(req.discountTotal)}
+        </Text>
+        <Text style={styles.requestTotalText}>Total: {formatPEN(req.total)}</Text>
+      </View>
+
+      {/* Acciones */}
+      <View style={styles.requestActionsRow}>
+        {isPending && (
+          <>
+            <TouchableOpacity
+              style={styles.approveBtn}
+              onPress={() => onApprove(req)}
+              disabled={isSubmitting}
+            >
+              <Check size={14} color={ui.onPrimary} />
+              <Text style={styles.approveBtnText}>Aprobar</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.rejectBtn}
+              onPress={() => onReject(req)}
+              disabled={isSubmitting}
+            >
+              <X size={14} color={ui.danger} />
+              <Text style={styles.rejectBtnText}>Rechazar</Text>
+            </TouchableOpacity>
+          </>
+        )}
+
+        {(isApproved || isPending) && (
+          <TouchableOpacity
+            style={styles.loadPosBtn}
+            onPress={() => onLoadPos(req)}
+            disabled={isSubmitting}
+          >
+            <ShoppingCart size={14} color={ui.onPrimary} />
+            <Text style={styles.loadPosBtnText}>Cargar al POS</Text>
+          </TouchableOpacity>
+        )}
+      </View>
+    </View>
+  );
+});
+
+export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
   visible,
   isOpen,
   onClose,
@@ -91,7 +328,8 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = ({
 
   const { accountId, branchId, userProfile } = useAuth();
   const { isCashOpen, activeCashSession, activeBranchName } = useSettings();
-  const { clearCart, addItem, setCustomer, setNotes } = useCart();
+  const { clearCart, addItem, setCustomer, setNotes, setSaleRequestId, setShippingAmount } = useCart();
+  const { products } = useProducts();
 
   // Pestaña activa
   const [activeTab, setActiveTab] = useState<SubTab>('team');
@@ -99,6 +337,7 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = ({
   // Estados de datos
   const [teamMembers, setTeamMembers] = useState<TeamMember[]>([]);
   const [payrollMovements, setPayrollMovements] = useState<PayrollMovement[]>([]);
+  const [payrollLoadError, setPayrollLoadError] = useState<string | null>(null);
   const [saleRequests, setSaleRequests] = useState<SaleRequest[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
@@ -122,6 +361,7 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = ({
   const [showCreateRequestModal, setShowCreateRequestModal] = useState<boolean>(false);
   const [reqCustomerName, setReqCustomerName] = useState<string>('');
   const [reqProductName, setReqProductName] = useState<string>('');
+  const [reqSelectedProduct, setReqSelectedProduct] = useState<Product | null>(null);
   const [reqOriginalPrice, setReqOriginalPrice] = useState<string>('');
   const [reqRequestedPrice, setReqRequestedPrice] = useState<string>('');
   const [reqQuantity, setReqQuantity] = useState<string>('1');
@@ -131,30 +371,46 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = ({
   useEffect(() => {
     if (!isVisible || !accountId) return;
 
+    let unsubTeam: (() => void) | undefined;
+    let unsubPayroll: (() => void) | undefined;
+    let unsubRequests: (() => void) | undefined;
+
     setLoading(true);
 
-    const unsubTeam = subscribeToTeamMembers(accountId, (data) => {
-      setTeamMembers(data);
-      if (data.length > 0 && !selectedEmployeeId) {
-        setSelectedEmployeeId(data[0].id);
-      }
-      setLoading(false);
-    });
+    if (activeTab === 'team' || activeTab === 'payroll') {
+      unsubTeam = subscribeToTeamMembers(accountId, (data) => {
+        setTeamMembers(data);
+        if (data.length > 0) {
+          setSelectedEmployeeId((prev) => prev || data[0].id);
+        }
+        if (activeTab === 'team') setLoading(false);
+      });
+    }
 
-    const unsubPayroll = subscribeToPayrollMovements(accountId, (data) => {
-      setPayrollMovements(data);
-    }, branchId);
+    if (activeTab === 'payroll') {
+      unsubPayroll = subscribeToPayrollMovements(accountId, (data) => {
+        setPayrollMovements(data);
+        setPayrollLoadError(null);
+        setLoading(false);
+      }, branchId, (error) => {
+        setPayrollLoadError(error instanceof Error ? error.message : 'No se pudo cargar el historial de planilla.');
+        setLoading(false);
+      });
+    }
 
-    const unsubRequests = subscribeToSaleRequests(accountId, (data) => {
-      setSaleRequests(data);
-    }, branchId);
+    if (activeTab === 'requests') {
+      unsubRequests = subscribeToSaleRequests(accountId, (data) => {
+        setSaleRequests(data);
+        setLoading(false);
+      }, branchId);
+    }
 
     return () => {
-      unsubTeam();
-      unsubPayroll();
-      unsubRequests();
+      unsubTeam?.();
+      unsubPayroll?.();
+      unsubRequests?.();
     };
-  }, [isVisible, accountId, branchId]);
+  }, [isVisible, accountId, branchId, activeTab]);
 
   // Colaborador seleccionado en el formulario
   const currentSelectedEmployee = useMemo(() => {
@@ -192,6 +448,15 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = ({
     }
     return result;
   }, [saleRequests, requestFilter, searchQuery]);
+
+  const requestProductMatches = useMemo(() => {
+    const query = reqProductName.trim().toLowerCase();
+    if (!query) return [];
+    return products
+      .filter((product) => product.name.toLowerCase().includes(query)
+        || (product.sku || '').toLowerCase().includes(query))
+      .slice(0, 8);
+  }, [products, reqProductName]);
 
   // Totales de nómina
   const payrollStats = useMemo(() => {
@@ -284,11 +549,11 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = ({
   // ==========================================================================
 
   // Aprobar solicitud
-  const handleApproveRequest = async (request: SaleRequest) => {
+  const handleApproveRequest = useCallback(async (request: SaleRequest) => {
     try {
       setIsSubmitting(true);
       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
-      await resolveSaleRequest(request.id, 'approved', userProfile, 'Aprobado por el Administrador/Caja');
+      await resolveSaleRequest(request.id, 'approved', userProfile, 'Aprobado por el Administrador/Caja', branchId);
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
       Alert.alert('Solicitud Aprobada', `La solicitud ${request.requestNumber} fue aprobada.`);
     } catch (err: any) {
@@ -296,10 +561,10 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = ({
     } finally {
       setIsSubmitting(false);
     }
-  };
+  }, [userProfile, branchId]);
 
   // Rechazar solicitud
-  const handleRejectRequest = (request: SaleRequest) => {
+  const handleRejectRequest = useCallback((request: SaleRequest) => {
     Alert.prompt
       ? Alert.prompt(
           'Rechazar Solicitud',
@@ -307,7 +572,7 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = ({
           async (notes) => {
             try {
               setIsSubmitting(true);
-              await resolveSaleRequest(request.id, 'rejected', userProfile, notes || 'Descuento no autorizado');
+              await resolveSaleRequest(request.id, 'rejected', userProfile, notes || 'Descuento no autorizado', branchId);
               Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning).catch(() => {});
             } catch (err: any) {
               Alert.alert('Error', err?.message || 'No se pudo rechazar la solicitud.');
@@ -327,7 +592,7 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = ({
               onPress: async () => {
                 try {
                   setIsSubmitting(true);
-                  await resolveSaleRequest(request.id, 'rejected', userProfile, 'Descuento no autorizado');
+                  await resolveSaleRequest(request.id, 'rejected', userProfile, 'Descuento no autorizado', branchId);
                 } catch (err: any) {
                   Alert.alert('Error', err?.message || 'No se pudo rechazar la solicitud.');
                 } finally {
@@ -337,10 +602,10 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = ({
             },
           ]
         );
-  };
+  }, [userProfile, branchId]);
 
   // Cargar solicitud al Carrito POS
-  const handleLoadRequestToPos = async (request: SaleRequest) => {
+  const handleLoadRequestToPos = useCallback(async (request: SaleRequest) => {
     try {
       setIsSubmitting(true);
       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
@@ -349,9 +614,9 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = ({
       clearCart();
 
       // 2. Cargar cliente si existe
-      if (request.customerName && request.customerName !== 'Cliente General') {
+      if (request.customerId && request.customerName && request.customerName !== 'Cliente General') {
         const clientObj: Customer = {
-          id: request.customerId || `cust_${Date.now()}`,
+          id: request.customerId,
           name: request.customerName,
           phone: request.customerPhone || undefined,
           email: request.customerEmail || undefined,
@@ -360,32 +625,34 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = ({
           accountId: accountId || '',
         };
         setCustomer(clientObj);
-      }
+      } else setCustomer(null);
 
       // 3. Cargar cada ítem al carrito con el precio solicitado
       request.items.forEach((item) => {
+        const requestedPrice = Number(item.requestedPrice ?? item.price) || 0;
+        const originalPrice = Number(item.originalPrice ?? item.price) || requestedPrice;
         const stubProduct: Product = {
-          id: item.productId || `prod_${Date.now()}`,
+          id: item.productId,
           name: item.productName,
           category: 'General',
           sku: item.sku || item.productId,
           costPrice: 0,
           minSalePrice: 0,
-          suggestedPrice: item.originalPrice,
-          price: item.requestedPrice,
+          suggestedPrice: originalPrice,
+          price: requestedPrice,
           stock: {},
           accountId: accountId || '',
         };
 
         addItem(stubProduct, {
           quantity: item.quantity,
-          customPrice: item.requestedPrice,
+          customPrice: requestedPrice,
           presentation: item.presentationId
             ? {
                 id: item.presentationId,
                 name: item.presentationName || '',
-                conversionFactor: 1,
-                price: item.requestedPrice,
+                conversionFactor: Number(item.presentationQty || item.conversionFactor) || 1,
+                price: requestedPrice,
               }
             : undefined,
           variant: item.variantId
@@ -397,12 +664,13 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = ({
             : undefined,
         });
       });
+      // Keep the approved request associated with the cart. Checkout will pass
+      // this ID to the server so conversion is atomic with the actual sale.
+      setSaleRequestId(request.id);
+      setShippingAmount(Number(request.shipping) || 0);
 
       // 4. Copiar nota
       setNotes(`Solicitud ${request.requestNumber} - Vendedor: ${request.sellerName}${request.reason ? ` (${request.reason})` : ''}`);
-
-      // 5. Marcar solicitud como convertida
-      await markSaleRequestAsConverted(request.id, `POS_${Date.now()}`);
 
       if (onLoadSaleRequestToPos) {
         onLoadSaleRequestToPos(request);
@@ -413,7 +681,7 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = ({
 
       Alert.alert(
         'Solicitud Cargada al Carrito POS',
-        `Productos y precios autorizados cargados exitosamente.\nTotal a Cobrar: ${formatPEN(request.total)}`,
+        `Productos y precios autorizados cargados exitosamente.${request.shipping ? `\nEnvío: ${formatPEN(request.shipping)}` : ''}\nTotal a Cobrar: ${formatPEN(request.total)}`,
         [{ text: 'Proceder al Cobro' }]
       );
     } catch (err: any) {
@@ -422,7 +690,7 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = ({
     } finally {
       setIsSubmitting(false);
     }
-  };
+  }, [accountId, clearCart, setCustomer, addItem, setSaleRequestId, setShippingAmount, setNotes, onLoadSaleRequestToPos, onClose]);
 
   // Crear nueva solicitud de venta (para vendedores de piso)
   const handleCreateSaleRequest = async () => {
@@ -430,8 +698,8 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = ({
     const reqPrice = parseFloat(reqRequestedPrice.replace(',', '.'));
     const qty = parseFloat(reqQuantity) || 1;
 
-    if (!reqProductName.trim() || isNaN(origPrice) || isNaN(reqPrice)) {
-      Alert.alert('Datos Incompletos', 'Completa el nombre del producto y los precios.');
+    if (!reqSelectedProduct?.id || isNaN(origPrice) || isNaN(reqPrice) || !Number.isFinite(qty) || qty <= 0 || reqPrice <= 0 || origPrice <= 0) {
+      Alert.alert('Datos Incompletos', 'Selecciona un producto del catálogo e ingresa cantidad y precios válidos.');
       return;
     }
 
@@ -451,11 +719,13 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = ({
         customerName: reqCustomerName.trim() || 'Cliente General',
         items: [
           {
-            productId: `prod_req_${Date.now()}`,
-            productName: reqProductName.trim(),
+            productId: reqSelectedProduct.id,
+            productName: reqSelectedProduct.name,
+            sku: reqSelectedProduct.sku || '',
             quantity: qty,
             originalPrice: origPrice,
             requestedPrice: reqPrice,
+            price: reqPrice,
             subtotal: total,
             discountAmount: discount,
           },
@@ -469,6 +739,8 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = ({
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
       setShowCreateRequestModal(false);
       setReqCustomerName('');
+      setReqProductName('');
+      setReqSelectedProduct(null);
       setReqProductName('');
       setReqOriginalPrice('');
       setReqRequestedPrice('');
@@ -586,65 +858,14 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = ({
                   )}
                 </View>
 
-                <ScrollView
-                  style={styles.scrollList}
-                  contentContainerStyle={[styles.scrollContent, { paddingBottom: insets.bottom + 20 }]}
-                >
-                  {filteredTeam.map((member) => (
-                    <View key={member.id} style={styles.memberCard}>
-                      <View style={styles.memberAvatar}>
-                        <Text style={styles.memberAvatarText}>
-                          {member.name.charAt(0).toUpperCase()}
-                        </Text>
-                      </View>
-
-                      <View style={styles.memberInfoCol}>
-                        <View style={styles.memberNameRow}>
-                          <Text style={styles.memberNameText} numberOfLines={1}>
-                            {member.name}
-                          </Text>
-                          {member.isActive ? (
-                            <View style={styles.activeDot} />
-                          ) : (
-                            <Text style={styles.inactiveTag}>Inactivo</Text>
-                          )}
-                        </View>
-
-                        <Text style={styles.memberRoleBadge}>{member.roleLabel}</Text>
-
-                        {member.email ? (
-                          <View style={styles.memberMetaRow}>
-                            <Mail size={12} color={ui.textMuted} />
-                            <Text style={styles.memberMetaText} numberOfLines={1}>
-                              {member.email}
-                            </Text>
-                          </View>
-                        ) : null}
-
-                        {member.phone ? (
-                          <View style={styles.memberMetaRow}>
-                            <Phone size={12} color={ui.textMuted} />
-                            <Text style={styles.memberMetaText}>{member.phone}</Text>
-                          </View>
-                        ) : null}
-
-                        {member.branchName ? (
-                          <View style={styles.memberMetaRow}>
-                            <Building2 size={12} color={ui.textMuted} />
-                            <Text style={styles.memberMetaText}>Sede: {member.branchName}</Text>
-                          </View>
-                        ) : null}
-                      </View>
-
-                      {member.baseSalary ? (
-                        <View style={styles.salaryCol}>
-                          <Text style={styles.salaryLabel}>Sueldo Base</Text>
-                          <Text style={styles.salaryValue}>{formatPEN(member.baseSalary)}</Text>
-                        </View>
-                      ) : null}
-                    </View>
-                  ))}
-                </ScrollView>
+                <FlashList
+                  data={filteredTeam}
+                  renderItem={({ item }) => <TeamMemberCardItem member={item} />}
+                  estimatedItemSize={100}
+                  keyExtractor={(item) => item.id}
+                  contentContainerStyle={[styles.scrollContent, { paddingBottom: insets.bottom + 20 }] as any}
+                  showsVerticalScrollIndicator={false}
+                />
               </View>
             )}
 
@@ -852,6 +1073,11 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = ({
                   /* HISTORIAL DE MOVIMIENTOS DE PLANILLA */
                   <View style={{ flex: 1 }}>
                     <SectionHeading title="Historial de pagos" />
+                    {payrollLoadError ? (
+                      <Text style={{ color: ui.danger, marginBottom: 12 }}>
+                        No se pudo cargar el historial completo. {payrollLoadError}
+                      </Text>
+                    ) : null}
                     {/* Tarjetas de Métricas de Planilla */}
                     <View style={styles.payrollStatsCard}>
                       <View style={styles.statBox}>
@@ -874,7 +1100,7 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = ({
                       </View>
                     </View>
 
-                    {payrollMovements.length === 0 ? (
+                    {payrollMovements.length === 0 && !payrollLoadError ? (
                       <View style={styles.centerBox}>
                         <Wallet size={44} color={ui.textMuted} />
                         <Text style={styles.emptyTitle}>Sin movimientos de planilla</Text>
@@ -883,57 +1109,14 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = ({
                         </Text>
                       </View>
                     ) : (
-                      <ScrollView
-                        style={styles.scrollList}
-                        contentContainerStyle={[styles.scrollContent, { paddingBottom: insets.bottom + 20 }]}
-                      >
-                        {payrollMovements.map((mov) => (
-                          <View key={mov.id} style={styles.movementCard}>
-                            <View style={styles.movementHeader}>
-                              <View>
-                                <Text style={styles.movementEmployeeName}>{mov.employeeName}</Text>
-                                <Text style={styles.movementDateText}>{formatDatePE(mov.date)}</Text>
-                              </View>
-
-                              <View
-                                style={[
-                                  styles.conceptBadge,
-                                  mov.conceptType === 'advance' && { backgroundColor: ui.warningSoft, borderColor: ui.warning },
-                                  mov.conceptType === 'salary' && { backgroundColor: ui.primarySoft, borderColor: ui.primary },
-                                  mov.conceptType === 'commission' && { backgroundColor: ui.primarySoft, borderColor: ui.primary },
-                                ]}
-                              >
-                                <Text
-                                  style={[
-                                    styles.conceptBadgeText,
-                                    mov.conceptType === 'advance' && { color: ui.warning },
-                                    mov.conceptType === 'salary' && { color: ui.primary },
-                                    mov.conceptType === 'commission' && { color: ui.primary },
-                                  ]}
-                                >
-                                  {mov.conceptLabel}
-                                </Text>
-                              </View>
-                            </View>
-
-                            <View style={styles.movementBody}>
-                              <View style={styles.movementMetaCol}>
-                                <Text style={styles.movementMethodText}>Método: {mov.paymentMethod}</Text>
-                                {mov.deductFromCashDrawer ? (
-                                  <Text style={styles.cashDeductedTag}>• Descontado de Caja Chica</Text>
-                                ) : null}
-                                {mov.notes ? (
-                                  <Text style={styles.movementNotesText} numberOfLines={2}>
-                                    {mov.notes}
-                                  </Text>
-                                ) : null}
-                              </View>
-
-                              <Text style={styles.movementAmountText}>{formatPEN(mov.amount)}</Text>
-                            </View>
-                          </View>
-                        ))}
-                      </ScrollView>
+                      <FlashList
+                        data={payrollMovements}
+                        renderItem={({ item }) => <PayrollMovementCardItem mov={item} />}
+                        estimatedItemSize={110}
+                        keyExtractor={(item) => item.id}
+                        contentContainerStyle={[styles.scrollContent, { paddingBottom: insets.bottom + 20 }] as any}
+                        showsVerticalScrollIndicator={false}
+                      />
                     )}
                   </View>
                 )}
@@ -996,122 +1179,22 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = ({
                     </Text>
                   </View>
                 ) : (
-                  <ScrollView
-                    style={styles.scrollList}
-                    contentContainerStyle={[styles.scrollContent, { paddingBottom: insets.bottom + 20 }]}
-                  >
-                    {filteredRequests.map((req) => {
-                      const isPending = req.status === 'pending';
-                      const isApproved = req.status === 'approved';
-                      return (
-                        <View key={req.id} style={styles.requestCard}>
-                          {/* Cabecera de la solicitud */}
-                          <View style={styles.requestCardHeader}>
-                            <View>
-                              <Text style={styles.requestNumText}>{req.requestNumber}</Text>
-                              <Text style={styles.requestSellerText}>Vendedor: {req.sellerName}</Text>
-                              <Text style={styles.requestDateText}>{formatDatePE(req.createdAt)}</Text>
-                            </View>
-
-                            <View
-                              style={[
-                                styles.statusBadge,
-                                req.status === 'pending' && { backgroundColor: ui.warningSoft, borderColor: ui.warning },
-                                req.status === 'approved' && { backgroundColor: ui.primarySoft, borderColor: ui.primary },
-                                req.status === 'converted' && { backgroundColor: ui.primarySoft, borderColor: ui.primary },
-                                req.status === 'rejected' && { backgroundColor: ui.dangerSoft, borderColor: ui.danger },
-                              ]}
-                            >
-                              <Text
-                                style={[
-                                  styles.statusBadgeText,
-                                  req.status === 'pending' && { color: ui.warning },
-                                  req.status === 'approved' && { color: ui.primary },
-                                  req.status === 'converted' && { color: ui.primary },
-                                  req.status === 'rejected' && { color: ui.danger },
-                                ]}
-                              >
-                                {req.status === 'pending'
-                                  ? 'Pendiente'
-                                  : req.status === 'approved'
-                                  ? 'Aprobada'
-                                  : req.status === 'converted'
-                                  ? 'En POS'
-                                  : 'Rechazada'}
-                              </Text>
-                            </View>
-                          </View>
-
-                          <View style={styles.divider} />
-
-                          {/* Cliente y Motivo */}
-                          <Text style={styles.requestClientText}>Cliente: {req.customerName}</Text>
-                          {req.reason ? (
-                            <Text style={styles.requestReasonText}>Motivo: "{req.reason}"</Text>
-                          ) : null}
-
-                          {/* Productos */}
-                          <View style={styles.requestItemsBox}>
-                            {req.items.map((it, idx) => (
-                              <View key={idx} style={styles.requestItemRow}>
-                                <Text style={styles.requestItemName}>
-                                  {it.quantity}x {it.productName}
-                                </Text>
-                                <View style={styles.requestItemPriceCol}>
-                                  <Text style={styles.requestOriginalPrice}>{formatPEN(it.originalPrice)}</Text>
-                                  <Text style={styles.requestDiscountedPrice}>{formatPEN(it.requestedPrice)}</Text>
-                                </View>
-                              </View>
-                            ))}
-                          </View>
-
-                          {/* Totales */}
-                          <View style={styles.requestTotalsRow}>
-                            <Text style={styles.requestDiscountText}>
-                              Ahorro: -{formatPEN(req.discountTotal)}
-                            </Text>
-                            <Text style={styles.requestTotalText}>Total: {formatPEN(req.total)}</Text>
-                          </View>
-
-                          {/* Acciones */}
-                          <View style={styles.requestActionsRow}>
-                            {isPending && (
-                              <>
-                                <TouchableOpacity
-                                  style={styles.approveBtn}
-                                  onPress={() => handleApproveRequest(req)}
-                                  disabled={isSubmitting}
-                                >
-                                  <Check size={14} color={ui.onPrimary} />
-                                  <Text style={styles.approveBtnText}>Aprobar</Text>
-                                </TouchableOpacity>
-
-                                <TouchableOpacity
-                                  style={styles.rejectBtn}
-                                  onPress={() => handleRejectRequest(req)}
-                                  disabled={isSubmitting}
-                                >
-                                  <X size={14} color={ui.danger} />
-                                  <Text style={styles.rejectBtnText}>Rechazar</Text>
-                                </TouchableOpacity>
-                              </>
-                            )}
-
-                            {(isApproved || isPending) && (
-                              <TouchableOpacity
-                                style={styles.loadPosBtn}
-                                onPress={() => handleLoadRequestToPos(req)}
-                                disabled={isSubmitting}
-                              >
-                                <ShoppingCart size={14} color={ui.onPrimary} />
-                                <Text style={styles.loadPosBtnText}>Cargar al POS</Text>
-                              </TouchableOpacity>
-                            )}
-                          </View>
-                        </View>
-                      );
-                    })}
-                  </ScrollView>
+                    <FlashList
+                      data={filteredRequests}
+                      renderItem={({ item }) => (
+                        <SaleRequestCardItem
+                          req={item}
+                          isSubmitting={isSubmitting}
+                          onApprove={handleApproveRequest}
+                          onReject={handleRejectRequest}
+                          onLoadPos={handleLoadRequestToPos}
+                        />
+                      )}
+                      estimatedItemSize={190}
+                      keyExtractor={(item) => item.id}
+                      contentContainerStyle={[styles.scrollContent, { paddingBottom: insets.bottom + 20 }] as any}
+                      showsVerticalScrollIndicator={false}
+                    />
                 )}
               </View>
             )}
@@ -1149,14 +1232,42 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = ({
                   onChangeText={setReqCustomerName}
                 />
 
-                <Text style={styles.dialogInputLabel}>Producto / Ítem:</Text>
+                <Text style={styles.dialogInputLabel}>Producto del catálogo:</Text>
                 <TextInput
                   style={styles.dialogInput}
-                  placeholder="Nombre del producto a solicitar"
+                  placeholder="Buscar por nombre o SKU"
                   placeholderTextColor={ui.textMuted}
                   value={reqProductName}
-                  onChangeText={setReqProductName}
+                  onChangeText={(value) => { setReqProductName(value); setReqSelectedProduct(null); }}
                 />
+                {reqSelectedProduct ? (
+                  <TouchableOpacity
+                    style={[styles.dialogInput, { borderColor: ui.primary, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }]}
+                    onPress={() => { setReqSelectedProduct(null); setReqProductName(''); }}
+                  >
+                    <Text style={{ color: ui.text, flex: 1 }}>{reqSelectedProduct.name} · {reqSelectedProduct.sku || 'Sin SKU'}</Text>
+                    <Text style={{ color: ui.primary }}>Cambiar</Text>
+                  </TouchableOpacity>
+                ) : requestProductMatches.length > 0 ? (
+                  <View style={{ borderWidth: 1, borderColor: ui.border, borderRadius: 10, marginBottom: 10, overflow: 'hidden' }}>
+                    {requestProductMatches.map((product) => (
+                      <TouchableOpacity
+                        key={product.id}
+                        style={{ padding: 11, borderBottomWidth: 1, borderBottomColor: ui.border }}
+                        onPress={() => {
+                          setReqSelectedProduct(product);
+                          setReqProductName(product.name);
+                          const listPrice = Number(product.suggestedPrice || product.price || 0);
+                          setReqOriginalPrice(String(listPrice));
+                          setReqRequestedPrice(String(listPrice));
+                        }}
+                      >
+                        <Text style={{ color: ui.text, fontWeight: '600' }}>{product.name}</Text>
+                        <Text style={{ color: ui.textMuted, fontSize: 12 }}>{product.sku || 'Sin SKU'} · {formatPEN(Number(product.suggestedPrice || product.price || 0))}</Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                ) : reqProductName.trim() ? <Text style={{ color: ui.textMuted, fontSize: 12, marginBottom: 10 }}>No hay productos coincidentes en el catálogo.</Text> : null}
 
                 <View style={{ flexDirection: 'row', gap: 10 }}>
                   <View style={{ flex: 1 }}>
@@ -1226,7 +1337,7 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = ({
       </View>
     </Modal>
   );
-};
+});
 
 // ============================================================================
 // ESTILOS NATIVOS

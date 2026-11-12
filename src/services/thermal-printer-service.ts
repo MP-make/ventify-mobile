@@ -18,6 +18,7 @@ import {
   buildCashClosureEscPos as coreBuildCashClosureEscPos,
   buildReceiptHtml,
   type EscPosOptions,
+  uint8ArrayToBase64,
 } from '@/lib/printing/escpos-builder';
 
 export interface ReceiptItem {
@@ -168,34 +169,9 @@ export const savePrinterConfig = async (
 // ============================================================================
 
 /**
- * Convierte un Uint8Array a cadena Base64 para pasarlo al puente nativo
+ * Convierte un Uint8Array a cadena Base64 centralizada en escpos-builder.ts
  */
-export const uint8ArrayToBase64 = (bytes: Uint8Array): string => {
-  let binary = '';
-  const len = bytes.byteLength;
-  for (let i = 0; i < len; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  if (typeof btoa === 'function') {
-    return btoa(binary);
-  }
-  // Fallback si btoa no está en el scope global
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
-  let output = '';
-  for (let block = 0, charCode, idx = 0, map = chars; idx < len; ) {
-    charCode = bytes[idx++];
-    block = (block << 8) | charCode;
-    if (idx % 3 === 0) {
-      output +=
-        map.charAt((block >> 18) & 63) +
-        map.charAt((block >> 12) & 63) +
-        map.charAt((block >> 6) & 63) +
-        map.charAt(block & 63);
-      block = 0;
-    }
-  }
-  return output;
-};
+export { uint8ArrayToBase64 };
 
 /**
  * Escanea o lista las impresoras térmicas Bluetooth vinculadas en el sistema
@@ -237,8 +213,21 @@ export const printRawEscPos = async (
     if (nativePlugin && typeof nativePlugin.printRaw === 'function' && address) {
       try {
         const base64Data = uint8ArrayToBase64(bytes);
-        const res = await nativePlugin.printRaw({ address, base64Data });
-        return res?.success ?? true;
+        let timeoutHandle: any;
+        const timeoutPromise = new Promise<never>((_, reject) => {
+          timeoutHandle = setTimeout(() => {
+            reject(new Error('Timeout de impresión térmica Bluetooth (6 segundos excedidos)'));
+          }, 6000);
+        });
+
+        const printPromise = nativePlugin.printRaw({ address, base64Data });
+
+        try {
+          const res = await Promise.race([printPromise, timeoutPromise]);
+          return res?.success ?? true;
+        } finally {
+          clearTimeout(timeoutHandle);
+        }
       } catch (err) {
         console.error('[ThermalPrinterService] Error en printRaw nativo:', err);
         throw err;

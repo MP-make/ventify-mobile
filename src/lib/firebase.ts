@@ -8,6 +8,7 @@ import {
   initializeFirestore,
   getFirestore,
   Firestore,
+  memoryLocalCache,
 } from 'firebase/firestore';
 import {
   initializeAuth,
@@ -83,6 +84,7 @@ let dbInstance: Firestore;
 try {
   dbInstance = initializeFirestore(app, {
     experimentalAutoDetectLongPolling: true,
+    localCache: memoryLocalCache(),
   });
 } catch {
   // Fallback if firestore has already been initialized with a previous configuration

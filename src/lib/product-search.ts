@@ -1,3 +1,4 @@
+import { normalizePresentation } from '@/lib/presentation-parity';
 /**
  * Ventify Mobile High-Speed Product Search & Pricing Engine
  * In-memory fuzzy and barcode search, stock availability, and tiered pricing
@@ -100,7 +101,7 @@ export function getAllPresentations(product: Product): ProductPresentation[] {
       }
     }
   }
-  return presentations;
+  return presentations.map(normalizePresentation);
 }
 
 /**

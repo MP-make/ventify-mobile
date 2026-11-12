@@ -8,7 +8,7 @@
  * para Ventas (POS), Productos e Inventario sin dependencias externas.
  */
 
-import { Platform } from 'react-native';
+import { Platform, AppState } from 'react-native';
 import * as Device from 'expo-device';
 import * as Crypto from 'expo-crypto';
 import * as Haptics from 'expo-haptics';
@@ -458,38 +458,44 @@ export async function sendScannedCodeToDesktop(
   void (async () => {
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 3500);
-      await fetch(`${APP_URL}/api/scanner/reader`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sessionId,
-          action: 'scan',
-          id: scanId,
-          code,
-        }),
-        signal: controller.signal,
-      });
-      clearTimeout(timeout);
+      const timeout = setTimeout(() => controller.abort(), 8000);
+      try {
+        await fetch(`${APP_URL}/api/scanner/reader`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sessionId,
+            action: 'scan',
+            id: scanId,
+            code,
+          }),
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
     } catch {}
 
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 3500);
-      await fetch(`${APP_URL}/api/scanner/${sessionId}/scan`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          id: scanId,
-          barcode: code,
-          code,
-          token,
-          productPreview,
-          timestamp: now,
-        }),
-        signal: controller.signal,
-      });
-      clearTimeout(timeout);
+      const timeout = setTimeout(() => controller.abort(), 8000);
+      try {
+        await fetch(`${APP_URL}/api/scanner/${sessionId}/scan`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            id: scanId,
+            barcode: code,
+            code,
+            token,
+            productPreview,
+            timestamp: now,
+          }),
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
     } catch {}
   })();
 
@@ -513,9 +519,10 @@ export function subscribeToScannerSession(
   const mobileRef = doc(db, SCANNER_COLLECTION_WEB, sessionId);
   let isActive = true;
 
-  // Pulso de vida continuo cada 15s para mantener el canal vivo
+  // Pulso de vida continuo cada 45s para mantener el canal vivo
   const heartbeatInterval = setInterval(() => {
     if (!isActive) return;
+    if (AppState && AppState.currentState && AppState.currentState !== 'active') return;
     const now = Date.now();
     void setDoc(
       mobileRef,
@@ -525,7 +532,7 @@ export function subscribeToScannerSession(
       },
       { merge: true }
     ).catch(() => {});
-  }, 15000);
+  }, 45000);
 
   const unsubscribe = onSnapshot(
     mobileRef,
@@ -600,11 +607,18 @@ export async function disconnectScannerSession(sessionId: string): Promise<void>
   // Notificación HTTP informativa de cierre
   void (async () => {
     try {
-      await fetch(`${APP_URL}/api/scanner/${sessionId}/disconnect`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId, action: 'disconnect' }),
-      }).catch(() => {});
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8000);
+      try {
+        await fetch(`${APP_URL}/api/scanner/${sessionId}/disconnect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionId, action: 'disconnect' }),
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
     } catch {}
   })();
 }

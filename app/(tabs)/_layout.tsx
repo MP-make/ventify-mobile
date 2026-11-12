@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import { Platform, StyleSheet, View, useWindowDimensions } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Tabs } from 'expo-router';
@@ -13,19 +13,36 @@ import { Header } from '@/components/Header';
 import { useCart } from '@/context/CartContext';
 import { ui } from '@/lib/theme';
 
+const TabHeader = React.memo(() => <Header />);
+const renderHeader = () => <TabHeader />;
+
 export default function TabLayout() {
   const { totalItemsCount } = useCart();
   const insets = useSafeAreaInsets();
   const { width } = useWindowDimensions();
   const expanded = width >= 900;
 
+  const tabBarStyle = useMemo(
+    () => [
+      styles.tabBar,
+      expanded
+        ? { width: 176, minWidth: 176, maxWidth: 176, paddingTop: insets.top + 24 }
+        : { height: 80 + insets.bottom, paddingBottom: Math.max(insets.bottom, 8) },
+    ],
+    [expanded, insets.top, insets.bottom]
+  );
+
   return (
     <Tabs
+      detachInactiveScreens={true}
       screenOptions={{
-        header: () => <Header />,
+        header: renderHeader,
+        freezeOnBlur: true,
+        lazy: true,
+        ...({ detachInactiveScreens: true } as any),
         tabBarPosition: expanded ? 'left' : 'bottom',
         tabBarLabelPosition: expanded ? 'beside-icon' : 'below-icon',
-        tabBarStyle: [styles.tabBar, expanded ? { width: 176, minWidth: 176, maxWidth: 176, paddingTop: insets.top + 24 } : { height: 80 + insets.bottom, paddingBottom: Math.max(insets.bottom, 8) }],
+        tabBarStyle,
         tabBarActiveTintColor: ui.primary,
         tabBarInactiveTintColor: ui.textSecondary,
         tabBarLabelStyle: styles.tabLabel,

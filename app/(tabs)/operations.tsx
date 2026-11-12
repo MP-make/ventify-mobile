@@ -1,3 +1,5 @@
+import { ReservationCompletionModal } from '@/components/ReservationCompletionModal';
+import { ReservationCancellationModal } from '@/components/ReservationCancellationModal';
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import {
   View,
@@ -7,13 +9,14 @@ import {
   TextInput,
   Modal,
   ScrollView,
-  FlatList,
+  InteractionManager,
   StyleSheet,
   Alert,
   Platform,
   ActivityIndicator,
   KeyboardAvoidingView,
 } from 'react-native';
+import { FlashList } from '@shopify/flash-list';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
 import {
@@ -47,6 +50,7 @@ import {
 
 import { useAuth } from '@/context/AuthContext';
 import { useSettings } from '@/context/SettingsContext';
+import { useProducts } from '@/context/ProductsContext';
 import { Header } from '@/components/Header';
 import { ui, theme, formatPEN, formatDatePE } from '@/lib/theme';
 import { ScreenHeading, SectionHeading } from '@/components/ui';
@@ -55,7 +59,7 @@ import {
   collection,
   query,
   where,
-  getDocs,
+  limit,
   onSnapshot,
   Timestamp,
 } from 'firebase/firestore';
@@ -77,7 +81,10 @@ import {
   registerFiadoPayment,
   getReservationsAndOrders,
   createReservationOrOrder,
+  approveOrder,
   completeOrCancelReservation,
+  getCustomerOpenFiados,
+  OpenFiado,
   CustomerData,
   ReservationOrder,
   ReservationOrderItem,
@@ -97,10 +104,421 @@ import { ReservationReceiptModal } from '@/components/ReservationReceiptModal';
 
 type OperationsTab = 'cash' | 'crm' | 'orders';
 
+const ListGap16 = () => <View style={{ height: 16 }} />;
+
+const SalePaymentBadges = React.memo(({ sale }: { sale: any }) => {
+  if (Array.isArray(sale.payments) && sale.payments.length > 0) {
+    return (
+      <>
+        {sale.payments.map((p: any, idx: number) => {
+          const cat = (p.category || '').toLowerCase();
+          const prov = (p.digitalProvider || '').toLowerCase();
+          let label = 'Otro';
+          let color: string = ui.textSecondary;
+          let bg: string = ui.surfaceMuted;
+
+          if (cat === 'cash') {
+            label = 'Efectivo';
+            color = '#16A34A';
+            bg = '#DCFCE7';
+          } else if (cat === 'card') {
+            label = 'Tarjeta';
+            color = '#2563EB';
+            bg = '#EFF6FF';
+          } else if (cat === 'credit') {
+            label = 'Fiado';
+            color = '#EA580C';
+            bg = '#FFEDD5';
+          } else if (cat === 'digital') {
+            if (prov === 'yape') {
+              label = 'Yape';
+              color = '#7E22CE';
+              bg = '#F3E8FF';
+            } else if (prov === 'plin') {
+              label = 'Plin';
+              color = '#0284C7';
+              bg = '#E0F2FE';
+            } else {
+              label = 'Transf.';
+              color = '#4F46E5';
+              bg = '#EEF2FF';
+            }
+          }
+          return (
+            <View key={idx} style={[styles.methodBadgePill, { backgroundColor: bg }]}>
+              <Text style={[styles.methodBadgeText, { color }]}>
+                {label} {p.amount ? formatPEN(p.amount) : ''}
+              </Text>
+            </View>
+          );
+        })}
+      </>
+    );
+  }
+
+  const m = (sale.paymentMethod || '').toLowerCase();
+  let label = 'Efectivo';
+  let color: string = '#16A34A';
+  let bg: string = '#DCFCE7';
+
+  if (m === 'yape') {
+    label = 'Yape';
+    color = '#7E22CE';
+    bg = '#F3E8FF';
+  } else if (m === 'plin') {
+    label = 'Plin';
+    color = '#0284C7';
+    bg = '#E0F2FE';
+  } else if (m === 'tarjeta' || m === 'card') {
+    label = 'Tarjeta';
+    color = '#2563EB';
+    bg = '#EFF6FF';
+  } else if (m === 'transferencia' || m === 'transfer') {
+    label = 'Transferencia';
+    color = '#4F46E5';
+    bg = '#EEF2FF';
+  } else if (m === 'fiado' || m === 'credit') {
+    label = 'Fiado';
+    color = '#EA580C';
+    bg = '#FFEDD5';
+  }
+
+  return (
+    <View style={[styles.methodBadgePill, { backgroundColor: bg }]}>
+      <Text style={[styles.methodBadgeText, { color }]}>{label}</Text>
+    </View>
+  );
+});
+
+const CashMovementRow = React.memo(({ movement }: { movement: CashMovement }) => {
+  const isIncome = movement.type === 'income';
+  return (
+    <View style={styles.movementItem}>
+      <View
+        style={[
+          styles.movementBadge,
+          { backgroundColor: isIncome ? ui.successSoft : ui.dangerSoft },
+        ]}
+      >
+        {isIncome ? (
+          <ArrowUpRight size={16} color={ui.success} />
+        ) : (
+          <ArrowDownRight size={16} color={ui.danger} />
+        )}
+      </View>
+      <View style={{ flex: 1, marginLeft: 12 }}>
+        <Text style={styles.movementTitle}>{movement.description || 'Movimiento de caja'}</Text>
+        <Text style={styles.movementSub}>
+          {formatDatePE(movement.createdAt)} • {movement.createdByName || 'Operador'}
+        </Text>
+      </View>
+      <Text
+        style={[
+          styles.movementAmount,
+          { color: isIncome ? ui.success : ui.danger },
+        ]}
+      >
+        {isIncome ? '+' : '-'}{formatPEN(movement.amount)}
+      </Text>
+    </View>
+  );
+});
+
+const SessionSaleRow = React.memo(({ sale }: { sale: any }) => {
+  const isCancelled = sale.status === 'cancelled';
+  const timeStr = formatDatePE(sale.createdAt || sale.date);
+  return (
+    <View style={styles.saleItemRow}>
+      <View style={{ flex: 1 }}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+          <Text style={styles.movementTitle}>
+            {sale.correlative || `#VTA-${String(sale.saleNumber || '').padStart(5, '0')}`}
+          </Text>
+          {isCancelled && (
+            <View style={[styles.methodBadgePill, { backgroundColor: ui.dangerSoft }]}>
+              <Text style={[styles.methodBadgeText, { color: ui.danger }]}>Anulada</Text>
+            </View>
+          )}
+        </View>
+        <Text style={styles.movementSub}>
+          {timeStr} • {sale.customerName || 'Cliente Varios'}
+        </Text>
+        <View style={{ flexDirection: 'row', flexWrap: 'wrap', marginTop: 4 }}>
+          <SalePaymentBadges sale={sale} />
+        </View>
+      </View>
+      <Text
+        style={[
+          styles.movementAmount,
+          { color: isCancelled ? ui.textMuted : ui.text },
+        ]}
+      >
+        {formatPEN(sale.total || 0)}
+      </Text>
+    </View>
+  );
+});
+
+const CustomerCardItem = React.memo(
+  ({
+    cust,
+    onCollectDebt,
+  }: {
+    cust: CustomerData;
+    onCollectDebt: (cust: CustomerData) => void;
+  }) => {
+    const debt = Number(cust.currentDebt) || 0;
+    const creditLim = Number(cust.creditLimit) || 1;
+    const debtRatio = Math.min(1, debt / creditLim);
+
+    return (
+      <View style={styles.customerCard}>
+        <View style={styles.customerTop}>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.customerName}>{cust.name}</Text>
+            <Text style={styles.customerDoc}>
+              {cust.documentType || 'DOC'}: {cust.documentNumber || 'Sin número'}
+              {cust.phone ? ` • Tel: ${cust.phone}` : ''}
+            </Text>
+          </View>
+
+          {debt > 0 ? (
+            <View style={{ alignItems: 'flex-end' }}>
+              <Text style={styles.debtLabel}>DEUDA ACTIVA</Text>
+              <Text style={styles.debtValue}>{formatPEN(debt)}</Text>
+            </View>
+          ) : (
+            <View style={styles.cleanDebtBadge}>
+              <Text style={styles.cleanDebtText}>AL DÍA</Text>
+            </View>
+          )}
+        </View>
+
+        <View style={styles.creditLineBox}>
+          <View style={styles.creditLineLabels}>
+            <Text style={styles.creditLineText}>Línea: {formatPEN(creditLim)}</Text>
+            <Text style={styles.creditLineText}>
+              Uso: {Math.round(debtRatio * 100)}%
+            </Text>
+          </View>
+          <View style={styles.progressBarBg}>
+            <View
+              style={[
+                styles.progressBarFill,
+                {
+                  width: `${debtRatio * 100}%`,
+                  backgroundColor:
+                    debtRatio > 0.8
+                      ? ui.danger
+                      : debtRatio > 0.5
+                      ? ui.warning
+                      : ui.primary,
+                },
+              ]}
+            />
+          </View>
+        </View>
+
+        {debt > 0 && (
+          <TouchableOpacity
+            style={styles.abonoButton}
+            onPress={() => onCollectDebt(cust)}
+          >
+            <Receipt size={16} color={ui.onPrimary} />
+            <Text style={styles.abonoButtonText}>Cobrar Abono de Deuda</Text>
+          </TouchableOpacity>
+        )}
+      </View>
+    );
+  }
+);
+
+const ReservationCardItem = React.memo(
+  ({
+    item,
+    onViewTicket,
+    onCancel,
+    onApprove,
+    onDeliver,
+  }: {
+    item: ReservationOrder;
+    onViewTicket: (item: ReservationOrder) => void;
+    onCancel: (item: ReservationOrder) => void;
+    onApprove: (item: ReservationOrder) => void;
+    onDeliver: (item: ReservationOrder) => void;
+  }) => {
+    const isPending = item.status === 'pending' || item.status === 'ready';
+    const canDeliver =
+      item.type === 'reservation'
+        ? isPending
+        : item.status === 'approved' || item.status === 'production';
+    const canCancel = isPending || item.status === 'approved' || item.status === 'production';
+    const isDelivered = item.status === 'completed';
+    const isCancelled = item.status === 'cancelled';
+
+    return (
+      <View style={styles.reservationCard}>
+        <View style={styles.reservationTop}>
+          <View style={styles.badgeRow}>
+            <View
+              style={[
+                styles.typeBadge,
+                { backgroundColor: item.type === 'order' ? ui.primarySoft : ui.accentSoft },
+              ]}
+            >
+              <Text
+                style={[
+                  styles.typeBadgeText,
+                  { color: item.type === 'order' ? ui.primary : ui.accent },
+                ]}
+              >
+                {item.type === 'order' ? 'PEDIDO' : 'RESERVA'} #{item.id.slice(-6).toUpperCase()}
+              </Text>
+            </View>
+
+            <View
+              style={[
+                styles.statusBadge,
+                {
+                  backgroundColor: isDelivered
+                    ? ui.successSoft
+                    : isCancelled
+                    ? ui.dangerSoft
+                    : ui.warningSoft,
+                },
+              ]}
+            >
+              <Text
+                style={[
+                  styles.statusBadgeText,
+                  {
+                    color: isDelivered
+                      ? ui.success
+                      : isCancelled
+                      ? ui.danger
+                      : ui.warning,
+                  },
+                ]}
+              >
+                {isDelivered
+                  ? 'ENTREGADO'
+                  : isCancelled
+                  ? 'CANCELADO'
+                  : ['approved', 'production'].includes(item.status)
+                  ? 'APROBADO'
+                  : 'PENDIENTE'}
+              </Text>
+            </View>
+          </View>
+
+          <Text style={styles.resClientName}>{item.customer?.name || 'Cliente sin nombre'}</Text>
+          {item.customer?.phone && (
+            <Text style={styles.resClientPhone}>Tel: {item.customer.phone}</Text>
+          )}
+        </View>
+
+        <View style={styles.resItemsList}>
+          {item.items?.map((it, idx) => (
+            <View key={idx} style={styles.resItemRow}>
+              <Text style={styles.resItemName}>
+                • {it.quantity}x {it.productName}
+              </Text>
+              <Text style={styles.resItemPrice}>
+                {formatPEN(it.price * it.quantity)}
+              </Text>
+            </View>
+          ))}
+        </View>
+
+        <View style={styles.resFinancialRow}>
+          <View>
+            <Text style={styles.resFinLabel}>Total</Text>
+            <Text style={styles.resFinValue}>{formatPEN(item.total)}</Text>
+          </View>
+          <View>
+            <Text style={styles.resFinLabel}>Adelanto Pagado</Text>
+            <Text style={[styles.resFinValue, { color: ui.success }]}>
+              {formatPEN(item.depositAmount || 0)}
+            </Text>
+          </View>
+          <View>
+            <Text style={styles.resFinLabel}>Saldo Pendiente</Text>
+            <Text style={[styles.resFinValue, { color: ui.warning }]}>
+              {formatPEN(item.remainingAmount || 0)}
+            </Text>
+          </View>
+        </View>
+
+        <View style={[styles.resActionRow, { marginTop: 12, flexWrap: 'wrap', gap: 8 }]}>
+          <TouchableOpacity
+            style={[
+              styles.resActionButton,
+              { borderColor: ui.border, backgroundColor: ui.surface, flex: 1, minWidth: 100 },
+            ]}
+            onPress={() => onViewTicket(item)}
+            activeOpacity={0.7}
+          >
+            <FileText size={15} color={ui.primary} />
+            <Text style={[styles.resActionText, { color: ui.primary, fontWeight: '700' }]}>
+              Ver Ticket
+            </Text>
+          </TouchableOpacity>
+
+          {canCancel && (
+            <TouchableOpacity
+              style={[styles.resActionButton, { borderColor: ui.danger, flex: 1, minWidth: 90 }]}
+              onPress={() => onCancel(item)}
+              activeOpacity={0.7}
+            >
+              <XCircle size={15} color={ui.danger} />
+              <Text style={[styles.resActionText, { color: ui.danger }]}>
+                Cancelar
+              </Text>
+            </TouchableOpacity>
+          )}
+
+          {item.type === 'order' && item.status === 'pending' && (
+            <TouchableOpacity
+              style={[
+                styles.resActionButton,
+                { backgroundColor: ui.accent, borderColor: ui.accent, flex: 1.2, minWidth: 110 },
+              ]}
+              onPress={() => onApprove(item)}
+              activeOpacity={0.7}
+            >
+              <CheckCircle2 size={15} color={ui.onPrimary} />
+              <Text style={[styles.resActionText, { color: ui.onPrimary, fontWeight: 'bold' }]}>
+                Aprobar pedido
+              </Text>
+            </TouchableOpacity>
+          )}
+
+          {canDeliver && (
+            <TouchableOpacity
+              style={[
+                styles.resActionButton,
+                { backgroundColor: ui.primary, borderColor: ui.primary, flex: 1.2, minWidth: 110 },
+              ]}
+              onPress={() => onDeliver(item)}
+              activeOpacity={0.7}
+            >
+              <CheckCircle2 size={15} color={ui.onPrimary} />
+              <Text style={[styles.resActionText, { color: ui.onPrimary, fontWeight: 'bold' }]}>
+                {item.remainingAmount && item.remainingAmount > 0 ? 'Cobrar y Entregar' : 'Entregar'}
+              </Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      </View>
+    );
+  }
+);
+
 export default function OperationsScreen() {
   const insets = useSafeAreaInsets();
   const { user, userProfile, accountId, branchId, role, setActiveBranchId } = useAuth();
   const { canManageUsers, canViewAllCashSessions } = usePermissions();
+  const { products: productCatalog } = useProducts();
   const {
     businessSettings,
     activeBranch,
@@ -122,22 +540,26 @@ export default function OperationsScreen() {
     if ((role !== 'owner' && role !== 'admin') || !branches || branches.length <= 1) return;
     setLoadingBranchSessions(true);
     try {
-      const results: Record<string, CashSession | null> = {};
-      for (const b of branches) {
-        const bId = b.id || 'main';
-        const sess = await getActiveCashSession(bId, accountId || undefined);
-        results[bId] = sess;
-      }
-      setBranchSessions(results);
+      const entries = await Promise.all(
+        branches.map(async (b) => {
+          const bId = b.id || 'main';
+          const sess = await getActiveCashSession(bId, accountId || undefined);
+          return [bId, sess] as const;
+        })
+      );
+      setBranchSessions(Object.fromEntries(entries));
     } catch (err) {
       console.warn('[Operations] Error al obtener sesiones multicaja:', err);
     } finally {
       setLoadingBranchSessions(false);
     }
-  }, [branches?.length, role, accountId]);
+  }, [branches, role, accountId]);
 
   useEffect(() => {
-    fetchBranchSessions();
+    const task = InteractionManager.runAfterInteractions(() => {
+      void fetchBranchSessions();
+    });
+    return () => task.cancel();
   }, [fetchBranchSessions, isCashOpen, branchId]);
 
   const handleSwitchBranchCash = (targetBranchId: string, branchName: string) => {
@@ -204,6 +626,8 @@ export default function OperationsScreen() {
   // Modal Abono de Deuda
   const [paymentModalVisible, setPaymentModalVisible] = useState<boolean>(false);
   const [selectedDebtor, setSelectedDebtor] = useState<CustomerData | null>(null);
+  const [openFiados, setOpenFiados] = useState<OpenFiado[]>([]);
+  const [selectedFiado, setSelectedFiado] = useState<OpenFiado | null>(null);
   const [paymentAmount, setPaymentAmount] = useState<string>('');
   const [paymentMethod, setPaymentMethod] = useState<'efectivo' | 'yape' | 'plin' | 'tarjeta' | 'transferencia'>('efectivo');
   const [paymentNotes, setPaymentNotes] = useState<string>('');
@@ -212,6 +636,8 @@ export default function OperationsScreen() {
   // ============================================================================
   // ESTADOS DEL SUB-MÓDULO 3: PEDIDOS Y RESERVAS
   // ============================================================================
+  const [completionTarget, setCompletionTarget] = useState<ReservationOrder | null>(null);
+  const [cancellationTarget, setCancellationTarget] = useState<ReservationOrder | null>(null);
   const [reservations, setReservations] = useState<ReservationOrder[]>([]);
   const [loadingReservations, setLoadingReservations] = useState<boolean>(false);
   const [reservationTypeFilter, setReservationTypeFilter] = useState<'all' | 'reservation' | 'order'>('all');
@@ -233,25 +659,32 @@ export default function OperationsScreen() {
   const [createdOrderTicket, setCreatedOrderTicket] = useState<any | null>(null);
   const [orderTicketModalOpen, setOrderTicketModalOpen] = useState<boolean>(false);
 
-  // DNI auto-lookup cuando alcanza 8 dígitos
+  // DNI auto-lookup cuando alcanza 8 dígitos (con debounce de 250ms)
   useEffect(() => {
     const cleanDoc = orderCustomerDoc.trim().replace(/\D/g, '');
-    if (cleanDoc.length === 8 && isValidDNI(cleanDoc)) {
+    if (cleanDoc.length !== 8 || !isValidDNI(cleanDoc)) return;
+    let cancelled = false;
+    const timer = setTimeout(() => {
       setIsSearchingOrderDni(true);
       lookupDocument('dni', cleanDoc)
         .then((res) => {
-          if (res && res.name) {
+          if (!cancelled && res && res.name) {
             setOrderCustomerName(res.name);
             Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
           }
         })
         .catch(() => {})
-        .finally(() => setIsSearchingOrderDni(false));
-    }
+        .finally(() => {
+          if (!cancelled) setIsSearchingOrderDni(false);
+        });
+    }, 250);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
   }, [orderCustomerDoc]);
 
   // Búsqueda de producto para agregar a la reserva
-  const [productCatalog, setProductCatalog] = useState<any[]>([]);
   const [productSearchQuery, setProductSearchQuery] = useState<string>('');
 
   // ============================================================================
@@ -265,14 +698,24 @@ export default function OperationsScreen() {
     }
 
     setLoadingMovements(true);
-    const unsubscribe = subscribeToSessionMovements(sessId, (movs) => {
-      setMovements(movs);
-      setLoadingMovements(false);
+    let cancelled = false;
+    let unsubscribeFn: (() => void) | undefined;
+
+    const task = InteractionManager.runAfterInteractions(() => {
+      if (cancelled) return;
+      unsubscribeFn = subscribeToSessionMovements(sessId, (movs) => {
+        if (!cancelled) {
+          setMovements(movs);
+          setLoadingMovements(false);
+        }
+      });
     });
 
     return () => {
-      if (typeof unsubscribe === 'function') {
-        unsubscribe();
+      cancelled = true;
+      task.cancel();
+      if (typeof unsubscribeFn === 'function') {
+        unsubscribeFn();
       }
     };
   }, [activeCashSession?.sessionId, activeCashSession?.id, isCashOpen]);
@@ -288,32 +731,46 @@ export default function OperationsScreen() {
     }
 
     setLoadingSessionSales(true);
-    const q = query(
-      collection(db, 'sales'),
-      where('accountId', '==', accountId),
-      where('sessionId', '==', sessId)
-    );
+    let cancelled = false;
+    let unsubscribeFn: (() => void) | undefined;
 
-    const unsubscribe = onSnapshot(
-      q,
-      (snapshot) => {
-        const salesList = snapshot.docs.map((d) => ({ id: d.id, ...d.data() }));
-        salesList.sort((a: any, b: any) => {
-          const tA = a.createdAt?.toMillis?.() || a.date || 0;
-          const tB = b.createdAt?.toMillis?.() || b.date || 0;
-          return tB - tA;
-        });
-        setSessionSales(salesList);
-        setLoadingSessionSales(false);
-      },
-      (err) => {
-        console.warn('[Operations] Error cargando ventas del turno:', err);
-        setLoadingSessionSales(false);
-      }
-    );
+    const task = InteractionManager.runAfterInteractions(() => {
+      if (cancelled) return;
+      const q = query(
+        collection(db, 'sales'),
+        where('accountId', '==', accountId),
+        where('sessionId', '==', sessId),
+        limit(150)
+      );
+
+      unsubscribeFn = onSnapshot(
+        q,
+        (snapshot) => {
+          if (cancelled) return;
+          const salesList = snapshot.docs.map((d) => ({ id: d.id, ...d.data() }));
+          salesList.sort((a: any, b: any) => {
+            const tA = a.createdAt?.toMillis?.() || a.date || 0;
+            const tB = b.createdAt?.toMillis?.() || b.date || 0;
+            return tB - tA;
+          });
+          setSessionSales(salesList);
+          setLoadingSessionSales(false);
+        },
+        (err) => {
+          if (!cancelled) {
+            console.warn('[Operations] Error cargando ventas del turno:', err);
+            setLoadingSessionSales(false);
+          }
+        }
+      );
+    });
 
     return () => {
-      unsubscribe();
+      cancelled = true;
+      task.cancel();
+      if (unsubscribeFn) {
+        unsubscribeFn();
+      }
     };
   }, [activeCashSession?.sessionId, activeCashSession?.id, accountId, isCashOpen]);
 
@@ -460,9 +917,11 @@ export default function OperationsScreen() {
   }, [accountId]);
 
   useEffect(() => {
-    if (activeTab === 'crm' && customers.length === 0) {
-      loadCustomersData();
-    }
+    if (activeTab !== 'crm' || customers.length > 0) return;
+    const task = InteractionManager.runAfterInteractions(() => {
+      void loadCustomersData();
+    });
+    return () => task.cancel();
   }, [activeTab, customers.length, loadCustomersData]);
 
   // ============================================================================
@@ -482,20 +941,19 @@ export default function OperationsScreen() {
   }, [accountId, branchId]);
 
   useEffect(() => {
-    if (activeTab === 'orders' && reservations.length === 0) {
-      loadReservationsData();
-    }
+    if (activeTab !== 'orders' || reservations.length > 0) return;
+    const task = InteractionManager.runAfterInteractions(() => {
+      void loadReservationsData();
+    });
+    return () => task.cancel();
   }, [activeTab, reservations.length, loadReservationsData]);
 
-  // Cargar catálogo rápido para modal de reservas (solo cuando se abre el modal)
-  useEffect(() => {
-    if (!newReservationModalVisible || !accountId || productCatalog.length > 0) return;
-    const q = query(collection(db, 'products'), where('accountId', '==', accountId));
-    getDocs(q).then((snap) => {
-      const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-      setProductCatalog(list);
-    }).catch(() => {});
-  }, [newReservationModalVisible, accountId, productCatalog.length]);
+  // Sugerencias memoizadas desde ProductsContext (sin descargar catálogo de Firestore)
+  const filteredCatalogSuggestions = useMemo(() => {
+    const q = productSearchQuery.trim().toLowerCase();
+    if (!q) return [];
+    return productCatalog.filter((p) => p.name?.toLowerCase().includes(q)).slice(0, 5);
+  }, [productCatalog, productSearchQuery]);
 
   // ============================================================================
   // ACCIONES SUB-MÓDULO 1: CAJA Y CIERRE Z
@@ -775,6 +1233,14 @@ export default function OperationsScreen() {
       Alert.alert('Monto Excesivo', `El abono no puede superar la deuda actual de ${formatPEN(selectedDebtor.currentDebt || 0)}.`);
       return;
     }
+    if (selectedFiado && amt > selectedFiado.remainingAmount) {
+      Alert.alert('Monto Excesivo', `El abono no puede superar el saldo del fiado seleccionado (${formatPEN(selectedFiado.remainingAmount)}).`);
+      return;
+    }
+    if (openFiados.length > 0 && !selectedFiado) {
+      Alert.alert('Seleccione un fiado', 'Elija el fiado al que desea aplicar este abono.');
+      return;
+    }
 
     if (!accountId || !branchId || !user) return;
 
@@ -790,6 +1256,7 @@ export default function OperationsScreen() {
           name: selectedDebtor.name,
           currentDebt: selectedDebtor.currentDebt,
         },
+        reservationId: selectedFiado?.id,
         amount: amt,
         paymentMethod,
         notes: paymentNotes.trim() || undefined,
@@ -805,6 +1272,8 @@ export default function OperationsScreen() {
       setPaymentAmount('');
       setPaymentNotes('');
       setSelectedDebtor(null);
+      setSelectedFiado(null);
+      setOpenFiados([]);
       loadCustomersData();
       refreshCashStatus();
 
@@ -825,7 +1294,10 @@ export default function OperationsScreen() {
   const filteredReservations = useMemo(() => {
     return reservations.filter((r) => {
       if (reservationTypeFilter !== 'all' && r.type !== reservationTypeFilter) return false;
-      if (reservationStatusFilter !== 'all' && r.status !== reservationStatusFilter) return false;
+      if (reservationStatusFilter !== 'all') {
+        const statusFilterValue = ['approved', 'production'].includes(r.status) ? 'pending' : r.status;
+        if (statusFilterValue !== reservationStatusFilter) return false;
+      }
       return true;
     });
   }, [reservations, reservationTypeFilter, reservationStatusFilter]);
@@ -955,144 +1427,132 @@ export default function OperationsScreen() {
     }
   };
 
-  const handleCompleteOrCancelOrder = async (
-    item: ReservationOrder,
-    action: 'complete' | 'cancel'
-  ) => {
-    const remaining = Number(item.remainingAmount || 0);
-    Alert.alert(
-      action === 'complete' ? '¿Marcar como Entregado?' : '¿Cancelar Reserva?',
-      action === 'complete'
-        ? (remaining > 0
-            ? `La reserva tiene un saldo pendiente de ${formatPEN(remaining)}. ¿Deseas cobrarlo y registrar la entrega?`
-            : 'El pedido pasará a estado completado y se liberará el stock reservado.')
-        : 'La reserva será anulada y el stock retenido volverá al inventario disponible.',
-      [
+  const handleCompleteOrCancelOrder = async (item: ReservationOrder, action: 'complete' | 'cancel') => {
+    if (action === 'complete') { setCompletionTarget(item); return; }
+    setCancellationTarget(item);
+  };
+
+  const confirmReservationCancellation = async (refund: { refundMethod?: string; refundPercent?: number }) => {
+    if (!cancellationTarget || !user) return;
+    try {
+      await completeOrCancelReservation(cancellationTarget, 'cancel', {
+        uid: user.uid,
+        displayName: userProfile?.displayName || user.email || 'Operador',
+        email: user.email,
+        role,
+      }, {
+        sessionId: activeCashSession?.sessionId || activeCashSession?.id,
+        ...refund,
+      });
+      setCancellationTarget(null);
+      void loadReservationsData();
+      void refreshCashStatus();
+    } catch (err) {
+      Alert.alert('No se pudo cancelar', err instanceof Error ? err.message : 'Actualiza los datos y vuelve a intentarlo.');
+    }
+  };
+  const handleApproveOrder = useCallback(
+    (item: ReservationOrder) => {
+      Alert.alert('¿Aprobar pedido?', 'Se reservará el stock de catálogo para iniciar su preparación.', [
         { text: 'Volver', style: 'cancel' },
         {
-          text: action === 'complete' ? (remaining > 0 ? 'Sí, Cobrar y Entregar' : 'Sí, Entregar') : 'Sí, Cancelar',
-          style: action === 'cancel' ? 'destructive' : 'default',
+          text: 'Aprobar',
           onPress: async () => {
-            if (!user) return;
             try {
-              const sessId = activeCashSession?.sessionId || activeCashSession?.id;
-              await completeOrCancelReservation(
-                item,
-                action,
-                {
-                  uid: user.uid,
-                  displayName: userProfile?.displayName || user.email || 'Operador',
-                  email: user.email,
-                  role,
-                },
-                action === 'complete' && remaining > 0
-                  ? {
-                      paymentMethod: 'efectivo',
-                      amount: remaining,
-                      sessionId: sessId,
-                    }
-                  : undefined
+              await approveOrder(item.id);
+              await loadReservationsData();
+              Alert.alert(
+                'Pedido aprobado',
+                'El stock quedó reservado y el pedido puede entregarse desde esta pantalla.'
               );
-              loadReservationsData();
-              refreshCashStatus();
-              if (action === 'complete') {
-                setCreatedOrderTicket({
-                  ...item,
-                  status: 'completed',
-                  depositAmount: item.total,
-                  remainingAmount: 0,
-                });
-                setOrderTicketModalOpen(true);
-              }
-              Alert.alert('Éxito', action === 'complete' ? 'Pedido entregado y comprobante listo.' : 'Reserva cancelada.');
-            } catch (err: any) {
-              Alert.alert('Error', err?.message || 'No se pudo actualizar el estado.');
+            } catch (error: any) {
+              Alert.alert('No se pudo aprobar', error?.message || 'Revisa el stock e inténtalo nuevamente.');
             }
           },
         },
-      ]
-    );
-  };
+      ]);
+    },
+    [loadReservationsData]
+  );
 
-  const renderSalePaymentBadges = (sale: any) => {
-    if (Array.isArray(sale.payments) && sale.payments.length > 0) {
-      return sale.payments.map((p: any, idx: number) => {
-        const cat = (p.category || '').toLowerCase();
-        const prov = (p.digitalProvider || '').toLowerCase();
-        let label = 'Otro';
-        let color: string = ui.textSecondary;
-        let bg: string = ui.surfaceMuted;
+  const handleViewReservationTicket = useCallback((item: ReservationOrder) => {
+    setCreatedOrderTicket(item);
+    setOrderTicketModalOpen(true);
+  }, []);
 
-        if (cat === 'cash') {
-          label = 'Efectivo';
-          color = '#16A34A';
-          bg = '#DCFCE7';
-        } else if (cat === 'card') {
-          label = 'Tarjeta';
-          color = '#2563EB';
-          bg = '#EFF6FF';
-        } else if (cat === 'credit') {
-          label = 'Fiado';
-          color = '#EA580C';
-          bg = '#FFEDD5';
-        } else if (cat === 'digital') {
-          if (prov === 'yape') {
-            label = 'Yape';
-            color = '#7E22CE';
-            bg = '#F3E8FF';
-          } else if (prov === 'plin') {
-            label = 'Plin';
-            color = '#0284C7';
-            bg = '#E0F2FE';
-          } else {
-            label = 'Transf.';
-            color = '#4F46E5';
-            bg = '#EEF2FF';
+  const handleCancelReservationCard = useCallback((item: ReservationOrder) => {
+    void handleCompleteOrCancelOrder(item, 'cancel');
+  }, []);
+
+  const handleDeliverReservationCard = useCallback((item: ReservationOrder) => {
+    void handleCompleteOrCancelOrder(item, 'complete');
+  }, []);
+
+  const handleCollectDebt = useCallback(
+    (cust: CustomerData) => {
+      setSelectedDebtor(cust);
+      setSelectedFiado(null);
+      setPaymentAmount('');
+      getCustomerOpenFiados(accountId || '', cust.id || '')
+        .then((records) => {
+          setOpenFiados(records);
+          if (records.length === 1) {
+            setSelectedFiado(records[0]);
+            setPaymentAmount(String(records[0].remainingAmount));
           }
-        }
-        return (
-          <View key={idx} style={[styles.methodBadgePill, { backgroundColor: bg }]}>
-            <Text style={[styles.methodBadgeText, { color }]}>
-              {label} {p.amount ? formatPEN(p.amount) : ''}
-            </Text>
-          </View>
-        );
-      });
-    }
+        })
+        .catch((error) => Alert.alert('Error', error?.message || 'No se pudieron cargar los fiados.'));
+      setPaymentModalVisible(true);
+    },
+    [accountId]
+  );
 
-    const m = (sale.paymentMethod || '').toLowerCase();
-    let label = 'Efectivo';
-    let color: string = '#16A34A';
-    let bg: string = '#DCFCE7';
+  const listContentContainerStyle = useMemo(
+    () => ({ paddingHorizontal: 20, paddingTop: 12, paddingBottom: insets.bottom + 80 }),
+    [insets.bottom]
+  );
 
-    if (m === 'yape') {
-      label = 'Yape';
-      color = '#7E22CE';
-      bg = '#F3E8FF';
-    } else if (m === 'plin') {
-      label = 'Plin';
-      color = '#0284C7';
-      bg = '#E0F2FE';
-    } else if (m === 'tarjeta' || m === 'card') {
-      label = 'Tarjeta';
-      color = '#2563EB';
-      bg = '#EFF6FF';
-    } else if (m === 'transferencia' || m === 'transfer') {
-      label = 'Transferencia';
-      color = '#4F46E5';
-      bg = '#EEF2FF';
-    } else if (m === 'fiado' || m === 'credit') {
-      label = 'Fiado';
-      color = '#EA580C';
-      bg = '#FFEDD5';
-    }
+  const movementKeyExtractor = useCallback((item: CashMovement, index: number) => item.id || `mov_${index}`, []);
+  const renderMovementItem = useCallback(
+    ({ item }: { item: CashMovement }) => <CashMovementRow movement={item} />,
+    []
+  );
 
-    return (
-      <View style={[styles.methodBadgePill, { backgroundColor: bg }]}>
-        <Text style={[styles.methodBadgeText, { color }]}>{label}</Text>
-      </View>
-    );
-  };
+  const sessionSaleKeyExtractor = useCallback((item: any, index: number) => item.id || `sale_${index}`, []);
+  const renderSessionSaleItem = useCallback(
+    ({ item }: { item: any }) => <SessionSaleRow sale={item} />,
+    []
+  );
+
+  const customerKeyExtractor = useCallback((item: CustomerData, index: number) => item.id || `cust_${index}`, []);
+  const renderCustomerItem = useCallback(
+    ({ item }: { item: CustomerData }) => (
+      <CustomerCardItem cust={item} onCollectDebt={handleCollectDebt} />
+    ),
+    [handleCollectDebt]
+  );
+
+  const reservationKeyExtractor = useCallback(
+    (item: ReservationOrder, index: number) => item.id || `res_${index}`,
+    []
+  );
+  const renderReservationItem = useCallback(
+    ({ item }: { item: ReservationOrder }) => (
+      <ReservationCardItem
+        item={item}
+        onViewTicket={handleViewReservationTicket}
+        onCancel={handleCancelReservationCard}
+        onApprove={handleApproveOrder}
+        onDeliver={handleDeliverReservationCard}
+      />
+    ),
+    [
+      handleViewReservationTicket,
+      handleCancelReservationCard,
+      handleApproveOrder,
+      handleDeliverReservationCard,
+    ]
+  );
 
   // ============================================================================
   // RENDER PRINCIPAL
@@ -1160,15 +1620,15 @@ export default function OperationsScreen() {
         </TouchableOpacity>
       </View>
 
-      <ScrollView
-        style={styles.contentContainer}
-        contentContainerStyle={{ paddingBottom: insets.bottom + 80 }}
-        keyboardShouldPersistTaps="handled"
-      >
         {/* ==================================================================== */}
         {/* SUB-MÓDULO 1: CONTROL DE CAJA Y ARQUEO */}
         {/* ==================================================================== */}
         {activeTab === 'cash' && (
+          <ScrollView
+            style={styles.contentContainer}
+            contentContainerStyle={{ paddingBottom: insets.bottom + 80 }}
+            keyboardShouldPersistTaps="handled"
+          >
           <View style={styles.moduleWrapper}>
             {!isCashOpen ? (
               // TARJETA DE APERTURA DE CAJA
@@ -1469,39 +1929,9 @@ export default function OperationsScreen() {
                         <Text style={styles.emptyText}>No hay movimientos registrados en este turno.</Text>
                       </View>
                     ) : (
-                      movements.map((m) => {
-                        const isIncome = m.type === 'income';
-                        return (
-                          <View key={m.id} style={styles.movementItem}>
-                            <View
-                              style={[
-                                styles.movementBadge,
-                                { backgroundColor: isIncome ? ui.successSoft : ui.dangerSoft },
-                              ]}
-                            >
-                              {isIncome ? (
-                                <ArrowUpRight size={16} color={ui.success} />
-                              ) : (
-                                <ArrowDownRight size={16} color={ui.danger} />
-                              )}
-                            </View>
-                            <View style={{ flex: 1, marginLeft: 12 }}>
-                              <Text style={styles.movementTitle}>{m.description || 'Movimiento de caja'}</Text>
-                              <Text style={styles.movementSub}>
-                                {formatDatePE(m.createdAt)} • {m.createdByName || 'Operador'}
-                              </Text>
-                            </View>
-                            <Text
-                              style={[
-                                styles.movementAmount,
-                                { color: isIncome ? ui.success : ui.danger },
-                              ]}
-                            >
-                              {isIncome ? '+' : '-'}{formatPEN(m.amount)}
-                            </Text>
-                          </View>
-                        );
-                      })
+                      movements.map((m, idx) => (
+                        <CashMovementRow key={m.id || `mov_${idx}`} movement={m} />
+                      ))
                     )
                   ) : (
                     loadingSessionSales ? (
@@ -1512,40 +1942,9 @@ export default function OperationsScreen() {
                         <Text style={styles.emptyText}>No hay ventas realizadas en este turno todavía.</Text>
                       </View>
                     ) : (
-                      sessionSales.map((sale) => {
-                        const isCancelled = sale.status === 'cancelled';
-                        const timeStr = formatDatePE(sale.createdAt || sale.date);
-                        return (
-                          <View key={sale.id} style={styles.saleItemRow}>
-                            <View style={{ flex: 1 }}>
-                              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-                                <Text style={styles.movementTitle}>
-                                  {sale.correlative || `#VTA-${String(sale.saleNumber || '').padStart(5, '0')}`}
-                                </Text>
-                                {isCancelled && (
-                                  <View style={[styles.methodBadgePill, { backgroundColor: ui.dangerSoft }]}>
-                                    <Text style={[styles.methodBadgeText, { color: ui.danger }]}>Anulada</Text>
-                                  </View>
-                                )}
-                              </View>
-                              <Text style={styles.movementSub}>
-                                {timeStr} • {sale.customerName || 'Cliente Varios'}
-                              </Text>
-                              <View style={{ flexDirection: 'row', flexWrap: 'wrap', marginTop: 4 }}>
-                                {renderSalePaymentBadges(sale)}
-                              </View>
-                            </View>
-                            <Text
-                              style={[
-                                styles.movementAmount,
-                                { color: isCancelled ? ui.textMuted : ui.text },
-                              ]}
-                            >
-                              {formatPEN(sale.total || 0)}
-                            </Text>
-                          </View>
-                        );
-                      })
+                      sessionSales.map((sale, idx) => (
+                        <SessionSaleRow key={sale.id || `sale_${idx}`} sale={sale} />
+                      ))
                     )
                   )}
                 </View>
@@ -1673,13 +2072,25 @@ export default function OperationsScreen() {
               </View>
             )}
           </View>
+        </ScrollView>
         )}
 
         {/* ==================================================================== */}
         {/* SUB-MÓDULO 2: CLIENTES Y FIADOS */}
         {/* ==================================================================== */}
         {activeTab === 'crm' && (
-          <View style={styles.moduleWrapper}>
+          <View style={{ flex: 1 }}>
+            <FlashList
+              data={loadingCustomers ? [] : displayedCustomers}
+              renderItem={renderCustomerItem}
+              keyExtractor={customerKeyExtractor}
+              estimatedItemSize={155}
+              contentContainerStyle={listContentContainerStyle}
+              keyboardShouldPersistTaps="handled"
+              showsVerticalScrollIndicator={false}
+              ItemSeparatorComponent={ListGap16}
+              ListHeaderComponent={
+                <View style={[styles.moduleWrapper, { marginBottom: 16 }]}>
             <SectionHeading title="Cartera de clientes" subtitle="Saldos pendientes y directorio" />
             {/* KPIs de Cartera */}
             <View style={styles.kpiRow}>
@@ -1776,97 +2187,28 @@ export default function OperationsScreen() {
               </TouchableOpacity>
             </View>
 
-            {/* Directorio de Clientes */}
-            {loadingCustomers ? (
-              <ActivityIndicator color={ui.primary} style={{ marginVertical: 30 }} />
-            ) : filteredCustomers.length === 0 ? (
-              <View style={styles.emptyContainer}>
-                <Users size={40} color={ui.textMuted} />
-                <Text style={styles.emptyText}>No se encontraron clientes en esta vista.</Text>
               </View>
-            ) : (
-              <>
-                {displayedCustomers.map((cust) => {
-                  const debt = Number(cust.currentDebt) || 0;
-                  const limit = Number(cust.creditLimit) || 1;
-                  const debtRatio = Math.min(1, debt / limit);
-
-                  return (
-                    <View key={cust.id} style={styles.customerCard}>
-                      <View style={styles.customerTop}>
-                        <View style={{ flex: 1 }}>
-                          <Text style={styles.customerName}>{cust.name}</Text>
-                          <Text style={styles.customerDoc}>
-                            {cust.documentType || 'DOC'}: {cust.documentNumber || 'Sin número'}
-                            {cust.phone ? ` • Tel: ${cust.phone}` : ''}
-                          </Text>
-                        </View>
-
-                        {debt > 0 ? (
-                          <View style={{ alignItems: 'flex-end' }}>
-                            <Text style={styles.debtLabel}>DEUDA ACTIVA</Text>
-                            <Text style={styles.debtValue}>{formatPEN(debt)}</Text>
-                          </View>
-                        ) : (
-                          <View style={styles.cleanDebtBadge}>
-                            <Text style={styles.cleanDebtText}>AL DÍA</Text>
-                          </View>
-                        )}
-                      </View>
-
-                      {/* Barra de uso de línea de crédito */}
-                      <View style={styles.creditLineBox}>
-                        <View style={styles.creditLineLabels}>
-                          <Text style={styles.creditLineText}>Línea: {formatPEN(limit)}</Text>
-                          <Text style={styles.creditLineText}>
-                            Uso: {Math.round(debtRatio * 100)}%
-                          </Text>
-                        </View>
-                        <View style={styles.progressBarBg}>
-                          <View
-                            style={[
-                              styles.progressBarFill,
-                              {
-                                width: `${debtRatio * 100}%`,
-                                backgroundColor:
-                                  debtRatio > 0.8
-                                    ? ui.danger
-                                    : debtRatio > 0.5
-                                    ? ui.warning
-                                    : ui.primary,
-                              },
-                            ]}
-                          />
-                        </View>
-                      </View>
-
-                      {/* Botón de Abonar si tiene deuda */}
-                      {debt > 0 && (
-                        <TouchableOpacity
-                          style={styles.abonoButton}
-                          onPress={() => {
-                            setSelectedDebtor(cust);
-                            setPaymentAmount(String(debt));
-                            setPaymentModalVisible(true);
-                          }}
-                        >
-                          <Receipt size={16} color={ui.onPrimary} />
-                          <Text style={styles.abonoButtonText}>Cobrar Abono de Deuda</Text>
-                        </TouchableOpacity>
-                      )}
-                    </View>
-                  );
-                })}
-
-                {filteredCustomers.length > 30 && (
-                  <View style={{ paddingVertical: 14, alignItems: 'center' }}>
+              }
+              ListEmptyComponent={
+                loadingCustomers ? (
+                  <ActivityIndicator color={ui.primary} style={{ marginVertical: 30 }} />
+                ) : (
+                  <View style={styles.emptyContainer}>
+                    <Users size={40} color={ui.textMuted} />
+                    <Text style={styles.emptyText}>No se encontraron clientes en esta vista.</Text>
+                  </View>
+                )
+              }
+              ListFooterComponent={
+                filteredCustomers.length > 30 ? (
+                  <View style={{ paddingTop: 16, paddingBottom: 14, alignItems: 'center' }}>
                     <Text style={{ fontSize: 13, color: ui.textMuted }}>
                       Mostrando 30 de {filteredCustomers.length} clientes. Use el buscador para afinar.
                     </Text>
                   </View>
-                )}
-              </>
-            )}
+                ) : null
+              }
+            />
           </View>
         )}
 
@@ -1874,7 +2216,18 @@ export default function OperationsScreen() {
         {/* SUB-MÓDULO 3: PEDIDOS Y RESERVAS */}
         {/* ==================================================================== */}
         {activeTab === 'orders' && (
-          <View style={styles.moduleWrapper}>
+          <View style={{ flex: 1 }}>
+            <FlashList
+              data={loadingReservations ? [] : displayedReservations}
+              renderItem={renderReservationItem}
+              keyExtractor={reservationKeyExtractor}
+              estimatedItemSize={220}
+              contentContainerStyle={listContentContainerStyle}
+              keyboardShouldPersistTaps="handled"
+              showsVerticalScrollIndicator={false}
+              ItemSeparatorComponent={ListGap16}
+              ListHeaderComponent={
+                <View style={[styles.moduleWrapper, { marginBottom: 16 }]}>
             <SectionHeading
               title="Reservas y pedidos"
               subtitle="Los productos reservados se mantienen apartados hasta la entrega."
@@ -1929,179 +2282,36 @@ export default function OperationsScreen() {
               </TouchableOpacity>
             </View>
 
-            {/* Lista de Reservas */}
-            {loadingReservations ? (
-              <ActivityIndicator color={ui.primary} style={{ marginVertical: 30 }} />
-            ) : filteredReservations.length === 0 ? (
-              <View style={styles.emptyContainer}>
-                <Package size={40} color={ui.textMuted} />
-                <Text style={styles.emptyText}>No hay pedidos ni reservas activos.</Text>
-              </View>
-            ) : (
-              <>
-                {displayedReservations.map((item) => {
-                  const isPending = item.status === 'pending' || item.status === 'ready';
-                  const isDelivered = item.status === 'completed';
-                  const isCancelled = item.status === 'cancelled';
-
-                  return (
-                    <View key={item.id} style={styles.reservationCard}>
-                      <View style={styles.reservationTop}>
-                        <View style={styles.badgeRow}>
-                          <View
-                            style={[
-                              styles.typeBadge,
-                              { backgroundColor: item.type === 'order' ? ui.primarySoft : ui.accentSoft },
-                            ]}
-                          >
-                            <Text
-                              style={[
-                                styles.typeBadgeText,
-                                { color: item.type === 'order' ? ui.primary : ui.accent },
-                              ]}
-                            >
-                              {item.type === 'order' ? 'PEDIDO' : 'RESERVA'} #{item.id.slice(-6).toUpperCase()}
-                            </Text>
-                          </View>
-
-                          <View
-                            style={[
-                              styles.statusBadge,
-                              {
-                                backgroundColor: isDelivered
-                                  ? ui.successSoft
-                                  : isCancelled
-                                  ? ui.dangerSoft
-                                  : ui.warningSoft,
-                              },
-                            ]}
-                          >
-                            <Text
-                              style={[
-                                styles.statusBadgeText,
-                                {
-                                  color: isDelivered
-                                    ? ui.success
-                                    : isCancelled
-                                    ? ui.danger
-                                    : ui.warning,
-                                },
-                              ]}
-                            >
-                              {isDelivered ? 'ENTREGADO' : isCancelled ? 'CANCELADO' : 'PENDIENTE'}
-                            </Text>
-                          </View>
-                        </View>
-
-                        <Text style={styles.resClientName}>{item.customer?.name || 'Cliente sin nombre'}</Text>
-                        {item.customer?.phone && (
-                          <Text style={styles.resClientPhone}>Tel: {item.customer.phone}</Text>
-                        )}
-                      </View>
-
-                      {/* Ítems reservados */}
-                      <View style={styles.resItemsList}>
-                        {item.items?.map((it, idx) => (
-                          <View key={idx} style={styles.resItemRow}>
-                            <Text style={styles.resItemName}>
-                              • {it.quantity}x {it.productName}
-                            </Text>
-                            <Text style={styles.resItemPrice}>
-                              {formatPEN(it.price * it.quantity)}
-                            </Text>
-                          </View>
-                        ))}
-                      </View>
-
-                      {/* Resumen Financiero */}
-                      <View style={styles.resFinancialRow}>
-                        <View>
-                          <Text style={styles.resFinLabel}>Total</Text>
-                          <Text style={styles.resFinValue}>{formatPEN(item.total)}</Text>
-                        </View>
-                        <View>
-                          <Text style={styles.resFinLabel}>Adelanto Pagado</Text>
-                          <Text style={[styles.resFinValue, { color: ui.success }]}>
-                            {formatPEN(item.depositAmount || 0)}
-                          </Text>
-                        </View>
-                        <View>
-                          <Text style={styles.resFinLabel}>Saldo Pendiente</Text>
-                          <Text style={[styles.resFinValue, { color: ui.warning }]}>
-                            {formatPEN(item.remainingAmount || 0)}
-                          </Text>
-                        </View>
-                      </View>
-
-                      {/* Acciones de Entrega, Cobro o Comprobante */}
-                      <View style={[styles.resActionRow, { marginTop: 12, flexWrap: 'wrap', gap: 8 }]}>
-                        <TouchableOpacity
-                          style={[
-                            styles.resActionButton,
-                            { borderColor: ui.border, backgroundColor: ui.surface, flex: 1, minWidth: 100 },
-                          ]}
-                          onPress={() => {
-                            setCreatedOrderTicket(item);
-                            setOrderTicketModalOpen(true);
-                          }}
-                          activeOpacity={0.7}
-                        >
-                          <FileText size={15} color={ui.primary} />
-                          <Text style={[styles.resActionText, { color: ui.primary, fontWeight: '700' }]}>
-                            Ver Ticket
-                          </Text>
-                        </TouchableOpacity>
-
-                        {isPending && (
-                          <TouchableOpacity
-                            style={[styles.resActionButton, { borderColor: ui.danger, flex: 1, minWidth: 90 }]}
-                            onPress={() => handleCompleteOrCancelOrder(item, 'cancel')}
-                            activeOpacity={0.7}
-                          >
-                            <XCircle size={15} color={ui.danger} />
-                            <Text style={[styles.resActionText, { color: ui.danger }]}>
-                              Cancelar
-                            </Text>
-                          </TouchableOpacity>
-                        )}
-
-                        {isPending && (
-                          <TouchableOpacity
-                            style={[
-                              styles.resActionButton,
-                              { backgroundColor: ui.primary, borderColor: ui.primary, flex: 1.2, minWidth: 110 },
-                            ]}
-                            onPress={() => handleCompleteOrCancelOrder(item, 'complete')}
-                            activeOpacity={0.7}
-                          >
-                            <CheckCircle2 size={15} color={ui.onPrimary} />
-                            <Text style={[styles.resActionText, { color: ui.onPrimary, fontWeight: 'bold' }]}>
-                              {item.remainingAmount && item.remainingAmount > 0 ? 'Cobrar y Entregar' : 'Entregar'}
-                            </Text>
-                          </TouchableOpacity>
-                        )}
-                      </View>
-                    </View>
-                  );
-                })}
-
-                {filteredReservations.length > 30 && (
-                  <View style={{ paddingVertical: 14, alignItems: 'center' }}>
-                    <Text style={{ fontSize: 13, color: ui.textMuted }}>
-                      Mostrando 30 de {filteredReservations.length} pedidos/reservas.
-                    </Text>
-                  </View>
-                )}
-              </>
-            )}
-          </View>
-        )}
-      </ScrollView>
+            </View>
+            }
+            ListEmptyComponent={
+              loadingReservations ? (
+                <ActivityIndicator color={ui.primary} style={{ marginVertical: 30 }} />
+              ) : (
+                <View style={styles.emptyContainer}>
+                  <Package size={40} color={ui.textMuted} />
+                  <Text style={styles.emptyText}>No hay pedidos ni reservas activos.</Text>
+                </View>
+              )
+            }
+            ListFooterComponent={
+              filteredReservations.length > 30 ? (
+                <View style={{ paddingTop: 16, paddingBottom: 14, alignItems: 'center' }}>
+                  <Text style={{ fontSize: 13, color: ui.textMuted }}>
+                    Mostrando 30 de {filteredReservations.length} pedidos/reservas.
+                  </Text>
+                </View>
+              ) : null
+            }
+          />
+        </View>
+      )}
 
       {/* ==================================================================== */}
       {/* MODAL: REGISTRAR INGRESO / EGRESO MANUAL DE CAJA */}
       {/* ==================================================================== */}
-      <Modal visible={movementModalVisible} transparent animationType="fade">
+      {movementModalVisible && (
+        <Modal visible={movementModalVisible} transparent animationType="fade">
         <KeyboardAvoidingView
           behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
           style={styles.modalOverlay}
@@ -2189,11 +2399,35 @@ export default function OperationsScreen() {
           </View>
         </KeyboardAvoidingView>
       </Modal>
+      )}
 
       {/* ==================================================================== */}
       {/* MODAL: ARQUEO Y CIERRE Z DE CAJA */}
       {/* ==================================================================== */}
-      <Modal visible={closeModalVisible} transparent animationType="fade">
+      {Boolean(completionTarget) && (
+        <ReservationCompletionModal
+          item={completionTarget}
+          onClose={() => setCompletionTarget(null)}
+          onCompleted={(item) => {
+            setCompletionTarget(null);
+            void loadReservationsData();
+            refreshCashStatus();
+            setCreatedOrderTicket({ ...item, status: 'completed', depositAmount: item.total, remainingAmount: 0 });
+            setOrderTicketModalOpen(true);
+          }}
+        />
+      )}
+      {Boolean(cancellationTarget) && (
+        <ReservationCancellationModal
+          visible={Boolean(cancellationTarget)}
+          item={cancellationTarget}
+          sessionId={activeCashSession?.sessionId || activeCashSession?.id}
+          onClose={() => setCancellationTarget(null)}
+          onConfirm={confirmReservationCancellation}
+        />
+      )}
+      {closeModalVisible && (
+        <Modal visible={closeModalVisible} transparent animationType="fade">
         <KeyboardAvoidingView
           behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
           style={styles.modalOverlay}
@@ -2220,6 +2454,28 @@ export default function OperationsScreen() {
                 {formatPEN(activeCashSession?.expectedAmount ?? 0)}
               </Text>
             </View>
+
+            {openFiados.length > 0 && (
+              <View style={styles.inputGroup}>
+                <Text style={styles.label}>Fiado que desea abonar</Text>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+                  {openFiados.map((fiado) => (
+                    <TouchableOpacity
+                      key={fiado.id}
+                      style={[styles.methodChip, selectedFiado?.id === fiado.id && styles.methodChipActive]}
+                      onPress={() => {
+                        setSelectedFiado(fiado);
+                        setPaymentAmount(String(fiado.remainingAmount));
+                      }}
+                    >
+                      <Text style={[styles.methodChipText, selectedFiado?.id === fiado.id && styles.methodChipTextActive]}>
+                        #{fiado.reservationNumber ?? fiado.id.slice(-6)} · {formatPEN(fiado.remainingAmount)}
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
+                </ScrollView>
+              </View>
+            )}
 
             <View style={styles.inputGroup}>
               <Text style={styles.label}>Efectivo Físico Recontado (Billetes y Monedas S/)</Text>
@@ -2299,41 +2555,45 @@ export default function OperationsScreen() {
           </View>
         </KeyboardAvoidingView>
       </Modal>
+      )}
 
       {/* ==================================================================== */}
       {/* MODAL: CIERRE EXITOSO Y TICKET TÉRMICO */}
       {/* ==================================================================== */}
-      <Modal visible={closureSuccessModal} transparent animationType="fade">
-        <View style={styles.modalOverlay}>
-          <View style={styles.modalContent}>
-            <View style={{ alignItems: 'center', marginVertical: 12 }}>
-              <CheckCircle2 size={48} color={ui.primary} />
-              <Text style={[styles.modalTitle, { marginTop: 8 }]}>¡Turno Cerrado con Éxito!</Text>
-              <Text style={styles.modalSub}>El reporte de Cierre Z ha sido guardado.</Text>
+      {closureSuccessModal && (
+        <Modal visible={closureSuccessModal} transparent animationType="fade">
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              <View style={{ alignItems: 'center', marginVertical: 12 }}>
+                <CheckCircle2 size={48} color={ui.primary} />
+                <Text style={[styles.modalTitle, { marginTop: 8 }]}>¡Turno Cerrado con Éxito!</Text>
+                <Text style={styles.modalSub}>El reporte de Cierre Z ha sido guardado.</Text>
+              </View>
+
+              <TouchableOpacity
+                style={styles.printTicketButton}
+                onPress={handlePrintClosureTicket}
+              >
+                <Printer size={20} color={ui.onPrimary} />
+                <Text style={styles.printTicketButtonText}>Imprimir Ticket Térmico Z</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={styles.secondaryDismissButton}
+                onPress={() => setClosureSuccessModal(false)}
+              >
+                <Text style={styles.secondaryDismissText}>Finalizar</Text>
+              </TouchableOpacity>
             </View>
-
-            <TouchableOpacity
-              style={styles.printTicketButton}
-              onPress={handlePrintClosureTicket}
-            >
-              <Printer size={20} color={ui.onPrimary} />
-              <Text style={styles.printTicketButtonText}>Imprimir Ticket Térmico Z</Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={styles.secondaryDismissButton}
-              onPress={() => setClosureSuccessModal(false)}
-            >
-              <Text style={styles.secondaryDismissText}>Finalizar</Text>
-            </TouchableOpacity>
           </View>
-        </View>
-      </Modal>
+        </Modal>
+      )}
 
       {/* ==================================================================== */}
       {/* MODAL: CREAR NUEVO CLIENTE (CON CONSULTA DNI/RUC) */}
       {/* ==================================================================== */}
-      <Modal visible={newCustomerModalVisible} transparent animationType="slide">
+      {newCustomerModalVisible && (
+        <Modal visible={newCustomerModalVisible} transparent animationType="slide">
         <KeyboardAvoidingView
           behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
           style={styles.modalOverlay}
@@ -2459,11 +2719,13 @@ export default function OperationsScreen() {
           </View>
         </KeyboardAvoidingView>
       </Modal>
+      )}
 
       {/* ==================================================================== */}
       {/* MODAL: REGISTRAR ABONO DE FIADO */}
       {/* ==================================================================== */}
-      <Modal visible={paymentModalVisible} transparent animationType="fade">
+      {paymentModalVisible && (
+        <Modal visible={paymentModalVisible} transparent animationType="fade">
         <KeyboardAvoidingView
           behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
           style={styles.modalOverlay}
@@ -2559,11 +2821,13 @@ export default function OperationsScreen() {
           </View>
         </KeyboardAvoidingView>
       </Modal>
+      )}
 
       {/* ==================================================================== */}
       {/* MODAL: NUEVA RESERVA O PEDIDO */}
       {/* ==================================================================== */}
-      <Modal visible={newReservationModalVisible} transparent animationType="slide">
+      {newReservationModalVisible && (
+        <Modal visible={newReservationModalVisible} transparent animationType="slide">
         <KeyboardAvoidingView
           behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
           style={styles.modalOverlay}
@@ -2661,26 +2925,23 @@ export default function OperationsScreen() {
                   onChangeText={setProductSearchQuery}
                 />
 
-                {productSearchQuery.length > 0 && (
+                {filteredCatalogSuggestions.length > 0 && (
                   <View style={styles.searchProductDropdown}>
-                    {productCatalog
-                      .filter((p) => p.name?.toLowerCase().includes(productSearchQuery.toLowerCase()))
-                      .slice(0, 5)
-                      .map((p) => (
-                        <TouchableOpacity
-                          key={p.id}
-                          style={styles.dropdownItem}
-                          onPress={() => {
-                            handleAddProductToReservation(p);
-                            setProductSearchQuery('');
-                          }}
-                        >
-                          <Text style={styles.dropdownName}>{p.name}</Text>
-                          <Text style={styles.dropdownPrice}>
-                            {formatPEN(p.price || p.suggestedPrice || 0)}
-                          </Text>
-                        </TouchableOpacity>
-                      ))}
+                    {filteredCatalogSuggestions.map((p: any) => (
+                      <TouchableOpacity
+                        key={p.id}
+                        style={styles.dropdownItem}
+                        onPress={() => {
+                          handleAddProductToReservation(p);
+                          setProductSearchQuery('');
+                        }}
+                      >
+                        <Text style={styles.dropdownName}>{p.name}</Text>
+                        <Text style={styles.dropdownPrice}>
+                          {formatPEN(p.price || p.suggestedPrice || 0)}
+                        </Text>
+                      </TouchableOpacity>
+                    ))}
                   </View>
                 )}
               </View>
@@ -2689,7 +2950,7 @@ export default function OperationsScreen() {
               {orderItems.length > 0 && (
                 <View style={styles.orderItemsList}>
                   {orderItems.map((it) => (
-                    <View key={it.productId} style={styles.orderItemCard}>
+                    <View key={`${it.id || it.productId || it.productName}-${it.variantId || 'base'}-${it.presentationId || 'base'}`} style={styles.orderItemCard}>
                       <View style={{ flex: 1 }}>
                         <Text style={styles.orderItemName}>{it.productName}</Text>
                         <Text style={styles.orderItemSub}>
@@ -2697,7 +2958,10 @@ export default function OperationsScreen() {
                         </Text>
                       </View>
                       <TouchableOpacity
-                        onPress={() => handleRemoveItemFromReservation(it.productId)}
+                        onPress={() => {
+                          const productId = it.productId || it.id;
+                          if (productId) handleRemoveItemFromReservation(productId);
+                        }}
                         style={styles.iconButton}
                         accessibilityRole="button"
                         accessibilityLabel={`Quitar ${it.productName} de la reserva`}
@@ -2764,18 +3028,23 @@ export default function OperationsScreen() {
           </View>
         </KeyboardAvoidingView>
       </Modal>
+      )}
 
-      <PayrollUsersModal
-        visible={payrollModalOpen}
-        onClose={() => setPayrollModalOpen(false)}
-      />
+      {payrollModalOpen && (
+        <PayrollUsersModal
+          visible={payrollModalOpen}
+          onClose={() => setPayrollModalOpen(false)}
+        />
+      )}
 
-      <ReservationReceiptModal
-        visible={orderTicketModalOpen}
-        onClose={() => setOrderTicketModalOpen(false)}
-        reservation={createdOrderTicket}
-        business={businessSettings}
-      />
+      {orderTicketModalOpen && (
+        <ReservationReceiptModal
+          visible={orderTicketModalOpen}
+          onClose={() => setOrderTicketModalOpen(false)}
+          reservation={createdOrderTicket}
+          business={businessSettings}
+        />
+      )}
     </View>
   );
 }

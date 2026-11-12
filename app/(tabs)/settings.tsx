@@ -821,118 +821,122 @@ export default function SettingsScreen() {
       {/* ==================================================================== */}
       {/* MODAL: DISPOSITIVOS BLUETOOTH ENCONTRADOS */}
       {/* ==================================================================== */}
-      <Modal visible={printerScanModalVisible} transparent animationType="slide">
-        <View style={styles.modalOverlay}>
-          <View style={styles.modalContent}>
-            <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>Impresoras Bluetooth</Text>
-              <TouchableOpacity
-                onPress={() => setPrinterScanModalVisible(false)}
-                style={styles.modalCloseButton}
-                accessibilityRole="button"
-                accessibilityLabel="Cerrar impresoras Bluetooth"
-              >
-                <X size={20} color={ui.textSecondary} />
-              </TouchableOpacity>
-            </View>
-
-            {scannedPrinters.length === 0 ? (
-              <View style={styles.emptyContainer}>
-                <Bluetooth size={36} color={ui.textMuted} />
-                <Text style={styles.emptyText}>No se detectaron impresoras vinculadas.</Text>
-                <Text style={styles.emptySub}>
-                  Asegúrate de vincular tu ticketera en los Ajustes de Bluetooth de Android/iOS primero.
-                </Text>
+      {printerScanModalVisible && (
+        <Modal visible={printerScanModalVisible} transparent animationType="slide">
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              <View style={styles.modalHeader}>
+                <Text style={styles.modalTitle}>Impresoras Bluetooth</Text>
+                <TouchableOpacity
+                  onPress={() => setPrinterScanModalVisible(false)}
+                  style={styles.modalCloseButton}
+                  accessibilityRole="button"
+                  accessibilityLabel="Cerrar impresoras Bluetooth"
+                >
+                  <X size={20} color={ui.textSecondary} />
+                </TouchableOpacity>
               </View>
-            ) : (
-              <ScrollView style={{ maxHeight: 250 }}>
-                {scannedPrinters.map((device, idx) => (
-                  <TouchableOpacity
-                    key={idx}
-                    style={styles.deviceItem}
-                    onPress={() => handleSelectPrinterDevice(device)}
-                  >
-                    <View style={{ flex: 1 }}>
-                      <Text style={styles.deviceName}>{device.name}</Text>
-                      <Text style={styles.deviceAddress}>{device.address}</Text>
-                    </View>
-                    <ChevronRight size={18} color={ui.primary} />
-                  </TouchableOpacity>
-                ))}
-              </ScrollView>
-            )}
+
+              {scannedPrinters.length === 0 ? (
+                <View style={styles.emptyContainer}>
+                  <Bluetooth size={36} color={ui.textMuted} />
+                  <Text style={styles.emptyText}>No se detectaron impresoras vinculadas.</Text>
+                  <Text style={styles.emptySub}>
+                    Asegúrate de vincular tu ticketera en los Ajustes de Bluetooth de Android/iOS primero.
+                  </Text>
+                </View>
+              ) : (
+                <ScrollView style={{ maxHeight: 250 }}>
+                  {scannedPrinters.map((device, idx) => (
+                    <TouchableOpacity
+                      key={device.address || idx}
+                      style={styles.deviceItem}
+                      onPress={() => handleSelectPrinterDevice(device)}
+                    >
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.deviceName}>{device.name}</Text>
+                        <Text style={styles.deviceAddress}>{device.address}</Text>
+                      </View>
+                      <ChevronRight size={18} color={ui.primary} />
+                    </TouchableOpacity>
+                  ))}
+                </ScrollView>
+              )}
+            </View>
           </View>
-        </View>
-      </Modal>
+        </Modal>
+      )}
 
       {/* ==================================================================== */}
       {/* MODAL: CAMBIO DE PIN DE BLOQUEO (4 DÍGITOS) */}
       {/* ==================================================================== */}
-      <Modal visible={pinModalVisible} transparent animationType="fade">
-        <KeyboardAvoidingView
-          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-          style={styles.modalOverlay}
-        >
-          <View style={styles.modalContent}>
-            <View style={styles.modalHeader}>
-              <View>
-                <Text style={styles.modalTitle}>Cambiar PIN de Terminal</Text>
-                <Text style={styles.modalSub}>Código de 4 dígitos para desbloqueo rápido</Text>
+      {pinModalVisible && (
+        <Modal visible={pinModalVisible} transparent animationType="fade">
+          <KeyboardAvoidingView
+            behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+            style={styles.modalOverlay}
+          >
+            <View style={styles.modalContent}>
+              <View style={styles.modalHeader}>
+                <View>
+                  <Text style={styles.modalTitle}>Cambiar PIN de Terminal</Text>
+                  <Text style={styles.modalSub}>Código de 4 dígitos para desbloqueo rápido</Text>
+                </View>
+                <TouchableOpacity
+                  onPress={() => setPinModalVisible(false)}
+                  style={styles.modalCloseButton}
+                  accessibilityRole="button"
+                  accessibilityLabel="Cerrar cambio de PIN"
+                >
+                  <X size={20} color={ui.textSecondary} />
+                </TouchableOpacity>
               </View>
+
+              <View style={styles.inputGroup}>
+                <Text style={styles.inputLabel}>Nuevo PIN (4 dígitos numéricos)</Text>
+                <TextInput
+                  style={[styles.textInput, { fontSize: 24, letterSpacing: 8, textAlign: 'center' }]}
+                  placeholder="••••"
+                  placeholderTextColor={ui.textMuted}
+                  keyboardType="numeric"
+                  maxLength={4}
+                  secureTextEntry
+                  value={newPinInput}
+                  onChangeText={setNewPinInput}
+                  accessibilityLabel="Nuevo PIN, cuatro dígitos"
+                />
+              </View>
+
+              <View style={styles.inputGroup}>
+                <Text style={styles.inputLabel}>Confirmar Nuevo PIN</Text>
+                <TextInput
+                  style={[styles.textInput, { fontSize: 24, letterSpacing: 8, textAlign: 'center' }]}
+                  placeholder="••••"
+                  placeholderTextColor={ui.textMuted}
+                  keyboardType="numeric"
+                  maxLength={4}
+                  secureTextEntry
+                  value={confirmPinInput}
+                  onChangeText={setConfirmPinInput}
+                  accessibilityLabel="Confirmar nuevo PIN"
+                />
+              </View>
+
               <TouchableOpacity
-                onPress={() => setPinModalVisible(false)}
-                style={styles.modalCloseButton}
-                accessibilityRole="button"
-                accessibilityLabel="Cerrar cambio de PIN"
+                style={[styles.saveButton, isUpdatingPin && styles.buttonDisabled]}
+                onPress={handleChangePin}
+                disabled={isUpdatingPin}
               >
-                <X size={20} color={ui.textSecondary} />
+                {isUpdatingPin ? (
+                  <ActivityIndicator color={ui.onPrimary} />
+                ) : (
+                  <Text style={styles.saveButtonText}>Guardar Nuevo PIN</Text>
+                )}
               </TouchableOpacity>
             </View>
-
-            <View style={styles.inputGroup}>
-              <Text style={styles.inputLabel}>Nuevo PIN (4 dígitos numéricos)</Text>
-              <TextInput
-                style={[styles.textInput, { fontSize: 24, letterSpacing: 8, textAlign: 'center' }]}
-                placeholder="••••"
-                placeholderTextColor={ui.textMuted}
-                keyboardType="numeric"
-                maxLength={4}
-                secureTextEntry
-                value={newPinInput}
-                onChangeText={setNewPinInput}
-                accessibilityLabel="Nuevo PIN, cuatro dígitos"
-              />
-            </View>
-
-            <View style={styles.inputGroup}>
-              <Text style={styles.inputLabel}>Confirmar Nuevo PIN</Text>
-              <TextInput
-                style={[styles.textInput, { fontSize: 24, letterSpacing: 8, textAlign: 'center' }]}
-                placeholder="••••"
-                placeholderTextColor={ui.textMuted}
-                keyboardType="numeric"
-                maxLength={4}
-                secureTextEntry
-                value={confirmPinInput}
-                onChangeText={setConfirmPinInput}
-                accessibilityLabel="Confirmar nuevo PIN"
-              />
-            </View>
-
-            <TouchableOpacity
-              style={[styles.saveButton, isUpdatingPin && styles.buttonDisabled]}
-              onPress={handleChangePin}
-              disabled={isUpdatingPin}
-            >
-              {isUpdatingPin ? (
-                <ActivityIndicator color={ui.onPrimary} />
-              ) : (
-                <Text style={styles.saveButtonText}>Guardar Nuevo PIN</Text>
-              )}
-            </TouchableOpacity>
-          </View>
-        </KeyboardAvoidingView>
-      </Modal>
+          </KeyboardAvoidingView>
+        </Modal>
+      )}
     </View>
   );
 }

@@ -1,3 +1,4 @@
+import { normalizePresentation } from '@/lib/presentation-parity';
 /**
  * Ventify Mobile - Inventory & Kardex Service
  * 
@@ -31,6 +32,7 @@ import {
   Timestamp,
 } from 'firebase/firestore';
 import { cleanFirestoreData } from '@/lib/firebase-utils';
+import { findProductByBarcode, type ScannedProductMatch } from '@/lib/product-search';
 
 // ============================================================================
 // CONSTANTES
@@ -117,6 +119,7 @@ export interface StockTransfer {
   sentBy?: string;
   sentByName?: string;
   sentAt?: number | Timestamp | any;
+  shippedAt?: number | Timestamp | any;
   receivedBy?: string;
   receivedByName?: string;
   receivedAt?: number | Timestamp | any;
@@ -161,6 +164,18 @@ export const calculateLowStockBranches = (
 };
 
 export const deriveLowStockBranches = calculateLowStockBranches;
+
+const aggregateTransferItems = <T extends { productId: string; productName?: string; name?: string; sku?: string; quantity: number }>(
+  items: T[]
+): Array<T & { quantity: number }> => {
+  const aggregated = new Map<string, T & { quantity: number }>();
+  for (const item of items) {
+    const existing = aggregated.get(item.productId);
+    if (existing) existing.quantity += Number(item.quantity) || 0;
+    else aggregated.set(item.productId, { ...item, quantity: Number(item.quantity) || 0 });
+  }
+  return [...aggregated.values()];
+};
 
 /**
  * Normaliza bidireccionalmente los documentos de `inventory_movements`
@@ -243,13 +258,23 @@ export const saveProduct = async (
     throw new Error('El identificador de cuenta (accountId) es obligatorio.');
   }
 
-  const stockMap: Record<string, number> = productData.stock || {};
-  const reservedMap: Record<string, number> = productData.reservedStock || {};
+  const creating = isNew || !productData.id;
+  const existingRef = !creating && productData.id
+    ? doc(db, PRODUCTS_COLLECTION, productData.id)
+    : null;
+  const existingSnapshot = existingRef ? await getDoc(existingRef) : null;
+  const existingData = existingSnapshot?.exists() ? existingSnapshot.data() : {};
+  if (existingRef && !existingSnapshot?.exists()) {
+    throw new Error(`El producto "${productData.id}" no existe.`);
+  }
+
+  const stockMap: Record<string, number> = productData.stock ?? existingData.stock ?? {};
+  const reservedMap: Record<string, number> = productData.reservedStock ?? existingData.reservedStock ?? {};
   const fallbackBranchIds = (productData.branchIds && productData.branchIds.length > 0)
     ? productData.branchIds
-    : (productData.branchId ? [productData.branchId] : []);
+    : (productData.branchId ? [productData.branchId] : (existingData.branchIds || []));
   const branchIds = deriveBranchIds(stockMap, fallbackBranchIds);
-  const minStock = productData.minStock ?? LOW_STOCK_THRESHOLD;
+  const minStock = productData.minStock ?? existingData.minStock ?? LOW_STOCK_THRESHOLD;
 
   const lowStockBranches = calculateLowStockBranches(stockMap, reservedMap, minStock);
 
@@ -261,13 +286,10 @@ export const saveProduct = async (
     minSalePrice: typeof productData.minSalePrice === 'number' ? Math.round(productData.minSalePrice * 100) / 100 : 0,
     suggestedPrice: typeof productData.suggestedPrice === 'number' ? Math.round(productData.suggestedPrice * 100) / 100 : 0,
     stock: stockMap,
-    reservedStock: reservedMap,
     branchIds,
     lowStockBranches,
     minStock,
-    presentations: Array.isArray(productData.presentations) ? productData.presentations : [],
-    variants: Array.isArray(productData.variants) ? productData.variants : [],
-    allowDecimals: Boolean(productData.allowDecimals),
+    presentations: Array.isArray(productData.presentations) ? productData.presentations.map(normalizePresentation) : [],
     unitOfMeasure: productData.unitOfMeasure || 'unit',
     category: productData.category || 'General',
     imageUrl: productData.imageUrl || '',
@@ -275,6 +297,19 @@ export const saveProduct = async (
     barcodes: Array.isArray(productData.barcodes) ? productData.barcodes : [],
     updatedAt: serverTimestamp(),
   };
+
+  // Edición es parcial: la ausencia de un campo significa “no fue editado”.
+  // En particular, reservas solo cambian por operaciones de inventario y no
+  // deben desaparecer al guardar el formulario general del producto.
+  if (creating) {
+    payload.reservedStock = reservedMap;
+    payload.variants = Array.isArray(productData.variants) ? productData.variants : [];
+    payload.allowDecimals = Boolean(productData.allowDecimals);
+  } else {
+    if (productData.reservedStock !== undefined) payload.reservedStock = productData.reservedStock;
+    if (productData.variants !== undefined) payload.variants = productData.variants;
+    if (productData.allowDecimals !== undefined) payload.allowDecimals = productData.allowDecimals;
+  }
 
   // Limpiar campos undefined
   Object.keys(payload).forEach((k) => {
@@ -327,12 +362,81 @@ export const saveProduct = async (
       }
     }
   } else {
-    const existingDocRef = doc(db, PRODUCTS_COLLECTION, productId);
-    await updateDoc(existingDocRef, cleanFirestoreData(payload));
+    await updateDoc(existingRef!, cleanFirestoreData(payload));
   }
 
   return productId;
 };
+
+/**
+ * Resuelve códigos contra el catálogo completo de una cuenta. El catálogo
+ * visual puede estar paginado/cargado parcialmente, pero el POS necesita una
+ * respuesta de barcode que no dependa del límite de productos en memoria.
+ */
+export const findByBarcodeRemote = async (
+  accountId: string,
+  code: string
+): Promise<ScannedProductMatch | null> => {
+  if (!accountId || !code?.trim()) return null;
+  const cleanCode = code.trim();
+
+  // 1. Consultar por barcode directo con limit(1)
+  const barcodeSnap = await getDocs(
+    query(
+      collection(db, PRODUCTS_COLLECTION),
+      where('accountId', '==', accountId),
+      where('barcode', '==', cleanCode),
+      firestoreLimit(1)
+    )
+  );
+  if (barcodeSnap.docs?.length) {
+    const products = barcodeSnap.docs.map((productDoc) => ({
+      id: productDoc.id,
+      ...productDoc.data(),
+    })) as Product[];
+    const match = findProductByBarcode(products, cleanCode);
+    if (match) return match;
+  }
+
+  // 2. Consultar por SKU con limit(1)
+  const skuSnap = await getDocs(
+    query(
+      collection(db, PRODUCTS_COLLECTION),
+      where('accountId', '==', accountId),
+      where('sku', '==', cleanCode),
+      firestoreLimit(1)
+    )
+  );
+  if (skuSnap.docs?.length) {
+    const products = skuSnap.docs.map((productDoc) => ({
+      id: productDoc.id,
+      ...productDoc.data(),
+    })) as Product[];
+    const match = findProductByBarcode(products, cleanCode);
+    if (match) return match;
+  }
+
+  // 3. Consultar por barcodes alternativos (array-contains) con limit(1)
+  const barcodesSnap = await getDocs(
+    query(
+      collection(db, PRODUCTS_COLLECTION),
+      where('accountId', '==', accountId),
+      where('barcodes', 'array-contains', cleanCode),
+      firestoreLimit(1)
+    )
+  );
+  if (barcodesSnap.docs?.length) {
+    const products = barcodesSnap.docs.map((productDoc) => ({
+      id: productDoc.id,
+      ...productDoc.data(),
+    })) as Product[];
+    const match = findProductByBarcode(products, cleanCode);
+    if (match) return match;
+  }
+
+  return null;
+};
+
 
 /**
  * Realiza un ajuste de stock atómico en una sucursal dada,
@@ -517,17 +621,22 @@ export const createStockTransfer = async (
 
   const transferDocRef = doc(collection(db, TRANSFERS_COLLECTION));
   const transferId = transferDocRef.id;
+  const reservationItems = aggregateTransferItems(items);
 
   await runTransaction(db, async (tx) => {
-    // 1. Validar y reservar stock en sucursal origen
-    for (const item of items) {
+    // Firestore requiere completar todas las lecturas antes de la primera escritura.
+    const productReads: Array<{ item: TransferItem; ref: ReturnType<typeof doc>; snap: Awaited<ReturnType<typeof tx.get>> }> = [];
+    for (const item of reservationItems) {
       if (item.quantity <= 0) {
         throw new Error(`La cantidad a transferir de "${item.productName}" debe ser mayor a cero.`);
       }
-
       const pRef = doc(db, PRODUCTS_COLLECTION, item.productId);
       const pSnap = await tx.get(pRef);
+      productReads.push({ item, ref: pRef, snap: pSnap });
+    }
 
+    // 1. Validar y reservar stock en sucursal origen
+    for (const { item, ref: pRef, snap: pSnap } of productReads) {
       if (!pSnap.exists()) {
         throw new Error(`El producto "${item.productName}" no fue encontrado.`);
       }
@@ -612,22 +721,39 @@ export const approveStockTransfer = async (
   if (!transferId) throw new Error('ID de transferencia requerido.');
 
   const transferRef = doc(db, TRANSFERS_COLLECTION, transferId);
-  const snap = await getDoc(transferRef);
-  if (!snap.exists()) {
-    throw new Error(`La transferencia "${transferId}" no existe.`);
-  }
+  await runTransaction(db, async (tx) => {
+    const snap = await tx.get(transferRef);
+    if (!snap.exists()) throw new Error(`La transferencia "${transferId}" no existe.`);
+    const data = snap.data();
+    if (data.status !== 'pending') {
+      throw new Error(`Solo se pueden aprobar transferencias pendientes (estado actual: ${data.status}).`);
+    }
+    tx.update(transferRef, {
+      status: 'approved',
+      approvedBy: userProfile.uid,
+      approvedByName: userProfile.displayName || userProfile.email || 'Usuario',
+      approvedAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  });
+};
 
-  const data = snap.data();
-  if (data.status !== 'pending') {
-    throw new Error(`Solo se pueden aprobar transferencias pendientes (estado actual: ${data.status}).`);
-  }
-
-  await updateDoc(transferRef, {
-    status: 'approved',
-    approvedBy: userProfile.uid,
-    approvedByName: userProfile.displayName || userProfile.email || 'Usuario',
-    approvedAt: serverTimestamp(),
-    updatedAt: serverTimestamp(),
+/** Marca el despacho físico de una transferencia aprobada. */
+export const sendStockTransfer = async (
+  transferId: string,
+  userProfile: UserProfileInfo
+): Promise<void> => {
+  if (!transferId) throw new Error('ID de transferencia requerido.');
+  const transferRef = doc(db, TRANSFERS_COLLECTION, transferId);
+  await runTransaction(db, async (tx) => {
+    const snap = await tx.get(transferRef);
+    if (!snap.exists()) throw new Error(`La transferencia "${transferId}" no existe.`);
+    if (snap.data().status !== 'approved') throw new Error('Solo se pueden enviar transferencias aprobadas.');
+    tx.update(transferRef, {
+      status: 'in_transit', sentBy: userProfile.uid,
+      sentByName: userProfile.displayName || userProfile.email || 'Usuario',
+      sentAt: serverTimestamp(), shippedAt: serverTimestamp(), updatedAt: serverTimestamp(),
+    });
   });
 };
 
@@ -637,7 +763,8 @@ export const approveStockTransfer = async (
 export const cancelStockTransfer = async (
   transferId: string,
   userProfile: UserProfileInfo,
-  reason: string = 'Transferencia cancelada'
+  reason: string = 'Transferencia cancelada',
+  finalStatus: 'cancelled' | 'rejected' = 'cancelled'
 ): Promise<void> => {
   if (!transferId) throw new Error('ID de transferencia requerido.');
 
@@ -650,21 +777,34 @@ export const cancelStockTransfer = async (
     }
 
     const tData = tSnap.data();
-    if (tData.status === 'completed') {
-      throw new Error('No se puede cancelar una transferencia que ya fue completada.');
+    if (tData.status === 'completed' || tData.status === 'in_transit') {
+      throw new Error('No se puede cancelar una transferencia completada o en tránsito.');
     }
     if (tData.status === 'cancelled' || tData.status === 'rejected') {
       return;
     }
+    if (finalStatus === 'rejected' && tData.status !== 'pending') {
+      throw new Error('Solo se pueden rechazar transferencias pendientes.');
+    }
+    if (finalStatus === 'cancelled' && !['pending', 'approved'].includes(tData.status)) {
+      throw new Error(`No se puede cancelar una transferencia en estado ${tData.status}.`);
+    }
 
     const srcBranchId = tData.sourceBranchId || tData.fromBranchId;
-    const rawItems: any[] = tData.products || tData.items || [];
+    if (!srcBranchId) throw new Error('La transferencia no tiene una sucursal de origen válida.');
+    const rawItems = aggregateTransferItems(tData.products || tData.items || []);
 
-    // Liberar reserva de stock en origen
+    // Leer productos antes de liberar reservas para respetar el protocolo de Firestore.
+    const productReads: Array<{ item: any; ref: ReturnType<typeof doc>; snap: Awaited<ReturnType<typeof tx.get>> }> = [];
     for (const item of rawItems) {
       if (!item.productId) continue;
       const pRef = doc(db, PRODUCTS_COLLECTION, item.productId);
       const pSnap = await tx.get(pRef);
+      productReads.push({ item, ref: pRef, snap: pSnap });
+    }
+
+    // Liberar reserva de stock en origen
+    for (const { item, ref: pRef, snap: pSnap } of productReads) {
       if (pSnap.exists()) {
         const pData = pSnap.data() as Record<string, any>;
         const currentReservedMap = { ...(pData.reservedStock || {}) };
@@ -691,7 +831,7 @@ export const cancelStockTransfer = async (
     }
 
     tx.update(transferRef, {
-      status: 'cancelled',
+      status: finalStatus,
       rejectionReason: reason,
       cancelledBy: userProfile.uid,
       cancelledByName: userProfile.displayName || userProfile.email || 'Usuario',
@@ -700,6 +840,12 @@ export const cancelStockTransfer = async (
     });
   });
 };
+
+export const rejectStockTransfer = (
+  transferId: string,
+  userProfile: UserProfileInfo,
+  reason = 'Transferencia rechazada'
+): Promise<void> => cancelStockTransfer(transferId, userProfile, reason, 'rejected');
 
 /**
  * Completa la recepción de una transferencia en la sucursal de destino.
@@ -729,13 +875,7 @@ export const completeStockTransfer = async (
 
   // Si está en 'pending', firestore.rules exige que pase a 'approved' primero
   if (initialData.status === 'pending') {
-    await updateDoc(transferRef, {
-      status: 'approved',
-      approvedBy: userProfile.uid,
-      approvedByName: userProfile.displayName || userProfile.email || 'Usuario',
-      approvedAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
+    throw new Error('La transferencia debe aprobarse antes de recibirla.');
   }
 
   await runTransaction(db, async (tx) => {
@@ -756,10 +896,13 @@ export const completeStockTransfer = async (
     const accountId = tData.accountId;
     const srcBranchId = tData.sourceBranchId || tData.fromBranchId;
     const dstBranchId = tData.destinationBranchId || tData.toBranchId;
+    if (!srcBranchId || !dstBranchId || srcBranchId === dstBranchId) {
+      throw new Error('La transferencia no tiene sucursales de origen y destino válidas.');
+    }
     const srcBranchName = tData.sourceBranchName || tData.fromBranchName || srcBranchId;
     const dstBranchName = tData.destinationBranchName || tData.toBranchName || dstBranchId;
 
-    const rawItems: any[] = tData.products || tData.items || [];
+    const rawItems = aggregateTransferItems(tData.products || tData.items || []);
     if (rawItems.length === 0) {
       throw new Error('La transferencia no contiene productos para ingresar a stock.');
     }
@@ -798,6 +941,10 @@ export const completeStockTransfer = async (
       const currentSrcStock = Number(currentStockMap[srcBranchId]) || 0;
       const currentDstStock = Number(currentStockMap[dstBranchId]) || 0;
       const currentSrcReserved = Number(currentReservedMap[srcBranchId]) || 0;
+
+      if (currentSrcStock < item.quantity || currentSrcReserved < item.quantity) {
+        throw new Error('La reserva del producto ya no está disponible para recibir la transferencia.');
+      }
 
       // 1. Restar stock físico en origen
       const newSrcStock = Math.max(0, Math.round((currentSrcStock - item.quantity) * 10000) / 10000);
@@ -994,11 +1141,14 @@ export const getStockTransfers = async (
 
 export const InventoryKardexService = {
   saveProduct,
+  findByBarcodeRemote,
   adjustProductStock,
   getProductKardex,
   createStockTransfer,
   approveStockTransfer,
+  rejectStockTransfer,
   cancelStockTransfer,
+  sendStockTransfer,
   completeStockTransfer,
   getStockTransfers,
   calculateLowStockBranches,

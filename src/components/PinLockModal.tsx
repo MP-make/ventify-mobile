@@ -15,7 +15,7 @@ import { useAuth } from '@/context/AuthContext';
 import { ui } from '@/lib/theme';
 import { BrandLogo } from '@/components/ui';
 
-export const PinLockModal: React.FC = () => {
+export const PinLockModal: React.FC = React.memo(() => {
   const insets = useSafeAreaInsets();
   const { isPinLocked, unlockWithPin, userProfile } = useAuth();
 
@@ -218,7 +218,7 @@ export const PinLockModal: React.FC = () => {
       </View>
     </Modal>
   );
-};
+});
 
 const styles = StyleSheet.create({
   container: {

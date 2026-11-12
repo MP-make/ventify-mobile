@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Modal,
   View,
@@ -6,9 +6,9 @@ import {
   TouchableOpacity,
   ScrollView,
   StyleSheet,
-  Image,
   Platform,
 } from 'react-native';
+import { Image } from 'expo-image';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   X,
@@ -40,7 +40,7 @@ export interface PresentationVariantModalProps {
   ) => void;
 }
 
-export const PresentationVariantModal: React.FC<PresentationVariantModalProps> = ({
+export const PresentationVariantModal: React.FC<PresentationVariantModalProps> = React.memo(({
   product,
   visible,
   isOpen,
@@ -85,7 +85,7 @@ export const PresentationVariantModal: React.FC<PresentationVariantModalProps> =
   const hasVariants = Array.isArray(product.variants) && product.variants.length > 0;
 
   // Calcular precio unitario e importe total de la selección actual
-  const { unitPrice, lineTotal } = useMemo(() => {
+  const { unitPrice, lineTotal } = (() => {
     let price = basePrice;
 
     if (selectedPresentation) {
@@ -100,7 +100,7 @@ export const PresentationVariantModal: React.FC<PresentationVariantModalProps> =
 
     const total = Math.round(price * quantity * 100) / 100;
     return { unitPrice: price, lineTotal: total };
-  }, [basePrice, selectedPresentation, selectedVariant, quantity]);
+  })();
 
   const handleConfirm = () => {
     Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
@@ -124,6 +124,8 @@ export const PresentationVariantModal: React.FC<PresentationVariantModalProps> =
     }
   };
 
+  if (!isModalVisible || !product) return null;
+
   return (
     <Modal
       visible={isModalVisible}
@@ -145,6 +147,8 @@ export const PresentationVariantModal: React.FC<PresentationVariantModalProps> =
                 <Image
                   source={{ uri: product.thumbUrl || product.imageUrl }}
                   style={styles.productThumb}
+                  cachePolicy="memory-disk"
+                  recyclingKey={product.id}
                 />
               ) : (
                 <View style={styles.productThumbPlaceholder}>
@@ -358,7 +362,7 @@ export const PresentationVariantModal: React.FC<PresentationVariantModalProps> =
       </View>
     </Modal>
   );
-};
+});
 
 const styles = StyleSheet.create({
   overlay: {

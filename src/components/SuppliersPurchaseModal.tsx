@@ -22,6 +22,7 @@ import {
   SafeAreaView,
   FlatList,
 } from 'react-native';
+import { FlashList } from '@shopify/flash-list';
 import * as Linking from 'expo-linking';
 import * as Haptics from 'expo-haptics';
 import {
@@ -57,6 +58,7 @@ import {
 } from 'lucide-react-native';
 
 import { useAuth } from '@/context/AuthContext';
+import { useSettings } from '@/context/SettingsContext';
 import { useProducts } from '@/context/ProductsContext';
 import { formatPEN, formatDatePE } from '@/lib/theme';
 import { ui } from '@/lib/theme';
@@ -105,13 +107,36 @@ const PAYMENT_TERMS_OPTIONS = [
   'Contra entrega',
 ];
 
-export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = ({
+interface ProductSuggestionItemProps {
+  prod: any;
+  stockInBranch: number;
+  onSelect: (prod: any) => void;
+}
+
+const ProductSuggestionItem = React.memo<ProductSuggestionItemProps>(({ prod, stockInBranch, onSelect }) => (
+  <TouchableOpacity
+    style={styles.productSuggestionItem}
+    onPress={() => onSelect(prod)}
+  >
+    <View style={{ flex: 1 }}>
+      <Text style={styles.productSuggestionName}>{prod.name}</Text>
+      <Text style={styles.productSuggestionMeta}>
+        SKU: {prod.sku || 'N/A'} • Stock actual: {stockInBranch} • Costo:{' '}
+        {formatPEN(prod.costPrice || 0)}
+      </Text>
+    </View>
+    <Plus size={16} color={ui.primary} />
+  </TouchableOpacity>
+));
+
+export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = React.memo(({
   visible,
   onClose,
   onStockUpdated,
   initialTab = 'orders',
 }) => {
   const { accountId, branchId, userProfile } = useAuth();
+  const { activeBranchName } = useSettings();
   const { products, getProductStock } = useProducts();
   const insets = useSafeAreaInsets();
 
@@ -179,12 +204,22 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = ({
   // CARGA Y SUSCRIPCIÓN EN TIEMPO REAL
   // --------------------------------------------------------------------------
   useEffect(() => {
-    if (!visible || !accountId) return;
+    let isCurrentAccount = true;
+    if (!visible || !accountId) {
+      setPurchaseOrders([]);
+      setSuppliers([]);
+      setOrdersLoading(false);
+      setSuppliersLoading(false);
+      return () => { isCurrentAccount = false; };
+    }
 
+    setPurchaseOrders([]);
+    setSuppliers([]);
     setOrdersLoading(true);
     const unsubscribeOrders = SuppliersPOService.subscribePurchaseOrders(
       accountId,
       (orders) => {
+        if (!isCurrentAccount) return;
         setPurchaseOrders(orders);
         setOrdersLoading(false);
       }
@@ -194,12 +229,14 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = ({
     const unsubscribeSuppliers = SuppliersPOService.subscribeSuppliers(
       accountId,
       (suppliersList) => {
+        if (!isCurrentAccount) return;
         setSuppliers(suppliersList);
         setSuppliersLoading(false);
       }
     );
 
     return () => {
+      isCurrentAccount = false;
       unsubscribeOrders();
       unsubscribeSuppliers();
     };
@@ -284,7 +321,8 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = ({
                 const result = await SuppliersPOService.receivePurchaseOrder(
                   order,
                   userProfile,
-                  branchId
+                  branchId,
+                  activeBranchName
                 );
 
                 Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
@@ -454,7 +492,7 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = ({
       await SuppliersPOService.createPurchaseOrder({
         accountId,
         branchId,
-        branchName: 'Principal',
+        branchName: activeBranchName || branchId,
         supplierId: selectedSupplier.id,
         supplierName: selectedSupplier.name,
         items: orderItems,
@@ -1103,6 +1141,8 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = ({
     );
   };
 
+  if (!visible) return null;
+
   return (
     <Modal visible={visible} animationType="slide" transparent={false} onRequestClose={onClose}>
       <SafeAreaView style={styles.safeArea}>
@@ -1270,26 +1310,22 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = ({
 
                 {/* Sugerencias de búsqueda */}
                 {filteredProductsForOrder.length > 0 && !selectedProductToAdd && (
-                  <View style={styles.productSuggestionsList}>
-                    {filteredProductsForOrder.map((prod) => {
-                      const stockInBranch = getProductStock(prod, branchId);
-                      return (
-                        <TouchableOpacity
-                          key={prod.id}
-                          style={styles.productSuggestionItem}
-                          onPress={() => handleSelectProductForOrder(prod)}
-                        >
-                          <View style={{ flex: 1 }}>
-                            <Text style={styles.productSuggestionName}>{prod.name}</Text>
-                            <Text style={styles.productSuggestionMeta}>
-                              SKU: {prod.sku || 'N/A'} • Stock actual: {stockInBranch} • Costo:{' '}
-                              {formatPEN(prod.costPrice || 0)}
-                            </Text>
-                          </View>
-                          <Plus size={16} color={ui.primary} />
-                        </TouchableOpacity>
-                      );
-                    })}
+                  <View style={[styles.productSuggestionsList, { maxHeight: 220 }]}>
+                    <FlashList
+                      data={filteredProductsForOrder}
+                      estimatedItemSize={60}
+                      keyExtractor={(item) => item.id}
+                      renderItem={({ item: prod }) => {
+                        const stockInBranch = getProductStock(prod, branchId);
+                        return (
+                          <ProductSuggestionItem
+                            prod={prod}
+                            stockInBranch={stockInBranch}
+                            onSelect={handleSelectProductForOrder}
+                          />
+                        );
+                      }}
+                    />
                   </View>
                 )}
 
@@ -1654,7 +1690,7 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = ({
       </SafeAreaView>
     </Modal>
   );
-};
+});
 
 // ============================================================================
 // ESTILOS NATIVOS

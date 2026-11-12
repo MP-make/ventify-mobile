@@ -14,8 +14,10 @@ import {
   ActivityIndicator,
   KeyboardAvoidingView,
   Image,
+  InteractionManager,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { FlashList } from '@shopify/flash-list';
 import {
   Receipt,
   Bot,
@@ -65,17 +67,19 @@ import {
   getDocs,
   orderBy,
   limit,
+  startAfter,
   onSnapshot,
 } from 'firebase/firestore';
 
 import { Sale, CartItem } from '@/types';
-import { cancelSaleWithReversal } from '@/services/sale-service';
+import { cancelSaleWithReversal, refundSaleLines } from '@/services/sale-service';
 import {
   askVentyAI,
   getCustomers,
   BusinessKPIContext,
   completeOrCancelReservation,
 } from '@/services/crm-operations-service';
+import { getHistoryDateBounds, toEpochMillis } from '@/services/crm-compat';
 
 import {
   buildSaleReceiptEscPos,
@@ -85,6 +89,7 @@ import {
 } from '@/services/thermal-printer-service';
 import { FinancialPnlModal } from '@/components/FinancialPnlModal';
 import { ReservationReceiptModal } from '@/components/ReservationReceiptModal';
+import { ReservationCancellationModal } from '@/components/ReservationCancellationModal';
 
 // Sub-módulos de Historial
 type HistoryTab = 'sales' | 'reservations' | 'ai';
@@ -98,6 +103,132 @@ interface ChatMessage {
   timestamp: number;
 }
 
+interface DocBadgeProps {
+  sale: Sale;
+}
+
+const DocBadge = React.memo<DocBadgeProps>(({ sale }) => {
+  const typeStr = String(sale.documentType || '').toLowerCase();
+  const isCancelled = sale.status === 'cancelled';
+
+  if (isCancelled) {
+    return (
+      <View style={[styles.badge, { backgroundColor: ui.dangerSoft }]}>
+        <Text style={[styles.badgeText, { color: ui.danger, textDecorationLine: 'line-through' }]}>
+          ANULADO
+        </Text>
+      </View>
+    );
+  }
+
+  if (typeStr.includes('factura') || typeStr === '01') {
+    return (
+      <View style={[styles.badge, { backgroundColor: ui.accentSoft }]}>
+        <Text style={[styles.badgeText, { color: ui.accent }]}>FACTURA</Text>
+      </View>
+    );
+  }
+
+  if (typeStr.includes('boleta') || typeStr === '03') {
+    return (
+      <View style={[styles.badge, { backgroundColor: ui.primarySoft }]}>
+        <Text style={[styles.badgeText, { color: ui.primary }]}>BOLETA</Text>
+      </View>
+    );
+  }
+
+  return (
+    <View style={[styles.badge, { backgroundColor: ui.surfaceMuted }]}>
+      <Text style={[styles.badgeText, { color: ui.textSecondary }]}>NOTA VENTA</Text>
+    </View>
+  );
+});
+
+interface SunatBadgeProps {
+  sale: Sale;
+}
+
+const SunatBadge = React.memo<SunatBadgeProps>(({ sale }) => {
+  const status = sale.sunatStatus || 'not_applicable';
+  if (status === 'accepted') {
+    return (
+      <View style={[styles.miniBadge, { backgroundColor: ui.primarySoft }]}>
+        <CheckCircle2 size={12} color={ui.primary} />
+        <Text style={[styles.miniBadgeText, { color: ui.primary }]}>SUNAT Aceptado</Text>
+      </View>
+    );
+  }
+  if (status === 'pending') {
+    return (
+      <View style={[styles.miniBadge, { backgroundColor: ui.warningSoft }]}>
+        <Clock size={12} color={ui.warning} />
+        <Text style={[styles.miniBadgeText, { color: ui.warning }]}>SUNAT Pendiente</Text>
+      </View>
+    );
+  }
+  if (status === 'rejected') {
+    return (
+      <View style={[styles.miniBadge, { backgroundColor: ui.dangerSoft }]}>
+        <AlertTriangle size={12} color={ui.danger} />
+        <Text style={[styles.miniBadgeText, { color: ui.danger }]}>SUNAT Observado</Text>
+      </View>
+    );
+  }
+  return null;
+});
+
+interface SaleCardItemProps {
+  sale: Sale;
+  onPress: (sale: Sale) => void;
+}
+
+const SaleCardItem = React.memo<SaleCardItemProps>(({ sale, onPress }) => {
+  const isCancelled = sale.status === 'cancelled';
+  const docNumber =
+    sale.documentNumber || `V-${String(sale.saleNumber || 1).padStart(6, '0')}`;
+
+  return (
+    <TouchableOpacity
+      style={[styles.saleCard, isCancelled && styles.saleCardCancelled]}
+      onPress={() => onPress(sale)}
+      accessibilityRole="button"
+      accessibilityLabel={`Ver comprobante ${docNumber}, ${formatPEN(sale.total)}, ${sale.customerName || 'Cliente General'}${isCancelled ? ', anulada' : ''}`}
+    >
+      <View style={styles.saleCardTop}>
+        <View style={{ flex: 1 }}>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+            <DocBadge sale={sale} />
+            <Text style={styles.saleDocNumber}>{docNumber}</Text>
+          </View>
+          <Text style={styles.saleDateText}>{formatDatePE(sale.date)}</Text>
+        </View>
+
+        <View style={{ alignItems: 'flex-end' }}>
+          <Text
+            style={[
+              styles.saleTotalText,
+              isCancelled && { color: ui.textMuted, textDecorationLine: 'line-through' },
+            ]}
+          >
+            {formatPEN(sale.total)}
+          </Text>
+          <Text style={styles.salePaymentMethod}>
+            {(sale.paymentMethod || 'Efectivo').toUpperCase()}
+          </Text>
+        </View>
+      </View>
+
+      {/* Fila Cliente & SUNAT */}
+      <View style={styles.saleCardBottom}>
+        <Text style={styles.saleCustomerText} numberOfLines={1}>
+          {sale.customerName ? `Cliente: ${sale.customerName}` : 'Cliente General'}
+        </Text>
+        <SunatBadge sale={sale} />
+      </View>
+    </TouchableOpacity>
+  );
+});
+
 export default function HistoryScreen() {
   const insets = useSafeAreaInsets();
   const { user, userProfile, accountId, branchId, role } = useAuth();
@@ -108,6 +239,7 @@ export default function HistoryScreen() {
     isCashOpen,
     activeCashSession,
     refreshCashStatus,
+    posSettings,
   } = useSettings();
 
   const [activeTab, setActiveTab] = useState<HistoryTab>('sales');
@@ -118,12 +250,21 @@ export default function HistoryScreen() {
   // ============================================================================
   const [sales, setSales] = useState<Sale[]>([]);
   const [loadingSales, setLoadingSales] = useState<boolean>(true);
+  const [loadingMoreSales, setLoadingMoreSales] = useState<boolean>(false);
+  const salesCursorRef = useRef<any>(null);
+  const salesGenerationRef = useRef(0);
+  const salesScopeRef = useRef('');
+  const [salesHasMore, setSalesHasMore] = useState<boolean>(false);
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [dateRange, setDateRange] = useState<DateRange>('all');
   const [customStartDate, setCustomStartDate] = useState<string>('');
   const [customEndDate, setCustomEndDate] = useState<string>('');
   const [customDateModalOpen, setCustomDateModalOpen] = useState<boolean>(false);
   const [docFilter, setDocFilter] = useState<DocFilter>('all');
+  const salesScope = `${accountId || ''}|${branchId || ''}|${dateRange}|${customStartDate}|${customEndDate}`;
+  // Keep the latest scope visible synchronously so an old request cannot commit
+  // in the render/effect gap after the account, branch, or date range changes.
+  salesScopeRef.current = salesScope;
 
   // Modal de Detalle de Comprobante
   const [selectedSale, setSelectedSale] = useState<Sale | null>(null);
@@ -133,6 +274,10 @@ export default function HistoryScreen() {
   const [cancelModalVisible, setCancelModalVisible] = useState<boolean>(false);
   const [cancelReason, setCancelReason] = useState<string>('');
   const [isCancelling, setIsCancelling] = useState<boolean>(false);
+  const [refundModalVisible, setRefundModalVisible] = useState(false);
+  const [refundLineIndices, setRefundLineIndices] = useState<number[]>([]);
+  const [refundPaymentMethod, setRefundPaymentMethod] = useState<'cash' | 'card' | 'digital'>('cash');
+  const [isRefunding, setIsRefunding] = useState(false);
 
   // Impresión y compartir
   const [isPrinting, setIsPrinting] = useState<boolean>(false);
@@ -183,6 +328,7 @@ export default function HistoryScreen() {
   // Modal de Comprobante / Ticket de Reserva
   const [receiptReservation, setReceiptReservation] = useState<any | null>(null);
   const [receiptModalVisible, setReceiptModalVisible] = useState(false);
+  const [cancellationTarget, setCancellationTarget] = useState<any | null>(null);
 
   // Modal de Cobro de Saldo Pendiente de Reserva
   const [paymentModalVisible, setPaymentModalVisible] = useState(false);
@@ -337,50 +483,44 @@ export default function HistoryScreen() {
     );
   };
 
-  const handleCancelReservation = async (res: any) => {
-    Alert.alert(
-      'Cancelar Reserva',
-      `¿Deseas cancelar esta reserva? Se liberará el stock reservado de los productos y quedará disponible para la venta.`,
-      [
-        { text: 'No cancelar', style: 'cancel' },
+  const handleCancelReservation = async (res: any) => setCancellationTarget(res);
+
+  const confirmReservationCancellation = async (refund: { refundMethod?: string; refundPercent?: number }) => {
+    if (!cancellationTarget) return;
+    const res = cancellationTarget;
+    const totalVal = Number(res.total || 0);
+    const depositVal = Number(res.depositAmount || 0);
+    try {
+      await completeOrCancelReservation(
         {
-          text: 'Sí, Cancelar',
-          style: 'destructive',
-          onPress: async () => {
-            try {
-              const totalVal = Number(res.total || 0);
-              const depositVal = Number(res.depositAmount || 0);
-              await completeOrCancelReservation(
-                {
-                  id: res.id,
-                  accountId: res.accountId || accountId,
-                  branchId: res.branchId || branchId,
-                  type: res.type || 'reservation',
-                  items: res.items || [],
-                  total: totalVal,
-                  depositAmount: depositVal,
-                  remainingAmount: Math.max(0, totalVal - depositVal),
-                  status: 'pending',
-                  customer: res.customer || { name: 'Cliente General' },
-                  createdBy: res.createdBy || user?.uid || 'user',
-                  createdAt: res.createdAt || Date.now(),
-                },
-                'cancel',
-                {
-                  uid: user?.uid || 'user',
-                  displayName: userProfile?.displayName || user?.email || 'Usuario',
-                  email: user?.email || '',
-                }
-              );
-              Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-              Alert.alert('Reserva Cancelada', 'El stock reservado ha sido liberado exitosamente.');
-            } catch (err: any) {
-              Alert.alert('Error', err?.message || 'No se pudo cancelar la reserva.');
-            }
-          },
+          id: res.id,
+          accountId: res.accountId || accountId,
+          branchId: res.branchId || branchId,
+          type: res.type || 'reservation',
+          items: res.items || [],
+          total: totalVal,
+          depositAmount: depositVal,
+          remainingAmount: Math.max(0, totalVal - depositVal),
+          status: 'pending',
+          customer: res.customer || { name: 'Cliente General' },
+          createdBy: res.createdBy || user?.uid || 'user',
+          createdAt: res.createdAt || Date.now(),
         },
-      ]
-    );
+        'cancel',
+        {
+          uid: user?.uid || 'user',
+          displayName: userProfile?.displayName || user?.email || 'Usuario',
+          email: user?.email || '',
+        },
+        { sessionId: activeCashSession?.sessionId || activeCashSession?.id, ...refund },
+      );
+      setCancellationTarget(null);
+      void refreshCashStatus();
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      Alert.alert('Cancelación completada', refund.refundMethod ? 'Se liberó el stock y se registró el reembolso.' : 'Se liberó el stock. El adelanto quedó retenido.');
+    } catch (err: any) {
+      Alert.alert('Error', err?.message || 'No se pudo cancelar la reserva.');
+    }
   };
 
   // ============================================================================
@@ -402,128 +542,149 @@ export default function HistoryScreen() {
   const [kpiContext, setKpiContext] = useState<BusinessKPIContext>({});
 
   // ============================================================================
-  // CARGA EN TIEMPO REAL DE VENTAS (CON CARGA DIRECTA HTTP RPC + STREAM)
+  // CARGA PAGINADA DE VENTAS CON RANGO APLICADO EN FIRESTORE
   // ============================================================================
-  useEffect(() => {
+  const fetchSalesPage = useCallback(async (reset: boolean) => {
     if (!accountId) {
       setSales([]);
       setLoadingSales(false);
+      setSalesHasMore(false);
+      salesCursorRef.current = null;
       return;
     }
-
-    setLoadingSales(true);
-    const coll = collection(db, 'sales');
-    const q =
-      branchId && branchId !== 'main'
-        ? query(
-            coll,
-            where('accountId', '==', accountId),
-            where('branchId', '==', branchId),
-            limit(250)
-          )
-        : query(coll, where('accountId', '==', accountId), limit(250));
-
-    const applySalesSnapshot = (snapshot: any) => {
-      const list: Sale[] = snapshot.docs.map((d: any) => ({
-        id: d.id,
-        ...(d.data() as any),
-      }));
-
-      list.sort((a, b) => {
-        const tA = a.date || (a as any).createdAt || 0;
-        const tB = b.date || (b as any).createdAt || 0;
-        return tB - tA;
+    if (reset) {
+      salesGenerationRef.current += 1;
+      salesScopeRef.current = salesScope;
+      salesCursorRef.current = null;
+      setLoadingSales(true);
+    }
+    else setLoadingMoreSales(true);
+    const generation = salesGenerationRef.current;
+    const requestScope = salesScope;
+    try {
+      const bounds = getHistoryDateBounds(dateRange, customStartDate, customEndDate);
+      const constraints: any[] = [where('accountId', '==', accountId)];
+      if (branchId && branchId !== 'main') constraints.push(where('branchId', '==', branchId));
+      if (bounds.start !== undefined) constraints.push(where('date', '>=', bounds.start));
+      if (bounds.end !== undefined) constraints.push(where('date', '<=', bounds.end));
+      constraints.push(orderBy('date', 'desc'));
+      if (!reset && salesCursorRef.current) constraints.push(startAfter(salesCursorRef.current));
+      constraints.push(limit(100));
+      const snapshot = await getDocs(query(collection(db, 'sales'), ...constraints));
+      if (generation !== salesGenerationRef.current || requestScope !== salesScopeRef.current) return;
+      const page: Sale[] = snapshot.docs.map((entry) => ({ id: entry.id, ...(entry.data() as any) }));
+      setSales((current) => {
+        if (reset) return page;
+        const byId = new Map(current.map((sale) => [sale.id, sale]));
+        page.forEach((sale) => byId.set(sale.id, sale));
+        return [...byId.values()];
       });
-
-      setSales(list);
-      setLoadingSales(false);
-    };
-
-    getDocs(q)
-      .then(applySalesSnapshot)
-      .catch((err) => {
-        console.warn('Warning getDocs ventas inicial:', err);
+      salesCursorRef.current = snapshot.docs.at(-1) || null;
+      setSalesHasMore(snapshot.docs.length === 100);
+    } catch (err: any) {
+      if (generation !== salesGenerationRef.current || requestScope !== salesScopeRef.current) return;
+      console.warn('Error cargando página de ventas:', err);
+      if (reset) setSales([]);
+      Alert.alert('No se pudo cargar el historial', err?.message || 'Revisa tu conexión y vuelve a intentar.');
+    } finally {
+      if (generation === salesGenerationRef.current && requestScope === salesScopeRef.current) {
         setLoadingSales(false);
-      });
-
-    const unsubscribe = onSnapshot(
-      q,
-      applySalesSnapshot,
-      (err) => {
-        console.error('Error escuchando ventas:', err);
-        setLoadingSales(false);
+        setLoadingMoreSales(false);
       }
-    );
+    }
+  }, [accountId, branchId, dateRange, customStartDate, customEndDate, salesScope]);
 
-    return () => {
-      unsubscribe();
-    };
-  }, [accountId, branchId]);
+  useEffect(() => {
+    setSalesHasMore(false);
+    const task = InteractionManager.runAfterInteractions(() => {
+      void fetchSalesPage(true);
+    });
+    return () => task.cancel();
+  }, [fetchSalesPage]);
 
   // Escuchar Reservas de la Sucursal
   useEffect(() => {
     if (!accountId || activeTab !== 'reservations') return;
     setLoadingReservations(true);
 
-    const q = query(
-      collection(db, 'reservations'),
-      where('accountId', '==', accountId),
-      where('branchId', '==', branchId),
-      limit(50)
-    );
+    let cancelled = false;
+    let unsubscribeActive: (() => void) | null = null;
 
-    const unsubscribe = onSnapshot(
-      q,
-      (snapshot) => {
-        const list: any[] = [];
-        snapshot.forEach((doc) => {
-          list.push({ id: doc.id, ...doc.data() });
-        });
-        list.sort((a, b) => {
-          const tA = a.createdAt?.toMillis ? a.createdAt.toMillis() : (a.createdAt || 0);
-          const tB = b.createdAt?.toMillis ? b.createdAt.toMillis() : (b.createdAt || 0);
-          return tB - tA;
-        });
-        setReservations(list);
-        setLoadingReservations(false);
-      },
-      (error) => {
-        console.warn('Error loading reservations:', error);
-        setLoadingReservations(false);
+    const attachListener = (useOrderedQuery: boolean) => {
+      const q = useOrderedQuery
+        ? query(
+            collection(db, 'reservations'),
+            where('accountId', '==', accountId),
+            where('branchId', '==', branchId),
+            orderBy('createdAt', 'desc'),
+            limit(50)
+          )
+        : query(
+            collection(db, 'reservations'),
+            where('accountId', '==', accountId),
+            where('branchId', '==', branchId),
+            limit(50)
+          );
+
+      unsubscribeActive = onSnapshot(
+        q,
+        (snapshot) => {
+          if (cancelled) return;
+          const list: any[] = [];
+          snapshot.forEach((d) => {
+            list.push({ id: d.id, ...d.data() });
+          });
+          if (!useOrderedQuery) {
+            list.sort((a, b) => {
+              const tA = a.createdAt?.toMillis ? a.createdAt.toMillis() : (a.createdAt || 0);
+              const tB = b.createdAt?.toMillis ? b.createdAt.toMillis() : (b.createdAt || 0);
+              return tB - tA;
+            });
+          }
+          setReservations(list);
+          setLoadingReservations(false);
+        },
+        (error: any) => {
+          if (cancelled) return;
+          if (useOrderedQuery && String(error?.code || '').includes('failed-precondition')) {
+            if (unsubscribeActive) {
+              unsubscribeActive();
+              unsubscribeActive = null;
+            }
+            attachListener(false);
+            return;
+          }
+          console.warn('Error loading reservations:', error);
+          setLoadingReservations(false);
+        }
+      );
+    };
+
+    const task = InteractionManager.runAfterInteractions(() => {
+      if (!cancelled) {
+        attachListener(true);
       }
-    );
+    });
 
-    return () => unsubscribe();
+    return () => {
+      cancelled = true;
+      task.cancel();
+      if (unsubscribeActive) unsubscribeActive();
+    };
   }, [accountId, branchId, activeTab]);
 
   // ============================================================================
   // FILTRADO DE VENTAS POR FECHA, TIPO Y BÚSQUEDA
   // ============================================================================
   const filteredSales = useMemo(() => {
-    const now = new Date();
-    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
-    const sevenDaysAgo = startOfToday - 7 * 24 * 60 * 60 * 1000;
-    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+    const bounds = getHistoryDateBounds(dateRange, customStartDate, customEndDate);
 
     return sales.filter((sale) => {
-      const saleDate = sale.date || (sale as any).createdAt || 0;
+      const saleDate = toEpochMillis(sale.date || (sale as any).createdAt);
 
       // 1. Filtro por Rango de Fechas
-      if (dateRange === 'today' && saleDate < startOfToday) return false;
-      if (dateRange === 'week' && saleDate < sevenDaysAgo) return false;
-      if (dateRange === 'month' && saleDate < startOfMonth) return false;
-      if (dateRange === 'custom') {
-        if (customStartDate) {
-          const [y, m, d] = customStartDate.split('-').map(Number);
-          const startTs = new Date(y, (m || 1) - 1, d || 1, 0, 0, 0, 0).getTime();
-          if (saleDate < startTs) return false;
-        }
-        if (customEndDate) {
-          const [y, m, d] = customEndDate.split('-').map(Number);
-          const endTs = new Date(y, (m || 1) - 1, d || 1, 23, 59, 59, 999).getTime();
-          if (saleDate > endTs) return false;
-        }
-      }
+      if (bounds.start !== undefined && saleDate < bounds.start) return false;
+      if (bounds.end !== undefined && saleDate > bounds.end) return false;
 
       // 2. Filtro por Tipo de Comprobante
       if (docFilter !== 'all') {
@@ -601,26 +762,35 @@ export default function HistoryScreen() {
   // ============================================================================
   // ACTUALIZAR CONTEXTO PARA VENTY IA
   // ============================================================================
-  useEffect(() => {
-    if (!accountId) return;
+  const [totalCustomerDebt, setTotalCustomerDebt] = useState<number>(0);
 
-    // Obtener deudas de clientes
+  useEffect(() => {
+    if (!accountId || activeTab !== 'ai') return;
+    let isCancelled = false;
     getCustomers(accountId).then((custs) => {
+      if (isCancelled) return;
       let totalDebt = 0;
       custs.forEach((c) => {
         totalDebt += Number(c.currentDebt) || 0;
       });
-
-      setKpiContext({
-        todaySales: periodKpis.totalSales,
-        salesCount: periodKpis.salesCount,
-        cashInDrawer: activeCashSession?.expectedAmount || 0,
-        totalDebt: Math.round(totalDebt * 100) / 100,
-        branchName: activeBranch?.name || 'Tienda Principal',
-        activeOperator: userProfile?.displayName || user?.email || 'Operador',
-      });
+      setTotalCustomerDebt(Math.round(totalDebt * 100) / 100);
     }).catch(() => {});
-  }, [accountId, periodKpis, activeCashSession?.expectedAmount, activeBranch?.name, userProfile?.displayName, user?.email]);
+    return () => {
+      isCancelled = true;
+    };
+  }, [accountId, activeTab]);
+
+  useEffect(() => {
+    if (!accountId) return;
+    setKpiContext({
+      todaySales: periodKpis.totalSales,
+      salesCount: periodKpis.salesCount,
+      cashInDrawer: activeCashSession?.expectedAmount || 0,
+      totalDebt: totalCustomerDebt,
+      branchName: activeBranch?.name || 'Tienda Principal',
+      activeOperator: userProfile?.displayName || user?.email || 'Operador',
+    });
+  }, [accountId, periodKpis, activeCashSession?.expectedAmount, totalCustomerDebt, activeBranch?.name, userProfile?.displayName, user?.email, setKpiContext]);
 
   // ============================================================================
   // ACCIONES DEL COMPROBANTE: REIMPRESIÓN, COMPARTIR Y ANULACIÓN
@@ -701,6 +871,49 @@ export default function HistoryScreen() {
     }
   };
 
+  const handleRefundSelectedLines = async () => {
+    if (!selectedSale || !user) return;
+    if (!canProcessReturn) {
+      Alert.alert('Acceso Denegado', 'No cuentas con permisos para procesar devoluciones.');
+      return;
+    }
+    if (refundLineIndices.length === 0) {
+      Alert.alert('Seleccione artículos', 'Seleccione al menos un artículo para devolver.');
+      return;
+    }
+    const amount = refundLineIndices.reduce((sum, index) => {
+      const line = selectedSale.items?.[index];
+      return sum + (Number(line?.lineTotal) || Number(line?.price || 0) * Number(line?.quantity || 0));
+    }, 0);
+    setIsRefunding(true);
+    try {
+      const sessionId = activeCashSession?.sessionId || activeCashSession?.id;
+      if (!sessionId) throw new Error('Abre una caja antes de registrar una devolución.');
+      const refundBranchId = selectedSale.branchId || branchId;
+      if (!accountId || !refundBranchId) throw new Error('No se pudo determinar la cuenta y sucursal de la venta.');
+      await refundSaleLines(selectedSale.id, refundLineIndices, {
+        accountId,
+        branchId: refundBranchId,
+        sessionId,
+        method: refundPaymentMethod,
+        cashAmount: refundPaymentMethod === 'cash' ? amount : 0,
+        cardAmount: refundPaymentMethod === 'card' ? amount : 0,
+        digitalAmount: refundPaymentMethod === 'digital' ? amount : 0,
+        operationId: `refund-${selectedSale.id}-${refundLineIndices.slice().sort((a, b) => a - b).join('-')}`,
+      });
+      setRefundModalVisible(false);
+      setSaleDetailModalVisible(false);
+      setRefundLineIndices([]);
+      await fetchSalesPage(true);
+      await refreshCashStatus();
+      Alert.alert('Devolución registrada', `${formatPEN(amount)} se registró como devolución parcial y el stock retornó al inventario.`);
+    } catch (error: any) {
+      Alert.alert('No se pudo devolver', error?.message || 'Revisa la venta e inténtalo nuevamente.');
+    } finally {
+      setIsRefunding(false);
+    }
+  };
+
   // ============================================================================
   // ACCIONES DE VENTY IA
   // ============================================================================
@@ -761,72 +974,30 @@ export default function HistoryScreen() {
     '¿Qué clientes tienen deuda de fiado?',
   ];
 
-  // Helper de badges para Comprobantes
-  const renderDocBadge = (sale: Sale) => {
-    const typeStr = String(sale.documentType || '').toLowerCase();
-    const isCancelled = sale.status === 'cancelled';
+  const handleSelectSale = useCallback((sale: Sale) => {
+    setSelectedSale(sale);
+    setSaleDetailModalVisible(true);
+  }, []);
 
-    if (isCancelled) {
-      return (
-        <View style={[styles.badge, { backgroundColor: ui.dangerSoft }]}>
-          <Text style={[styles.badgeText, { color: ui.danger, textDecorationLine: 'line-through' }]}>
-            ANULADO
-          </Text>
-        </View>
-      );
-    }
+  const renderHistorySaleItem = useCallback(
+    ({ item }: { item: Sale }) => <SaleCardItem sale={item} onPress={handleSelectSale} />,
+    [handleSelectSale]
+  );
 
-    if (typeStr.includes('factura') || typeStr === '01') {
-      return (
-        <View style={[styles.badge, { backgroundColor: ui.accentSoft }]}>
-          <Text style={[styles.badgeText, { color: ui.accent }]}>FACTURA</Text>
-        </View>
-      );
-    }
+  const saleKeyExtractor = useCallback((item: Sale) => item.id, []);
 
-    if (typeStr.includes('boleta') || typeStr === '03') {
-      return (
-        <View style={[styles.badge, { backgroundColor: ui.primarySoft }]}>
-          <Text style={[styles.badgeText, { color: ui.primary }]}>BOLETA</Text>
-        </View>
-      );
-    }
+  const saleItemType = useCallback(() => 'sale', []);
 
-    return (
-      <View style={[styles.badge, { backgroundColor: ui.surfaceMuted }]}>
-        <Text style={[styles.badgeText, { color: ui.textSecondary }]}>NOTA VENTA</Text>
-      </View>
-    );
-  };
+  const handleSalesEndReached = useCallback(() => {
+    if (salesHasMore && !loadingSales && !loadingMoreSales) {
+      void fetchSalesPage(false);
+    }
+  }, [salesHasMore, loadingSales, loadingMoreSales, fetchSalesPage]);
 
-  const renderSunatBadge = (sale: Sale) => {
-    const status = sale.sunatStatus || 'not_applicable';
-    if (status === 'accepted') {
-      return (
-        <View style={[styles.miniBadge, { backgroundColor: ui.primarySoft }]}>
-          <CheckCircle2 size={12} color={ui.primary} />
-          <Text style={[styles.miniBadgeText, { color: ui.primary }]}>SUNAT Aceptado</Text>
-        </View>
-      );
-    }
-    if (status === 'pending') {
-      return (
-        <View style={[styles.miniBadge, { backgroundColor: ui.warningSoft }]}>
-          <Clock size={12} color={ui.warning} />
-          <Text style={[styles.miniBadgeText, { color: ui.warning }]}>SUNAT Pendiente</Text>
-        </View>
-      );
-    }
-    if (status === 'rejected') {
-      return (
-        <View style={[styles.miniBadge, { backgroundColor: ui.dangerSoft }]}>
-          <AlertTriangle size={12} color={ui.danger} />
-          <Text style={[styles.miniBadgeText, { color: ui.danger }]}>SUNAT Observado</Text>
-        </View>
-      );
-    }
-    return null;
-  };
+  const salesListContentStyle = useMemo(
+    () => ({ paddingHorizontal: 20, paddingTop: 12, paddingBottom: insets.bottom + 80 }),
+    [insets.bottom]
+  );
 
   // ============================================================================
   // RENDER PRINCIPAL
@@ -902,11 +1073,20 @@ export default function HistoryScreen() {
       {/* SUB-MÓDULO 1: HISTORIAL DE VENTAS Y SUNAT */}
       {/* ==================================================================== */}
       {activeTab === 'sales' && (
-        <ScrollView
-          style={styles.contentContainer}
-          contentContainerStyle={{ paddingBottom: insets.bottom + 80 }}
-          keyboardShouldPersistTaps="handled"
-        >
+        <View style={{ flex: 1 }}>
+          <FlashList
+            data={loadingSales ? [] : filteredSales}
+            renderItem={renderHistorySaleItem}
+            keyExtractor={saleKeyExtractor}
+            getItemType={saleItemType}
+            estimatedItemSize={94}
+            contentContainerStyle={salesListContentStyle}
+            keyboardShouldPersistTaps="handled"
+            showsVerticalScrollIndicator={false}
+            onEndReachedThreshold={0.4}
+            onEndReached={handleSalesEndReached}
+            ListHeaderComponent={
+              <>
           {/* Fila unificada: Resumen del período + Filtros de fecha */}
           <View style={styles.summaryWithFiltersRow}>
             <View style={styles.summaryTitleCol}>
@@ -1116,74 +1296,42 @@ export default function HistoryScreen() {
             ))}
           </View>
 
-          {/* Lista de Comprobantes */}
-          {loadingSales ? (
-            <ActivityIndicator color={ui.primary} style={{ marginVertical: 40 }} />
-          ) : filteredSales.length === 0 ? (
-            <View style={styles.emptyContainer}>
-              <Receipt size={44} color={ui.textMuted} />
-              <Text style={styles.emptyTitle}>
-                {sales.length === 0 ? 'Aún no hay comprobantes' : 'Sin ventas con estos filtros'}
-              </Text>
-              <Text style={styles.emptySub}>
-                {sales.length === 0
-                  ? 'Las ventas registradas aparecerán aquí.'
-                  : 'Prueba otro periodo, tipo de comprobante o búsqueda.'}
-              </Text>
-            </View>
-          ) : (
-            filteredSales.map((sale) => {
-              const isCancelled = sale.status === 'cancelled';
-              const docNumber =
-                sale.documentNumber || `V-${String(sale.saleNumber || 1).padStart(6, '0')}`;
-
-              return (
+              </>
+            }
+            ListEmptyComponent={
+              loadingSales ? (
+                <ActivityIndicator color={ui.primary} style={{ marginVertical: 40 }} />
+              ) : (
+                <View style={styles.emptyContainer}>
+                  <Receipt size={44} color={ui.textMuted} />
+                  <Text style={styles.emptyTitle}>
+                    {sales.length === 0 ? 'Aún no hay comprobantes' : 'Sin ventas con estos filtros'}
+                  </Text>
+                  <Text style={styles.emptySub}>
+                    {sales.length === 0
+                      ? 'Las ventas registradas aparecerán aquí.'
+                      : 'Prueba otro periodo, tipo de comprobante o búsqueda.'}
+                  </Text>
+                </View>
+              )
+            }
+            ListFooterComponent={
+              salesHasMore && !loadingSales ? (
                 <TouchableOpacity
-                  key={sale.id}
-                  style={[styles.saleCard, isCancelled && styles.saleCardCancelled]}
-                  onPress={() => {
-                    setSelectedSale(sale);
-                    setSaleDetailModalVisible(true);
-                  }}
-                  accessibilityRole="button"
-                  accessibilityLabel={`Ver comprobante ${docNumber}, ${formatPEN(sale.total)}, ${sale.customerName || 'Cliente General'}${isCancelled ? ', anulada' : ''}`}
+                  style={[styles.confirmCancelBtn, { marginHorizontal: 20, marginTop: 12, marginBottom: 20 }]}
+                  onPress={() => void fetchSalesPage(false)}
+                  disabled={loadingMoreSales}
                 >
-                  <View style={styles.saleCardTop}>
-                    <View style={{ flex: 1 }}>
-                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-                        {renderDocBadge(sale)}
-                        <Text style={styles.saleDocNumber}>{docNumber}</Text>
-                      </View>
-                      <Text style={styles.saleDateText}>{formatDatePE(sale.date)}</Text>
-                    </View>
-
-                    <View style={{ alignItems: 'flex-end' }}>
-                      <Text
-                        style={[
-                          styles.saleTotalText,
-                          isCancelled && { color: ui.textMuted, textDecorationLine: 'line-through' },
-                        ]}
-                      >
-                        {formatPEN(sale.total)}
-                      </Text>
-                      <Text style={styles.salePaymentMethod}>
-                        {(sale.paymentMethod || 'Efectivo').toUpperCase()}
-                      </Text>
-                    </View>
-                  </View>
-
-                  {/* Fila Cliente & SUNAT */}
-                  <View style={styles.saleCardBottom}>
-                    <Text style={styles.saleCustomerText} numberOfLines={1}>
-                      {sale.customerName ? `Cliente: ${sale.customerName}` : 'Cliente General'}
-                    </Text>
-                    {renderSunatBadge(sale)}
-                  </View>
+                  {loadingMoreSales ? (
+                    <ActivityIndicator color={ui.onPrimary} />
+                  ) : (
+                    <Text style={styles.confirmCancelBtnText}>Cargar más ventas</Text>
+                  )}
                 </TouchableOpacity>
-              );
-            })
-          )}
-        </ScrollView>
+              ) : null
+            }
+          />
+        </View>
       )}
 
       {/* ==================================================================== */}
@@ -1534,7 +1682,8 @@ export default function HistoryScreen() {
       {/* ==================================================================== */}
       {/* MODAL: DETALLE DEL COMPROBANTE Y ACCIONES */}
       {/* ==================================================================== */}
-      <Modal visible={saleDetailModalVisible} transparent animationType="slide">
+      {saleDetailModalVisible && (
+        <Modal visible={saleDetailModalVisible} transparent animationType="slide">
         <View style={styles.modalOverlay}>
           <View style={[styles.modalContent, { maxHeight: '90%' }]}>
             {selectedSale && (
@@ -1696,7 +1845,7 @@ export default function HistoryScreen() {
                 </View>
 
                 {/* Botón de Anulación si no está anulada y tiene permisos */}
-                {selectedSale.status !== 'cancelled' && canProcessReturn && (
+                {selectedSale.status === 'completed' && !(selectedSale as any).refundedLineIndices?.length && !Number((selectedSale as any).refundedAmount || 0) && canProcessReturn && ['owner', 'admin'].includes(role || '') && (
                   <TouchableOpacity
                     style={styles.cancelSaleBtn}
                     onPress={() => {
@@ -1710,16 +1859,90 @@ export default function HistoryScreen() {
                     <Text style={styles.cancelSaleText}>Anular Venta y Revertir Stock</Text>
                   </TouchableOpacity>
                 )}
+                {selectedSale.status === 'completed' && !selectedSale.isReturn && canProcessReturn && (posSettings.enableSellerAttribution || (selectedSale as any).attributionVersion === 1) && (
+                  <TouchableOpacity
+                    style={[styles.cancelSaleBtn, { borderColor: ui.warning, marginTop: 8 }]}
+                    onPress={() => {
+                      setRefundLineIndices([]);
+                      setRefundPaymentMethod('cash');
+                      setRefundModalVisible(true);
+                    }}
+                    accessibilityRole="button"
+                    accessibilityLabel="Devolver uno o más artículos de la venta"
+                  >
+                    <RefreshCw size={18} color={ui.warning} />
+                    <Text style={[styles.cancelSaleText, { color: ui.warning }]}>Devolver artículos</Text>
+                  </TouchableOpacity>
+                )}
               </>
             )}
           </View>
         </View>
       </Modal>
+      )}
+
+      {refundModalVisible && (
+        <Modal visible={refundModalVisible} transparent animationType="fade">
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalContent, { maxHeight: '85%' }]}>
+            <View style={styles.modalHeader}>
+              <View>
+                <Text style={styles.modalTitle}>Devolución parcial</Text>
+                <Text style={styles.modalSub}>Selecciona los artículos que regresan</Text>
+              </View>
+              <TouchableOpacity onPress={() => setRefundModalVisible(false)} style={styles.iconButton} accessibilityRole="button" accessibilityLabel="Cerrar devolución">
+                <X size={20} color={ui.textSecondary} />
+              </TouchableOpacity>
+            </View>
+            <ScrollView>
+              {selectedSale?.items?.map((line, index) => {
+                const selected = refundLineIndices.includes(index);
+                const lineAmount = Number(line.lineTotal) || Number(line.price || 0) * Number(line.quantity || 0);
+                return (
+                  <TouchableOpacity
+                    key={`${line.id}-${index}`}
+                    style={[styles.itemRow, selected && { backgroundColor: ui.warningSoft, borderRadius: 8 }]}
+                    onPress={() => setRefundLineIndices((current) => selected
+                      ? current.filter((itemIndex) => itemIndex !== index)
+                      : [...current, index])}
+                    accessibilityRole="checkbox"
+                    accessibilityState={{ checked: selected }}
+                  >
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.itemName}>{line.name}</Text>
+                      <Text style={styles.itemSub}>{line.quantity} x {formatPEN(line.price)}</Text>
+                    </View>
+                    <Text style={styles.itemTotal}>{formatPEN(lineAmount)}</Text>
+                    {selected && <CheckCircle2 size={18} color={ui.warning} style={{ marginLeft: 8 }} />}
+                  </TouchableOpacity>
+                );
+              })}
+            </ScrollView>
+            <Text style={styles.detailSectionTitle}>MÉTODO DE REEMBOLSO</Text>
+            <View style={styles.actionGrid}>
+              {[
+                { id: 'cash', label: 'Efectivo' },
+                { id: 'card', label: 'Tarjeta' },
+                { id: 'digital', label: 'Digital' },
+              ].map((method) => (
+                <TouchableOpacity key={method.id} style={[styles.refundMethodChip, refundPaymentMethod === method.id && styles.refundMethodChipActive]} onPress={() => setRefundPaymentMethod(method.id as any)}>
+                  <Text style={[styles.refundMethodChipText, refundPaymentMethod === method.id && styles.refundMethodChipTextActive]}>{method.label}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+            <TouchableOpacity style={[styles.confirmCancelBtn, isRefunding && styles.buttonDisabled]} onPress={handleRefundSelectedLines} disabled={isRefunding}>
+              {isRefunding ? <ActivityIndicator color={ui.onPrimary} /> : <Text style={styles.confirmCancelBtnText}>Registrar devolución</Text>}
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+      )}
 
       {/* ==================================================================== */}
       {/* MODAL: CONFIRMACIÓN Y MOTIVO DE ANULACIÓN */}
       {/* ==================================================================== */}
-      <Modal visible={cancelModalVisible} transparent animationType="fade">
+      {cancelModalVisible && (
+        <Modal visible={cancelModalVisible} transparent animationType="fade">
         <KeyboardAvoidingView
           behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
           style={styles.modalOverlay}
@@ -1775,14 +1998,18 @@ export default function HistoryScreen() {
           </View>
         </KeyboardAvoidingView>
       </Modal>
+      )}
 
-      <FinancialPnlModal
-        visible={pnlModalOpen}
-        onClose={() => setPnlModalOpen(false)}
-      />
+      {pnlModalOpen && (
+        <FinancialPnlModal
+          visible={pnlModalOpen}
+          onClose={() => setPnlModalOpen(false)}
+        />
+      )}
 
       {/* Modal de Rango de Fechas Personalizado */}
-      <Modal visible={customDateModalOpen} transparent animationType="fade">
+      {customDateModalOpen && (
+        <Modal visible={customDateModalOpen} transparent animationType="fade">
         <KeyboardAvoidingView
           behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
           style={styles.modalOverlay}
@@ -1888,19 +2115,34 @@ export default function HistoryScreen() {
           </View>
         </KeyboardAvoidingView>
       </Modal>
+      )}
+
       {/* Modal de Comprobante / Ticket de Reserva */}
-      <ReservationReceiptModal
-        visible={receiptModalVisible}
-        onClose={() => {
-          setReceiptModalVisible(false);
-          setReceiptReservation(null);
-        }}
-        reservation={receiptReservation}
-        business={{ ...businessSettings, ...activeBranch }}
-      />
+      {receiptModalVisible && (
+        <ReservationReceiptModal
+          visible={receiptModalVisible}
+          onClose={() => {
+            setReceiptModalVisible(false);
+            setReceiptReservation(null);
+          }}
+          reservation={receiptReservation}
+          business={{ ...businessSettings, ...activeBranch }}
+        />
+      )}
+
+      {Boolean(cancellationTarget) && (
+        <ReservationCancellationModal
+          visible={Boolean(cancellationTarget)}
+          item={cancellationTarget}
+          sessionId={activeCashSession?.sessionId || activeCashSession?.id}
+          onClose={() => setCancellationTarget(null)}
+          onConfirm={confirmReservationCancellation}
+        />
+      )}
 
       {/* Modal para Cobrar Saldo Pendiente de Reserva */}
-      <Modal visible={paymentModalVisible} transparent animationType="fade">
+      {paymentModalVisible && (
+        <Modal visible={paymentModalVisible} transparent animationType="fade">
         <KeyboardAvoidingView
           behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
           style={styles.modalOverlay}
@@ -2013,6 +2255,7 @@ export default function HistoryScreen() {
           </View>
         </KeyboardAvoidingView>
       </Modal>
+      )}
     </View>
   );
 }
@@ -2884,6 +3127,28 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '700',
     color: ui.onPrimary,
+  },
+  refundMethodChip: {
+    flex: 1,
+    minHeight: 40,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: ui.border,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 8,
+  },
+  refundMethodChipActive: {
+    borderColor: ui.primary,
+    backgroundColor: ui.primarySoft,
+  },
+  refundMethodChipText: {
+    color: ui.textSecondary,
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  refundMethodChipTextActive: {
+    color: ui.primary,
   },
   inlineScannerCard: {
     backgroundColor: ui.surface,

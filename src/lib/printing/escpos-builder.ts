@@ -201,15 +201,22 @@ export class EscPosBuilder {
  * Safe for React Native native modules and Bluetooth bridges
  */
 export function uint8ArrayToBase64(bytes: Uint8Array): string {
+  const CHUNK_SIZE = 32768; // 32KB chunks
   let binary = '';
-  const len = bytes.byteLength;
-  for (let i = 0; i < len; i++) {
-    binary += String.fromCharCode(bytes[i]);
+  const len = bytes.length;
+  for (let i = 0; i < len; i += CHUNK_SIZE) {
+    const chunk = bytes.subarray(i, Math.min(i + CHUNK_SIZE, len));
+    binary += String.fromCharCode.apply(null, chunk as any);
   }
+
   // In modern React Native / JS environments, btoa is available globally
   if (typeof btoa === 'function') {
     return btoa(binary);
   }
+  if (typeof Buffer !== 'undefined') {
+    return Buffer.from(binary, 'binary').toString('base64');
+  }
+
   // Fallback to manual base64 encoder if btoa is unavailable
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
   let result = '';
@@ -362,11 +369,16 @@ export function buildSaleReceiptEscPos(
   builder.twoColumns('TOTAL:', formatPEN(sale.total));
   builder.size('normal').bold(false);
 
+  if ((sale.surchargeAmount || 0) > 0) {
+    builder.twoColumns('Recargo:', formatPEN(sale.surchargeAmount!));
+    builder.bold(true).twoColumns('TOTAL COBRADO:', formatPEN(sale.chargedAmount ?? sale.total + sale.surchargeAmount!)).bold(false);
+  }
+
   // 8. Cash Received & Change
   if (sale.cashReceived && sale.cashReceived > 0) {
     builder.divider('.');
     builder.twoColumns('Efectivo Recibido:', formatPEN(sale.cashReceived));
-    builder.twoColumns('Vuelto:', formatPEN(sale.changeGiven ?? Math.max(0, sale.cashReceived - sale.total)));
+    builder.twoColumns('Vuelto:', formatPEN(sale.changeGiven ?? Math.max(0, sale.cashReceived - (sale.chargedAmount ?? sale.total))));
   }
 
   // 9. Amount in Words
@@ -633,10 +645,15 @@ export function buildReceiptHtml(
     <span>${formatPEN(sale.total)}</span>
   </div>
 
+  ${(sale.surchargeAmount || 0) > 0 ? `
+    <div class="row"><span>Recargo:</span><span>${formatPEN(sale.surchargeAmount!)}</span></div>
+    <div class="row bold"><span>TOTAL COBRADO:</span><span>${formatPEN(sale.chargedAmount ?? sale.total + sale.surchargeAmount!)}</span></div>
+  ` : ''}
+
   ${sale.cashReceived && sale.cashReceived > 0 ? `
     <div class="divider"></div>
     <div class="row"><span>Efectivo Recibido:</span><span>${formatPEN(sale.cashReceived)}</span></div>
-    <div class="row"><span>Vuelto:</span><span>${formatPEN(sale.changeGiven ?? Math.max(0, sale.cashReceived - sale.total))}</span></div>
+    <div class="row"><span>Vuelto:</span><span>${formatPEN(sale.changeGiven ?? Math.max(0, sale.cashReceived - (sale.chargedAmount ?? sale.total)))}</span></div>
   ` : ''}
 
   <div class="divider"></div>

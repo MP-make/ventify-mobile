@@ -20,7 +20,6 @@ import {
   orderBy,
   getDocs,
   getDoc,
-  deleteDoc,
   onSnapshot,
   QuerySnapshot,
   DocumentData,
@@ -74,9 +73,26 @@ export interface CashSession {
   cashSales?: number;
   cardSales?: number;
   digitalSales?: number;
+  creditSales?: number;
   totalSales?: number;
   totalIncome?: number;
   totalExpenses?: number;
+  totalReservationDeposits?: number;
+  reservationDepositsCount?: number;
+  cashReservationDeposits?: number;
+  cardReservationDeposits?: number;
+  digitalReservationDeposits?: number;
+  chequeReservationDeposits?: number;
+  totalOrderDeposits?: number;
+  orderDepositsCount?: number;
+  cashOrderDeposits?: number;
+  cardOrderDeposits?: number;
+  digitalOrderDeposits?: number;
+  chequeOrderDeposits?: number;
+  totalRefunds?: number;
+  totalCommissionAmount?: number;
+  totalSurchargeAmount?: number;
+  auditRevision?: number;
   expectedAmount?: number;
   countedAmount?: number;
   difference?: number;
@@ -97,6 +113,9 @@ export interface CashMovement {
   description: string;
   saleId?: string;
   paymentMethod?: string;
+  method?: string;
+  refundAmount?: number;
+  originalPaymentMethod?: string;
   createdBy: string;
   createdByName: string;
   createdAt: number | Timestamp;
@@ -143,6 +162,40 @@ export interface CashAuditResult {
   cashRefunds: number;
   expectedCashInDrawer: number;
 }
+
+const paymentAmountForAudit = (split: { amount?: number; chargedAmount?: number }): number => {
+  const chargedAmount = Number(split.chargedAmount);
+  if (Number.isFinite(chargedAmount) && chargedAmount >= 0) return chargedAmount;
+  const amount = Number(split.amount);
+  return Number.isFinite(amount) && amount >= 0 ? amount : 0;
+};
+
+export const cashAuditSnapshotMatches = (calculated: CashSession, current: CashSession): boolean => {
+  const fields: Array<keyof CashSession> = [
+    'expectedAmount', 'cashSales', 'cardSales', 'digitalSales', 'creditSales',
+    'totalSales', 'totalIncome', 'totalExpenses', 'transactionCount',
+    'initialAmount', 'openingBalance',
+    'auditRevision',
+    'totalReservationDeposits', 'reservationDepositsCount', 'cashReservationDeposits',
+    'cardReservationDeposits', 'digitalReservationDeposits', 'chequeReservationDeposits',
+    'totalOrderDeposits', 'orderDepositsCount', 'cashOrderDeposits', 'cardOrderDeposits',
+    'digitalOrderDeposits', 'chequeOrderDeposits', 'totalRefunds',
+    'totalCommissionAmount', 'totalSurchargeAmount',
+  ];
+  return fields.every((field) => Number(calculated[field] || 0) === Number(current[field] || 0));
+};
+
+/** Clear an operator pointer only when it still points at the session being closed. */
+export const clearActiveCashSessionPointer = async (pointerRef: any, closedSessionId: string): Promise<void> => {
+  await runTransaction(db, async (tx) => {
+    const pointerSnap = await tx.get(pointerRef);
+    if (!pointerSnap.exists()) return;
+    const pointer: any = pointerSnap.data();
+    if ((pointer?.activeSessionId ?? pointer?.sessionId) === closedSessionId) {
+      tx.delete(pointerRef);
+    }
+  });
+};
 
 export interface CloseCashSessionParams {
   accountId: string;
@@ -500,6 +553,9 @@ export const getSessionMovements = async (
         description: data.description || '',
         saleId: data.saleId,
         paymentMethod: data.paymentMethod,
+        method: data.method,
+        refundAmount: data.refundAmount,
+        originalPaymentMethod: data.originalPaymentMethod,
         createdBy: data.createdBy,
         createdByName: data.createdByName,
         createdAt: data.createdAt,
@@ -516,7 +572,7 @@ export const getSessionMovements = async (
     return movements;
   } catch (err) {
     console.error('[CashRegisterService] Error obteniendo movimientos de sesión:', err);
-    return [];
+    throw err;
   }
 };
 
@@ -530,10 +586,58 @@ export const calculateCashAudit = (
 ): CashAuditResult => {
   const openingBalance = session.initialAmount || session.openingBalance || 0;
 
-  // Filtrar solo ventas completadas de esta sesión
+  // Las devoluciones de una venta anulada ya no tienen una venta física que
+  // revertir en este arqueo. Ignorar también su movimiento compensatorio.
   const validSales = sales.filter(
     (s) => s.status !== 'cancelled' && (s.sessionId === session.id || !s.sessionId)
   );
+  const cancelledSaleIds = new Set(
+    sales.filter(s => s.status === 'cancelled').map(s => String(s.id || '')).filter(Boolean)
+  );
+  const isDepositPayment = (sale: any): boolean => sale.isDepositPayment === true;
+  const isCashMethod = (value: unknown): boolean => {
+    const method = String(value || '').toLowerCase();
+    return method === 'cash' || method.includes('efectivo') || method.includes('cash');
+  };
+  const chargedAmount = (sale: any): number => {
+    if (sale.amountReceived != null) {
+      const received = Number(sale.amountReceived);
+      if (Number.isFinite(received) && received >= 0) return received;
+    }
+    if (sale.chargedAmount != null) {
+      const charged = Number(sale.chargedAmount);
+      if (Number.isFinite(charged) && charged >= 0) return charged;
+    }
+    if (sale.depositInfo?.remainingAmount != null) {
+      const remaining = Number(sale.depositInfo.remainingAmount);
+      if (Number.isFinite(remaining) && remaining >= 0) return remaining;
+    }
+    if (sale.total == null) return 0;
+    const total = Number(sale.total);
+    return Number.isFinite(total) && total >= 0 ? total : 0;
+  };
+  const depositCashFromSale = (sale: any): number => {
+    if (Array.isArray(sale.payments) && sale.payments.length > 0) {
+      return sale.payments.reduce((sum: number, split: any) =>
+        sum + (split.category === 'cash' ? paymentAmountForAudit(split) : 0), 0);
+    }
+    if (typeof sale.cashAmount === 'number' && sale.cashAmount >= 0) return sale.cashAmount;
+    if (sale.paymentCategory === 'cash' || isCashMethod(sale.paymentMethod) || isCashMethod(sale.paymentMethodId)) {
+      return chargedAmount(sale);
+    }
+    return 0;
+  };
+
+  const depositSales = validSales.filter(isDepositPayment);
+  const commercialSales = validSales.filter(s => !isDepositPayment(s));
+  // Los contadores de sesión son autoridad para los adelantos porque ya
+  // incorporan sus reembolsos. Si no existen en una sesión legacy, derivarlos
+  // de las ventas de depósito disponibles.
+  const depositCountersPresent =
+    typeof session.cashReservationDeposits === 'number' || typeof session.cashOrderDeposits === 'number';
+  const cashDeposits = depositCountersPresent
+    ? (session.cashReservationDeposits || 0) + (session.cashOrderDeposits || 0)
+    : depositSales.reduce((sum, sale) => sum + depositCashFromSale(sale), 0);
 
   let cashSales = 0;
   let creditSales = 0;
@@ -545,15 +649,15 @@ export const calculateCashAudit = (
     totalDigital: 0,
   };
 
-  for (const sale of validSales) {
-    const total = sale.total || 0;
+  for (const sale of commercialSales) {
+    const total = chargedAmount(sale);
     const pMethod = (sale.paymentMethod || '').toLowerCase();
 
     // 1. Desglose si tiene pagos mixtos v2
     if (Array.isArray(sale.payments) && sale.payments.length > 0) {
       for (const split of sale.payments) {
         const cat = split.category || '';
-        const amt = split.amount || 0;
+        const amt = paymentAmountForAudit(split);
         const provider = (split.digitalProvider || '').toLowerCase();
 
         if (cat === 'cash') {
@@ -570,17 +674,17 @@ export const calculateCashAudit = (
       }
     } else {
       // 2. Desglose tradicional
-      if (pMethod === 'efectivo') {
+      if (sale.paymentCategory === 'cash' || isCashMethod(pMethod) || isCashMethod(sale.paymentMethodId)) {
         cashSales += total;
-      } else if (pMethod === 'tarjeta') {
+      } else if (sale.paymentCategory === 'card' || pMethod === 'tarjeta' || pMethod === 'card') {
         digitalSales.card += total;
-      } else if (pMethod === 'yape') {
+      } else if (pMethod === 'yape' || sale.digitalProvider === 'yape') {
         digitalSales.yape += total;
-      } else if (pMethod === 'plin') {
+      } else if (pMethod === 'plin' || sale.digitalProvider === 'plin') {
         digitalSales.plin += total;
-      } else if (pMethod === 'transferencia') {
+      } else if (pMethod === 'transferencia' || sale.paymentCategory === 'digital') {
         digitalSales.transfer += total;
-      } else if (pMethod === 'fiado') {
+      } else if (pMethod === 'fiado' || pMethod === 'credit' || sale.paymentCategory === 'credit') {
         creditSales += total;
       } else {
         // En caso de tener cashAmount explícito
@@ -603,17 +707,44 @@ export const calculateCashAudit = (
   let manualIncomes = 0;
   let manualExpenses = 0;
   let cashRefunds = 0;
+  let cashDepositRefundAdjustments = 0;
 
   for (const m of movements) {
     const amt = Math.abs(m.amount || 0);
-    if (m.type === 'income' && m.category !== 'opening' && m.category !== 'sale') {
-      manualIncomes += amt;
-    } else if (m.type === 'expense') {
-      if (m.category === 'refund') {
-        cashRefunds += amt;
-      } else {
-        manualExpenses += amt;
+    const category = String(m.category || '').toLowerCase();
+    const method = (m as any).method ?? m.paymentMethod;
+    const isDepositRefund = category === 'reservation_refund' || category === 'order_refund';
+    const isRefund = isDepositRefund || category === 'sale_refund' || category === 'refund' || category === 'return';
+    if (isRefund) {
+      // Adelantos ya ajustaron sus contadores de sesión. Para devoluciones de
+      // venta, la categoría es el contrato canónico aunque `type` no exista.
+      if (isDepositRefund) {
+        // El contador de depósito ya revierte devoluciones del método original.
+        // Solo sale efectivo extra cuando se devuelve en efectivo un adelanto
+        // originalmente cobrado por un medio no físico.
+        const originalMethod = (m as any).originalPaymentMethod;
+        const refundAmount = Math.abs(Number(m.refundAmount) || Number(m.amount) || 0);
+        if (refundAmount > 0 && originalMethod) {
+          if (isCashMethod(originalMethod) && !isCashMethod(method)) {
+            // El saldo cash del depósito ya bajó, aunque el efectivo se quedó.
+            cashDepositRefundAdjustments += refundAmount;
+          } else if (!isCashMethod(originalMethod) && isCashMethod(method)) {
+            // El depósito original no estaba en esta caja física; ahora sí sale efectivo.
+            cashRefunds += refundAmount;
+          }
+        }
+        continue;
       }
+      if (m.saleId && cancelledSaleIds.has(String(m.saleId))) continue;
+      const linkedSale = m.saleId ? sales.find(s => String(s.id || '') === String(m.saleId)) : undefined;
+      const linkedMethod = linkedSale?.paymentMethod || linkedSale?.paymentCategory || linkedSale?.paymentMethodId;
+      if (Number(m.amount) < 0 && (isCashMethod(method || linkedMethod) || (!method && !linkedMethod))) cashRefunds += amt;
+      continue;
+    }
+    if (m.type === 'income' && m.category !== 'opening' && m.category !== 'sale') {
+      if (isCashMethod(method) || !method) manualIncomes += amt;
+    } else if (m.type === 'expense' && (isCashMethod(method) || !method)) {
+      manualExpenses += amt;
     }
   }
 
@@ -621,7 +752,7 @@ export const calculateCashAudit = (
   // Saldo Apertura + Ventas Efectivo + Ingresos Manuales - Gastos Manuales - Devoluciones Efectivo
   const expectedCashInDrawer =
     Math.round(
-      (openingBalance + cashSales + manualIncomes - manualExpenses - cashRefunds) * 100
+      (openingBalance + cashSales + cashDeposits + cashDepositRefundAdjustments + manualIncomes - manualExpenses - cashRefunds) * 100
     ) / 100;
 
   return {
@@ -636,7 +767,7 @@ export const calculateCashAudit = (
     },
     creditSales: Math.round(creditSales * 100) / 100,
     totalSales: Math.round(totalSales * 100) / 100,
-    salesCount: validSales.length,
+    salesCount: commercialSales.length,
     manualIncomes: Math.round(manualIncomes * 100) / 100,
     manualExpenses: Math.round(manualExpenses * 100) / 100,
     cashRefunds: Math.round(cashRefunds * 100) / 100,
@@ -700,6 +831,10 @@ export const closeCashSession = async (
     if (!freshSessionSnap.exists() || freshSessionSnap.data()?.status === 'closed') {
       throw new Error('La sesión de caja ya se encuentra cerrada.');
     }
+    const freshSession = freshSessionSnap.data() as CashSession;
+    if (!cashAuditSnapshotMatches(sessionData, freshSession)) {
+      throw new Error('La caja cambió durante el arqueo. Actualiza el arqueo antes de cerrar.');
+    }
 
     // Actualizar documento de sesión
     tx.update(sessionRef, {
@@ -744,7 +879,7 @@ export const closeCashSession = async (
         CASH_SESSIONS_COLLECTION,
         `active_${accountId}_${branchId}_${sessionData.startedBy}`
       );
-      await deleteDoc(userPointerRef);
+      await clearActiveCashSessionPointer(userPointerRef, sessionId);
     } catch (cleanupErr) {
       console.warn('[CashRegisterService] No se pudo eliminar el puntero de sesión activa del operador tras cerrar:', cleanupErr);
     }
@@ -779,10 +914,11 @@ export const subscribeToSessionMovements = (
   }
 
   const coll = collection(db, CASH_MOVEMENTS_COLLECTION);
-  const constraints = [where('sessionId', '==', sessionId)];
+  const constraints: any[] = [where('sessionId', '==', sessionId)];
   if (accountId) {
     constraints.push(where('accountId', '==', accountId));
   }
+  constraints.push(limit(100));
   const q = query(coll, ...constraints);
 
   return onSnapshot(
@@ -806,3 +942,6 @@ export const subscribeToSessionMovements = (
     }
   );
 };
+
+export const subscribeToCashMovements = subscribeToSessionMovements;
+

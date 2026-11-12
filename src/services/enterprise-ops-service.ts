@@ -3,7 +3,7 @@
  * 
  * Gestión integral de Operaciones Empresariales:
  * 1. Cotizaciones (`quotes` collection)
- * 2. Solicitudes de Venta y Aprobación de Descuentos (`quotes` con `isSaleRequest: true` como backend autorizado)
+ * 2. Solicitudes de venta en la API canónica `saleRequests`
  * 3. Personal, Colaboradores y Planillas (`users`, `cash_register_movements` y `payroll_settlements`)
  * 
  * Cumple al 100% las reglas de Firestore eliminando referencias a colecciones inexistentes
@@ -11,6 +11,15 @@
  */
 
 import { db, auth } from '@/lib/firebase';
+
+const getAppState = (): { currentState?: string } | null => {
+  try {
+    const rn = (typeof require !== 'undefined' ? require : () => null)('react-native');
+    return rn?.AppState || null;
+  } catch {
+    return null;
+  }
+};
 import {
   collection,
   doc,
@@ -32,13 +41,13 @@ import {
   QuerySnapshot,
 } from 'firebase/firestore';
 import { cleanFirestoreData } from '@/lib/firebase-utils';
+import { apiRequest } from '@/lib/api-client';
 
 // ============================================================================
 // CONSTANTES DE COLECCIONES OFICIALES
 // ============================================================================
 
 export const QUOTES_COLLECTION = 'quotes';
-export const SALE_REQUESTS_COLLECTION = 'sale_requests';
 export const USERS_COLLECTION = 'users';
 export const PAYROLL_SETTLEMENTS_COLLECTION = 'payroll_settlements';
 export const CASH_SESSIONS_COLLECTION = 'cash_register_sessions';
@@ -57,6 +66,8 @@ export interface QuoteItem {
   quantity: number;
   sku: string;
   originalPrice?: number;
+  discountAmount?: number;
+  discountPercent?: number;
   modifiedPrice?: number;
   priceModifiedBy?: string;
   priceModificationReason?: string;
@@ -87,6 +98,8 @@ export interface Quote {
   items: QuoteItem[];
   subtotal: number;
   tax: number;
+  discountAmount?: number;
+  shippingAmount?: number;
   total: number;
   status: QuoteStatus;
   branchId: string;
@@ -126,7 +139,9 @@ export interface CreateQuoteInput {
   branchName?: string;
   items: QuoteItem[];
   subtotal: number;
+  discountAmount?: number;
   tax?: number;
+  shippingAmount?: number;
   total: number;
   customerName: string;
   customerId?: string;
@@ -153,10 +168,15 @@ export type SaleRequestStatus = 'pending' | 'approved' | 'rejected' | 'converted
 export interface SaleRequestItem {
   productId: string;
   productName: string;
+  id?: string;
+  name?: string;
   sku?: string;
   quantity: number;
   originalPrice: number;
   requestedPrice: number;
+  price?: number;
+  presentationQty?: number;
+  conversionFactor?: number;
   subtotal: number;
   discountAmount?: number;
   discountPercent?: number;
@@ -184,6 +204,7 @@ export interface SaleRequest {
   subtotal: number;
   discountTotal: number;
   total: number;
+  shipping?: number;
   reason?: string;
   notes?: string;
   status: SaleRequestStatus;
@@ -211,6 +232,7 @@ export interface CreateSaleRequestInput {
   subtotal: number;
   discountTotal?: number;
   total: number;
+  shipping?: number;
   reason?: string;
   notes?: string;
 }
@@ -357,6 +379,8 @@ export const quoteFromDoc = (docSnap: QueryDocumentSnapshot<DocumentData>): Quot
     items: Array.isArray(data.items) ? data.items : [],
     subtotal: Number(data.subtotal) || Number(data.total) || 0,
     tax: Number(data.tax) || 0,
+    discountAmount: Number(data.discountAmount) || 0,
+    shippingAmount: Number(data.shippingAmount) || 0,
     total: Number(data.total) || 0,
     status: (data.status as QuoteStatus) || 'pending',
     branchId: data.branchId || '',
@@ -443,6 +467,8 @@ export const getQuotes = async (
     if (filters?.status && filters.status !== 'all') {
       q = query(q, where('status', '==', filters.status));
     }
+
+    q = query(q, limit(100));
 
     const snapshot = await getDocs(q);
     let quotes = snapshot.docs
@@ -564,7 +590,9 @@ export const createQuote = async (input: CreateQuoteInput): Promise<Quote> => {
     validityDays,
     items: input.items || [],
     subtotal: Math.round(input.subtotal * 100) / 100,
+    discountAmount: Math.round((input.discountAmount || 0) * 100) / 100,
     tax: Math.round((input.tax || 0) * 100) / 100,
+    shippingAmount: Math.round((input.shippingAmount || 0) * 100) / 100,
     total: Math.round(total * 100) / 100,
     status: 'pending' as QuoteStatus,
     branchId,
@@ -642,7 +670,7 @@ export const convertQuoteToSale = async (quoteId: string, saleId: string): Promi
 /**
  * Obtiene las solicitudes de venta enviadas por los vendedores de piso.
  * En firestore.rules no existe regla directa para clientes en `sale_requests`.
- * Soporta consulta transparente en `quotes` (con `isSaleRequest: true`) y fallback seguro.
+ * El servidor aplica los permisos de cuenta y sucursal antes de devolver resultados.
  */
 export const getSaleRequests = async (
   accountId: string,
@@ -650,248 +678,131 @@ export const getSaleRequests = async (
   status?: SaleRequestStatus | 'all'
 ): Promise<SaleRequest[]> => {
   if (!accountId) return [];
-
-  try {
-    const requests: SaleRequest[] = [];
-
-    // 1. Consultar quotes con isSaleRequest == true (ruta autorizada para clientes)
-    try {
-      const quotesColl = collection(db, QUOTES_COLLECTION);
-      let q = query(
-        quotesColl,
-        where('accountId', '==', accountId),
-        where('isSaleRequest', '==', true)
-      );
-
-      if (branchId && branchId !== 'all' && branchId !== 'main') {
-        q = query(q, where('branchId', '==', branchId));
-      }
-
-      if (status && status !== 'all') {
-        q = query(q, where('status', '==', status));
-      }
-
-      const snap = await getDocs(q);
-      snap.docs.forEach((docSnap) => {
-        requests.push(saleRequestFromDoc(docSnap));
-      });
-    } catch {
-      // Fallback sin índice compuesto: filtrar en memoria
-      try {
-        const quotesColl = collection(db, QUOTES_COLLECTION);
-        const q = query(quotesColl, where('accountId', '==', accountId));
-        const snap = await getDocs(q);
-        snap.docs.forEach((docSnap) => {
-          const d = docSnap.data();
-          if (d.isSaleRequest === true || d.source === 'sale_request') {
-            if (branchId && branchId !== 'all' && branchId !== 'main' && d.branchId !== branchId) return;
-            if (status && status !== 'all' && d.status !== status) return;
-            requests.push(saleRequestFromDoc(docSnap));
-          }
-        });
-      } catch (fbErr) {
-        console.warn('[EnterpriseOps] Fallback quotes para sale_requests:', fbErr);
-      }
-    }
-
-    // 2. Si no encontró en quotes, intentar lectura en sale_requests con try/catch seguro
-    if (requests.length === 0) {
-      try {
-        const srColl = collection(db, SALE_REQUESTS_COLLECTION);
-        let q = query(srColl, where('accountId', '==', accountId));
-        if (branchId && branchId !== 'all' && branchId !== 'main') {
-          q = query(q, where('branchId', '==', branchId));
-        }
-        if (status && status !== 'all') {
-          q = query(q, where('status', '==', status));
-        }
-        const snap = await getDocs(q);
-        snap.docs.forEach((docSnap) => {
-          requests.push(saleRequestFromDoc(docSnap));
-        });
-      } catch {
-        // Ignorar fallo de permisos en sale_requests
-      }
-    }
-
-    requests.sort((a, b) => b.createdAt - a.createdAt);
-    return requests;
-  } catch (error) {
-    console.error('[EnterpriseOps] Error al obtener solicitudes de venta:', error);
-    return [];
-  }
+  const params = new URLSearchParams({ accountId, limit: '300' });
+  const response = await apiRequest<{ success: boolean; data: any[] }>(`/api/admin/sale-requests?${params.toString()}`);
+  return (response.data || [])
+    .map((item) => normalizeSaleRequest(item))
+    .filter((request) => (!branchId || branchId === 'all' || branchId === 'main' || !request.branchId || request.branchId === branchId)
+      && (!status || status === 'all' || request.status === status))
+    .sort((a, b) => b.createdAt - a.createdAt);
 };
 
-/**
- * Suscripción reactiva a solicitudes de venta
- */
+const normalizeSaleRequest = (data: any): SaleRequest => ({
+  id: String(data.id || ''),
+  requestNumber: data.requestNumber || `SOL-${String(data.id || '').slice(-4).toUpperCase()}`,
+  accountId: data.accountId || '',
+  branchId: data.branchId || '',
+  branchName: data.branchName || '',
+  sellerId: data.sellerId || data.createdBy || '',
+  sellerName: data.sellerName || data.createdByName || 'Vendedor',
+  sellerEmail: data.sellerEmail || '',
+  customerId: data.customerId || undefined,
+  customerName: data.customerName || 'Cliente General',
+  customerPhone: data.customerPhone || '',
+  customerEmail: data.customerEmail || '',
+  items: Array.isArray(data.items) ? data.items.map((raw: any) => {
+    const productId = String(raw.productId || raw.id || '');
+    const productName = String(raw.productName || raw.name || 'Producto');
+    const requestedPrice = Number(raw.requestedPrice ?? raw.price ?? raw.salePrice) || 0;
+    const originalPrice = Number(raw.originalPrice ?? raw.price ?? raw.salePrice) || requestedPrice;
+    return {
+      ...raw,
+      productId,
+      productName,
+      id: productId,
+      name: productName,
+      originalPrice,
+      requestedPrice,
+      price: requestedPrice,
+      subtotal: Number(raw.subtotal) || requestedPrice * (Number(raw.quantity) || 0),
+      presentationQty: Number(raw.presentationQty ?? raw.conversionFactor) || 1,
+      conversionFactor: Number(raw.conversionFactor ?? raw.presentationQty) || 1,
+    };
+  }) : [],
+  subtotal: Number(data.subtotal) || Number(data.total) || 0,
+  discountTotal: Number(data.discountTotal) || 0,
+  total: Number(data.total) || 0,
+  shipping: Number(data.shipping) || 0,
+  reason: data.reason || data.notes || '',
+  notes: data.notes || '',
+  status: data.reviewStatus === 'rejected' ? 'rejected'
+    : data.reviewStatus === 'approved' && data.status === 'pending' ? 'approved'
+      : data.status || 'pending',
+  createdAt: toMillis(data.createdAt || data.date),
+  reviewedAt: data.reviewedAt ? toMillis(data.reviewedAt) : undefined,
+  reviewedBy: data.reviewedBy,
+  reviewerName: data.reviewerName,
+  reviewNotes: data.reviewNotes,
+  convertedSaleId: data.convertedToSaleId || data.convertedSaleId,
+  convertedAt: data.convertedAt ? toMillis(data.convertedAt) : undefined,
+});
+
+/** Poll the canonical server resource because saleRequests is restricted to the Admin SDK. */
 export const subscribeToSaleRequests = (
   accountId: string,
   callback: (requests: SaleRequest[]) => void,
   branchId?: string
 ): (() => void) => {
-  if (!accountId) {
-    callback([]);
-    return () => {};
-  }
-
-  try {
-    const coll = collection(db, QUOTES_COLLECTION);
-    let q = query(coll, where('accountId', '==', accountId));
-
-    if (branchId && branchId !== 'all' && branchId !== 'main') {
-      q = query(q, where('branchId', '==', branchId));
+  if (!accountId) { callback([]); return () => {}; }
+  let active = true;
+  const refresh = async () => {
+    try {
+      const requests = await getSaleRequests(accountId, branchId);
+      if (active) callback(requests);
+    } catch (error) {
+      console.warn('[EnterpriseOps] No se pudieron consultar las solicitudes:', error);
+      if (active) callback([]);
     }
-
-    q = query(q, limit(100));
-
-    return onSnapshot(
-      q,
-      (snapshot: QuerySnapshot<DocumentData>) => {
-        const requests = snapshot.docs
-          .filter((d) => {
-            const data = d.data();
-            return data.isSaleRequest === true || data.source === 'sale_request';
-          })
-          .map(saleRequestFromDoc);
-        requests.sort((a, b) => b.createdAt - a.createdAt);
-        callback(requests);
-      },
-      (error) => {
-        console.warn('[EnterpriseOps] Error en suscripción a solicitudes de venta:', error);
-        callback([]);
-      }
-    );
-  } catch (error) {
-    console.error('[EnterpriseOps] Error en subscribeToSaleRequests:', error);
-    return () => {};
-  }
+  };
+  void refresh();
+  const timer = setInterval(() => {
+    const appState = getAppState();
+    if (active && (!appState || appState.currentState === 'active')) {
+      void refresh();
+    }
+  }, 30_000);
+  return () => { active = false; clearInterval(timer); };
 };
 
-/**
- * Resuelve una solicitud de venta: el Administrador o Cajero aprueba o rechaza el descuento
- */
 export const resolveSaleRequest = async (
   requestId: string,
   status: 'approved' | 'rejected',
   reviewerProfile?: { uid?: string; displayName?: string | null; role?: string; email?: string | null } | null,
-  notes?: string
+  notes?: string,
+  branchId?: string
 ): Promise<void> => {
   if (!requestId) throw new Error('ID de solicitud requerido');
-
-  const currentUser = auth.currentUser;
-  const updateData: any = {
-    status,
-    reviewedAt: Date.now(),
-    reviewedBy: reviewerProfile?.uid || currentUser?.uid || '',
-    reviewerName: reviewerProfile?.displayName || currentUser?.displayName || currentUser?.email || 'Administrador',
-    reviewNotes: notes || '',
-    updatedAt: serverTimestamp(),
-  };
-
-  // 1. Actualizar en quotes (autorizado)
-  try {
-    const quoteRef = doc(db, QUOTES_COLLECTION, requestId);
-    await updateDoc(quoteRef, updateData);
-  } catch (qErr) {
-    console.warn('[EnterpriseOps] Fallo actualizando quote para saleRequest:', qErr);
-  }
-
-  // 2. Intentar actualizar en sale_requests silenciosamente
-  try {
-    const srRef = doc(db, SALE_REQUESTS_COLLECTION, requestId);
-    await updateDoc(srRef, updateData);
-  } catch {
-    // Si sale_requests arroja permiso denegado, se ignora limpiamente
-  }
+  await apiRequest(`/api/admin/sale-requests/${encodeURIComponent(requestId)}`, {
+    method: 'PATCH',
+    body: { status, reviewNotes: notes || '', ...(branchId ? {branchId} : {}) },
+  });
 };
 
-/**
- * Registra una nueva solicitud de venta enviada por un vendedor.
- * Se guarda de forma transparente en `quotes` con `isSaleRequest: true` para cumplir firestore.rules.
- */
 export const createSaleRequest = async (input: CreateSaleRequestInput): Promise<SaleRequest> => {
-  const { accountId, branchId, total } = input;
-  if (!accountId || !branchId) {
-    throw new Error('Cuenta y sucursal requeridas para crear solicitud de venta.');
-  }
-
-  const now = Date.now();
-  const requestNumber = `SOL-${Math.floor(1000 + Math.random() * 9000)}`;
-  const currentUser = auth.currentUser;
-  const currentUserId = input.sellerId || currentUser?.uid || '';
-  const currentUserName = input.sellerName || currentUser?.displayName || currentUser?.email || 'Vendedor';
-
-  const payload: any = {
-    isSaleRequest: true,
-    requestNumber,
-    accountId,
-    branchId,
-    branchName: input.branchName || '',
-    sellerId: currentUserId,
-    sellerName: currentUserName,
-    sellerEmail: input.sellerEmail || currentUser?.email || '',
-    createdBy: currentUserId,
-    createdByName: currentUserName,
-    customerId: input.customerId || null,
-    customerName: (input.customerName || 'Cliente General').trim(),
-    customerPhone: input.customerPhone || null,
-    customerEmail: input.customerEmail || null,
-    items: input.items || [],
-    subtotal: Math.round(input.subtotal * 100) / 100,
-    discountTotal: Math.round((input.discountTotal || 0) * 100) / 100,
-    total: Math.round(total * 100) / 100,
-    reason: input.reason || '',
-    notes: input.notes || '',
-    status: 'pending' as SaleRequestStatus,
-    source: 'sale_request',
-    date: now,
-    createdAt: now,
-    serverCreatedAt: serverTimestamp(),
-  };
-
-  const cleanPayload = cleanFirestoreData(payload);
-
-  // 1. Guardar en quotes (autorizado en firestore.rules)
-  const docRef = await addDoc(collection(db, QUOTES_COLLECTION), cleanPayload);
-
-  // 2. Intentar guardar en sale_requests de forma oportunista y segura
-  try {
-    const saleReqRef = doc(db, SALE_REQUESTS_COLLECTION, docRef.id);
-    await setDoc(saleReqRef, cleanPayload);
-  } catch {
-    // Si sale_requests arroja permission-denied en cliente, se ignora
-  }
-
-  return {
-    id: docRef.id,
-    ...cleanPayload,
-  };
+  if (!input.accountId || !input.branchId) throw new Error('Cuenta y sucursal requeridas para crear solicitud de venta.');
+  const response = await apiRequest<{ success: boolean; data: any }>('/api/admin/sale-requests', {
+    method: 'POST',
+    body: {
+      ...input,
+      source: 'mobile',
+      shipping: Math.round((input.shipping || 0) * 100) / 100,
+      items: (input.items || []).map((item) => {
+        const price = Number(item.requestedPrice ?? item.price) || 0;
+        return { ...item, id: item.productId, name: item.productName, price, requestedPrice: price };
+      }),
+      subtotal: Math.round(input.subtotal * 100) / 100,
+      discountTotal: Math.round((input.discountTotal || 0) * 100) / 100,
+      total: Math.round(input.total * 100) / 100,
+    },
+  });
+  return normalizeSaleRequest(response.data);
 };
 
-/**
- * Marca una solicitud de venta como convertida a venta real en el POS
- */
-export const markSaleRequestAsConverted = async (
-  requestId: string,
-  saleId: string
-): Promise<void> => {
-  const updatePayload = {
-    status: 'converted',
-    convertedSaleId: saleId,
-    convertedAt: Date.now(),
-    updatedAt: serverTimestamp(),
-  };
-
-  try {
-    const quoteRef = doc(db, QUOTES_COLLECTION, requestId);
-    await updateDoc(quoteRef, updatePayload);
-  } catch {}
-
-  try {
-    const srRef = doc(db, SALE_REQUESTS_COLLECTION, requestId);
-    await updateDoc(srRef, updatePayload);
-  } catch {}
+export const markSaleRequestAsConverted = async (requestId: string, saleId: string): Promise<void> => {
+  if (!requestId || !saleId) throw new Error('Solicitud y venta requeridas.');
+  await apiRequest(`/api/admin/sale-requests/${encodeURIComponent(requestId)}`, {
+    method: 'PATCH', body: { status: 'converted', convertedToSaleId: saleId },
+  });
 };
 
 // ============================================================================
@@ -1036,16 +947,16 @@ export const getPayrollMovements = async (
     const movements: PayrollMovement[] = [];
 
     // 1. Consultar cash_register_movements (adelantos y egresos de caja chica)
-    try {
-      const coll = collection(db, CASH_MOVEMENTS_COLLECTION);
-      let q = query(coll, where('accountId', '==', accountId));
+    const coll = collection(db, CASH_MOVEMENTS_COLLECTION);
+    let q = query(coll, where('accountId', '==', accountId));
 
-      if (branchId && branchId !== 'all' && branchId !== 'main') {
-        q = query(q, where('branchId', '==', branchId));
-      }
+    if (branchId && branchId !== 'all' && branchId !== 'main') {
+      q = query(q, where('branchId', '==', branchId));
+    }
+    q = query(q, limit(100));
 
-      const snapshot = await getDocs(q);
-      snapshot.docs.forEach((docSnap) => {
+    const snapshot = await getDocs(q);
+    snapshot.docs.forEach((docSnap) => {
         const data = docSnap.data();
         const isAdvance = data.isEmployeeAdvance === true ||
           data.category === 'payroll_advance' ||
@@ -1077,22 +988,19 @@ export const getPayrollMovements = async (
           date: toMillis(data.date || data.createdAt),
           createdAt: data.createdAt,
         });
-      });
-    } catch (cashErr) {
-      console.warn('[EnterpriseOps] Error leyendo cash_register_movements para nómina:', cashErr);
-    }
+    });
 
     // 2. Consultar payroll_settlements (liquidaciones y pagos no deducidos de caja)
-    try {
-      const setColl = collection(db, PAYROLL_SETTLEMENTS_COLLECTION);
-      let setQ = query(setColl, where('accountId', '==', accountId));
+    const setColl = collection(db, PAYROLL_SETTLEMENTS_COLLECTION);
+    let setQ = query(setColl, where('accountId', '==', accountId));
 
-      if (branchId && branchId !== 'all' && branchId !== 'main') {
-        setQ = query(setQ, where('branchId', '==', branchId));
-      }
+    if (branchId && branchId !== 'all' && branchId !== 'main') {
+      setQ = query(setQ, where('branchId', '==', branchId));
+    }
+    setQ = query(setQ, limit(100));
 
-      const setSnap = await getDocs(setQ);
-      setSnap.docs.forEach((docSnap) => {
+    const setSnap = await getDocs(setQ);
+    setSnap.docs.forEach((docSnap) => {
         const data = docSnap.data();
         const rawConcept: PayrollConceptType = (data.conceptType as PayrollConceptType) || 'salary';
         const amt = Math.abs(Number(data.netPayable) || Number(data.netSalary) || Number(data.total) || 0);
@@ -1118,16 +1026,13 @@ export const getPayrollMovements = async (
           date: toMillis(data.date || data.createdAt),
           createdAt: data.createdAt,
         });
-      });
-    } catch {
-      // payroll_settlements puede tener acceso restringido a no-admins; si falla, se ignora limpiamente
-    }
+    });
 
     movements.sort((a, b) => b.date - a.date);
     return movements;
   } catch (error) {
     console.error('[EnterpriseOps] Error al obtener movimientos de planilla:', error);
-    return [];
+    throw error;
   }
 };
 
@@ -1137,70 +1042,32 @@ export const getPayrollMovements = async (
 export const subscribeToPayrollMovements = (
   accountId: string,
   callback: (movements: PayrollMovement[]) => void,
-  branchId?: string
+  branchId?: string,
+  onError?: (error: unknown) => void,
 ): (() => void) => {
   if (!accountId) {
     callback([]);
     return () => {};
   }
 
-  try {
-    const coll = collection(db, CASH_MOVEMENTS_COLLECTION);
-    let q = query(coll, where('accountId', '==', accountId));
-
-    if (branchId && branchId !== 'all' && branchId !== 'main') {
-      q = query(q, where('branchId', '==', branchId));
+  let active = true;
+  const refresh = async () => {
+    try {
+      const movements = await getPayrollMovements(accountId, branchId);
+      if (active) callback(movements);
+    } catch (error) {
+      console.error('[EnterpriseOps] Error al consultar historial de planilla:', error);
+      if (active) onError?.(error);
     }
-
-    q = query(q, limit(150));
-
-    return onSnapshot(
-      q,
-      (snapshot) => {
-        const movements: PayrollMovement[] = [];
-        snapshot.docs.forEach((docSnap) => {
-          const data = docSnap.data();
-          const isAdvance = data.isEmployeeAdvance === true ||
-            data.category === 'payroll_advance' ||
-            data.category === 'payroll';
-
-          if (!isAdvance) return;
-
-          const rawConcept = (data.conceptType || 'advance') as PayrollConceptType;
-          movements.push({
-            id: docSnap.id,
-            accountId: data.accountId || accountId,
-            branchId: data.branchId || '',
-            branchName: data.branchName || '',
-            employeeId: data.employeeId || '',
-            employeeName: data.employeeName || 'Colaborador',
-            employeeRole: data.employeeRole || '',
-            amount: Math.abs(Number(data.amount) || 0),
-            conceptType: rawConcept,
-            conceptLabel: getConceptDisplay(rawConcept),
-            paymentMethod: data.paymentMethod || 'Efectivo',
-            notes: data.description || data.notes || '',
-            deductFromCashDrawer: true,
-            sessionId: data.sessionId || null,
-            cashMovementId: docSnap.id,
-            createdBy: data.createdBy || '',
-            createdByName: data.createdByName || 'Usuario',
-            date: toMillis(data.date || data.createdAt),
-          });
-        });
-
-        movements.sort((a, b) => b.date - a.date);
-        callback(movements);
-      },
-      (error) => {
-        console.warn('[EnterpriseOps] Error en subscribeToPayrollMovements:', error);
-        callback([]);
-      }
-    );
-  } catch (error) {
-    console.error('[EnterpriseOps] Error al configurar subscribeToPayrollMovements:', error);
-    return () => {};
-  }
+  };
+  void refresh();
+  const timer = setInterval(() => {
+    const appState = getAppState();
+    if (active && (!appState || appState.currentState === 'active')) {
+      void refresh();
+    }
+  }, 30_000);
+  return () => { active = false; clearInterval(timer); };
 };
 
 /**
@@ -1329,19 +1196,16 @@ export const registerPayrollPayment = async (
     conceptType,
     paymentMethod: paymentMethod || 'Transferencia',
     notes: notes || '',
-    status: 'draft',
+    status: 'approved',
     createdBy: currentUserId,
     createdByName: currentUserName,
     date: now,
+    paidAt: now,
     createdAt: Date.now(),
     serverCreatedAt: serverTimestamp(),
   };
 
-  try {
-    await setDoc(settlementRef, cleanFirestoreData(settlementPayload));
-  } catch (err: any) {
-    console.warn('[EnterpriseOps] Aviso al registrar en payroll_settlements (posible rol no-admin):', err?.message);
-  }
+  await setDoc(settlementRef, cleanFirestoreData(settlementPayload));
 
   return {
     payrollMovementId: settlementId,

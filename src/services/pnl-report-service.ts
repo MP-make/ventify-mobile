@@ -6,20 +6,11 @@
  * Genera reportes en PDF ejecutivos vía expo-print y expo-sharing.
  */
 
-import { db } from '@/lib/firebase';
-import {
-  collection,
-  query,
-  where,
-  getDocs,
-  getDoc,
-  doc,
-  Timestamp,
-} from 'firebase/firestore';
+import { apiRequest } from '@/lib/api-client';
 import * as Print from 'expo-print';
 import * as Sharing from 'expo-sharing';
 import { formatPEN, formatDatePE } from '@/lib/theme';
-import type { Product, Sale, CartItem } from '@/types';
+import type { Product } from '@/types';
 
 // ============================================================================
 // TIPOS E INTERFACES DEL ESTADO DE RESULTADOS (P&L)
@@ -89,28 +80,36 @@ export interface PnlReportResult {
 
   // Cascada de Estado de Resultados (P&L Waterfall)
   grossSales: number;           // Ventas brutas totales facturadas
+  salesClosed: number;
   cancelledOrRefunded: number;  // Ventas anuladas y devoluciones
   netRevenue: number;           // Ventas netas operativas (grossSales - cancelledOrRefunded)
-  transactionCount: number;     // Transacciones de venta efectivas
+  transactionCount?: number;
 
   cogs: number;                 // Costo de Mercadería Vendida (CMV)
   grossProfit: number;          // Utilidad Bruta (netRevenue - cogs)
   grossMarginPercent: number;   // Margen Bruto % ((grossProfit / netRevenue) * 100)
 
   operatingExpenses: number;    // Gastos Operativos Totales (Caja chica + Planilla)
-  pettyCashExpenses: number;    // Gastos de caja chica
-  payrollExpenses: number;      // Gastos de planilla / salarios
-  expensesByCategory: Record<string, number>;
-  expenseBreakdown: ExpenseCategoryBreakdown[];
+  pettyCashExpenses?: number;
+  payrollExpenses?: number;
+  expensesByCategory?: Record<string, number>;
+  expenseBreakdown?: ExpenseCategoryBreakdown[];
 
   netProfit: number;            // Utilidad Neta Real (grossProfit - operatingExpenses)
   netMarginPercent: number;     // Margen Neto % ((netProfit / netRevenue) * 100)
 
   // Desgloses y Rankings
-  paymentBreakdown: PaymentBreakdownSummary;
-  topProductsByRevenue: TopProductMetric[];
-  topProductsByProfit: TopProductMetric[];
-  sellerPerformance: SellerPerformanceMetric[];
+  paymentBreakdown?: PaymentBreakdownSummary;
+  topProductsByRevenue?: TopProductMetric[];
+  topProductsByProfit?: TopProductMetric[];
+  sellerPerformance?: SellerPerformanceMetric[];
+  detailsAvailable: boolean;
+  fiadosIssued: number;
+  returns: number;
+  badDebt: number;
+  employeeAdvances: number;
+  cashOperatingExpenses: number;
+  terminalCommissions: number;
 }
 
 // ============================================================================
@@ -120,6 +119,14 @@ export interface PnlReportResult {
 export function roundToCents(amount: number): number {
   if (!Number.isFinite(amount)) return 0;
   return Math.round(amount * 100) / 100;
+}
+
+function requireReportAmount(data: Record<string, any>, field: string): number {
+  const value = data[field];
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new Error(`El reporte Web no devolvió la métrica financiera "${field}".`);
+  }
+  return roundToCents(value);
 }
 
 export function toMillis(val: any): number {
@@ -222,507 +229,60 @@ export function getExpenseCategoryLabel(catId?: string | null): string {
 // ============================================================================
 
 export async function generatePnlReport(params: GeneratePnlReportParams): Promise<PnlReportResult> {
-  const { accountId, branchId, productsMap } = params;
-  const filterBranch = branchId && branchId !== 'all' ? branchId : undefined;
-
+  if (!params.accountId) throw new Error('La cuenta es requerida para consultar el P&L.');
   const startMs = toMillis(params.startDate);
-  let endMs = toMillis(params.endDate);
-
-  // Si la fecha final es a las 00:00:00, extenderla al final del día
-  const endDateObj = new Date(endMs);
-  if (endDateObj.getHours() === 0 && endDateObj.getMinutes() === 0 && endDateObj.getSeconds() === 0) {
-    endMs = new Date(endDateObj.getFullYear(), endDateObj.getMonth(), endDateObj.getDate(), 23, 59, 59, 999).getTime();
-  }
-
-  // 1. CONSULTA RESILIENTE DE VENTAS (sales)
-  let salesDocs: Array<Record<string, any>> = [];
-  try {
-    let q = query(
-      collection(db, 'sales'),
-      where('accountId', '==', accountId),
-      where('date', '>=', startMs),
-      where('date', '<=', endMs)
-    );
-    if (filterBranch) {
-      q = query(
-        collection(db, 'sales'),
-        where('accountId', '==', accountId),
-        where('branchId', '==', filterBranch),
-        where('date', '>=', startMs),
-        where('date', '<=', endMs)
-      );
-    }
-    const snap = await getDocs(q);
-    salesDocs = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-  } catch (err: any) {
-    // Fallback sin rango en Firestore si falta el índice compuesto
-    try {
-      let fallbackQ = query(
-        collection(db, 'sales'),
-        where('accountId', '==', accountId)
-      );
-      if (filterBranch) {
-        fallbackQ = query(
-          collection(db, 'sales'),
-          where('accountId', '==', accountId),
-          where('branchId', '==', filterBranch)
-        );
-      }
-      const snap = await getDocs(fallbackQ);
-      salesDocs = snap.docs
-        .map((d) => ({ id: d.id, ...d.data() }))
-        .filter((sale: any) => {
-          const sTime = toMillis(sale.date || sale.createdAt);
-          return sTime >= startMs && sTime <= endMs;
-        });
-    } catch (fbErr) {
-      console.error('[PnlService] Error consultando ventas:', fbErr);
-      salesDocs = [];
-    }
-  }
-
-  // 2. CONSULTA RESILIENTE DE MOVIMIENTOS DE CAJA (cash_register_movements)
-  let movementsDocs: Array<Record<string, any>> = [];
-  try {
-    let q = query(
-      collection(db, 'cash_register_movements'),
-      where('accountId', '==', accountId),
-      where('createdAt', '>=', Timestamp.fromMillis(startMs)),
-      where('createdAt', '<=', Timestamp.fromMillis(endMs))
-    );
-    if (filterBranch) {
-      q = query(
-        collection(db, 'cash_register_movements'),
-        where('accountId', '==', accountId),
-        where('branchId', '==', filterBranch),
-        where('createdAt', '>=', Timestamp.fromMillis(startMs)),
-        where('createdAt', '<=', Timestamp.fromMillis(endMs))
-      );
-    }
-    const snap = await getDocs(q);
-    movementsDocs = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-  } catch (err: any) {
-    // Fallback sin filtro de fecha en Firestore
-    try {
-      let fallbackQ = query(
-        collection(db, 'cash_register_movements'),
-        where('accountId', '==', accountId)
-      );
-      if (filterBranch) {
-        fallbackQ = query(
-          collection(db, 'cash_register_movements'),
-          where('accountId', '==', accountId),
-          where('branchId', '==', filterBranch)
-        );
-      }
-      const snap = await getDocs(fallbackQ);
-      movementsDocs = snap.docs
-        .map((d) => ({ id: d.id, ...d.data() }))
-        .filter((m: any) => {
-          const mTime = toMillis(m.createdAt || m.date);
-          return mTime >= startMs && mTime <= endMs;
-        });
-    } catch (fbErr) {
-      console.error('[PnlService] Error consultando movimientos de caja:', fbErr);
-      movementsDocs = [];
-    }
-  }
-
-  // 3. CONSULTA RESILIENTE DE LIQUIDACIONES DE PLANILLA (payroll_settlements)
-  // NOTA: No se consulta la colección inexistente `payroll_movements`. Los adelantos de sueldo
-  // ya vienen incluidos en `cash_register_movements` con category === 'payroll_advance' o isEmployeeAdvance === true.
-  let settlementItems: Array<{ amount: number; description: string; date: number }> = [];
-  try {
-    const pSettlementsQ = query(
-      collection(db, 'payroll_settlements'),
-      where('accountId', '==', accountId)
-    );
-    const snap = await getDocs(pSettlementsQ);
-    snap.docs.forEach((d) => {
-      const data = d.data() as any;
-      if (filterBranch && data.branchId && data.branchId !== filterBranch) return;
-      if (data.status === 'draft') return; // Solo liquidadas o pagadas
-      const t = toMillis(data.date || data.createdAt || data.periodEnd);
-      if (t >= startMs && t <= endMs) {
-        const netSal = Number(data.netSalary ?? data.netPayable ?? data.total) || 0;
-        if (netSal > 0) {
-          settlementItems.push({
-            amount: netSal,
-            description: `Liquidación Planilla: ${data.employeeName || ''}`,
-            date: t,
-          });
-        }
-      }
-    });
-  } catch {
-    // Colección de liquidaciones opcional y protegida por rol admin
-  }
-
-  // 4. MAPA DE COSTOS DE PRODUCTOS DE APOYO (si no vienen en snapshot)
-  const getProductCost = (productId?: string): number => {
-    if (!productId) return 0;
-    if (productsMap) {
-      if (typeof (productsMap as any).get === 'function') {
-        const p = (productsMap as Map<string, Product>).get(productId);
-        if (p) {
-          if (filterBranch && p.branchPrices?.[filterBranch]?.costPrice !== undefined) {
-            return Number(p.branchPrices[filterBranch]?.costPrice) || 0;
-          }
-          return Number(p.costPrice) || 0;
-        }
-      } else if (typeof productsMap === 'object') {
-        const p = (productsMap as Record<string, Product>)[productId];
-        if (p) {
-          if (filterBranch && p.branchPrices?.[filterBranch]?.costPrice !== undefined) {
-            return Number(p.branchPrices[filterBranch]?.costPrice) || 0;
-          }
-          return Number(p.costPrice) || 0;
-        }
-      }
-    }
-    return 0;
-  };
-
-  // 5. CÁLCULO DE VENTAS, COGS, MÉTODOS DE PAGO Y RENDIMIENTOS
-  let grossSales = 0;
-  let cancelledOrRefunded = 0;
-  let totalCogs = 0;
-  let validTransactionCount = 0;
-
-  const paymentAmounts = {
-    cash: 0,
-    yape: 0,
-    plin: 0,
-    card: 0,
-    transfer: 0,
-    fiado: 0,
-    other: 0,
-  };
-
-  const productMetricsMap = new Map<string, {
-    productId: string;
-    productName: string;
-    sku: string;
-    quantity: number;
-    revenue: number;
-    cogs: number;
-  }>();
-
-  const sellerMetricsMap = new Map<string, {
-    sellerId: string;
-    sellerName: string;
-    count: number;
-    revenue: number;
-    cogs: number;
-  }>();
-
-  for (const sale of salesDocs) {
-    const isCancelled = sale.status === 'cancelled';
-    const isRefund = sale.status === 'refunded' || sale.isReturn === true;
-    const isDeposit = sale.isDepositPayment === true;
-    const saleTotal = Number(sale.total) || 0;
-
-    // A. Ventas anuladas: se descartan del ingreso neto
-    if (isCancelled) {
-      cancelledOrRefunded = roundToCents(cancelledOrRefunded + saleTotal);
-      continue;
-    }
-
-    // B. Devoluciones o reembolsos: restan ingreso y revierten CMV
-    if (isRefund) {
-      const refundAmt = Math.abs(Number(sale.refundAmount ?? saleTotal) || 0);
-      cancelledOrRefunded = roundToCents(cancelledOrRefunded + refundAmt);
-
-      // Revertir costo de mercadería devuelta si viene en los items
-      if (Array.isArray(sale.items)) {
-        for (const item of sale.items) {
-          const qty = Number(item.quantity) || 0;
-          const factor = Number(item.presentationQty ?? item.conversionFactor) > 0
-            ? Number(item.presentationQty ?? item.conversionFactor)
-            : 1;
-          const units = Number(item.baseUnits) > 0 ? Number(item.baseUnits) : qty * factor;
-          const unitCost = typeof item.costPrice === 'number' && item.costPrice > 0
-            ? item.costPrice
-            : getProductCost(item.productId || item.id);
-          totalCogs = roundToCents(totalCogs - (unitCost * units));
-        }
-      }
-      continue;
-    }
-
-    // C. Pagos de saldo / depósito (evitar duplicar ventas cerradas)
-    if (isDeposit) {
-      continue;
-    }
-
-    // D. Venta efectiva regular
-    grossSales = roundToCents(grossSales + saleTotal);
-    validTransactionCount += 1;
-
-    // Calcular CMV de los ítems de la venta
-    let saleCogs = 0;
-    if (Array.isArray(sale.items)) {
-      for (const item of sale.items) {
-        const qty = Number(item.quantity) || 0;
-        const factor = Number(item.presentationQty ?? item.conversionFactor) > 0
-          ? Number(item.presentationQty ?? item.conversionFactor)
-          : 1;
-        const units = Number(item.baseUnits) > 0 ? Number(item.baseUnits) : qty * factor;
-        const unitCost = typeof item.costPrice === 'number' && item.costPrice > 0
-          ? item.costPrice
-          : getProductCost(item.productId || item.id);
-
-        const lineCost = unitCost * units;
-        const linePrice = Number(item.price ?? item.salePrice ?? item.unitPrice) || 0;
-        const lineRevenue = Number(item.lineTotal) || (linePrice * qty);
-
-        saleCogs += lineCost;
-
-        // Métricas por producto
-        const prodId = String(item.productId || item.id || item.name || 'unnamed');
-        const prodName = String(item.name || 'Producto General');
-        const prodSku = String(item.sku || '');
-
-        const existingProd = productMetricsMap.get(prodId) || {
-          productId: prodId,
-          productName: prodName,
-          sku: prodSku,
-          quantity: 0,
-          revenue: 0,
-          cogs: 0,
-        };
-
-        existingProd.quantity += qty;
-        existingProd.revenue += lineRevenue;
-        existingProd.cogs += lineCost;
-        productMetricsMap.set(prodId, existingProd);
-      }
-    } else if (typeof sale.totalCost === 'number' && sale.totalCost > 0) {
-      // Si la venta tiene totalCost precalculado
-      saleCogs = sale.totalCost;
-    }
-
-    totalCogs = roundToCents(totalCogs + saleCogs);
-
-    // Desglose de Métodos de Pago
-    if (Array.isArray(sale.payments) && sale.payments.length > 0) {
-      for (const p of sale.payments) {
-        const cat = String(p.category || p.paymentMethod || '').toLowerCase();
-        const prov = String(p.digitalProvider || '').toLowerCase();
-        const amt = Number(p.amount) || 0;
-
-        if (cat.includes('cash') || cat.includes('efectivo')) {
-          paymentAmounts.cash += amt;
-        } else if (prov === 'yape' || cat.includes('yape')) {
-          paymentAmounts.yape += amt;
-        } else if (prov === 'plin' || cat.includes('plin')) {
-          paymentAmounts.plin += amt;
-        } else if (cat.includes('card') || cat.includes('tarjeta')) {
-          paymentAmounts.card += amt;
-        } else if (cat.includes('transfer')) {
-          paymentAmounts.transfer += amt;
-        } else if (cat.includes('fiado') || cat.includes('credit')) {
-          paymentAmounts.fiado += amt;
-        } else {
-          paymentAmounts.other += amt;
-        }
-      }
-    } else {
-      const pm = String(sale.paymentMethod || '').toLowerCase();
-      const digProv = String(sale.digitalProvider || '').toLowerCase();
-
-      if (pm === 'mixto' || pm === 'mixed') {
-        paymentAmounts.cash += Number(sale.cashAmount) || 0;
-        paymentAmounts.card += Number(sale.cardAmount) || 0;
-        const dig = Number(sale.digitalAmount) || 0;
-        if (digProv === 'plin') paymentAmounts.plin += dig;
-        else paymentAmounts.yape += dig;
-      } else if (pm.includes('efectivo') || pm === 'cash') {
-        paymentAmounts.cash += saleTotal;
-      } else if (pm === 'yape' || (pm.includes('digital') && digProv === 'yape')) {
-        paymentAmounts.yape += saleTotal;
-      } else if (pm === 'plin' || (pm.includes('digital') && digProv === 'plin')) {
-        paymentAmounts.plin += saleTotal;
-      } else if (pm.includes('tarjeta') || pm === 'card') {
-        paymentAmounts.card += saleTotal;
-      } else if (pm.includes('transfer')) {
-        paymentAmounts.transfer += saleTotal;
-      } else if (pm.includes('fiado') || pm.includes('credit')) {
-        paymentAmounts.fiado += saleTotal;
-      } else {
-        paymentAmounts.other += saleTotal;
-      }
-    }
-
-    // Rendimiento por Vendedor / Cajero
-    const sellerId = String(sale.sellerId || sale.userId || sale.cashierId || 'unassigned');
-    const sellerName = String(sale.sellerName || sale.userName || sale.cashierUsername || 'Ventas General');
-
-    const existingSeller = sellerMetricsMap.get(sellerId) || {
-      sellerId,
-      sellerName,
-      count: 0,
-      revenue: 0,
-      cogs: 0,
-    };
-    existingSeller.count += 1;
-    existingSeller.revenue += saleTotal;
-    existingSeller.cogs += saleCogs;
-    sellerMetricsMap.set(sellerId, existingSeller);
-  }
-
-  // 6. GASTOS OPERATIVOS DE CAJA CHICA Y CATEGORIZACIÓN
-  const expensesByCategory: Record<string, number> = {};
-  let pettyCashExpenses = 0;
-  let cashPayrollExpenses = 0;
-
-  for (const m of movementsDocs) {
-    if (m.type !== 'expense') continue;
-
-    // Excluir devoluciones de venta en caja chica que ya restan ventas
-    const cat = String(m.category || '').toLowerCase();
-    if (cat === 'refund' || cat === 'sale_refund' || cat === 'reservation_refund') {
-      continue;
-    }
-
-    const amt = Math.abs(Number(m.amount) || 0);
-    if (amt <= 0) continue;
-
-    const isPayrollAdvance = m.isEmployeeAdvance === true ||
-      cat === 'payroll_advance' ||
-      cat === 'payroll';
-
-    if (isPayrollAdvance) {
-      cashPayrollExpenses = roundToCents(cashPayrollExpenses + amt);
-      const label = getExpenseCategoryLabel('payroll');
-      expensesByCategory[label] = roundToCents((expensesByCategory[label] || 0) + amt);
-    } else {
-      pettyCashExpenses = roundToCents(pettyCashExpenses + amt);
-      const catKey = m.expenseCategoryId || m.category || 'other';
-      const label = getExpenseCategoryLabel(catKey);
-      expensesByCategory[label] = roundToCents((expensesByCategory[label] || 0) + amt);
-    }
-  }
-
-  // 7. GASTOS DE PLANILLA (Adelantos de caja + Liquidaciones de nómina en payroll_settlements)
-  let settlementPayrollExpenses = 0;
-  for (const p of settlementItems) {
-    settlementPayrollExpenses = roundToCents(settlementPayrollExpenses + p.amount);
-  }
-  if (settlementPayrollExpenses > 0) {
-    const pLabel = getExpenseCategoryLabel('payroll');
-    expensesByCategory[pLabel] = roundToCents((expensesByCategory[pLabel] || 0) + settlementPayrollExpenses);
-  }
-
-  const payrollExpenses = roundToCents(cashPayrollExpenses + settlementPayrollExpenses);
-  const operatingExpenses = roundToCents(pettyCashExpenses + payrollExpenses);
-
-  // Desglose ordenado de gastos con porcentajes
-  const expenseBreakdown: ExpenseCategoryBreakdown[] = Object.entries(expensesByCategory).map(([label, amt]) => ({
-    category: label,
-    label,
-    amount: amt,
-    percentage: operatingExpenses > 0 ? roundToCents((amt / operatingExpenses) * 100) : 0,
-  })).sort((a, b) => b.amount - a.amount);
-
-  // 8. CÁLCULO FINAL DE MÁRGENES Y TOTALES
-  const netRevenue = roundToCents(grossSales - cancelledOrRefunded);
-  const grossProfit = roundToCents(netRevenue - totalCogs);
-  const grossMarginPercent = netRevenue > 0 ? roundToCents((grossProfit / netRevenue) * 100) : 0;
-
-  const netProfit = roundToCents(grossProfit - operatingExpenses);
-  const netMarginPercent = netRevenue > 0 ? roundToCents((netProfit / netRevenue) * 100) : 0;
-
-  // Resumen de métodos de pago con porcentajes
-  const totalPayments = Object.values(paymentAmounts).reduce((acc, v) => acc + v, 0);
-  const calcShare = (val: number): PaymentMethodShare => ({
-    amount: roundToCents(val),
-    percentage: totalPayments > 0 ? roundToCents((val / totalPayments) * 100) : 0,
+  const endMs = toMillis(params.endDate);
+  const search = new URLSearchParams({
+    accountId: params.accountId,
+    from: new Date(startMs).toISOString(),
+    to: new Date(endMs).toISOString(),
   });
+  if (params.branchId && params.branchId !== 'all') search.set('branchId', params.branchId);
 
-  const paymentBreakdown: PaymentBreakdownSummary = {
-    cash: calcShare(paymentAmounts.cash),
-    yape: calcShare(paymentAmounts.yape),
-    plin: calcShare(paymentAmounts.plin),
-    card: calcShare(paymentAmounts.card),
-    transfer: calcShare(paymentAmounts.transfer),
-    fiado: calcShare(paymentAmounts.fiado),
-    other: calcShare(paymentAmounts.other),
-    total: roundToCents(totalPayments),
-  };
+  let data: Record<string, any>;
+  try {
+    data = await apiRequest<Record<string, any>>(`/api/reports/pnl?${search.toString()}`);
+  } catch (error: any) {
+    throw new Error(error?.status === 403
+      ? 'No tienes permiso para ver márgenes y reportes financieros.'
+      : error?.message || 'No se pudo generar el Estado de Resultados.');
+  }
 
-  // Top 10 Productos por Ingresos y por Ganancia
-  const allProductMetrics: TopProductMetric[] = Array.from(productMetricsMap.values()).map((p) => {
-    const profit = roundToCents(p.revenue - p.cogs);
-    return {
-      productId: p.productId,
-      productName: p.productName,
-      sku: p.sku,
-      quantitySold: roundToCents(p.quantity),
-      revenue: roundToCents(p.revenue),
-      cogs: roundToCents(p.cogs),
-      profit,
-      marginPercent: p.revenue > 0 ? roundToCents((profit / p.revenue) * 100) : 0,
-    };
-  });
-
-  const topProductsByRevenue = [...allProductMetrics]
-    .sort((a, b) => b.revenue - a.revenue)
-    .slice(0, 10);
-
-  const topProductsByProfit = [...allProductMetrics]
-    .sort((a, b) => b.profit - a.profit)
-    .slice(0, 10);
-
-  // Rendimiento de Vendedores
-  const sellerPerformance: SellerPerformanceMetric[] = Array.from(sellerMetricsMap.values()).map((s) => {
-    const profit = roundToCents(s.revenue - s.cogs);
-    return {
-      sellerId: s.sellerId,
-      sellerName: s.sellerName,
-      transactionsCount: s.count,
-      revenue: roundToCents(s.revenue),
-      cogs: roundToCents(s.cogs),
-      profit,
-      marginPercent: s.revenue > 0 ? roundToCents((profit / s.revenue) * 100) : 0,
-    };
-  }).sort((a, b) => b.revenue - a.revenue);
+  const salesClosed = requireReportAmount(data, 'salesClosed');
+  const fiadosIssued = requireReportAmount(data, 'fiadosIssued');
+  const netRevenue = requireReportAmount(data, 'accruedSales');
+  const grossProfit = requireReportAmount(data, 'grossProfit');
+  const operatingExpenses = requireReportAmount(data, 'operatingExpenses');
+  const netProfit = requireReportAmount(data, 'netProfit');
+  const grossSales = roundToCents(salesClosed + fiadosIssued);
+  const canceled = requireReportAmount(data, 'returns');
 
   return {
-    accountId,
-    branchId: filterBranch,
-    startDate: startMs,
-    endDate: endMs,
-    generatedAt: Date.now(),
-
+    accountId: params.accountId,
+    branchId: data.branchId || params.branchId,
+    startDate: Number(data.fromMs) || startMs,
+    endDate: Number(data.toMs) || endMs,
+    generatedAt: Number(data.generatedAt) || Date.now(),
     grossSales,
-    cancelledOrRefunded,
+    salesClosed,
+    cancelledOrRefunded: canceled,
     netRevenue,
-    transactionCount: validTransactionCount,
-
-    cogs: totalCogs,
+    transactionCount: typeof data.transactionCount === 'number' ? data.transactionCount : undefined,
+    cogs: requireReportAmount(data, 'cmv'),
     grossProfit,
-    grossMarginPercent,
-
+    grossMarginPercent: netRevenue > 0 ? roundToCents((grossProfit / netRevenue) * 100) : 0,
     operatingExpenses,
-    pettyCashExpenses,
-    payrollExpenses,
-    expensesByCategory,
-    expenseBreakdown,
-
     netProfit,
-    netMarginPercent,
-
-    paymentBreakdown,
-    topProductsByRevenue,
-    topProductsByProfit,
-    sellerPerformance,
+    netMarginPercent: netRevenue > 0 ? roundToCents((netProfit / netRevenue) * 100) : 0,
+    detailsAvailable: false,
+    fiadosIssued,
+    returns: canceled,
+    badDebt: requireReportAmount(data, 'badDebt'),
+    employeeAdvances: requireReportAmount(data, 'employeeAdvances'),
+    cashOperatingExpenses: requireReportAmount(data, 'cashOperatingExpenses'),
+    terminalCommissions: requireReportAmount(data, 'terminalCommissions'),
   };
 }
-
-// ============================================================================
-// EXPORTACIÓN EJECUTIVA EN PDF (expo-print & expo-sharing)
-// ============================================================================
 
 export async function exportPnlReportPDF(
   report: PnlReportResult,
@@ -733,9 +293,13 @@ export async function exportPnlReportPDF(
   const isProfitable = report.netProfit >= 0;
   const netProfitColor = isProfitable ? '#10B981' : '#EF4444';
   const netMarginSign = report.netMarginPercent >= 0 ? '+' : '';
+  const topProducts = report.topProductsByProfit || [];
+  const sellers = report.sellerPerformance || [];
+  const expenses = report.expenseBreakdown || [];
+  const paymentBreakdown = report.paymentBreakdown;
 
   // Filas del Top 10 Productos
-  const topProductsRows = report.topProductsByProfit.map((prod, idx) => {
+  const topProductsRows = topProducts.map((prod, idx) => {
     const profitColor = prod.profit >= 0 ? '#10B981' : '#EF4444';
     return `
       <tr>
@@ -754,7 +318,7 @@ export async function exportPnlReportPDF(
   }).join('');
 
   // Filas del Rendimiento por Vendedor
-  const sellerRows = report.sellerPerformance.map((seller) => {
+  const sellerRows = sellers.map((seller) => {
     return `
       <tr>
         <td style="font-weight: 600; color: #111827;">${seller.sellerName}</td>
@@ -768,7 +332,7 @@ export async function exportPnlReportPDF(
   }).join('');
 
   // Filas de Gastos Operativos por Categoría
-  const expenseRows = report.expenseBreakdown.map((exp) => {
+  const expenseRows = expenses.map((exp) => {
     return `
       <tr>
         <td style="font-weight: 500; color: #1F2937;">${exp.label}</td>
@@ -779,15 +343,15 @@ export async function exportPnlReportPDF(
   }).join('');
 
   // Filas de Métodos de Pago
-  const paymentMethodsList = [
-    { label: 'Efectivo', data: report.paymentBreakdown.cash, color: '#10B981' },
-    { label: 'Yape', data: report.paymentBreakdown.yape, color: '#8B5CF6' },
-    { label: 'Plin', data: report.paymentBreakdown.plin, color: '#06B6D4' },
-    { label: 'Tarjeta Débito/Crédito', data: report.paymentBreakdown.card, color: '#3B82F6' },
-    { label: 'Transferencia Bancaria', data: report.paymentBreakdown.transfer, color: '#F59E0B' },
-    { label: 'Fiado / Crédito', data: report.paymentBreakdown.fiado, color: '#F97316' },
-    { label: 'Otros Métodos', data: report.paymentBreakdown.other, color: '#6B7280' },
-  ].filter((m) => m.data.amount > 0);
+  const paymentMethodsList = paymentBreakdown ? [
+    { label: 'Efectivo', data: paymentBreakdown.cash, color: '#10B981' },
+    { label: 'Yape', data: paymentBreakdown.yape, color: '#8B5CF6' },
+    { label: 'Plin', data: paymentBreakdown.plin, color: '#06B6D4' },
+    { label: 'Tarjeta Débito/Crédito', data: paymentBreakdown.card, color: '#3B82F6' },
+    { label: 'Transferencia Bancaria', data: paymentBreakdown.transfer, color: '#F59E0B' },
+    { label: 'Fiado / Crédito', data: paymentBreakdown.fiado, color: '#F97316' },
+    { label: 'Otros Métodos', data: paymentBreakdown.other, color: '#6B7280' },
+  ].filter((m) => m.data.amount > 0) : [];
 
   const paymentRows = paymentMethodsList.map((m) => `
     <tr>
@@ -966,7 +530,7 @@ export async function exportPnlReportPDF(
         <div class="kpi-card">
           <div class="kpi-label">Ingresos Netos</div>
           <div class="kpi-value">${formatPEN(report.netRevenue)}</div>
-          <div class="kpi-sub" style="color: #64748B;">${report.transactionCount} ventas efectivas</div>
+          <div class="kpi-sub" style="color: #64748B;">${report.transactionCount !== undefined ? `${report.transactionCount} ventas efectivas` : 'Totales del reporte Web'}</div>
         </div>
         <div class="kpi-card">
           <div class="kpi-label">Utilidad Bruta</div>
@@ -976,7 +540,7 @@ export async function exportPnlReportPDF(
         <div class="kpi-card">
           <div class="kpi-label">Gastos Operativos</div>
           <div class="kpi-value" style="color: #EF4444;">${formatPEN(report.operatingExpenses)}</div>
-          <div class="kpi-sub" style="color: #DC2626;">Caja chica y planilla</div>
+          <div class="kpi-sub" style="color: #DC2626;">Incluye conceptos consolidados y castigos de fiados</div>
         </div>
         <div class="kpi-card" style="border-color: ${netProfitColor}; background: ${isProfitable ? '#F0FDF4' : '#FEF2F2'};">
           <div class="kpi-label" style="color: ${netProfitColor};">Utilidad Neta Real</div>
@@ -997,7 +561,7 @@ export async function exportPnlReportPDF(
         </thead>
         <tbody>
           <tr>
-            <td>(+) Ventas Brutas Totales</td>
+            <td>(+) Ventas cerradas y fiados emitidos</td>
             <td style="text-align: right; font-weight: 600;">${formatPEN(report.grossSales)}</td>
             <td style="text-align: right; color: #64748B;">100.0%</td>
           </tr>
@@ -1022,14 +586,9 @@ export async function exportPnlReportPDF(
             <td style="text-align: right;">${report.grossMarginPercent.toFixed(1)}%</td>
           </tr>
           <tr>
-            <td>(-) Gastos Operativos de Caja Chica</td>
-            <td style="text-align: right; color: #EF4444;">-${formatPEN(report.pettyCashExpenses)}</td>
-            <td style="text-align: right; color: #64748B;">${report.netRevenue > 0 ? ((report.pettyCashExpenses / report.netRevenue) * 100).toFixed(1) : '0.0'}%</td>
-          </tr>
-          <tr>
-            <td>(-) Gastos de Planilla y Sueldos</td>
-            <td style="text-align: right; color: #EF4444;">-${formatPEN(report.payrollExpenses)}</td>
-            <td style="text-align: right; color: #64748B;">${report.netRevenue > 0 ? ((report.payrollExpenses / report.netRevenue) * 100).toFixed(1) : '0.0'}%</td>
+            <td>(-) Gastos operativos, comisiones y castigos de fiado</td>
+            <td style="text-align: right; color: #EF4444;">-${formatPEN(report.operatingExpenses)}</td>
+            <td style="text-align: right; color: #64748B;">${report.netRevenue > 0 ? ((report.operatingExpenses / report.netRevenue) * 100).toFixed(1) : '0.0'}%</td>
           </tr>
           <tr class="row-waterfall-main">
             <td>(=) TOTAL GASTOS OPERATIVOS</td>
@@ -1044,11 +603,25 @@ export async function exportPnlReportPDF(
         </tbody>
       </table>
 
-      <!-- 2. DESGLOSE DE COBRANZA Y GASTOS (2 COLUMNAS) -->
+      <div class="section-title">2. Componentes del período</div>
+      <table class="pnl-table">
+        <thead><tr><th>Concepto</th><th style="text-align: right;">Monto (PEN)</th></tr></thead>
+        <tbody>
+          <tr><td>Ventas cerradas</td><td style="text-align: right;">${formatPEN(report.salesClosed)}</td></tr>
+          <tr><td>Fiados emitidos</td><td style="text-align: right;">${formatPEN(report.fiadosIssued)}</td></tr>
+          <tr><td>Devoluciones</td><td style="text-align: right;">-${formatPEN(report.returns)}</td></tr>
+          <tr><td>Castigos de fiado</td><td style="text-align: right;">${formatPEN(report.badDebt)}</td></tr>
+          <tr><td>Gastos operativos de caja</td><td style="text-align: right;">${formatPEN(report.cashOperatingExpenses)}</td></tr>
+          <tr><td>Comisiones de terminal</td><td style="text-align: right;">${formatPEN(report.terminalCommissions)}</td></tr>
+          <tr><td>Adelantos a empleados (flujo de caja)</td><td style="text-align: right;">${formatPEN(report.employeeAdvances)}</td></tr>
+        </tbody>
+      </table>
+
+      <!-- 3. DESGLOSE DE COBRANZA Y GASTOS (2 COLUMNAS) -->
       <table style="width: 100%; border: none; margin-bottom: 16px;">
         <tr>
           <td style="width: 50%; vertical-align: top; padding: 0 8px 0 0; border: none;">
-            <div class="section-title" style="margin-top: 0;">2. Cobranza por Método de Pago</div>
+            <div class="section-title" style="margin-top: 0;">3. Cobranza por Método de Pago</div>
             <table class="pnl-table">
               <thead>
                 <tr>
@@ -1058,12 +631,12 @@ export async function exportPnlReportPDF(
                 </tr>
               </thead>
               <tbody>
-                ${paymentRows || '<tr><td colspan="3" style="text-align: center; color: #9CA3AF;">Sin cobros en el período</td></tr>'}
+                ${paymentRows || `<tr><td colspan="3" style="text-align: center; color: #9CA3AF;">${report.detailsAvailable ? 'Sin cobros en el período' : 'Este reporte no incluye un desglose por método de pago'}</td></tr>`}
               </tbody>
             </table>
           </td>
           <td style="width: 50%; vertical-align: top; padding: 0 0 0 8px; border: none;">
-            <div class="section-title" style="margin-top: 0;">3. Gastos por Categoría</div>
+            <div class="section-title" style="margin-top: 0;">4. Gastos por Categoría</div>
             <table class="pnl-table">
               <thead>
                 <tr>
@@ -1073,7 +646,7 @@ export async function exportPnlReportPDF(
                 </tr>
               </thead>
               <tbody>
-                ${expenseRows || '<tr><td colspan="3" style="text-align: center; color: #9CA3AF;">Sin gastos en el período</td></tr>'}
+                ${expenseRows || `<tr><td colspan="3" style="text-align: center; color: #9CA3AF;">${report.detailsAvailable ? 'Sin gastos en el período' : 'Este reporte no incluye un desglose por categoría de gasto'}</td></tr>`}
               </tbody>
             </table>
           </td>
@@ -1081,7 +654,7 @@ export async function exportPnlReportPDF(
       </table>
 
       <!-- 3. TOP 10 PRODUCTOS POR UTILIDAD APORTADA -->
-      <div class="section-title">4. Top 10 Productos Más Rentables</div>
+      <div class="section-title">5. Top 10 Productos Más Rentables</div>
       <table class="pnl-table">
         <thead>
           <tr>
@@ -1095,12 +668,12 @@ export async function exportPnlReportPDF(
           </tr>
         </thead>
         <tbody>
-          ${topProductsRows || '<tr><td colspan="7" style="text-align: center; color: #9CA3AF;">Sin ventas en el período</td></tr>'}
+          ${topProductsRows || `<tr><td colspan="7" style="text-align: center; color: #9CA3AF;">${report.detailsAvailable ? 'Sin ventas en el período' : 'Este reporte no incluye un desglose por producto'}</td></tr>`}
         </tbody>
       </table>
 
       <!-- 4. RENDIMIENTO POR VENDEDOR / CAJERO -->
-      ${report.sellerPerformance.length > 0 ? `
+      ${sellers.length > 0 ? `
         <div class="section-title">5. Rendimiento de Vendedores y Cajeros</div>
         <table class="pnl-table">
           <thead>

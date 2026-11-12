@@ -25,6 +25,7 @@ import {
   Timestamp,
 } from 'firebase/firestore';
 import { cleanFirestoreData } from '@/lib/firebase-utils';
+import { apiRequest } from '@/lib/api-client';
 import {
   deriveBranchIds,
   deriveLowStockBranches,
@@ -52,6 +53,21 @@ const APP_URL =
   process.env.EXPO_PUBLIC_APP_URL ||
   process.env.NEXT_PUBLIC_APP_URL ||
   'https://ventify.com.pe';
+
+export interface SaleSellerOption {
+  id: string;
+  name: string;
+  branchIds: string[];
+  isActive: boolean;
+  userId?: string;
+}
+
+export const getAvailableSaleSellers = async (branchId: string): Promise<SaleSellerOption[]> => {
+  const response = await apiRequest<{ sellers: SaleSellerOption[] }>(
+    `/api/sales/sellers?branchId=${encodeURIComponent(branchId)}`,
+  );
+  return Array.isArray(response.sellers) ? response.sellers : [];
+};
 
 // ============================================================================
 // TIPOS E INTERFACES
@@ -93,12 +109,16 @@ export interface SaleItemInput {
   presentationName?: string;
   presentationQty?: number;
   conversionFactor?: number;
+  /** Canonical stock map key consumed by this line (branch or legacy Principal alias). */
+  stockBranchId?: string;
   allowDecimals?: boolean;
   unitOfMeasure?: string;
   subtotal?: number;
   tax?: number;
   total?: number;
   imageUrl?: string;
+  variantId?: string;
+  variantName?: string;
 }
 
 export interface CustomerInput {
@@ -126,9 +146,17 @@ export interface CreateSaleTransactionParams {
   userRole?: string;
   items: SaleItemInput[];
   paymentMethod: PaymentMethod;
+  paymentMethodId?: string;
+  paymentMethodName?: string;
+  chargedAmount?: number;
+  commissionAmount?: number;
+  surchargeAmount?: number;
+  netAmount?: number;
   documentType: SaleDocumentType;
   subtotal?: number;
   tax?: number;
+  shippingAmount?: number;
+  discountAmount?: number;
   total: number;
   payments?: PaymentSplit[];
   cashAmount?: number;
@@ -140,6 +168,9 @@ export interface CreateSaleTransactionParams {
   customerId?: string;
   customerName?: string;
   sessionId?: string;
+  saleDate?: number;
+  sellerId?: string;
+  sellerName?: string;
   notes?: string;
   offlineId?: string;
   isQuote?: boolean;
@@ -152,6 +183,8 @@ export interface CreateSaleTransactionParams {
     remainingAmount: number;
     depositSaleId?: string;
   };
+  sourceSaleRequestId?: string;
+  sourceQuoteId?: string;
 }
 
 export interface CreateSaleTransactionResult {
@@ -175,6 +208,29 @@ export interface CancelSaleResult {
   cancelledAt: Date;
 }
 
+export interface RefundSaleResult {
+  refundId: string;
+  saleId: string;
+  refundedAmount: number;
+  refundedLineIndices: number[];
+  status: 'completed' | 'refunded';
+  cashRefunded: number;
+  reversalMovementsCount: number;
+  refundedAt: number;
+  replay: boolean;
+}
+
+export interface RefundSaleOptions {
+  accountId: string;
+  branchId: string;
+  sessionId: string;
+  method: string;
+  cashAmount?: number;
+  cardAmount?: number;
+  digitalAmount?: number;
+  operationId?: string;
+}
+
 // ============================================================================
 // HELPERS
 // ============================================================================
@@ -195,6 +251,15 @@ export const calculateBaseUnits = (item: SaleItemInput): number => {
 
   // Redondeo seguro para evitar aberraciones de punto flotante en pesos/medidas
   return Math.round(baseUnits * 10000) / 10000;
+};
+
+const resolveStockBranchKey = (stock: unknown, branchId: string): string => {
+  if (!stock || typeof stock !== 'object') return branchId;
+  const stockMap = stock as Record<string, unknown>;
+  if (Object.prototype.hasOwnProperty.call(stockMap, branchId)) return branchId;
+  return Object.keys(stockMap).find((key) =>
+    key.toLowerCase().includes('principal') || key.toLowerCase().includes('main'),
+  ) || branchId;
 };
 
 /**
@@ -228,6 +293,42 @@ export const resolveDocumentSeries = (
  */
 export const formatCorrelative = (series: string, number: number): string => {
   return `${series}-${String(number).padStart(6, '0')}`;
+};
+
+const stableRefundOperationId = (value: string): string => {
+  const hash = (seed: number) => {
+    let result = seed >>> 0;
+    for (let index = 0; index < value.length; index++) {
+      result = Math.imul(result ^ value.charCodeAt(index), 16777619) >>> 0;
+    }
+    return result.toString(16).padStart(8, '0');
+  };
+  return `refund_${hash(2166136261)}${hash(2246822519)}`;
+};
+
+export const refundSaleLines = async (
+  saleId: string,
+  lineIndices: number[],
+  options: RefundSaleOptions,
+): Promise<RefundSaleResult> => {
+  if (!saleId || !options.sessionId || !lineIndices.length || lineIndices.some((index) => !Number.isInteger(index) || index < 0)) {
+    throw new Error('Selecciona al menos un producto y una caja abierta para devolver.');
+  }
+  const normalizedIndices = [...new Set(lineIndices)].sort((a, b) => a - b);
+  const operationId = options.operationId || stableRefundOperationId(`${saleId}:${options.sessionId}:${normalizedIndices.join(',')}:${options.method}:${options.cashAmount || 0}:${options.cardAmount || 0}:${options.digitalAmount || 0}`);
+  return apiRequest<RefundSaleResult>('/api/sales/refund', {
+    method: 'POST',
+    body: {
+      saleId,
+      sessionId: options.sessionId,
+      operationId,
+      lineIndices: normalizedIndices,
+      method: options.method,
+      cashAmount: options.cashAmount,
+      cardAmount: options.cardAmount,
+      digitalAmount: options.digitalAmount,
+    },
+  });
 };
 
 /**
@@ -266,6 +367,74 @@ export const derivePaymentCategory = (
   return 'cash';
 };
 
+const isPrepaidCreditMethod = (method: string): boolean =>
+  ['credits', 'creditos', 'créditos'].includes(method.toLowerCase());
+
+const legacyPaymentMethodId = (method: string, payments?: PaymentSplit[]): string => {
+  const aliases: Record<string, string> = { cash: 'efectivo', card: 'tarjeta', mixed: 'mixto', credit: 'creditos', fiado: 'creditos', credits: 'creditos', 'créditos': 'creditos' };
+  const normalized = method.toLowerCase();
+  if (normalized === 'digital') return payments?.find(part => part.category === 'digital')?.digitalProvider || 'transferencia';
+  return aliases[normalized] || method;
+};
+
+export const buildAttributedSalePayload = (
+  params: CreateSaleTransactionParams,
+  resolvedSessionId?: string,
+) => ({
+  accountId: params.accountId,
+  branchId: params.branchId,
+  sessionId: resolvedSessionId || params.sessionId || '',
+  total: Math.round(params.total * 100) / 100,
+  subtotal: Math.round((params.subtotal ?? params.total) * 100) / 100,
+  tax: Math.round((params.tax ?? 0) * 100) / 100,
+  shippingAmount: Math.round((params.shippingAmount ?? 0) * 100) / 100,
+  discountAmount: Math.round((params.discountAmount ?? 0) * 100) / 100,
+  paymentMethod: params.paymentMethodName || params.paymentMethod,
+  paymentMethodId: params.paymentMethodId || legacyPaymentMethodId(params.paymentMethod, params.payments),
+  paymentCategory: derivePaymentCategory(params.paymentMethod, params.payments),
+  payments: (params.payments || []).map(part => ({ ...part,
+    methodId: part.methodId || legacyPaymentMethodId(part.category, [part]),
+  })),
+  cashAmount: params.cashAmount,
+  cardAmount: params.cardAmount,
+  digitalAmount: params.digitalAmount,
+  cashReceived: params.cashReceived,
+  changeGiven: params.changeGiven,
+  documentType: params.documentType,
+  items: params.items.map((item) => ({
+    id: item.productId,
+    productId: item.productId,
+    name: item.name,
+    sku: item.sku,
+    price: item.price,
+    quantity: item.quantity,
+    costPrice: item.costPrice,
+    minSalePrice: item.minSalePrice,
+    presentationId: item.presentationId,
+    presentationName: item.presentationName,
+    presentationQty: item.presentationQty,
+    conversionFactor: item.conversionFactor,
+    subtotal: item.subtotal,
+    total: item.total,
+    variantId: item.variantId,
+    variantName: item.variantName,
+  })),
+  customerId: params.customerId || params.customer?.id,
+  customerName: params.customerName || params.customer?.name,
+  customerDni: params.customer?.documentType === 'DNI' ? params.customer.documentNumber : undefined,
+  customerRuc: params.customer?.documentType === 'RUC' ? params.customer.documentNumber : undefined,
+  customerPhone: params.customer?.phone,
+  customerEmail: params.customer?.email,
+  customerAddress: params.customer?.address,
+  notes: params.notes,
+  sellerId: params.sellerId,
+  sellerName: params.sellerName,
+  creditMode: params.paymentMethod === 'fiado' || params.paymentMethod === 'credit'
+    ? 'receivable'
+    : isPrepaidCreditMethod(params.paymentMethod) ? 'prepaid' : undefined,
+  date: params.saleDate,
+});
+
 /**
  * Envía la venta para su confirmación atómica en el servidor vía POST /api/sales/finalize
  * Requerido cuando la cuenta tiene habilitada la regla de atribución de vendedores
@@ -282,68 +451,39 @@ export const finalizeAttributedSaleViaServer = async (
   }
 
   const operationId = params.offlineId || `op_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
-  const paymentCategory = derivePaymentCategory(params.paymentMethod, params.payments);
+  const salePayload = buildAttributedSalePayload(params, resolvedSessionId);
 
-  const salePayload: any = {
-    accountId: params.accountId,
-    branchId: params.branchId,
-    sessionId: resolvedSessionId || params.sessionId || '',
-    total: Math.round(params.total * 100) / 100,
-    subtotal: Math.round((params.subtotal ?? (params.total / 1.18)) * 100) / 100,
-    tax: Math.round((params.tax ?? (params.total - params.total / 1.18)) * 100) / 100,
-    paymentMethod: params.paymentMethod,
-    paymentCategory,
-    payments: params.payments || [],
-    cashAmount: params.cashAmount,
-    cardAmount: params.cardAmount,
-    digitalAmount: params.digitalAmount,
-    cashReceived: params.cashReceived,
-    changeGiven: params.changeGiven,
-    documentType: params.documentType,
-    items: params.items.map((item) => ({
-      id: item.productId,
-      productId: item.productId,
-      name: item.name,
-      sku: item.sku,
-      price: item.price,
-      quantity: item.quantity,
-      costPrice: item.costPrice,
-      minSalePrice: item.minSalePrice,
-      presentationId: item.presentationId,
-      presentationName: item.presentationName,
-      presentationQty: item.presentationQty,
-      conversionFactor: item.conversionFactor,
-      subtotal: item.subtotal,
-      total: item.total,
-    })),
-    customerId: params.customerId || params.customer?.id,
-    customerName: params.customerName || params.customer?.name,
-    customerDni: params.customer?.documentType === 'DNI' ? params.customer.documentNumber : undefined,
-    customerRuc: params.customer?.documentType === 'RUC' ? params.customer.documentNumber : undefined,
-    customerPhone: params.customer?.phone,
-    customerEmail: params.customer?.email,
-    customerAddress: params.customer?.address,
-    notes: params.notes,
-  };
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 12000);
+  let response: Response;
+  let data: any;
 
-  const response = await fetch(`${APP_URL}/api/sales/finalize`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify({
-      sale: cleanFirestoreData(salePayload),
-      operationId,
-      completion: params.depositInfo
-        ? { type: params.depositInfo.type, id: params.depositInfo.depositSaleId || '' }
-        : undefined,
-    }),
-  });
+  try {
+    response = await fetch(`${APP_URL}/api/sales/finalize`, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        sale: cleanFirestoreData(salePayload),
+        operationId,
+        completion: params.depositInfo
+          ? { type: params.depositInfo.type, id: params.depositInfo.depositSaleId || '' }
+          : undefined,
+        sourceSaleRequestId: params.sourceSaleRequestId,
+        sourceQuoteId: params.sourceQuoteId,
+      }),
+    });
 
-  const data = await response.json();
+    data = await response.json();
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
   if (!response.ok) {
-    throw new Error(data.error || 'No se pudo confirmar el cobro en el servidor.');
+    throw new Error(data?.error || 'No se pudo confirmar el cobro en el servidor.');
   }
 
   const savedSale = data.sale || {};
@@ -399,8 +539,8 @@ export const createSaleTransaction = async (
     paymentMethod,
     documentType,
     total,
-    subtotal = total / 1.18,
-    tax = total - total / 1.18,
+    subtotal = total,
+    tax = 0,
     payments,
     cashAmount = (paymentMethod === 'efectivo' || paymentMethod === 'cash') ? total : 0,
     cardAmount = (paymentMethod === 'tarjeta' || paymentMethod === 'card') ? total : 0,
@@ -412,6 +552,7 @@ export const createSaleTransaction = async (
     customerName = customer?.name,
     notes,
     offlineId,
+    saleDate,
     isQuote = documentType === 'cotizacion',
     depositInfo,
   } = params;
@@ -421,18 +562,23 @@ export const createSaleTransaction = async (
   let effectiveCard = cardAmount;
   let effectiveDigital = digitalAmount;
   let effectiveCredit = (paymentMethod === 'fiado' || paymentMethod === 'credit') ? total : 0;
+  let effectivePrepaidCredits = isPrepaidCreditMethod(paymentMethod) ? total : 0;
 
   if (Array.isArray(payments) && payments.length > 0) {
     effectiveCash = 0;
     effectiveCard = 0;
     effectiveDigital = 0;
     effectiveCredit = 0;
+    effectivePrepaidCredits = 0;
     for (const p of payments) {
-      const amt = p.amount || 0;
+      const amt = p.category === 'credit' ? (p.amount || 0) : (p.chargedAmount ?? p.amount ?? 0);
       if (p.category === 'cash') effectiveCash += amt;
       else if (p.category === 'card') effectiveCard += amt;
       else if (p.category === 'digital') effectiveDigital += amt;
-      else if (p.category === 'credit') effectiveCredit += amt;
+      else if (p.category === 'credit') {
+        if (isPrepaidCreditMethod(paymentMethod)) effectivePrepaidCredits += amt;
+        else effectiveCredit += amt;
+      }
     }
   }
 
@@ -486,7 +632,7 @@ export const createSaleTransaction = async (
       console.warn('[SaleService] Error checking settings for seller attribution:', e);
     }
 
-    if (enableSellerAttribution) {
+    if (enableSellerAttribution || params.sourceSaleRequestId || params.sourceQuoteId) {
       let resolvedSession = params.sessionId;
       if (!resolvedSession) {
         try {
@@ -559,34 +705,67 @@ export const createSaleTransaction = async (
 
     const validatedItems: ValidatedItemData[] = [];
 
+    // Validar que todos los ítems tengan productId
     for (const item of items) {
-      let pId = item.productId;
-      if (!pId) {
+      if (!item.productId) {
         throw new Error(`Ítem inválido en la venta: falta productId (${item.name || 'desconocido'})`);
       }
+    }
 
-      let productRef = doc(db, PRODUCTS_COLLECTION, pId);
-      let productSnap = await tx.get(productRef);
+    // Deduplicar productIds y leer en paralelo
+    const uniqueProductIds = Array.from(new Set(items.map((it) => it.productId)));
+    const initialProductSnaps = await Promise.all(
+      uniqueProductIds.map((pId) => tx.get(doc(db, PRODUCTS_COLLECTION, pId)))
+    );
+
+    const productDocMap = new Map<string, { ref: any; snap: any }>();
+    uniqueProductIds.forEach((pId, idx) => {
+      productDocMap.set(pId, { ref: doc(db, PRODUCTS_COLLECTION, pId), snap: initialProductSnaps[idx] });
+    });
+
+    const missingCandidateBases = Array.from(
+      new Set(
+        uniqueProductIds
+          .filter((pId) => {
+            const entry = productDocMap.get(pId);
+            return (!entry?.snap?.exists() || !entry.snap.data()) && pId.includes('_');
+          })
+          .map((pId) => pId.split('_')[0])
+      )
+    ).filter((base) => !productDocMap.has(base));
+
+    if (missingCandidateBases.length > 0) {
+      const fallbackSnaps = await Promise.all(
+        missingCandidateBases.map((base) => tx.get(doc(db, PRODUCTS_COLLECTION, base)))
+      );
+      missingCandidateBases.forEach((base, idx) => {
+        productDocMap.set(base, { ref: doc(db, PRODUCTS_COLLECTION, base), snap: fallbackSnaps[idx] });
+      });
+    }
+
+    for (const item of items) {
+      let pId = item.productId;
+      let docEntry = productDocMap.get(pId);
 
       // Si no existe directamente y contiene guiones bajos (ej: ID_base_base), intentar con la clave base
-      if (!productSnap.exists() && pId.includes('_')) {
+      if ((!docEntry?.snap?.exists() || !docEntry.snap.data()) && pId.includes('_')) {
         const parts = pId.split('_');
         if (parts.length >= 2) {
           const candidateBase = parts[0];
-          const fallbackRef = doc(db, PRODUCTS_COLLECTION, candidateBase);
-          const fallbackSnap = await tx.get(fallbackRef);
-          if (fallbackSnap.exists()) {
+          const fallbackEntry = productDocMap.get(candidateBase);
+          if (fallbackEntry?.snap?.exists()) {
             pId = candidateBase;
-            productRef = fallbackRef;
-            productSnap = fallbackSnap;
+            docEntry = fallbackEntry;
           }
         }
       }
 
-      if (!productSnap.exists()) {
+      if (!docEntry?.snap?.exists()) {
         throw new Error(`El producto "${item.name || pId}" no existe en el catálogo.`);
       }
 
+      const productRef = docEntry.ref;
+      const productSnap = docEntry.snap;
       const productData = productSnap.data();
 
       // Validación de precio mínimo de venta
@@ -617,17 +796,13 @@ export const createSaleTransaction = async (
         } else {
           // Resolver fallback coherente con catálogo móvil y web
           const stockKeys = Object.keys(productData.stock);
-          if (stockKeys.length === 1) {
-            effectiveStockBranchKey = stockKeys[0];
-            currentPhysicalStock = Number(productData.stock[effectiveStockBranchKey] || 0);
-          } else if (stockKeys.length > 0) {
-            const matchedKey =
-              stockKeys.find(
-                (k) =>
-                  k === branchId ||
-                  k.toLowerCase().includes('principal') ||
-                  k.toLowerCase().includes('main')
-              ) || stockKeys[0];
+          if (stockKeys.length > 0) {
+            const matchedKey = stockKeys.find(
+              (k) => k.toLowerCase().includes('principal') || k.toLowerCase().includes('main'),
+            );
+            if (!matchedKey) {
+              throw new Error(`El producto "${item.name}" no tiene stock asociado a la sucursal activa.`);
+            }
             effectiveStockBranchKey = matchedKey;
             currentPhysicalStock = Number(productData.stock[effectiveStockBranchKey] || 0);
           }
@@ -673,6 +848,80 @@ export const createSaleTransaction = async (
       });
     }
 
+    // A cart can contain several lines for the same product (variants,
+    // presentations, or repeated scans). Firestore snapshots all represent the
+    // same original product state, so calculate a single combined mutation.
+    const productStockPlans = new Map<string, {
+      productRef: any;
+      update: Record<string, any>;
+      entries: ValidatedItemData[];
+    }>();
+    const groupedItems = new Map<string, ValidatedItemData[]>();
+    for (const item of validatedItems) {
+      const path = item.productRef.path || item.item.productId;
+      const group = groupedItems.get(path) || [];
+      group.push(item);
+      groupedItems.set(path, group);
+    }
+    for (const [path, group] of groupedItems) {
+      const first = group[0];
+      const branchKey = first.effectiveStockBranchKey;
+      const totalBaseUnits = group.reduce((sum, item) => sum + item.baseUnitsToDeduct, 0);
+      const currentPhysicalStock = first.previousStock;
+      const reservedStock = Number(
+        first.productData.reservedStock?.[branchKey] ||
+        first.productData.reservedStock?.[branchId] ||
+        0,
+      );
+      if (!isQuote && currentPhysicalStock - reservedStock < totalBaseUnits - 0.00001) {
+        throw new Error(
+          `Stock insuficiente para "${first.item.name}". Disponible: ${Math.max(0, currentPhysicalStock - reservedStock).toFixed(2)}, Requerido: ${totalBaseUnits.toFixed(2)}.`,
+        );
+      }
+      let runningStock = currentPhysicalStock;
+      for (const item of group) {
+        item.previousStock = runningStock;
+        runningStock = Math.round((runningStock - item.baseUnitsToDeduct) * 10000) / 10000;
+        item.newStock = runningStock;
+      }
+      const stockMap: Record<string, number> = {
+        ...(typeof first.productData.stock === 'object' && first.productData.stock !== null
+          ? first.productData.stock
+          : {}),
+        [branchKey]: runningStock,
+      };
+      const update: Record<string, any> = {
+        stock: stockMap,
+        branchIds: deriveBranchIds(stockMap),
+        lowStockBranches: deriveLowStockBranches(stockMap, first.productData.reservedStock),
+      };
+      if (Array.isArray(first.productData.variants)) {
+        const variantUnits = new Map<string, number>();
+        for (const item of group) {
+          const variantId = item.item.variantId || (item.item as any).variant?.id;
+          if (variantId) variantUnits.set(variantId, (variantUnits.get(variantId) || 0) + item.baseUnitsToDeduct);
+        }
+        update.variants = first.productData.variants.map((variant: any) => {
+          const units = variantUnits.get(variant.id) || 0;
+          if (!units) return variant;
+          const current = typeof variant.stock === 'number'
+            ? variant.stock
+            : Number(variant.stock?.[branchKey] || 0);
+          if (!isQuote && current < units - 0.00001) {
+            throw new Error(`Stock insuficiente para la variante "${variant.name || variant.id}".`);
+          }
+          if (typeof variant.stock === 'object' && variant.stock !== null) {
+            return { ...variant, stock: {
+              ...variant.stock,
+              [branchKey]: Math.max(0, Math.round((current - units) * 10000) / 10000),
+            } };
+          }
+          return { ...variant, stock: Math.max(0, Math.round((current - units) * 10000) / 10000) };
+        });
+      }
+      productStockPlans.set(path, { productRef: first.productRef, update, entries: group });
+    }
+
     // C. Obtener correlativo secuencial atómico oficial desde nota-counters/{branchId}
     const normalizedDocType: SaleDocumentType = isQuote
       ? 'cotizacion'
@@ -683,6 +932,57 @@ export const createSaleTransaction = async (
     const counterSnap = await tx.get(counterRef);
 
     let nextNumber = 1;
+    if (counterSnap.exists()) {
+      const counterData = counterSnap.data();
+      nextNumber = (counterData?.counter || 0) + 1;
+    }
+
+    const correlative = formatCorrelative(series, nextNumber);
+
+    // D. Gestionar cuenta por cobrar y deuda si es 'fiado' / crédito
+    let customerRef: any = null;
+    let customerSnap: any = null;
+    let newCustomerDebt: number | null = null;
+    const isPrepaidCredits = isPrepaidCreditMethod(paymentMethod) || effectivePrepaidCredits > 0;
+    const isFiado = !isPrepaidCredits && (paymentMethod === 'fiado' || paymentMethod === 'credit' || effectiveCredit > 0);
+
+    if (!isQuote && (isFiado || isPrepaidCredits)) {
+      if (!customerId) {
+        throw new Error(isFiado
+          ? 'Para ventas al fiado es obligatorio seleccionar o registrar un cliente.'
+          : 'Para usar créditos prepagados debes seleccionar un cliente.');
+      }
+      customerRef = doc(db, CUSTOMERS_COLLECTION, customerId);
+      customerSnap = await tx.get(customerRef);
+      if (!customerSnap.exists()) {
+        throw new Error('El cliente seleccionado no existe.');
+      }
+      if (customerSnap.exists()) {
+        const custData = (customerSnap.data() as any) || {};
+        if (isPrepaidCredits) {
+          const availableCredits = Number(custData.credits || 0);
+          if (!Number.isFinite(availableCredits) || availableCredits < effectivePrepaidCredits) {
+            throw new Error('El cliente no dispone de créditos prepagados suficientes.');
+          }
+        } else {
+          const currentDebt = Number(custData.currentDebt || 0);
+          const debtToAdd = effectiveCredit > 0 ? effectiveCredit : total;
+          newCustomerDebt = Math.round((currentDebt + debtToAdd) * 100) / 100;
+        }
+      }
+    }
+
+    // Firestore requires every transactional read to finish before the first write.
+    const sessionRef = resolvedSessionId
+      ? doc(db, CASH_SESSIONS_COLLECTION, resolvedSessionId)
+      : null;
+    const sessionSnap = sessionRef ? await tx.get(sessionRef) : null;
+    if (sessionRef && (!sessionSnap?.exists() || sessionSnap.data()?.status !== 'open')) {
+      throw new Error('La sesión de caja asociada a esta venta ya está cerrada. Abre una nueva caja para continuar.');
+    }
+    const activePointerSnap = resolvedSessionId ? await tx.get(activePointerRef) : null;
+    const userPointerSnap = resolvedSessionId && userPointerRef ? await tx.get(userPointerRef) : null;
+
     if (!counterSnap.exists()) {
       tx.set(counterRef, {
         accountId,
@@ -690,39 +990,24 @@ export const createSaleTransaction = async (
         counter: 1,
         updatedAt: serverTimestamp(),
       });
-      nextNumber = 1;
     } else {
-      const counterData = counterSnap.data();
-      nextNumber = (counterData?.counter || 0) + 1;
       tx.update(counterRef, {
         counter: nextNumber,
         updatedAt: serverTimestamp(),
       });
     }
 
-    const correlative = formatCorrelative(series, nextNumber);
-
-    // D. Gestionar cuenta por cobrar y deuda si es 'fiado' / crédito
-    let customerRef: any = null;
-    let newCustomerDebt: number | null = null;
-    const isFiado = paymentMethod === 'fiado' || paymentMethod === 'credit' || effectiveCredit > 0;
-
-    if (!isQuote && isFiado) {
-      if (!customerId) {
-        throw new Error('Para ventas al fiado es obligatorio seleccionar o registrar un cliente.');
-      }
-      customerRef = doc(db, CUSTOMERS_COLLECTION, customerId);
-      const custSnap = await tx.get(customerRef);
-      if (custSnap.exists()) {
-        const custData = (custSnap.data() as any) || {};
-        const currentDebt = Number(custData.currentDebt || 0);
-        const debtToAdd = effectiveCredit > 0 ? effectiveCredit : total;
-        newCustomerDebt = Math.round((currentDebt + debtToAdd) * 100) / 100;
-        tx.update(customerRef, {
-          currentDebt: newCustomerDebt,
-          lastPurchaseDate: serverTimestamp(),
-        });
-      }
+    if (customerRef && customerSnap?.exists() && newCustomerDebt !== null) {
+      tx.update(customerRef, {
+        currentDebt: newCustomerDebt,
+        lastPurchaseDate: serverTimestamp(),
+      });
+    }
+    if (customerRef && customerSnap?.exists() && isPrepaidCredits) {
+      const currentCredits = Number(customerSnap.data()?.credits || 0);
+      tx.update(customerRef, {
+        credits: Math.round((currentCredits - effectivePrepaidCredits) * 100) / 100,
+      });
     }
 
     // E. Crear el documento de venta en Firestore
@@ -733,12 +1018,13 @@ export const createSaleTransaction = async (
     let totalMargin = 0;
     let totalCost = 0;
 
-    const enrichedItems = validatedItems.map(({ item, baseUnitsToDeduct, costPrice, margin }) => {
+    const enrichedItems = validatedItems.map(({ item, effectiveStockBranchKey, baseUnitsToDeduct, costPrice, margin }) => {
       totalMargin += margin;
       totalCost += costPrice * baseUnitsToDeduct;
       const { product, ...cleanItem } = item as any;
       return {
         ...cleanItem,
+        stockBranchId: effectiveStockBranchKey,
         costPrice,
         margin,
         baseUnits: baseUnitsToDeduct,
@@ -758,7 +1044,7 @@ export const createSaleTransaction = async (
       branchId,
       userId,
       userName,
-      date: Date.now(),
+      date: saleDate || Date.now(),
       createdAt: serverTimestamp(),
       items: enrichedItems,
       subtotal: Math.round(subtotal * 100) / 100,
@@ -768,6 +1054,14 @@ export const createSaleTransaction = async (
       totalMargin: Math.round(totalMargin * 100) / 100,
       marginPercent: total > 0 ? Math.round((totalMargin / total) * 10000) / 100 : 0,
       paymentMethod,
+      paymentMethodId: params.paymentMethodId,
+      creditMode: effectivePrepaidCredits > 0 ? 'prepaid' : effectiveCredit > 0 ? 'receivable' : undefined,
+      creditAmount: effectiveCredit,
+      prepaidCreditAmount: effectivePrepaidCredits,
+      chargedAmount: params.chargedAmount ?? total,
+      commissionAmount: params.commissionAmount ?? 0,
+      surchargeAmount: params.surchargeAmount ?? 0,
+      netAmount: params.netAmount ?? total,
       paymentCategory,
       payments: payments || [],
       cashAmount: Math.round(effectiveCash * 100) / 100,
@@ -804,54 +1098,16 @@ export const createSaleTransaction = async (
 
     // F. Si no es cotización, descontar stock físico y generar Kardex
     if (!isQuote) {
+      const updatedProducts = new Set<string>();
       for (const vi of validatedItems) {
         const { item, productRef, productData, baseUnitsToDeduct, previousStock, newStock, effectiveStockBranchKey } = vi;
-
-        // Recalcular stockMap, branchIds y lowStockBranches con libreria compartida
-        const currentStockMap: Record<string, number> = {
-          ...(typeof productData.stock === 'object' ? productData.stock : {}),
-          [effectiveStockBranchKey]: newStock,
-        };
-
-        const branchIds = deriveBranchIds(currentStockMap);
-        const lowStockBranches = deriveLowStockBranches(currentStockMap, productData.reservedStock);
-
-        const productUpdate: Record<string, any> = {
-          stock: currentStockMap,
-          branchIds,
-          lowStockBranches,
-        };
-
-        // Si el ítem vendido tenía variantId y el producto tiene variants, descontar también en la variante
-        const targetVariantId = (item as any).variantId || (item as any).variant?.id;
-        if (targetVariantId && Array.isArray(productData.variants)) {
-          productUpdate.variants = productData.variants.map((v: any) => {
-            if (v.id === targetVariantId) {
-              const currentVarStock = typeof v.stock === 'number'
-                ? v.stock
-                : (v.stock?.[effectiveStockBranchKey] ?? 0);
-
-              if (typeof v.stock === 'object' && v.stock !== null) {
-                return {
-                  ...v,
-                  stock: {
-                    ...v.stock,
-                    [effectiveStockBranchKey]: Math.max(0, Math.round(((v.stock[effectiveStockBranchKey] || 0) - baseUnitsToDeduct) * 10000) / 10000),
-                  },
-                };
-              } else {
-                return {
-                  ...v,
-                  stock: Math.max(0, Math.round((currentVarStock - baseUnitsToDeduct) * 10000) / 10000),
-                };
-              }
-            }
-            return v;
-          });
+        const productPath = productRef.path || vi.item.productId;
+        if (!updatedProducts.has(productPath)) {
+          const plan = productStockPlans.get(productPath)!;
+          // NUNCA incluir updatedAt para respetar las reglas de cajero (firestore.rules línea 514)
+          tx.update(plan.productRef, plan.update);
+          updatedProducts.add(productPath);
         }
-
-        // NUNCA incluir updatedAt para respetar las reglas de cajero (firestore.rules línea 514)
-        tx.update(productRef, productUpdate);
 
         // Registrar movimiento en el Kardex oficial (inventory_movements)
         // Con campos canónicos Web y alias móviles
@@ -890,45 +1146,42 @@ export const createSaleTransaction = async (
       // G. Actualizar acumuladores en la sesión de caja (SIN crear doc en cash_register_movements para no duplicar arqueo)
       if (resolvedSessionId) {
         // Actualizar acumuladores en la sesión específica
-        const sessionRef = doc(db, CASH_SESSIONS_COLLECTION, resolvedSessionId);
-        const sessionSnap = await tx.get(sessionRef);
-        if (sessionSnap.exists()) {
+        if (sessionSnap?.exists()) {
           const sData = sessionSnap.data();
-          tx.update(sessionRef, {
+          tx.update(sessionRef!, {
             cashSales: (sData.cashSales || 0) + effectiveCash,
             cardSales: (sData.cardSales || 0) + effectiveCard,
             digitalSales: (sData.digitalSales || 0) + effectiveDigital,
-            creditSales: (sData.creditSales || 0) + effectiveCredit,
-            totalSales: (sData.totalSales || 0) + total,
+            creditSales: (sData.creditSales || 0) + effectiveCredit + effectivePrepaidCredits,
+            totalSales: (sData.totalSales || 0) + (params.chargedAmount ?? total),
+            totalCommissionAmount: (sData.totalCommissionAmount || 0) + (params.commissionAmount || 0),
+            totalSurchargeAmount: (sData.totalSurchargeAmount || 0) + (params.surchargeAmount || 0),
             transactionCount: (sData.transactionCount || 0) + 1,
             expectedAmount: (sData.expectedAmount || 0) + effectiveCash,
+            auditRevision: (sData.auditRevision || 0) + 1,
             updatedAt: serverTimestamp(),
           });
         }
 
         // Actualizar acumuladores en el puntero de sesión activa
-        const pointerSnap = await tx.get(activePointerRef);
-        if (pointerSnap.exists() && pointerSnap.data()?.activeSessionId === resolvedSessionId) {
-          const pData = pointerSnap.data();
+        if (activePointerSnap?.exists() && activePointerSnap.data()?.activeSessionId === resolvedSessionId) {
+          const pData = activePointerSnap.data();
           tx.update(activePointerRef, {
             cashSalesTotal: (pData.cashSalesTotal || 0) + effectiveCash,
-            totalSales: (pData.totalSales || 0) + total,
+            totalSales: (pData.totalSales || 0) + (params.chargedAmount ?? total),
             transactionCount: (pData.transactionCount || 0) + 1,
             lastSaleAt: serverTimestamp(),
           });
         }
 
-        if (userPointerRef) {
-          const uSnap = await tx.get(userPointerRef);
-          if (uSnap.exists() && uSnap.data()?.activeSessionId === resolvedSessionId) {
-            const uData = uSnap.data();
-            tx.update(userPointerRef, {
+        if (userPointerSnap?.exists() && userPointerSnap.data()?.activeSessionId === resolvedSessionId) {
+            const uData = userPointerSnap.data();
+          tx.update(userPointerRef!, {
               cashSalesTotal: (uData.cashSalesTotal || 0) + effectiveCash,
-              totalSales: (uData.totalSales || 0) + total,
+              totalSales: (uData.totalSales || 0) + (params.chargedAmount ?? total),
               transactionCount: (uData.transactionCount || 0) + 1,
               lastSaleAt: serverTimestamp(),
             });
-          }
         }
       }
 
@@ -989,12 +1242,15 @@ export const emitToSunatAsync = async (
   accountId: string,
   branchId: string
 ): Promise<void> => {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 12000);
   try {
     const currentUser = auth.currentUser;
     const token = await currentUser?.getIdToken();
 
     const response = await fetch(`${APP_URL}/api/invoicing/emit`, {
       method: 'POST',
+      signal: controller.signal,
       headers: {
         'Content-Type': 'application/json',
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
@@ -1035,6 +1291,8 @@ export const emitToSunatAsync = async (
         sunatUpdatedAt: serverTimestamp(),
       });
     } catch (_) {}
+  } finally {
+    clearTimeout(timeoutId);
   }
 };
 
@@ -1058,6 +1316,27 @@ export const cancelSaleWithReversal = async (
     throw new Error('Debe proporcionar un motivo de anulación justificado.');
   }
 
+  const legacySaleSnapshot = await getDoc(doc(db, SALES_COLLECTION, saleId));
+  const legacyAccountId = legacySaleSnapshot.exists()
+    ? String(legacySaleSnapshot.data()?.accountId || '')
+    : '';
+  const legacyMovements = legacyAccountId ? await getDocs(query(
+    collection(db, INVENTORY_MOVEMENTS_COLLECTION),
+    where('saleId', '==', saleId),
+    where('accountId', '==', legacyAccountId),
+  )) : { docs: [] };
+  const legacyStockBranchByProduct = new Map<string, string>();
+  for (const movement of legacyMovements.docs) {
+    const data = movement.data();
+    if (typeof data.productId === 'string' && typeof data.branchId === 'string') {
+      legacyStockBranchByProduct.set(data.productId, data.branchId);
+    }
+  }
+
+  const linkedReceivables = legacyAccountId ? await getDocs(query(
+    collection(db, RECEIVABLES_COLLECTION), where('accountId', '==', legacyAccountId), where('saleId', '==', saleId),
+  )) : { docs: [] };
+
   const result = await runTransaction(db, async (tx) => {
     const saleRef = doc(db, SALES_COLLECTION, saleId);
     const saleSnap = await tx.get(saleRef);
@@ -1067,89 +1346,196 @@ export const cancelSaleWithReversal = async (
     }
 
     const saleData = saleSnap.data();
+    if (legacyAccountId && saleData.accountId !== legacyAccountId) {
+      throw new Error('La venta cambió de cuenta durante la anulación.');
+    }
 
     if (saleData.status === 'cancelled') {
       throw new Error(`La venta ${saleData.correlative || saleId} ya se encuentra anulada.`);
+    }
+
+    if (saleData.status === 'refunded' || (saleData.refundedLineIndices?.length || 0) > 0 || Number(saleData.refundedAmount || 0) > 0) {
+      throw new Error('Esta venta ya tiene una devolución. Devuelve únicamente las líneas restantes desde el historial.');
     }
 
     const branchId = saleData.branchId;
     const accountId = saleData.accountId;
     const items: any[] = saleData.items || [];
 
-    // 1. Devolver el stock a cada producto y registrar el contra-movimiento en Kardex
-    let reversalCount = 0;
+    const uniqueProductIds = Array.from(
+      new Set(
+        items
+          .map((item: any) => item.productId || item.id)
+          .filter((id: any): id is string => Boolean(id))
+      )
+    );
 
+    const initialProductSnaps = await Promise.all(
+      uniqueProductIds.map((pId) => tx.get(doc(db, PRODUCTS_COLLECTION, pId)))
+    );
+
+    const productDocMap = new Map<string, { ref: any; snap: any }>();
+    uniqueProductIds.forEach((pId, idx) => {
+      productDocMap.set(pId, { ref: doc(db, PRODUCTS_COLLECTION, pId), snap: initialProductSnaps[idx] });
+    });
+
+    const missingCandidateBases = Array.from(
+      new Set(
+        uniqueProductIds
+          .filter((pId) => {
+            const entry = productDocMap.get(pId);
+            return (!entry?.snap?.exists() || !entry.snap.data()) && pId.includes('_');
+          })
+          .map((pId) => pId.split('_')[0])
+      )
+    ).filter((base) => !productDocMap.has(base));
+
+    if (missingCandidateBases.length > 0) {
+      const fallbackSnaps = await Promise.all(
+        missingCandidateBases.map((base) => tx.get(doc(db, PRODUCTS_COLLECTION, base)))
+      );
+      missingCandidateBases.forEach((base, idx) => {
+        productDocMap.set(base, { ref: doc(db, PRODUCTS_COLLECTION, base), snap: fallbackSnaps[idx] });
+      });
+    }
+
+    const preparedItems: Array<{ item: any; productId: string; productRef: any; productSnap: any; stockBranchKey: string }> = [];
     for (const item of items) {
-      let pId = item.productId || item.id;
-      if (!pId) continue;
+      let productId = item.productId || item.id;
+      if (!productId) continue;
 
-      let productRef = doc(db, PRODUCTS_COLLECTION, pId);
-      let productSnap = await tx.get(productRef);
-
-      if (!productSnap.exists() && pId.includes('_')) {
-        const parts = pId.split('_');
-        if (parts.length >= 2) {
-          const candidateBase = parts[0];
-          const fallbackRef = doc(db, PRODUCTS_COLLECTION, candidateBase);
-          const fallbackSnap = await tx.get(fallbackRef);
-          if (fallbackSnap.exists()) {
-            pId = candidateBase;
-            productRef = fallbackRef;
-            productSnap = fallbackSnap;
-          }
+      let docEntry = productDocMap.get(productId);
+      if ((!docEntry?.snap?.exists() || !docEntry.snap.data()) && productId.includes('_')) {
+        const candidateBase = productId.split('_')[0];
+        const fallbackEntry = productDocMap.get(candidateBase);
+        if (fallbackEntry?.snap?.exists()) {
+          productId = candidateBase;
+          docEntry = fallbackEntry;
         }
       }
 
+      const productRef = docEntry?.ref || doc(db, PRODUCTS_COLLECTION, productId);
+      const productSnap = docEntry?.snap || { exists: () => false, data: () => undefined };
+      const productData = productSnap.exists() ? productSnap.data() : undefined;
+      const stockBranchKey = item.stockBranchId || legacyStockBranchByProduct.get(productId) ||
+        resolveStockBranchKey(productData?.stock, branchId);
+      preparedItems.push({ item, productId, productRef, productSnap, stockBranchKey });
+    }
+
+    const cashRefundAmount =
+      saleData.cashAmount || (saleData.paymentMethod === 'efectivo' ? saleData.total : 0) || 0;
+    const sessionRef = saleData.sessionId
+      ? doc(db, CASH_SESSIONS_COLLECTION, saleData.sessionId)
+      : null;
+    const sessionSnap = sessionRef ? await tx.get(sessionRef) : null;
+    if (cashRefundAmount > 0 && (!sessionSnap?.exists() || sessionSnap.data()?.status !== 'open')) {
+      throw new Error('No se puede devolver efectivo en una caja cerrada. Abre una caja activa y registra la devolución desde el historial.');
+    }
+    const creditParts = (saleData.payments || []).filter((part: PaymentSplit) => part.category === 'credit');
+    const creditAmount = creditParts.length
+      ? creditParts.reduce((sum: number, part: PaymentSplit) => sum + (Number(part.amount) || 0), 0)
+      : Number(saleData.creditAmount ?? saleData.prepaidCreditAmount ?? saleData.total);
+    const isPrepaidCreditSale = saleData.creditMode === 'prepaid' || (saleData.creditMode !== 'receivable' && (
+      isPrepaidCreditMethod(String(saleData.paymentMethod || '')) || isPrepaidCreditMethod(String(saleData.paymentMethodId || ''))
+    ));
+    const isFiadoSale = !isPrepaidCreditSale && (
+      saleData.creditMode === 'receivable' || creditParts.length > 0 || saleData.paymentMethod === 'fiado' ||
+      saleData.paymentMethod === 'credit' || saleData.paymentCategory === 'credit' || Number(saleData.creditAmount || 0) > 0
+    );
+    const customerRef = (isFiadoSale || isPrepaidCreditSale) && saleData.customerId
+      ? doc(db, CUSTOMERS_COLLECTION, saleData.customerId)
+      : null;
+    const customerSnap = customerRef ? await tx.get(customerRef) : null;
+    const receivableSnapshots = isFiadoSale
+      ? await Promise.all(linkedReceivables.docs.map(entry => tx.get(entry.ref))) : [];
+    const receivables = receivableSnapshots.filter(entry => entry.exists()).map(entry => ({ ref: entry.ref, data: entry.data()! }));
+    if (receivables.some(entry => entry.data.accountId !== accountId || entry.data.saleId !== saleId || entry.data.customerId !== saleData.customerId)) {
+      throw new Error('La cuenta por cobrar cambió. Actualiza el historial antes de anular.');
+    }
+
+
+    const cancellationGroups = new Map<string, typeof preparedItems>();
+    for (const prepared of preparedItems) {
+      const path = prepared.productRef.path || prepared.productId;
+      const group = cancellationGroups.get(path) || [];
+      group.push(prepared);
+      cancellationGroups.set(path, group);
+    }
+    const cancellationPlans = new Map<string, {
+      update: Record<string, any>;
+      before: number;
+      after: number;
+      entries: typeof preparedItems;
+    }>();
+    for (const [path, group] of cancellationGroups) {
+      const first = group[0];
+      if (!first.productSnap.exists()) continue;
+      const productData = first.productSnap.data();
+      const stockMap: Record<string, number> = {
+        ...(typeof productData.stock === 'object' && productData.stock !== null ? productData.stock : {}),
+      };
+      const unitsByBranch = new Map<string, number>();
+      for (const entry of group) {
+        unitsByBranch.set(entry.stockBranchKey, (unitsByBranch.get(entry.stockBranchKey) || 0) + calculateBaseUnits(entry.item));
+      }
+      for (const [stockBranchKey, units] of unitsByBranch) {
+        stockMap[stockBranchKey] = Math.round((Number(stockMap[stockBranchKey] || 0) + units) * 10000) / 10000;
+      }
+      const update: Record<string, any> = {
+        stock: stockMap,
+        branchIds: deriveBranchIds(stockMap),
+        lowStockBranches: deriveLowStockBranches(stockMap, productData.reservedStock),
+      };
+      if (Array.isArray(productData.variants)) {
+        const variantUnits = new Map<string, number>();
+        for (const entry of group) {
+          const variantId = entry.item.variantId || entry.item.variant?.id;
+          if (variantId) variantUnits.set(variantId, (variantUnits.get(variantId) || 0) + calculateBaseUnits(entry.item));
+        }
+        update.variants = productData.variants.map((variant: any) => {
+          const units = variantUnits.get(variant.id) || 0;
+          if (!units) return variant;
+          const variantStock = typeof variant.stock === 'object' && variant.stock !== null
+            ? { ...variant.stock }
+            : null;
+          for (const entry of group) {
+            const entryVariantId = entry.item.variantId || entry.item.variant?.id;
+            if (entryVariantId !== variant.id) continue;
+            const key = entry.stockBranchKey;
+            if (variantStock) {
+              variantStock[key] = Math.round((Number(variantStock[key] || 0) + calculateBaseUnits(entry.item)) * 10000) / 10000;
+            }
+          }
+          return variantStock
+            ? { ...variant, stock: variantStock }
+            : { ...variant, stock: Math.round((Number(variant.stock || 0) + units) * 10000) / 10000 };
+        });
+      }
+      cancellationPlans.set(path, { update, before: 0, after: 0, entries: group });
+    }
+
+    // 1. Devolver el stock a cada producto y registrar el contra-movimiento en Kardex
+    let reversalCount = 0;
+    const updatedProducts = new Set<string>();
+    const runningStockByProduct = new Map<string, number>();
+
+    for (const { item, productId: pId, productRef, productSnap, stockBranchKey } of preparedItems) {
       if (productSnap.exists()) {
         const pData = productSnap.data();
         const baseUnits = calculateBaseUnits(item);
-        const currentStock = pData.stock?.[branchId] || 0;
+        const productPath = productRef.path || pId;
+        const plan = cancellationPlans.get(productPath)!;
+        const cursorKey = `${productPath}:${stockBranchKey}`;
+        const currentStock = runningStockByProduct.has(cursorKey)
+          ? runningStockByProduct.get(cursorKey)!
+          : Number(pData.stock?.[stockBranchKey] || 0);
         const restoredStock = Math.round((currentStock + baseUnits) * 10000) / 10000;
-
-        const restoredStockMap: Record<string, number> = {
-          ...(typeof pData.stock === 'object' ? pData.stock : {}),
-          [branchId]: restoredStock,
-        };
-
-        const branchIds = deriveBranchIds(restoredStockMap);
-        const lowStockBranches = deriveLowStockBranches(restoredStockMap, pData.reservedStock);
-
-        const productUpdate: Record<string, any> = {
-          stock: restoredStockMap,
-          branchIds,
-          lowStockBranches,
-        };
-
-        // Si la venta tenía variantId, restaurar también en la variante
-        const targetVariantId = item.variantId || item.variant?.id;
-        if (targetVariantId && Array.isArray(pData.variants)) {
-          productUpdate.variants = pData.variants.map((v: any) => {
-            if (v.id === targetVariantId) {
-              const currentVarStock = typeof v.stock === 'number'
-                ? v.stock
-                : (v.stock?.[branchId] ?? 0);
-
-              if (typeof v.stock === 'object' && v.stock !== null) {
-                return {
-                  ...v,
-                  stock: {
-                    ...v.stock,
-                    [branchId]: Math.round(((v.stock[branchId] || 0) + baseUnits) * 10000) / 10000,
-                  },
-                };
-              } else {
-                return {
-                  ...v,
-                  stock: Math.round((currentVarStock + baseUnits) * 10000) / 10000,
-                };
-              }
-            }
-            return v;
-          });
+        runningStockByProduct.set(cursorKey, restoredStock);
+        if (!updatedProducts.has(productPath)) {
+          // NUNCA incluir updatedAt para respetar las reglas de cajero (firestore.rules línea 514)
+          tx.update(productRef, plan.update);
+          updatedProducts.add(productPath);
         }
-
-        // NUNCA incluir updatedAt para respetar las reglas de cajero (firestore.rules línea 514)
-        tx.update(productRef, productUpdate);
 
         // Registrar entrada por anulación en el Kardex oficial (inventory_movements)
         // Con campos canónicos de Web y alias móviles
@@ -1157,7 +1543,7 @@ export const cancelSaleWithReversal = async (
         tx.set(movementRef, {
           // Campos canónicos Web
           accountId,
-          branchId,
+          branchId: stockBranchKey,
           userId: userProfile.uid,
           userName: userProfile.displayName || userProfile.email || 'Usuario',
           userRole: userProfile.role || 'cashier',
@@ -1188,9 +1574,6 @@ export const cancelSaleWithReversal = async (
     }
 
     // 2. Compensar movimiento en caja si hubo dinero en efectivo
-    const cashRefundAmount =
-      saleData.cashAmount || (saleData.paymentMethod === 'efectivo' ? saleData.total : 0) || 0;
-
     if (cashRefundAmount > 0 && saleData.sessionId) {
       const compensatoryMovementRef = doc(collection(db, CASH_MOVEMENTS_COLLECTION));
       tx.set(compensatoryMovementRef, {
@@ -1208,37 +1591,43 @@ export const cancelSaleWithReversal = async (
       });
 
       // Actualizar sesión si está abierta
-      const sessionRef = doc(db, CASH_SESSIONS_COLLECTION, saleData.sessionId);
-      const sessionSnap = await tx.get(sessionRef);
-      if (sessionSnap.exists() && sessionSnap.data()?.status === 'open') {
-        const sData = sessionSnap.data();
-        tx.update(sessionRef, {
-          totalExpenses: (sData.totalExpenses || 0) + cashRefundAmount,
-          expectedAmount: (sData.expectedAmount || 0) - cashRefundAmount,
-          updatedAt: serverTimestamp(),
-        });
-      }
     }
 
-    // 3. Si era al fiado, revertir deuda del cliente
-    const isFiadoSale =
-      saleData.paymentMethod === 'fiado' ||
-      saleData.paymentCategory === 'credit' ||
-      (saleData.creditAmount && saleData.creditAmount > 0);
+    if (sessionRef && sessionSnap?.exists() && sessionSnap.data()?.status === 'open') {
+      const sData = sessionSnap.data();
+      const sessionPatch: Record<string, any> = {
+        auditRevision: (sData.auditRevision || 0) + 1,
+      };
+      if (cashRefundAmount > 0) {
+        sessionPatch.totalExpenses = (sData.totalExpenses || 0) + cashRefundAmount;
+        sessionPatch.expectedAmount = (sData.expectedAmount || 0) - cashRefundAmount;
+      }
+      tx.update(sessionRef, sessionPatch);
+    }
 
-    if (isFiadoSale && saleData.customerId) {
-      const customerRef = doc(db, CUSTOMERS_COLLECTION, saleData.customerId);
-      const custSnap = await tx.get(customerRef);
-      if (custSnap.exists()) {
-        const custData = custSnap.data();
+    // 3. Revertir deuda por cobrar o devolver créditos prepagados según el método original
+    if (customerRef && customerSnap?.exists()) {
+      const custData = customerSnap.data();
+      const creditReverted = isFiadoSale && receivables.length
+        ? receivables.reduce((sum, entry) => sum + Math.max(0, Number(entry.data.currentDebt) || 0), 0)
+        : creditAmount;
+      if (isPrepaidCreditSale) {
+        const currentCredits = Number(custData.credits || 0);
+        tx.update(customerRef, {
+          credits: Math.round((currentCredits + creditReverted) * 100) / 100,
+        });
+      } else {
         const currentDebt = Number(custData.currentDebt || 0);
-        const creditReverted = saleData.creditAmount || saleData.total;
         const revertedDebt = Math.max(0, Math.round((currentDebt - creditReverted) * 100) / 100);
         tx.update(customerRef, {
           currentDebt: revertedDebt,
           lastModified: serverTimestamp(),
         });
       }
+    }
+
+    for (const entry of receivables) {
+      tx.update(entry.ref, { currentDebt: 0, status: 'cancelled', lastModified: serverTimestamp() });
     }
 
     // 4. Marcar venta como anulada

@@ -2,7 +2,7 @@
   "expo": {
     "name": "Ventify POS",
     "slug": "ventify-mobile",
-    "version": "2.0.0",
+    "version": "2.0.1",
     "orientation": "portrait",
     "scheme": "ventify",
     "userInterfaceStyle": "light",
@@ -27,7 +27,7 @@
     },
     "android": {
       "package": "pe.com.ventify.pos",
-      "versionCode": 2,
+      "versionCode": 3,
       "jsEngine": "hermes",
       "adaptiveIcon": {
         "foregroundImage": "./assets/brand/ventify-logo.png",

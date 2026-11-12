@@ -1,3 +1,4 @@
+import { createProfileResolutionGate, loadIdentitySources } from '@/lib/auth-startup';
 import React, {
   createContext,
   useContext,
@@ -5,6 +6,7 @@ import React, {
   useEffect,
   useCallback,
   useMemo,
+  useRef,
 } from 'react';
 import {
   User,
@@ -24,6 +26,9 @@ import {
 } from 'firebase/firestore';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SecureStore from 'expo-secure-store';
+import { AppState } from 'react-native';
+import { apiRequest } from '@/lib/api-client';
+import { accessBlockReason, profilePermissions, liveProfileAccount, type SubscriptionAccess } from '@/lib/access-policy';
 import { auth, db } from '@/lib/firebase';
 import { UserProfile } from '@/types';
 import { hasAllBranchesAccess } from '@/lib/branch-access';
@@ -43,6 +48,11 @@ export interface AuthContextType {
   role: UserRole;
   allBranchesAccess: boolean;
   customPermissions: CustomUserPermissions | null;
+  isActive: boolean;
+  accessChecking: boolean;
+  accessError: string | null;
+  accessBlocked: string | null;
+  refreshAccess: () => Promise<void>;
   initialized: boolean;
   loading: boolean;
   isPinLocked: boolean;
@@ -69,6 +79,11 @@ const AuthContext = createContext<AuthContextType>({
   role: 'cashier',
   allBranchesAccess: false,
   customPermissions: null,
+  isActive: true,
+  accessChecking: true,
+  accessError: null,
+  accessBlocked: null,
+  refreshAccess: async () => {},
   initialized: false,
   loading: true,
   isPinLocked: false,
@@ -90,6 +105,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [role, setRole] = useState<UserRole>('cashier');
   const [allBranchesAccess, setAllBranchesAccess] = useState<boolean>(false);
   const [customPermissions, setCustomPermissions] = useState<CustomUserPermissions | null>(null);
+  const [isActive, setIsActive] = useState(true);
+  const [isSuperAdmin, setIsSuperAdmin] = useState(false);
+  const [subscription, setSubscription] = useState<SubscriptionAccess | null>(null);
+  const [accessChecking, setAccessChecking] = useState(true);
+  const [accessError, setAccessError] = useState<string | null>(null);
+  const [accessClock, setAccessClock] = useState(Date.now());
+  const identityRef = useRef('');
+  const accessRequestRef = useRef(0);
+  identityRef.current = `${user?.uid || ''}:${accountId || ''}`;
+
 
   const [initialized, setInitialized] = useState<boolean>(false);
   const [loading, setLoading] = useState<boolean>(true);
@@ -121,16 +146,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           setPinCode(savedPin);
         }
 
-        // Cargar accountId y branchId cacheados
-        const [savedAccId, savedBId] = await Promise.all([
-          AsyncStorage.getItem(STORAGE_ACCOUNT_ID_KEY),
-          AsyncStorage.getItem(STORAGE_BRANCH_ID_KEY),
-        ]);
-
-        if (isMounted) {
-          if (savedAccId) setAccountId(savedAccId);
-          if (savedBId) setBranchIdState(savedBId);
-        }
       } catch (err) {
         console.warn('[AuthContext] Error loading initial storage:', err);
       }
@@ -142,8 +157,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     };
   }, []);
 
+  const resolveProfileOnce = useMemo(createProfileResolutionGate, []);
+
   // 2. Resolver accountId, role, branchId y permisos del usuario autenticado
-  const resolveUserProfile = useCallback(async (firebaseUser: User) => {
+  const resolveUserProfile = useCallback((firebaseUser: User) => resolveProfileOnce(firebaseUser.uid, async () => {
     try {
       let resolvedAccountId: string | null = null;
       let resolvedRole: UserRole = 'cashier';
@@ -151,10 +168,19 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       let resolvedAllBranches = false;
       let resolvedCustomPermissions: CustomUserPermissions | null = null;
 
+      const [claimsResult, profileResult] = await loadIdentitySources(
+        () => firebaseUser.getIdTokenResult(false),
+        () => getDoc(doc(db, 'users', firebaseUser.uid)),
+      );
+      if (auth.currentUser?.uid !== firebaseUser.uid) return null;
+
       // 1. Verificar custom claims del JWT
       try {
-        const tokenResult = await firebaseUser.getIdTokenResult(true);
+        if (claimsResult.status === 'rejected') throw claimsResult.reason;
+        const tokenResult = claimsResult.value;
         const claims = tokenResult.claims;
+        if (auth.currentUser?.uid !== firebaseUser.uid) return null;
+        setIsSuperAdmin(claims.isSuperAdmin === true || claims.superAdmin === true);
 
         if (claims.accountId) {
           resolvedAccountId = String(claims.accountId);
@@ -174,12 +200,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       // 2. Consultar documento del usuario en Firestore `users/{uid}`
       try {
-        const userRef = doc(db, 'users', firebaseUser.uid);
-        const userSnap = await getDoc(userRef);
+        if (profileResult.status === 'rejected') throw profileResult.reason;
+        const userSnap = profileResult.value;
 
         if (userSnap.exists()) {
           const uData = userSnap.data();
-          if (!resolvedAccountId && uData.accountId) {
+          if (auth.currentUser?.uid !== firebaseUser.uid) return null;
+          setIsActive(uData.isActive !== false);
+          if (uData.accountId) {
             resolvedAccountId = uData.accountId;
           }
           if (uData.role) {
@@ -191,9 +219,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           if (uData.allBranchesAccess !== undefined) {
             resolvedAllBranches = Boolean(uData.allBranchesAccess);
           }
-          if (uData.customPermissions) {
-            resolvedCustomPermissions = uData.customPermissions;
-          }
+          resolvedCustomPermissions = profilePermissions(uData);
 
           setUserProfile({
             uid: firebaseUser.uid,
@@ -264,18 +290,18 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         allBranchesAccess: resolvedAllBranches,
       });
 
-      // Actualizar estado reactivo
+      // Ignore an old user lookup if sign-out or another login happened meanwhile.
+      if (auth.currentUser?.uid !== firebaseUser.uid) return null;
+      setAccountId(resolvedAccountId);
       if (resolvedAccountId) {
-        setAccountId(resolvedAccountId);
         await AsyncStorage.setItem(STORAGE_ACCOUNT_ID_KEY, resolvedAccountId).catch(() => {});
       }
 
       setRole(resolvedRole);
       setAllBranchesAccess(resolvedAllBranches);
-      if (resolvedCustomPermissions) {
-        setCustomPermissions(resolvedCustomPermissions);
-      }
+      setCustomPermissions(resolvedCustomPermissions);
 
+      setBranchIdState(resolvedBranchId || 'main');
       if (resolvedBranchId && resolvedBranchId !== 'main') {
         setBranchIdState(resolvedBranchId);
         await AsyncStorage.setItem(STORAGE_BRANCH_ID_KEY, resolvedBranchId).catch(() => {});
@@ -286,18 +312,32 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       console.error('[AuthContext] General error resolving user profile:', generalErr);
       return null;
     }
-  }, []);
+  }), [resolveProfileOnce]);
 
   // 3. Escuchar cambios de autenticación en Firebase
   useEffect(() => {
     let unsubUserDoc: (() => void) | null = null;
 
     const unsubscribeAuth = onAuthStateChanged(auth, async (u) => {
+      if (unsubUserDoc) { unsubUserDoc(); unsubUserDoc = null; }
       setUser(u);
+      setUserProfile(null);
+      setIsSuperAdmin(false);
+      setAccountId(null);
+      setBranchIdState('main');
+      setRole('cashier');
+      setAllBranchesAccess(false);
+      setSubscription(null);
+      setAccessError(null);
+      setAccessChecking(Boolean(u));
+      setCustomPermissions(null);
+      setIsActive(true);
 
       if (u) {
         setLoading(true);
-        await resolveUserProfile(u);
+        const resolvedAccount = await resolveUserProfile(u);
+        if (auth.currentUser?.uid !== u.uid) return;
+        if (!resolvedAccount) { setAccessChecking(false); setAccessError("No se pudo determinar la cuenta. Vuelve a iniciar sesión."); }
         // Desbloquear UI inmediatamente tras resolver perfil y claims
         setLoading(false);
         setInitialized(true);
@@ -305,22 +345,32 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         // Suscribirse en tiempo real al documento del usuario para reflejar cambios de rol o sede
         try {
           const userDocRef = doc(db, 'users', u.uid);
+          let hasSeenExplicitAccount = false;
           unsubUserDoc = onSnapshot(
             userDocRef,
             (snap) => {
+              if (auth.currentUser?.uid !== u.uid) return;
               if (snap.exists()) {
                 const data = snap.data();
+                setIsActive(data.isActive !== false);
                 const uRole = (data.role as UserRole) || 'cashier';
                 setRole(uRole);
 
+                const liveAccountId = liveProfileAccount(data.accountId, resolvedAccount, hasSeenExplicitAccount);
+                if (data.accountId) hasSeenExplicitAccount = true;
+                const accountChanged = identityRef.current !== `${u.uid}:${liveAccountId || ''}`;
+                if (accountChanged) { setSubscription(null); setAccessChecking(Boolean(liveAccountId)); }
+                setAccountId(liveAccountId);
                 if (data.accountId) {
-                  setAccountId(data.accountId);
                   AsyncStorage.setItem(STORAGE_ACCOUNT_ID_KEY, data.accountId).catch(() => {});
                 }
 
                 if (data.branchId) {
                   setBranchIdState(data.branchId);
                   AsyncStorage.setItem(STORAGE_BRANCH_ID_KEY, data.branchId).catch(() => {});
+                } else if (accountChanged) {
+                  setBranchIdState('main');
+                  void resolveUserProfile(u);
                 }
 
                 const effectiveAllBranches = hasAllBranchesAccess({
@@ -330,22 +380,35 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
                 });
                 setAllBranchesAccess(effectiveAllBranches);
 
-                if (data.customPermissions) {
-                  setCustomPermissions(data.customPermissions);
-                }
+                setCustomPermissions(profilePermissions(data));
 
-                setUserProfile({
+                const nextProfile: UserProfile = {
                   uid: u.uid,
                   email: u.email,
                   displayName: data.displayName || data.name || u.displayName,
                   photoURL: data.photoURL || u.photoURL,
                   emailVerified: u.emailVerified,
                   role: uRole,
-                  accountId: data.accountId,
+                  accountId: liveAccountId || undefined,
                   branchId: data.branchId,
                   createdAt: data.createdAt,
+                };
+                setUserProfile((prev) => {
+                  if (
+                    prev &&
+                    prev.uid === nextProfile.uid &&
+                    prev.email === nextProfile.email &&
+                    prev.displayName === nextProfile.displayName &&
+                    prev.photoURL === nextProfile.photoURL &&
+                    prev.role === nextProfile.role &&
+                    prev.accountId === nextProfile.accountId &&
+                    prev.branchId === nextProfile.branchId
+                  ) {
+                    return prev;
+                  }
+                  return nextProfile;
                 });
-              }
+              } else { setIsActive(false); setCustomPermissions(null); }
             },
             (err) => {
               console.warn('[AuthContext] Realtime user doc subscription warning:', err);
@@ -364,6 +427,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setAllBranchesAccess(false);
         setCustomPermissions(null);
         setIsPinLocked(false);
+        setIsSuperAdmin(false);
+        setAccessChecking(false);
 
         await AsyncStorage.multiRemove([
           STORAGE_ACCOUNT_ID_KEY,
@@ -371,7 +436,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           '@ventify_pos_cart',
         ]).catch(() => {});
 
-        if (unsubUserDoc) unsubUserDoc();
         setLoading(false);
         setInitialized(true);
       }
@@ -382,6 +446,62 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (unsubUserDoc) unsubUserDoc();
     };
   }, [resolveUserProfile]);
+
+  // The same plan endpoint and six-hour fallback cache used by the web client.
+  const refreshAccess = useCallback(async () => {
+    if (!user || !accountId || loading) return;
+    if (role === 'seller' || isSuperAdmin) {
+      // The seller report endpoint enforces its own business and profile state.
+      setAccessChecking(false);
+      setAccessError(null);
+      return;
+    }
+    const scope = `${user.uid}:${accountId}`;
+    const requestId = ++accessRequestRef.current;
+    const isCurrent = () => identityRef.current === scope && accessRequestRef.current === requestId;
+    const cacheKey = `@ventify_plan:${scope}`;
+    let cached: { subscription: SubscriptionAccess | null; cachedAt: number } | null = null;
+    try {
+      const raw = await AsyncStorage.getItem(cacheKey);
+      cached = raw ? JSON.parse(raw) : null;
+      if (cached && Date.now() - cached.cachedAt < 6 * 3600000 && isCurrent()) {
+        setSubscription(cached.subscription);
+        setAccessChecking(false);
+      }
+    } catch { /* A malformed cache never grants access. */ }
+    try {
+      const data = await apiRequest<{ subscription: SubscriptionAccess | null }>(`/api/plan-limits/${encodeURIComponent(accountId)}`);
+      if (!isCurrent()) return;
+      setSubscription(data.subscription);
+      setAccessError(null);
+      await AsyncStorage.setItem(cacheKey, JSON.stringify({ subscription: data.subscription, cachedAt: Date.now() }));
+    } catch (error) {
+      if (!isCurrent()) return;
+      const status = (error as { status?: number }).status;
+      const mayUseCache = (!status || status === 408 || status >= 500) && cached && Date.now() - cached.cachedAt < 6 * 3600000;
+      if (!mayUseCache) setAccessError(error instanceof Error ? error.message : 'No se pudo verificar el acceso del negocio.');
+    } finally {
+      if (isCurrent()) { setAccessClock(Date.now()); setAccessChecking(false); }
+    }
+  }, [user?.uid, accountId, role, isSuperAdmin, loading]);
+
+  useEffect(() => {
+    if (!user || !accountId || loading) return;
+    setAccessChecking(true);
+    setAccessError(null);
+    void refreshAccess();
+    const foreground = AppState.addEventListener('change', (state) => {
+      if (state === 'active') {
+        setAccessClock(Date.now());
+        void refreshAccess();
+      }
+    });
+    return () => {
+      foreground.remove();
+    };
+  }, [user?.uid, accountId, loading, refreshAccess]);
+
+  const accessBlocked = accessBlockReason({ isActive, isSuperAdmin }, subscription, accessClock);
 
   // 4. Cambiar sucursal activa
   const setActiveBranchId = useCallback((newBranchId: string) => {
@@ -478,6 +598,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       role,
       allBranchesAccess,
       customPermissions,
+      isActive,
+      accessChecking,
+      accessError,
+      accessBlocked,
+      refreshAccess,
       initialized,
       loading,
       isPinLocked,
@@ -498,6 +623,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       role,
       allBranchesAccess,
       customPermissions,
+      isActive,
+      accessChecking,
+      accessError,
+      accessBlocked,
+      refreshAccess,
       initialized,
       loading,
       isPinLocked,

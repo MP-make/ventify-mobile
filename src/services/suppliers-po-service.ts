@@ -585,8 +585,8 @@ export const createPurchaseOrder = async (
     supplierId,
     supplierName,
     items,
-    branchId = 'main',
-    branchName = 'Principal',
+    branchId,
+    branchName,
     status = 'pending',
     expectedDate,
     notes,
@@ -634,8 +634,8 @@ export const createPurchaseOrder = async (
 
   const docData: any = {
     accountId,
-    branchId,
-    branchName,
+    ...(branchId ? { branchId } : {}),
+    ...(branchName ? { branchName } : {}),
     supplierId,
     supplierName,
     orderNumber,
@@ -723,7 +723,8 @@ export const updatePurchaseOrderStatus = async (
 export const receivePurchaseOrder = async (
   orderOrId: PurchaseOrder | string,
   userProfile?: UserProfileInfo | null,
-  branchIdOverride?: string
+  branchIdOverride?: string,
+  branchNameOverride?: string
 ): Promise<ReceivePurchaseOrderResult> => {
   const orderId = typeof orderOrId === 'string' ? orderOrId : orderOrId.id;
 
@@ -757,8 +758,13 @@ export const receivePurchaseOrder = async (
       throw new Error('No es posible recibir una orden que ha sido cancelada.');
     }
 
-    const effectiveBranchId = branchIdOverride || orderData.branchId || 'main';
-    const effectiveBranchName = orderData.branchName || effectiveBranchId;
+    const effectiveBranchId = branchIdOverride || orderData.branchId;
+    if (!effectiveBranchId || effectiveBranchId === 'all') {
+      throw new Error('Selecciona una sucursal antes de recibir la orden.');
+    }
+    const effectiveBranchName = branchNameOverride ||
+      (effectiveBranchId === orderData.branchId ? orderData.branchName : undefined) ||
+      effectiveBranchId;
     const items: PurchaseOrderItem[] = Array.isArray(orderData.items) ? orderData.items : [];
 
     if (items.length === 0) {

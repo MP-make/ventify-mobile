@@ -5,6 +5,9 @@ import {
   mergeCatalogOptions,
   uniqueCatalogValues,
   normalizeCatalogLabel,
+  buildCatalogProductIndex,
+  filterCatalogIndex,
+  getCatalogCategoryCounts,
 } from '../catalog-filters';
 
 describe('catalog-filters', () => {
@@ -77,5 +80,38 @@ describe('catalog-filters', () => {
     expect(matchQuery(product, 'PACK-6')).toBe(true);
     expect(matchQuery(product, '750 ml')).toBe(true);
     expect(matchQuery(product, 'cerveza')).toBe(false);
+  });
+
+  it('indexes and searches names, product references, IDs, barcodes, brands, and sizes accent-insensitively', () => {
+    const products = [
+      { id: 'ref-001', name: 'Café Molido', category: 'Bebidas', sku: 'CAF-1', barcode: '123', brand: 'El Cisne', sizeLabel: 'Tamaño XL' },
+      { id: 'ref-002', name: 'Arroz', category: 'Abarrotes', barcodes: ['PACK-6'], attributes: { Talla: 'Medida Grande' } },
+    ] as any[];
+    const index = buildCatalogProductIndex(products as any);
+
+    expect(filterCatalogIndex(index, { query: 'cafe' })).toEqual([products[0]]);
+    expect(filterCatalogIndex(index, { query: 'ref-001' })).toEqual([products[0]]);
+    expect(filterCatalogIndex(index, { query: 'pack-6' })).toEqual([products[1]]);
+    expect(filterCatalogIndex(index, { query: 'cisne' })).toEqual([products[0]]);
+    expect(filterCatalogIndex(index, { query: 'tamano xl' })).toEqual([products[0]]);
+    expect(filterCatalogIndex(index, { query: 'medida grande' })).toEqual([products[1]]);
+    expect(filterCatalogIndex(index, { category: 'Bebídas', brand: 'el cisne', size: 'Tamaño XL' })).toEqual([products[0]]);
+  });
+
+  it('computes category counts in one index pass, including uncategorized products', () => {
+    const products = [
+      { id: '1', name: 'A', category: 'Bebidas' },
+      { id: '2', name: 'B', category: 'Bebidas' },
+      { id: '3', name: 'C', category: 'Abarrotes' },
+      { id: '4', name: 'D' },
+    ] as any[];
+    const index = buildCatalogProductIndex(products as any);
+
+    expect(getCatalogCategoryCounts(['Bebidas', 'Abarrotes', 'Sin Categoría'], index)).toEqual([
+      { name: 'Todas', count: 4 },
+      { name: 'Bebidas', count: 2 },
+      { name: 'Abarrotes', count: 1 },
+      { name: 'Sin Categoría', count: 1 },
+    ]);
   });
 });

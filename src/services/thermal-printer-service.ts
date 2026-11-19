@@ -11,7 +11,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Print from 'expo-print';
 import * as Sharing from 'expo-sharing';
-import { Platform, NativeModules, Linking } from 'react-native';
+import { Platform, NativeModules, Linking, PermissionsAndroid } from 'react-native';
 import {
   EscPosBuilder,
   buildSaleReceiptEscPos as coreBuildSaleReceiptEscPos,
@@ -20,20 +20,36 @@ import {
   type EscPosOptions,
   uint8ArrayToBase64,
 } from '@/lib/printing/escpos-builder';
+import { buildQrSvgMarkup } from '@/lib/invoicing/qr-matrix';
+import {
+  resolveAccountTaxProfile,
+  type TaxProfileConfig,
+  type TaxProfileInput,
+} from '@/lib/invoicing/receipt-amounts';
+import type { Branch } from '@/types';
 
 export interface ReceiptItem {
   name: string;
+  sku?: string;
+  variantName?: string;
   quantity: number;
   price: number;
   total: number;
   unitOfMeasure?: string;
+  discount?: number;
 }
 
 export interface EscPosReceiptData {
   businessName?: string;
+  razonSocial?: string;
+  description?: string;
+  logoUrl?: string;
   ruc?: string;
   address?: string;
+  fiscalAddress?: string;
+  commercialAddress?: string;
   phone?: string;
+  email?: string;
   documentTitle: string;
   documentNumber: string;
   date: string;
@@ -46,11 +62,20 @@ export interface EscPosReceiptData {
   paymentMethod: string;
   items: ReceiptItem[];
   subtotal: number;
+  discountAmount?: number;
   tax?: number;
+  taxRate?: number;
+  exemptAmount?: number;
+  isAmazonExempt?: boolean;
   total: number;
+  surchargeAmount?: number;
+  chargedAmount?: number;
   cashReceived?: number;
   changeGiven?: number;
   amountInWords?: string;
+  qrContent?: string;
+  sunatHash?: string;
+  sunatResolution?: string;
   consultUrl?: string;
   footerNote?: string;
 }
@@ -60,6 +85,7 @@ export interface EscPosReceiptData {
 // ============================================================================
 
 export const PRINTER_CONFIG_STORAGE_KEY = 'ventify_printer_config_v2';
+const BLUETOOTH_PRINT_TIMEOUT_MS = 10_000;
 
 // ============================================================================
 // TIPOS E INTERFACES
@@ -165,8 +191,81 @@ export const savePrinterConfig = async (
 };
 
 // ============================================================================
-// CONEXIÓN Y ESCANEO BLUETOOTH
+// PERMISOS, CONEXIÓN Y ESCANEO BLUETOOTH
 // ============================================================================
+
+const getAndroidApiLevel = (): number => {
+  if (Platform.OS !== 'android') return 0;
+  if (typeof Platform.Version === 'number') return Platform.Version;
+  const parsed = parseInt(String(Platform.Version || '0'), 10);
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+
+/**
+ * Solicita permisos runtime de Bluetooth en Android 12+ (API >= 31).
+ */
+export const ensureBluetoothPermissions = async (requireScan: boolean = false): Promise<void> => {
+  if (Platform.OS !== 'android') return;
+  if (getAndroidApiLevel() < 31) return;
+  if (!PermissionsAndroid) return;
+
+  const connectPerm =
+    PermissionsAndroid.PERMISSIONS?.BLUETOOTH_CONNECT || 'android.permission.BLUETOOTH_CONNECT';
+  const scanPerm =
+    PermissionsAndroid.PERMISSIONS?.BLUETOOTH_SCAN || 'android.permission.BLUETOOTH_SCAN';
+  const requiredPerms = requireScan ? [connectPerm, scanPerm] : [connectPerm];
+
+  if (typeof PermissionsAndroid.requestMultiple === 'function') {
+    const statuses = await PermissionsAndroid.requestMultiple(requiredPerms as any);
+    const grantedStatus = PermissionsAndroid.RESULTS?.GRANTED || 'granted';
+    const allGranted = requiredPerms.every((perm) => statuses?.[perm] === grantedStatus);
+    if (!allGranted) {
+      throw new Error(
+        'Permiso de Bluetooth denegado. Habilita "Dispositivos cercanos" para Ventify POS en Ajustes de Android.'
+      );
+    }
+    return;
+  }
+
+  if (typeof PermissionsAndroid.request === 'function') {
+    const grantedStatus = PermissionsAndroid.RESULTS?.GRANTED || 'granted';
+    for (const perm of requiredPerms) {
+      const status = await PermissionsAndroid.request(perm as any);
+      if (status !== grantedStatus) {
+        throw new Error(
+          'Permiso de Bluetooth denegado. Habilita "Dispositivos cercanos" para Ventify POS en Ajustes de Android.'
+        );
+      }
+    }
+  }
+};
+
+/**
+ * Comprueba o solicita permisos de Bluetooth para mostrar estado en UI.
+ */
+export const requestBluetoothPermissions = async (): Promise<{
+  granted: boolean;
+  message?: string;
+}> => {
+  if (Platform.OS !== 'android') {
+    return {
+      granted: false,
+      message: 'La impresión Bluetooth ESC/POS directa está disponible únicamente en Android.',
+    };
+  }
+
+  try {
+    await ensureBluetoothPermissions(true);
+    return { granted: true };
+  } catch (err: any) {
+    return {
+      granted: false,
+      message:
+        err?.message ||
+        'No se otorgaron permisos de Bluetooth para acceder a ticketeras cercanas.',
+    };
+  }
+};
 
 /**
  * Convierte un Uint8Array a cadena Base64 centralizada en escpos-builder.ts
@@ -174,69 +273,187 @@ export const savePrinterConfig = async (
 export { uint8ArrayToBase64 };
 
 /**
- * Escanea o lista las impresoras térmicas Bluetooth vinculadas en el sistema
+ * Escanea o lista las impresoras térmicas Bluetooth vinculadas en el sistema.
+ * No devuelve dispositivos simulados ante errores de permisos o hardware.
  */
 export const scanBluetoothPrinters = async (): Promise<BluetoothPrinterDevice[]> => {
-  if (Platform.OS === 'android') {
-    const nativePlugin = NativeModules.ThermalPrinter;
-    if (nativePlugin && typeof nativePlugin.getPairedPrinters === 'function') {
-      try {
-        const res = await nativePlugin.getPairedPrinters();
-        if (Array.isArray(res?.devices)) {
-          return res.devices;
-        }
-      } catch (e) {
-        console.warn('[ThermalPrinterService] Error consultando ThermalPrinter nativo:', e);
-      }
-    }
+  if (Platform.OS !== 'android') {
+    throw new Error(
+      'El escaneo de ticketeras Bluetooth ESC/POS solo está disponible en Android. En este dispositivo usa "PDF / Sistema".'
+    );
   }
 
-  // Lista de diagnóstico o fallback simulado para desarrollo / Expo Go
-  return [
-    { name: 'Impresora Bluetooth Térmica (Detectada)', address: '00:11:22:33:44:55' },
-    { name: 'POS-80 Series', address: '66:77:88:99:AA:BB' },
-  ];
+  await ensureBluetoothPermissions(true);
+
+  const nativePlugin = NativeModules?.ThermalPrinter;
+  if (!nativePlugin || typeof nativePlugin.getPairedPrinters !== 'function') {
+    throw new Error(
+      'El módulo nativo de impresión Bluetooth (ThermalPrinter) no está disponible en esta compilación. Usa el modo "PDF / Sistema".'
+    );
+  }
+
+  const res = await nativePlugin.getPairedPrinters();
+  if (Array.isArray(res?.devices)) {
+    return res.devices;
+  }
+
+  return [];
 };
 
 /**
- * Envía un buffer binario ESC/POS a la impresora térmica Bluetooth
+ * Envía un buffer binario ESC/POS a la impresora térmica Bluetooth.
+ * Devuelve `false` si no es Android, falta dirección MAC, falta módulo nativo o falla la conexión,
+ * permitiendo que los llamadores hagan fallback limpio a `printTicketPDF`.
  */
 export const printRawEscPos = async (
   bytes: Uint8Array,
   deviceAddress?: string
 ): Promise<boolean> => {
-  const config = await getPrinterConfig();
-  const address = deviceAddress || config.selectedDevice?.address;
-
-  if (Platform.OS === 'android') {
-    const nativePlugin = NativeModules.ThermalPrinter;
-    if (nativePlugin && typeof nativePlugin.printRaw === 'function' && address) {
-      try {
-        const base64Data = uint8ArrayToBase64(bytes);
-        let timeoutHandle: any;
-        const timeoutPromise = new Promise<never>((_, reject) => {
-          timeoutHandle = setTimeout(() => {
-            reject(new Error('Timeout de impresión térmica Bluetooth (6 segundos excedidos)'));
-          }, 6000);
-        });
-
-        const printPromise = nativePlugin.printRaw({ address, base64Data });
-
-        try {
-          const res = await Promise.race([printPromise, timeoutPromise]);
-          return res?.success ?? true;
-        } finally {
-          clearTimeout(timeoutHandle);
-        }
-      } catch (err) {
-        console.error('[ThermalPrinterService] Error en printRaw nativo:', err);
-        throw err;
-      }
-    }
+  if (Platform.OS !== 'android') {
+    return false;
   }
 
-  console.log(`[ThermalPrinterService] Simulación ESC/POS (${bytes.length} bytes enviados a ${address || 'default'})`);
-  return true;
+  const config = await getPrinterConfig();
+  const address = (deviceAddress || config.selectedDevice?.address || '').trim();
+  if (!address) {
+    return false;
+  }
+
+  const nativePlugin = NativeModules?.ThermalPrinter;
+  if (!nativePlugin || typeof nativePlugin.printRaw !== 'function') {
+    return false;
+  }
+
+  try {
+    await ensureBluetoothPermissions(false);
+
+    const base64Data = uint8ArrayToBase64(bytes);
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutHandle = setTimeout(() => {
+        reject(new Error('Timeout de impresión térmica Bluetooth (10 segundos excedidos)'));
+      }, BLUETOOTH_PRINT_TIMEOUT_MS);
+    });
+
+    const printPromise = nativePlugin.printRaw({ address, base64Data });
+
+    try {
+      const res = await Promise.race([printPromise, timeoutPromise]);
+      return res?.success === true || res?.success === undefined;
+    } finally {
+      if (timeoutHandle !== undefined) {
+        clearTimeout(timeoutHandle);
+      }
+    }
+  } catch (err) {
+    console.warn('[ThermalPrinterService] Error en printRaw nativo (usando fallback PDF):', err);
+    return false;
+  }
+};
+
+/**
+ * Prueba la conexión física enviando un mini ticket ESC/POS a la ticketera Bluetooth.
+ */
+export const testPrinterConnection = async (
+  deviceAddress?: string
+): Promise<{ success: boolean; message: string }> => {
+  if (Platform.OS !== 'android') {
+    return {
+      success: false,
+      message: 'La impresión térmica Bluetooth directa solo está soportada en Android.',
+    };
+  }
+
+  try {
+    await ensureBluetoothPermissions(false);
+  } catch (permErr: any) {
+    return {
+      success: false,
+      message: permErr?.message || 'Permiso Bluetooth denegado.',
+    };
+  }
+
+  const config = await getPrinterConfig();
+  const address = (deviceAddress || config.selectedDevice?.address || '').trim();
+  if (!address) {
+    return {
+      success: false,
+      message: 'No hay ninguna impresora Bluetooth seleccionada.',
+    };
+  }
+
+  const nativePlugin = NativeModules?.ThermalPrinter;
+  if (!nativePlugin || typeof nativePlugin.printRaw !== 'function') {
+    return {
+      success: false,
+      message:
+        'El módulo nativo ThermalPrinter no está disponible en esta compilación. Usa "PDF / Sistema".',
+    };
+  }
+
+  const builder = new EscPosBuilder({
+    paperWidth: config.paperWidth,
+    autoCut: config.autoCut,
+  });
+  builder
+    .align('center')
+    .bold(true)
+    .size('double-height')
+    .line('VENTIFY POS')
+    .size('normal')
+    .bold(false)
+    .divider('-')
+    .line('PRUEBA DE CONEXION BLUETOOTH')
+    .line(`Ancho: ${config.paperWidth}mm`)
+    .line(`MAC: ${address}`)
+    .line(`Fecha: ${new Date().toLocaleString('es-PE')}`)
+    .divider('-')
+    .line('Impresora lista para operar.')
+    .feed(2);
+
+  if (config.autoCut !== false) {
+    builder.cut(true, 3);
+  }
+
+  const bytes = builder.build();
+  const base64Data = uint8ArrayToBase64(bytes);
+
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutHandle = setTimeout(() => {
+        reject(new Error('La impresora no respondió dentro de 10 segundos.'));
+      }, BLUETOOTH_PRINT_TIMEOUT_MS);
+    });
+
+    const res = await Promise.race([
+      nativePlugin.printRaw({ address, base64Data }),
+      timeoutPromise,
+    ]);
+
+    if (res?.success === false) {
+      return {
+        success: false,
+        message: 'La impresora rechazó el comando de prueba.',
+      };
+    }
+
+    return {
+      success: true,
+      message: `Ticket de prueba enviado correctamente a ${address}.`,
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      message:
+        err?.message ||
+        'No se pudo conectar con la impresora Bluetooth. Verifica que esté encendida y vinculada.',
+    };
+  } finally {
+    if (timeoutHandle !== undefined) {
+      clearTimeout(timeoutHandle);
+    }
+  }
 };
 
 // ============================================================================
@@ -251,7 +468,15 @@ export const buildSaleReceiptEscPos = (
   businessOrOptions?: any,
   maybeOptions?: EscPosOptions
 ): Uint8Array => {
-  if (maybeOptions || (businessOrOptions && ('businessName' in businessOrOptions || 'ruc' in businessOrOptions || 'name' in businessOrOptions))) {
+  if (
+    maybeOptions ||
+    (businessOrOptions &&
+      ('businessName' in businessOrOptions ||
+        'ruc' in businessOrOptions ||
+        'name' in businessOrOptions ||
+        'fiscalAddress' in businessOrOptions ||
+        'commercialAddress' in businessOrOptions))
+  ) {
     return coreBuildSaleReceiptEscPos(saleOrData, businessOrOptions || {}, maybeOptions || {});
   }
   return coreBuildSaleReceiptEscPos(saleOrData, {}, businessOrOptions || {});
@@ -377,27 +602,79 @@ export const buildCashClosureEscPos = (
 // IMPRESIÓN UNIVERSAL EXPO-PRINT & COMPARTIR WHATSAPP
 // ============================================================================
 
+const escapeHtml = (value: unknown): string =>
+  String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
+const sanitizeImageSrc = (url?: string): string => {
+  const trimmed = String(url || '').trim();
+  if (!trimmed) return '';
+  if (/^(https?:\/\/|data:image\/)/i.test(trimmed)) {
+    return escapeHtml(trimmed);
+  }
+  return '';
+};
+
 /**
  * Genera la plantilla HTML estilizada como ticket térmico (58mm u 80mm)
  */
 export const generateReceiptHTML = (
   data: EscPosReceiptData,
-  paperWidth: PrinterPaperWidth = 80
+  paperWidth: PrinterPaperWidth = 80,
+  taxProfile?: TaxProfileConfig | null
 ): string => {
   const is58 = paperWidth === 58;
   const maxWidth = is58 ? '48mm' : '72mm';
   const fontSize = is58 ? '10px' : '12px';
 
+  const resolvedProfile = taxProfile ? resolveAccountTaxProfile(taxProfile) : null;
+  const isAmazonExempt = Boolean(data.isAmazonExempt || resolvedProfile?.isAmazonExempt);
+  const igvRate = isAmazonExempt
+    ? 0
+    : typeof data.taxRate === 'number' && data.taxRate > 0
+    ? Math.round(data.taxRate)
+    : resolvedProfile && resolvedProfile.taxRate > 0
+    ? Math.round(resolvedProfile.taxRate)
+    : data.subtotal > 0 && (data.tax || 0) > 0
+    ? Math.round(((data.tax || 0) / data.subtotal) * 100)
+    : 18;
+
   const rows = (data.items || [])
-    .map(
-      (it: ReceiptItem) => `
+    .map((it: ReceiptItem) => {
+      const safeName = escapeHtml(it.name);
+      const safeVariant = it.variantName ? ` (${escapeHtml(it.variantName)})` : '';
+      const safeSku = escapeHtml(it.sku || '-');
+      const safeUnit = escapeHtml((it.unitOfMeasure || 'UND').toUpperCase());
+      const qty = Number(it.quantity) || 0;
+      const price = Number(it.price) || 0;
+      const total = Number(it.total) || 0;
+
+      return `
       <tr>
-        <td style="text-align: left; padding: 2px 0;">${it.name}<br/><small style="color: #666;">${it.quantity} x S/ ${it.price.toFixed(2)}</small></td>
-        <td style="text-align: right; vertical-align: top; padding: 2px 0;">S/ ${it.total.toFixed(2)}</td>
+        <td colspan="4" style="text-align: left; padding: 3px 0 1px; font-weight: bold;">${safeName}${safeVariant}</td>
       </tr>
-    `
-    )
+      <tr style="font-size: 0.85em; color: #444; border-bottom: 1px dotted #ddd;">
+        <td style="padding-bottom: 3px;">${safeSku}</td>
+        <td style="padding-bottom: 3px;">${qty} ${safeUnit}</td>
+        <td class="text-right" style="padding-bottom: 3px;">${price.toFixed(2)}</td>
+        <td class="text-right bold" style="padding-bottom: 3px; color: #000;">S/ ${total.toFixed(2)}</td>
+      </tr>
+    `;
+    })
     .join('');
+
+  const qrSvg = data.qrContent ? buildQrSvgMarkup(data.qrContent, is58 ? 96 : 112, 2) : '';
+  const wordsLine = data.amountInWords
+    ? String(data.amountInWords).toUpperCase().startsWith('SON:')
+      ? data.amountInWords
+      : `SON: ${data.amountInWords}`
+    : '';
+  const safeLogoSrc = sanitizeImageSrc(data.logoUrl);
+  const effectiveFiscalAddress = data.fiscalAddress || data.address;
 
   return `
     <!DOCTYPE html>
@@ -415,46 +692,52 @@ export const generateReceiptHTML = (
             font-size: ${fontSize};
             color: #000;
             background: #fff;
-            line-height: 1.25;
+            line-height: 1.28;
           }
           .text-center { text-align: center; }
           .text-right { text-align: right; }
           .bold { font-weight: bold; }
-          .title { font-size: 1.3em; margin: 4px 0; }
+          .title { font-size: 1.25em; margin: 4px 0; }
           .divider { border-bottom: 1px dashed #000; margin: 6px 0; }
-          .double-divider { border-bottom: 2px solid #000; margin: 6px 0; }
           table { width: 100%; border-collapse: collapse; }
-          .total-row { font-size: 1.2em; font-weight: bold; }
-          .footer { font-size: 0.85em; text-align: center; margin-top: 10px; }
+          .total-row { font-size: 1.18em; font-weight: bold; }
+          .footer { font-size: 0.85em; text-align: center; margin-top: 8px; }
         </style>
       </head>
       <body>
         <div class="text-center">
-          ${data.businessName ? `<div class="bold title">${data.businessName}</div>` : ''}
-          ${data.ruc ? `<div>RUC: ${data.ruc}</div>` : ''}
-          ${data.address ? `<div>${data.address}</div>` : ''}
-          ${data.phone ? `<div>Telf: ${data.phone}</div>` : ''}
+          ${safeLogoSrc ? `<img src="${safeLogoSrc}" alt="Logo" style="max-width: ${is58 ? '100px' : '132px'}; max-height: 52px; object-fit: contain; margin: 0 auto 4px; display: block;" />` : ''}
+          ${data.businessName ? `<div class="bold title">${escapeHtml(data.businessName)}</div>` : ''}
+          ${data.razonSocial && data.razonSocial !== data.businessName ? `<div>${escapeHtml(data.razonSocial)}</div>` : ''}
+          ${data.description ? `<div><em>"${escapeHtml(data.description)}"</em></div>` : ''}
+          ${data.ruc ? `<div class="bold">RUC: ${escapeHtml(data.ruc)}</div>` : ''}
+          ${effectiveFiscalAddress ? `<div>${escapeHtml(effectiveFiscalAddress)}</div>` : ''}
+          ${data.commercialAddress && data.commercialAddress !== effectiveFiscalAddress ? `<div>Tienda: ${escapeHtml(data.commercialAddress)}</div>` : ''}
+          ${data.phone ? `<div>Telf: ${escapeHtml(data.phone)}</div>` : ''}
+          ${data.email ? `<div>${escapeHtml(data.email)}</div>` : ''}
           <div class="divider"></div>
-          <div class="bold title">${data.documentTitle}</div>
-          <div class="bold">${data.documentNumber}</div>
+          <div class="bold title">${escapeHtml(data.documentTitle)}</div>
+          <div class="bold">${escapeHtml(data.documentNumber)}</div>
         </div>
 
         <div class="divider"></div>
 
-        <div><strong>Fecha:</strong> ${data.date} ${data.time || ''}</div>
-        ${data.sellerName ? `<div><strong>Vendedor:</strong> ${data.sellerName}</div>` : ''}
-        ${data.customerName ? `<div><strong>Cliente:</strong> ${data.customerName}</div>` : ''}
-        ${data.customerDocNumber ? `<div><strong>${data.customerDocType || 'Doc'}:</strong> ${data.customerDocNumber}</div>` : ''}
-        ${data.customerAddress ? `<div><strong>Dirección:</strong> ${data.customerAddress}</div>` : ''}
-        <div><strong>Forma de Pago:</strong> ${(data.paymentMethod || 'EFECTIVO').toUpperCase()}</div>
+        <div><strong>Fecha:</strong> ${escapeHtml(data.date)} ${escapeHtml(data.time || '')}</div>
+        ${data.sellerName ? `<div><strong>Vendedor:</strong> ${escapeHtml(data.sellerName)}</div>` : ''}
+        ${data.customerName ? `<div><strong>Cliente:</strong> ${escapeHtml(data.customerName)}</div>` : ''}
+        ${data.customerDocNumber ? `<div><strong>${escapeHtml(data.customerDocType || 'Doc')}:</strong> ${escapeHtml(data.customerDocNumber)}</div>` : ''}
+        ${data.customerAddress ? `<div><strong>Dirección:</strong> ${escapeHtml(data.customerAddress)}</div>` : ''}
+        <div><strong>Forma de Pago:</strong> ${escapeHtml((data.paymentMethod || 'EFECTIVO').toUpperCase())}</div>
 
         <div class="divider"></div>
 
         <table>
           <thead>
-            <tr>
-              <th style="text-align: left; border-bottom: 1px solid #000;">DESCRIPCIÓN</th>
-              <th style="text-align: right; border-bottom: 1px solid #000;">TOTAL</th>
+            <tr style="border-bottom: 1px dashed #000; font-size: 0.85em;">
+              <th style="text-align: left;">SKU</th>
+              <th style="text-align: left;">CANT</th>
+              <th style="text-align: right;">PRECIO</th>
+              <th style="text-align: right;">TOTAL</th>
             </tr>
           </thead>
           <tbody>
@@ -465,26 +748,28 @@ export const generateReceiptHTML = (
         <div class="divider"></div>
 
         <table>
-          <tr>
-            <td>Subtotal:</td>
-            <td class="text-right">S/ ${(data.subtotal || 0).toFixed(2)}</td>
-          </tr>
-          ${data.tax ? `<tr><td>IGV (18%):</td><td class="text-right">S/ ${data.tax.toFixed(2)}</td></tr>` : ''}
+          ${data.discountAmount && data.discountAmount > 0 ? `<tr><td>Descuento:</td><td class="text-right">-S/ ${Number(data.discountAmount).toFixed(2)}</td></tr>` : ''}
+          ${isAmazonExempt ? `<tr><td>Op. Exonerada:</td><td class="text-right">S/ ${Number(data.exemptAmount ?? data.subtotal ?? data.total).toFixed(2)}</td></tr>` : `<tr><td>${data.tax && data.tax > 0 ? 'Op. Gravada:' : 'Subtotal:'}</td><td class="text-right">S/ ${Number(data.subtotal || 0).toFixed(2)}</td></tr>`}
+          ${!isAmazonExempt && data.tax && data.tax > 0 ? `<tr><td>IGV (${igvRate}%):</td><td class="text-right">S/ ${Number(data.tax).toFixed(2)}</td></tr>` : ''}
           <tr class="total-row">
             <td style="padding-top: 4px;">TOTAL:</td>
-            <td class="text-right" style="padding-top: 4px;">S/ ${(data.total || 0).toFixed(2)}</td>
+            <td class="text-right" style="padding-top: 4px;">S/ ${Number(data.total || 0).toFixed(2)}</td>
           </tr>
-          ${data.cashReceived ? `<tr><td>Efectivo Recibido:</td><td class="text-right">S/ ${data.cashReceived.toFixed(2)}</td></tr>` : ''}
-          ${data.changeGiven ? `<tr><td>Vuelto:</td><td class="text-right">S/ ${data.changeGiven.toFixed(2)}</td></tr>` : ''}
+          ${data.surchargeAmount && data.surchargeAmount > 0 ? `<tr><td>Recargo:</td><td class="text-right">S/ ${Number(data.surchargeAmount).toFixed(2)}</td></tr><tr class="bold"><td>TOTAL COBRADO:</td><td class="text-right">S/ ${Number(data.chargedAmount ?? data.total + data.surchargeAmount).toFixed(2)}</td></tr>` : ''}
+          ${data.cashReceived ? `<tr><td>Efectivo Recibido:</td><td class="text-right">S/ ${Number(data.cashReceived).toFixed(2)}</td></tr>` : ''}
+          ${data.changeGiven ? `<tr><td>Vuelto:</td><td class="text-right">S/ ${Number(data.changeGiven).toFixed(2)}</td></tr>` : ''}
         </table>
 
-        ${data.amountInWords ? `<div class="divider"></div><div style="font-size: 0.85em;">SON: ${data.amountInWords.toUpperCase()}</div>` : ''}
+        ${wordsLine ? `<div class="divider"></div><div style="font-size: 0.85em; font-weight: bold;">${escapeHtml(wordsLine.toUpperCase())}</div>` : ''}
+        ${isAmazonExempt ? `<div class="text-center" style="font-size: 0.78em; margin-top: 4px;">BIENES TRANSFERIDOS EN LA AMAZONÍA REGIÓN SELVA PARA SER CONSUMIDOS EN LA MISMA</div>` : ''}
+        ${qrSvg ? `<div class="divider"></div><div class="text-center" style="margin: 6px 0;">${qrSvg}</div>` : ''}
+        ${data.sunatHash ? `<div class="text-center" style="font-size: 0.75em; word-break: break-all;">Hash: ${escapeHtml(data.sunatHash)}</div>` : ''}
 
         <div class="divider"></div>
         <div class="footer">
-          <div>¡Gracias por su compra!</div>
-          ${data.consultUrl ? `<div>Consulte en: ${data.consultUrl}</div>` : ''}
-          ${data.footerNote ? `<div>${data.footerNote}</div>` : ''}
+          ${data.consultUrl ? `<div>Consulte en: <strong>${escapeHtml(data.consultUrl)}</strong></div>` : ''}
+          ${data.sunatResolution ? `<div style="font-size: 0.85em; margin-top: 2px;">${escapeHtml(data.sunatResolution)}</div>` : ''}
+          <div>${escapeHtml(data.footerNote || '¡Gracias por su compra!')}</div>
         </div>
       </body>
     </html>
@@ -496,11 +781,24 @@ export const generateReceiptHTML = (
  */
 export const printTicketPDF = async (
   receipt: any,
-  config?: Partial<PrinterConfig>
+  config?: Partial<PrinterConfig> & {
+    branch?: Partial<Branch> | null;
+    taxProfile?: (TaxProfileInput & { taxRate?: number | null }) | null;
+    receiptFooter?: string;
+    consultUrl?: string;
+  }
 ): Promise<void> => {
   try {
     const currentConfig = await getPrinterConfig();
     const width = config?.paperWidth || currentConfig.paperWidth;
+    const htmlOptions: EscPosOptions = {
+      paperWidth: width,
+      branch: config?.branch,
+      taxProfile: config?.taxProfile,
+      receiptFooter: config?.receiptFooter,
+      consultUrl: config?.consultUrl,
+      ...(receipt?.options || {}),
+    };
 
     let htmlContent = '';
     if (typeof receipt === 'string') {
@@ -508,11 +806,15 @@ export const printTicketPDF = async (
     } else if (receipt?.htmlContent) {
       htmlContent = receipt.htmlContent;
     } else if (receipt?.sale) {
-      htmlContent = buildReceiptHtml(receipt.sale, receipt.business || {});
+      htmlContent = buildReceiptHtml(receipt.sale, receipt.business || {}, htmlOptions);
     } else if (receipt?.documentTitle) {
-      htmlContent = generateReceiptHTML(receipt, width);
+      htmlContent = generateReceiptHTML(
+        receipt,
+        width,
+        (htmlOptions.taxProfile as TaxProfileConfig | null | undefined) ?? config?.taxProfile
+      );
     } else {
-      htmlContent = buildReceiptHtml(receipt, {});
+      htmlContent = buildReceiptHtml(receipt, {}, htmlOptions);
     }
 
     await Print.printAsync({
@@ -525,36 +827,81 @@ export const printTicketPDF = async (
   }
 };
 
+export interface ShareTicketWhatsAppConfig {
+  phone?: string;
+  paperWidth?: PrinterPaperWidth | '58mm' | '80mm';
+  branch?: Partial<Branch> | null;
+  taxProfile?: (TaxProfileInput & { taxRate?: number | null }) | null;
+  receiptFooter?: string;
+  consultUrl?: string;
+}
+
 /**
  * Genera el ticket en formato PDF y lo comparte vía WhatsApp mediante `expo-sharing`
  */
 export const shareTicketWhatsApp = async (
   receiptOrSale: any,
   businessOrPhone?: any,
-  phoneOrConfig?: any
+  phoneOrConfig?: string | ShareTicketWhatsAppConfig
 ): Promise<void> => {
   try {
     const currentConfig = await getPrinterConfig();
-    const width = currentConfig.paperWidth;
+    const extraCfg: ShareTicketWhatsAppConfig =
+      typeof phoneOrConfig === 'object' && phoneOrConfig !== null ? phoneOrConfig : {};
+    const rawWidth = extraCfg.paperWidth || receiptOrSale?.options?.paperWidth || currentConfig.paperWidth;
+    const width: PrinterPaperWidth = rawWidth === 58 || rawWidth === '58mm' ? 58 : 80;
 
     let htmlContent = '';
     let customerPhone = '';
+    let docNumber = '';
+    let saleTotal: number | undefined;
 
     if (typeof receiptOrSale === 'string') {
       htmlContent = receiptOrSale;
-      customerPhone = typeof businessOrPhone === 'string' ? businessOrPhone : '';
+      customerPhone = typeof businessOrPhone === 'string' ? businessOrPhone : extraCfg.phone || '';
     } else if (receiptOrSale?.documentTitle) {
-      htmlContent = generateReceiptHTML(receiptOrSale, width);
-      customerPhone = typeof businessOrPhone === 'string' ? businessOrPhone : '';
+      htmlContent = generateReceiptHTML(
+        receiptOrSale,
+        width,
+        (extraCfg.taxProfile as TaxProfileConfig | null | undefined) ?? undefined
+      );
+      customerPhone = typeof businessOrPhone === 'string' ? businessOrPhone : extraCfg.phone || '';
+      docNumber = receiptOrSale.documentNumber || '';
+      saleTotal = receiptOrSale.total;
+    } else if (receiptOrSale?.sale) {
+      htmlContent = buildReceiptHtml(receiptOrSale.sale, receiptOrSale.business || {}, {
+        paperWidth: width,
+        branch: extraCfg.branch,
+        taxProfile: extraCfg.taxProfile,
+        receiptFooter: extraCfg.receiptFooter,
+        consultUrl: extraCfg.consultUrl,
+        ...(receiptOrSale.options || {}),
+      });
+      customerPhone =
+        typeof businessOrPhone === 'string'
+          ? businessOrPhone
+          : extraCfg.phone || receiptOrSale.sale?.customerPhone || '';
+      docNumber = receiptOrSale.sale?.documentNumber || '';
+      saleTotal = receiptOrSale.sale?.total;
     } else {
       const businessObj = typeof businessOrPhone === 'object' ? businessOrPhone : {};
-      htmlContent = buildReceiptHtml(receiptOrSale, businessObj);
+      htmlContent = buildReceiptHtml(receiptOrSale, businessObj, {
+        paperWidth: width,
+        branch: extraCfg.branch,
+        taxProfile: extraCfg.taxProfile,
+        receiptFooter: extraCfg.receiptFooter,
+        consultUrl: extraCfg.consultUrl,
+      });
       customerPhone =
         typeof phoneOrConfig === 'string'
           ? phoneOrConfig
+          : extraCfg.phone
+          ? extraCfg.phone
           : typeof businessOrPhone === 'string'
           ? businessOrPhone
           : receiptOrSale?.customerPhone || '';
+      docNumber = receiptOrSale?.documentNumber || '';
+      saleTotal = receiptOrSale?.total;
     }
 
     // 1. Generar archivo PDF temporal
@@ -567,7 +914,9 @@ export const shareTicketWhatsApp = async (
     if (customerPhone) {
       const cleanPhone = customerPhone.replace(/\D/g, '');
       const fullPhone = cleanPhone.startsWith('51') ? cleanPhone : `51${cleanPhone}`;
-      const msg = encodeURIComponent('Hola! Te enviamos tu comprobante de compra.');
+      const docLabel = docNumber ? ` ${docNumber}` : '';
+      const totalLabel = typeof saleTotal === 'number' ? ` por S/ ${saleTotal.toFixed(2)}` : '';
+      const msg = encodeURIComponent(`Hola! Te enviamos tu comprobante${docLabel}${totalLabel}.`);
       const whatsappUrl = `whatsapp://send?phone=${fullPhone}&text=${msg}`;
 
       const canOpen = await Linking.canOpenURL(whatsappUrl);

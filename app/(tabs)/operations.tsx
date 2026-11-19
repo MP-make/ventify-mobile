@@ -1,6 +1,6 @@
 import { ReservationCompletionModal } from '@/components/ReservationCompletionModal';
 import { ReservationCancellationModal } from '@/components/ReservationCancellationModal';
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   View,
   Text,
@@ -17,7 +17,8 @@ import {
   KeyboardAvoidingView,
 } from 'react-native';
 import { FlashList } from '@shopify/flash-list';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useRouter } from 'expo-router';
 import * as Haptics from 'expo-haptics';
 import {
   Wallet,
@@ -46,6 +47,13 @@ import {
   Percent,
   Check,
   X,
+  Lock,
+  Sparkles,
+  Send,
+  BarChart3,
+  RotateCcw,
+  AlertTriangle,
+  ShieldAlert,
 } from 'lucide-react-native';
 
 import { useAuth } from '@/context/AuthContext';
@@ -57,6 +65,8 @@ import { ScreenHeading, SectionHeading } from '@/components/ui';
 import { db } from '@/lib/firebase';
 import {
   collection,
+  doc,
+  getDoc,
   query,
   where,
   limit,
@@ -70,6 +80,13 @@ import {
   registerCashMovement,
   subscribeToSessionMovements,
   getActiveCashSession,
+  DEFAULT_EXPENSE_CATEGORIES,
+  EMPLOYEE_ADVANCE_CATEGORY_ID,
+  expenseCategoryLabel,
+  cashierNeedsPinAuthorization,
+  authorizeCashExpenseViaPin,
+  ExpenseCategoryId,
+  ExpenseReceiptType,
   CashMovement,
   CashMovementType,
   CashSession,
@@ -84,11 +101,22 @@ import {
   approveOrder,
   completeOrCancelReservation,
   getCustomerOpenFiados,
+  getCustomerFiadoHistory,
+  returnFiadoMerchandise,
+  writeOffFiado,
+  recalculateCustomerDebt,
+  askVentyAI,
+  FiadoHistoryEntry,
   OpenFiado,
   CustomerData,
   ReservationOrder,
   ReservationOrderItem,
 } from '@/services/crm-operations-service';
+
+import {
+  getTeamMembers,
+  TeamMember,
+} from '@/services/enterprise-ops-service';
 
 import {
   printRawEscPos,
@@ -101,8 +129,17 @@ import { isValidDNI } from '@/lib/invoicing/types';
 import { usePermissions } from '@/hooks/usePermissions';
 import { PayrollUsersModal } from '@/components/PayrollUsersModal';
 import { ReservationReceiptModal } from '@/components/ReservationReceiptModal';
+import { FinancialPnlModal } from '@/components/FinancialPnlModal';
 
 type OperationsTab = 'cash' | 'crm' | 'orders';
+
+interface VentyChatMessage {
+  id: string;
+  sender: 'user' | 'ai';
+  text: string;
+  isError?: boolean;
+  timestamp: number;
+}
 
 const ListGap16 = () => <View style={{ height: 16 }} />;
 
@@ -191,7 +228,10 @@ const SalePaymentBadges = React.memo(({ sale }: { sale: any }) => {
 });
 
 const CashMovementRow = React.memo(({ movement }: { movement: CashMovement }) => {
-  const isIncome = movement.type === 'income';
+  const numericAmt = Number(movement.amount) || 0;
+  const isIncome = movement.type ? movement.type === 'income' : numericAmt >= 0;
+  const catLabel = expenseCategoryLabel(movement.expenseCategoryId, movement.category);
+  const hasReceipt = Boolean(movement.receiptType && movement.receiptType !== 'ninguno');
   return (
     <View style={styles.movementItem}>
       <View
@@ -207,9 +247,12 @@ const CashMovementRow = React.memo(({ movement }: { movement: CashMovement }) =>
         )}
       </View>
       <View style={{ flex: 1, marginLeft: 12 }}>
-        <Text style={styles.movementTitle}>{movement.description || 'Movimiento de caja'}</Text>
+        <Text style={styles.movementTitle}>{movement.reason || movement.description || 'Movimiento de caja'}</Text>
         <Text style={styles.movementSub}>
-          {formatDatePE(movement.createdAt)} • {movement.createdByName || 'Operador'}
+          {formatDatePE(movement.createdAt)} • {catLabel} • {movement.createdByName || 'Operador'}
+          {hasReceipt
+            ? ` • ${String(movement.receiptType).toUpperCase()}${movement.receiptNumber ? ` ${movement.receiptNumber}` : ''}`
+            : ''}
         </Text>
       </View>
       <Text
@@ -218,7 +261,7 @@ const CashMovementRow = React.memo(({ movement }: { movement: CashMovement }) =>
           { color: isIncome ? ui.success : ui.danger },
         ]}
       >
-        {isIncome ? '+' : '-'}{formatPEN(movement.amount)}
+        {isIncome ? '+' : '-'}{formatPEN(Math.abs(numericAmt))}
       </Text>
     </View>
   );
@@ -263,16 +306,25 @@ const CustomerCardItem = React.memo(
   ({
     cust,
     onCollectDebt,
+    onOpenDetail,
   }: {
     cust: CustomerData;
     onCollectDebt: (cust: CustomerData) => void;
+    onOpenDetail: (cust: CustomerData) => void;
   }) => {
     const debt = Number(cust.currentDebt) || 0;
-    const creditLim = Number(cust.creditLimit) || 1;
-    const debtRatio = Math.min(1, debt / creditLim);
+    const credits = Number(cust.credits) || 0;
+    const creditLim = Number(cust.maxCreditLimit ?? cust.creditLimit) || 0;
+    const debtRatio = creditLim > 0 ? Math.min(1, debt / creditLim) : 0;
 
     return (
-      <View style={styles.customerCard}>
+      <TouchableOpacity
+        activeOpacity={0.85}
+        style={styles.customerCard}
+        onPress={() => onOpenDetail(cust)}
+        accessibilityRole="button"
+        accessibilityLabel={`Ver detalle de ${cust.name}`}
+      >
         <View style={styles.customerTop}>
           <View style={{ flex: 1 }}>
             <Text style={styles.customerName}>{cust.name}</Text>
@@ -294,41 +346,65 @@ const CustomerCardItem = React.memo(
           )}
         </View>
 
-        <View style={styles.creditLineBox}>
-          <View style={styles.creditLineLabels}>
-            <Text style={styles.creditLineText}>Línea: {formatPEN(creditLim)}</Text>
-            <Text style={styles.creditLineText}>
-              Uso: {Math.round(debtRatio * 100)}%
+        {credits > 0 && (
+          <View style={styles.creditWalletRow}>
+            <Coins size={13} color={ui.primary} />
+            <Text style={styles.creditWalletText}>
+              Créditos a favor: {formatPEN(credits)}
             </Text>
           </View>
-          <View style={styles.progressBarBg}>
-            <View
-              style={[
-                styles.progressBarFill,
-                {
-                  width: `${debtRatio * 100}%`,
-                  backgroundColor:
-                    debtRatio > 0.8
-                      ? ui.danger
-                      : debtRatio > 0.5
-                      ? ui.warning
-                      : ui.primary,
-                },
-              ]}
-            />
+        )}
+
+        <View style={styles.creditLineBox}>
+          <View style={styles.creditLineLabels}>
+            <Text style={styles.creditLineText}>
+              Línea: {creditLim > 0 ? formatPEN(creditLim) : 'Sin límite'}
+            </Text>
+            {creditLim > 0 && (
+              <Text style={styles.creditLineText}>
+                Uso: {Math.round(debtRatio * 100)}%
+              </Text>
+            )}
           </View>
+          {creditLim > 0 && (
+            <View style={styles.progressBarBg}>
+              <View
+                style={[
+                  styles.progressBarFill,
+                  {
+                    width: `${debtRatio * 100}%`,
+                    backgroundColor:
+                      debtRatio > 0.8
+                        ? ui.danger
+                        : debtRatio > 0.5
+                        ? ui.warning
+                        : ui.primary,
+                  },
+                ]}
+              />
+            </View>
+          )}
         </View>
 
-        {debt > 0 && (
+        <View style={styles.customerActionsRow}>
           <TouchableOpacity
-            style={styles.abonoButton}
-            onPress={() => onCollectDebt(cust)}
+            style={styles.detailButton}
+            onPress={() => onOpenDetail(cust)}
           >
-            <Receipt size={16} color={ui.onPrimary} />
-            <Text style={styles.abonoButtonText}>Cobrar Abono de Deuda</Text>
+            <FileText size={15} color={ui.primary} />
+            <Text style={styles.detailButtonText}>Detalle y Fiados</Text>
           </TouchableOpacity>
-        )}
-      </View>
+          {debt > 0 && (
+            <TouchableOpacity
+              style={[styles.abonoButton, { flex: 1 }]}
+              onPress={() => onCollectDebt(cust)}
+            >
+              <Receipt size={15} color={ui.onPrimary} />
+              <Text style={styles.abonoButtonText}>Cobrar Abono</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      </TouchableOpacity>
     );
   }
 );
@@ -516,8 +592,20 @@ const ReservationCardItem = React.memo(
 
 export default function OperationsScreen() {
   const insets = useSafeAreaInsets();
+  const router = useRouter();
   const { user, userProfile, accountId, branchId, role, setActiveBranchId } = useAuth();
-  const { canManageUsers, canViewAllCashSessions } = usePermissions();
+  const {
+    canManageUsers,
+    canViewAllCashSessions,
+    isOwner,
+    isAdmin,
+    isCashier,
+    canManageCustomers,
+    canProcessReturn,
+    canViewMargins,
+    canViewReports,
+  } = usePermissions();
+  const isSupervisor = isOwner || isAdmin;
   const { products: productCatalog } = useProducts();
   const {
     businessSettings,
@@ -531,6 +619,22 @@ export default function OperationsScreen() {
 
   const [activeTab, setActiveTab] = useState<OperationsTab>('cash');
   const [payrollModalOpen, setPayrollModalOpen] = useState<boolean>(false);
+  const [pnlModalOpen, setPnlModalOpen] = useState<boolean>(false);
+
+  // Venty AI Modal con streaming progresivo y control de error/offline
+  const [ventyModalVisible, setVentyModalVisible] = useState<boolean>(false);
+  const [ventyInput, setVentyInput] = useState<string>('');
+  const [ventyLoading, setVentyLoading] = useState<boolean>(false);
+  const [ventyError, setVentyError] = useState<string | null>(null);
+  const [ventyMessages, setVentyMessages] = useState<VentyChatMessage[]>([
+    {
+      id: 'venty_welcome',
+      sender: 'ai',
+      text: '¡Hola! Soy Venty IA. Puedo analizar tu caja actual, ventas, stock crítico o cuentas por cobrar. ¿Qué deseas consultar?',
+      timestamp: Date.now(),
+    },
+  ]);
+  const ventyScrollRef = useRef<ScrollView | null>(null);
 
   // Multi-caja para Dueños y Administradores
   const [branchSessions, setBranchSessions] = useState<Record<string, CashSession | null>>({});
@@ -592,8 +696,29 @@ export default function OperationsScreen() {
   const [movementType, setMovementType] = useState<CashMovementType>('expense');
   const [movementAmount, setMovementAmount] = useState<string>('');
   const [movementReason, setMovementReason] = useState<string>('');
-  const [movementCategory, setMovementCategory] = useState<string>('petty_cash');
+  const [movementCategory, setMovementCategory] = useState<string>('other');
+  const [movementReceiptType, setMovementReceiptType] = useState<ExpenseReceiptType>('ninguno');
+  const [movementReceiptNumber, setMovementReceiptNumber] = useState<string>('');
+  const [movementEmployeeId, setMovementEmployeeId] = useState<string>('');
+  const [teamEmployees, setTeamEmployees] = useState<TeamMember[]>([]);
+  const [loadingEmployees, setLoadingEmployees] = useState<boolean>(false);
+  const [accountExpenseLimit, setAccountExpenseLimit] = useState<number | undefined>(undefined);
   const [isSavingMovement, setIsSavingMovement] = useState<boolean>(false);
+
+  // Modal de Autorización por PIN (para egresos de cajero que superan cashierExpenseLimit)
+  const [pinModalVisible, setPinModalVisible] = useState<boolean>(false);
+  const [pinInput, setPinInput] = useState<string>('');
+  const [pinError, setPinError] = useState<string>('');
+  const [isAuthorizingPin, setIsAuthorizingPin] = useState<boolean>(false);
+  const [pendingPinExpense, setPendingPinExpense] = useState<{
+    sessionId: string;
+    amount: number;
+    reason: string;
+    expenseCategoryId: ExpenseCategoryId;
+    employeeId?: string;
+    receiptType?: ExpenseReceiptType;
+    receiptNumber?: string;
+  } | null>(null);
 
   // Modal de Cierre de Caja (Corte Z)
   const [closeModalVisible, setCloseModalVisible] = useState<boolean>(false);
@@ -632,6 +757,26 @@ export default function OperationsScreen() {
   const [paymentMethod, setPaymentMethod] = useState<'efectivo' | 'yape' | 'plin' | 'tarjeta' | 'transferencia'>('efectivo');
   const [paymentNotes, setPaymentNotes] = useState<string>('');
   const [isProcessingPayment, setIsProcessingPayment] = useState<boolean>(false);
+
+  // Modal Detalle de Cliente + Devolución / Castigo / Recalcular Deuda
+  const [customerDetailModalVisible, setCustomerDetailModalVisible] = useState<boolean>(false);
+  const [detailCustomer, setDetailCustomer] = useState<CustomerData | null>(null);
+  const [detailOpenFiados, setDetailOpenFiados] = useState<OpenFiado[]>([]);
+  const [detailFiadoHistory, setDetailFiadoHistory] = useState<FiadoHistoryEntry[]>([]);
+  const [loadingCustomerDetail, setLoadingCustomerDetail] = useState<boolean>(false);
+  const [isRecalculatingDebt, setIsRecalculatingDebt] = useState<boolean>(false);
+
+  // Modal Devolver Mercadería de Fiado
+  const [returnFiadoTarget, setReturnFiadoTarget] = useState<OpenFiado | null>(null);
+  const [returnQtyMap, setReturnQtyMap] = useState<Record<string, string>>({});
+  const [returnReasonInput, setReturnReasonInput] = useState<string>('');
+  const [isSubmittingFiadoReturn, setIsSubmittingFiadoReturn] = useState<boolean>(false);
+
+  // Modal Castigar Deuda (Write-off Owner/Admin)
+  const [writeOffTarget, setWriteOffTarget] = useState<OpenFiado | null>(null);
+  const [writeOffReasonInput, setWriteOffReasonInput] = useState<string>('');
+  const [writeOffConfirmed, setWriteOffConfirmed] = useState<boolean>(false);
+  const [isSubmittingWriteOff, setIsSubmittingWriteOff] = useState<boolean>(false);
 
   // ============================================================================
   // ESTADOS DEL SUB-MÓDULO 3: PEDIDOS Y RESERVAS
@@ -956,6 +1101,57 @@ export default function OperationsScreen() {
   }, [productCatalog, productSearchQuery]);
 
   // ============================================================================
+  // EFECTO: CARGAR CONFIGURACIÓN DE GASTOS Y EQUIPO PARA ADELANTOS
+  // ============================================================================
+  useEffect(() => {
+    if (!accountId) {
+      setAccountExpenseLimit(undefined);
+      setTeamEmployees([]);
+      return;
+    }
+    let alive = true;
+    getDoc(doc(db, 'settings', `${accountId}_expenses`))
+      .then((snap) => {
+        if (!alive) return;
+        if (snap.exists()) {
+          const val = Number(snap.data()?.cashierExpenseLimit);
+          setAccountExpenseLimit(Number.isFinite(val) && val > 0 ? val : undefined);
+        } else {
+          setAccountExpenseLimit(undefined);
+        }
+      })
+      .catch(() => {
+        if (alive) setAccountExpenseLimit(undefined);
+      });
+
+    setLoadingEmployees(true);
+    getTeamMembers(accountId)
+      .then((members) => {
+        if (!alive) return;
+        setTeamEmployees(members.filter((m) => m.isActive !== false));
+      })
+      .catch(() => {
+        if (alive) setTeamEmployees([]);
+      })
+      .finally(() => {
+        if (alive) setLoadingEmployees(false);
+      });
+
+    return () => {
+      alive = false;
+    };
+  }, [accountId]);
+
+  const resetMovementForm = useCallback(() => {
+    setMovementAmount('');
+    setMovementReason('');
+    setMovementCategory('other');
+    setMovementReceiptType('ninguno');
+    setMovementReceiptNumber('');
+    setMovementEmployeeId('');
+  }, []);
+
+  // ============================================================================
   // ACCIONES SUB-MÓDULO 1: CAJA Y CIERRE Z
   // ============================================================================
   const handleOpenCash = async () => {
@@ -1004,9 +1200,37 @@ export default function OperationsScreen() {
       return;
     }
 
+    const isExpense = movementType === 'expense';
+    const isAdvance = isExpense && movementCategory === EMPLOYEE_ADVANCE_CATEGORY_ID;
+    if (isAdvance && !movementEmployeeId) {
+      Alert.alert('Trabajador Requerido', 'Selecciona el trabajador que recibe el adelanto.');
+      return;
+    }
+
     const sessId = activeCashSession?.sessionId || activeCashSession?.id;
     if (!sessId || !accountId || !branchId || !user) {
       Alert.alert('Error', 'No hay una sesión de caja activa disponible.');
+      return;
+    }
+
+    const effectiveLimit = activeCashSession?.cashierExpenseLimit ?? accountExpenseLimit;
+    const effectiveRole = isCashier ? 'cashier' : role;
+    if (isExpense && cashierNeedsPinAuthorization(effectiveRole, -amt, { cashierExpenseLimit: effectiveLimit })) {
+      setPendingPinExpense({
+        sessionId: sessId,
+        amount: amt,
+        reason: movementReason.trim(),
+        expenseCategoryId: movementCategory as ExpenseCategoryId,
+        ...(isAdvance ? { employeeId: movementEmployeeId } : {}),
+        receiptType: movementReceiptType,
+        ...(movementReceiptType !== 'ninguno' && movementReceiptNumber.trim()
+          ? { receiptNumber: movementReceiptNumber.trim() }
+          : {}),
+      });
+      setPinInput('');
+      setPinError('');
+      setMovementModalVisible(false);
+      setPinModalVisible(true);
       return;
     }
 
@@ -1018,24 +1242,72 @@ export default function OperationsScreen() {
         sessionId: sessId,
         type: movementType,
         amount: amt,
-        category: movementCategory,
+        category: isExpense ? movementCategory : 'manual_income',
+        expenseCategoryId: isExpense ? (movementCategory as ExpenseCategoryId) : undefined,
+        employeeId: isAdvance ? movementEmployeeId : undefined,
+        receiptType: isExpense ? movementReceiptType : undefined,
+        receiptNumber:
+          isExpense && movementReceiptType !== 'ninguno' && movementReceiptNumber.trim()
+            ? movementReceiptNumber.trim()
+            : undefined,
         description: movementReason.trim(),
+        reason: movementReason.trim(),
         userId: user.uid,
         userName: userProfile?.displayName || user.email || 'Operador',
+        userRole: effectiveRole,
       });
 
-      setMovementAmount('');
-      setMovementReason('');
+      resetMovementForm();
       setMovementModalVisible(false);
       refreshCashStatus();
       Alert.alert(
         'Movimiento Registrado',
-        `Se registró el ${movementType === 'income' ? 'ingreso' : 'egreso/gasto'} de ${formatPEN(amt)} con éxito.`
+        `Se registró el ${movementType === 'income' ? 'ingreso' : isAdvance ? 'adelanto' : 'egreso/gasto'} de ${formatPEN(amt)} con éxito.`
       );
     } catch (err: any) {
       Alert.alert('Error', err?.message || 'No se pudo registrar el movimiento.');
     } finally {
       setIsSavingMovement(false);
+    }
+  };
+
+  const handleAuthorizeExpenseWithPin = async () => {
+    if (!pendingPinExpense) return;
+    const cleanPin = pinInput.replace(/\D/g, '');
+    if (!/^\d{4,8}$/.test(cleanPin)) {
+      setPinError('Ingresa un PIN numérico de 4 a 8 dígitos.');
+      return;
+    }
+
+    setIsAuthorizingPin(true);
+    setPinError('');
+    try {
+      await authorizeCashExpenseViaPin({
+        sessionId: pendingPinExpense.sessionId,
+        amount: pendingPinExpense.amount,
+        reason: pendingPinExpense.reason,
+        expenseCategoryId: pendingPinExpense.expenseCategoryId,
+        employeeId: pendingPinExpense.employeeId,
+        receiptType: pendingPinExpense.receiptType,
+        receiptNumber: pendingPinExpense.receiptNumber,
+        pin: cleanPin,
+      });
+
+      const authorizedAmount = pendingPinExpense.amount;
+      setPinModalVisible(false);
+      setPendingPinExpense(null);
+      setPinInput('');
+      setPinError('');
+      resetMovementForm();
+      refreshCashStatus();
+      Alert.alert(
+        'Egreso Autorizado',
+        `Se autorizó y registró el retiro de ${formatPEN(authorizedAmount)} correctamente.`
+      );
+    } catch (err: any) {
+      setPinError(err?.message || 'PIN incorrecto o no se pudo autorizar el egreso.');
+    } finally {
+      setIsAuthorizingPin(false);
     }
   };
 
@@ -1092,9 +1364,9 @@ export default function OperationsScreen() {
       const closureDetails = {
         totalIncomes: lastClosureReport.audit?.manualIncomes || 0,
         totalExpenses: lastClosureReport.audit?.manualExpenses || 0,
-        expectedAmount: lastClosureReport.expectedAmount,
-        countedAmount: lastClosureReport.countedAmount,
-        difference: lastClosureReport.difference,
+        expectedAmount: lastClosureReport.expectedAmount ?? lastClosureReport.expectedCash ?? 0,
+        countedAmount: lastClosureReport.countedAmount ?? lastClosureReport.countedCash ?? 0,
+        difference: lastClosureReport.difference ?? 0,
         closedByName: userProfile?.displayName || user?.email || 'Operador',
         notes: lastClosureReport.notes,
       };
@@ -1268,13 +1540,17 @@ export default function OperationsScreen() {
         },
       });
 
+      const paidCustId = selectedDebtor.id;
       setPaymentModalVisible(false);
       setPaymentAmount('');
       setPaymentNotes('');
       setSelectedDebtor(null);
       setSelectedFiado(null);
       setOpenFiados([]);
-      loadCustomersData();
+      void loadCustomersData();
+      if (customerDetailModalVisible && detailCustomer?.id && detailCustomer.id === paidCustId) {
+        void loadCustomerDetailData(detailCustomer);
+      }
       refreshCashStatus();
 
       Alert.alert(
@@ -1285,6 +1561,281 @@ export default function OperationsScreen() {
       Alert.alert('Error al Registrar Abono', err?.message || 'No se pudo procesar el pago.');
     } finally {
       setIsProcessingPayment(false);
+    }
+  };
+
+  // ============================================================================
+  // ACCIONES DE DETALLE CRM: FIADOS, DEVOLUCIONES, CASTIGO Y RECÁLCULO
+  // ============================================================================
+  const loadCustomerDetailData = useCallback(
+    async (cust: CustomerData) => {
+      if (!accountId || !cust.id) return;
+      setLoadingCustomerDetail(true);
+      try {
+        const [fiados, history, freshCustomers] = await Promise.all([
+          getCustomerOpenFiados(accountId, cust.id),
+          getCustomerFiadoHistory(accountId, cust.id),
+          getCustomers(accountId),
+        ]);
+        setDetailOpenFiados(fiados);
+        setDetailFiadoHistory(history);
+        const refreshed = freshCustomers.find((c) => c.id === cust.id);
+        if (refreshed) {
+          setDetailCustomer(refreshed);
+        }
+        setCustomers(freshCustomers);
+      } catch (err: any) {
+        Alert.alert('Error', err?.message || 'No se pudieron cargar los detalles del cliente.');
+      } finally {
+        setLoadingCustomerDetail(false);
+      }
+    },
+    [accountId]
+  );
+
+  const handleOpenCustomerDetail = useCallback(
+    (cust: CustomerData) => {
+      setDetailCustomer(cust);
+      setDetailOpenFiados([]);
+      setDetailFiadoHistory([]);
+      setCustomerDetailModalVisible(true);
+      void loadCustomerDetailData(cust);
+    },
+    [loadCustomerDetailData]
+  );
+
+  const handleRecalculateDebt = async () => {
+    if (!accountId || !detailCustomer?.id) return;
+    setIsRecalculatingDebt(true);
+    try {
+      const res = await recalculateCustomerDebt(accountId, detailCustomer.id);
+      const before = Number((res as any).before ?? res.previousDebt ?? detailCustomer.currentDebt ?? 0);
+      const after = Number((res as any).after ?? res.recalculatedDebt ?? before);
+      const corrected = typeof (res as any).corrected === 'boolean' ? (res as any).corrected : before !== after;
+
+      setDetailCustomer((prev) => (prev ? { ...prev, currentDebt: after } : prev));
+      setCustomers((prev) =>
+        prev.map((c) => (c.id === detailCustomer.id ? { ...c, currentDebt: after } : c))
+      );
+      await loadCustomerDetailData({ ...detailCustomer, currentDebt: after });
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+      Alert.alert(
+        corrected ? 'Deuda Recalculada y Corregida' : 'Deuda Verificada',
+        `Saldo anterior: ${formatPEN(before)}\nSaldo actual: ${formatPEN(after)}`
+      );
+    } catch (err: any) {
+      Alert.alert('No se pudo recalcular', err?.message || 'Error al recalcular la deuda del cliente.');
+    } finally {
+      setIsRecalculatingDebt(false);
+    }
+  };
+
+  const handleOpenReturnFiado = (fiado: OpenFiado) => {
+    setReturnFiadoTarget(fiado);
+    setReturnQtyMap({});
+    setReturnReasonInput('');
+  };
+
+  const handleSubmitReturnFiado = async () => {
+    if (!returnFiadoTarget || !accountId || !user) return;
+    const returnedByProduct = new Map<string, number>();
+    for (const ret of returnFiadoTarget.returnHistory || []) {
+      for (const line of ret.items || []) {
+        const pid = String(line.productId || '');
+        returnedByProduct.set(pid, (returnedByProduct.get(pid) || 0) + (Number(line.quantity) || 0));
+      }
+    }
+
+    const itemsPayload: Array<{ productId: string; quantity: number }> = [];
+    for (const it of returnFiadoTarget.items || []) {
+      const pid = String(it.productId || it.id || '');
+      if (!pid) continue;
+      const qty = parseFloat((returnQtyMap[pid] || '').replace(',', '.'));
+      if (!Number.isFinite(qty) || qty <= 0) continue;
+      const already = returnedByProduct.get(pid) || 0;
+      const maxQty = Math.max(0, Number(it.quantity || 0) - already);
+      if (qty > maxQty) {
+        Alert.alert('Cantidad inválida', `Solo puedes devolver hasta ${maxQty} unidad(es) de ${it.productName || it.name || pid}.`);
+        return;
+      }
+      itemsPayload.push({ productId: pid, quantity: qty });
+    }
+
+    if (itemsPayload.length === 0) {
+      Alert.alert('Cantidad requerida', 'Ingresa la cantidad de al menos un producto a devolver.');
+      return;
+    }
+    if (returnReasonInput.trim().length < 3) {
+      Alert.alert('Motivo requerido', 'Indica el motivo de la devolución (mínimo 3 caracteres).');
+      return;
+    }
+
+    setIsSubmittingFiadoReturn(true);
+    try {
+      const res = await returnFiadoMerchandise({
+        accountId,
+        reservationId: returnFiadoTarget.id,
+        items: itemsPayload,
+        reason: returnReasonInput.trim(),
+        userProfile: {
+          uid: user.uid,
+          displayName: userProfile?.displayName || user.email || 'Operador',
+          email: user.email,
+          role,
+        },
+      });
+
+      setReturnFiadoTarget(null);
+      setReturnQtyMap({});
+      setReturnReasonInput('');
+      if (detailCustomer) {
+        await loadCustomerDetailData(detailCustomer);
+      } else {
+        await loadCustomersData();
+      }
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+      Alert.alert(
+        res.settled ? 'Fiado Liquidado por Devolución' : 'Devolución Registrada',
+        res.creditApplied > 0
+          ? `Se reingresó el stock (${formatPEN(res.returnAmount)}) y el excedente de ${formatPEN(res.creditApplied)} pasó a créditos del cliente.`
+          : `Se reingresó el stock (${formatPEN(res.returnAmount)}). Saldo pendiente del fiado: ${formatPEN(res.remaining)}.`
+      );
+    } catch (err: any) {
+      Alert.alert('No se pudo devolver', err?.message || 'Error al registrar devolución de fiado.');
+    } finally {
+      setIsSubmittingFiadoReturn(false);
+    }
+  };
+
+  const handleOpenWriteOff = (fiado: OpenFiado) => {
+    setWriteOffTarget(fiado);
+    setWriteOffReasonInput('');
+    setWriteOffConfirmed(false);
+  };
+
+  const handleSubmitWriteOff = async () => {
+    if (!writeOffTarget || !accountId || !user) return;
+    if (writeOffReasonInput.trim().length < 3) {
+      Alert.alert('Motivo requerido', 'Indica por qué se castiga la deuda (mínimo 3 caracteres).');
+      return;
+    }
+    if (!writeOffConfirmed) {
+      Alert.alert('Confirmación requerida', 'Confirma que la deuda es incobrable.');
+      return;
+    }
+
+    setIsSubmittingWriteOff(true);
+    try {
+      const res = await writeOffFiado({
+        accountId,
+        reservationId: writeOffTarget.id,
+        reason: writeOffReasonInput.trim(),
+        userProfile: {
+          uid: user.uid,
+          displayName: userProfile?.displayName || user.email || 'Administrador',
+          email: user.email,
+          role,
+        },
+      });
+      setWriteOffTarget(null);
+      setWriteOffReasonInput('');
+      setWriteOffConfirmed(false);
+      if (detailCustomer) {
+        await loadCustomerDetailData(detailCustomer);
+      } else {
+        await loadCustomersData();
+      }
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning).catch(() => {});
+      Alert.alert(
+        'Deuda Castigada',
+        `Se excluyeron ${formatPEN(res.writeOffAmount)} de la deuda del cliente. Nuevo saldo total: ${formatPEN(res.nextDebt)}.`
+      );
+    } catch (err: any) {
+      Alert.alert('No se pudo castigar', err?.message || 'Error al castigar deuda.');
+    } finally {
+      setIsSubmittingWriteOff(false);
+    }
+  };
+
+  // ============================================================================
+  // ACCIONES: VENTY IA STREAMING
+  // ============================================================================
+  const handleSendVentyMessage = async (customText?: string) => {
+    const question = (customText ?? ventyInput).trim();
+    if (!question || ventyLoading) return;
+
+    setVentyError(null);
+    if (!isOnline) {
+      setVentyError('Sin conexión a internet. Venty IA necesita conexión activa.');
+      return;
+    }
+
+    const userMsg: VentyChatMessage = {
+      id: `v_u_${Date.now()}`,
+      sender: 'user',
+      text: question,
+      timestamp: Date.now(),
+    };
+    const streamAiId = `v_ai_${Date.now() + 1}`;
+    const placeholderAi: VentyChatMessage = {
+      id: streamAiId,
+      sender: 'ai',
+      text: '',
+      timestamp: Date.now(),
+    };
+
+    const historyPayload = ventyMessages
+      .filter((m) => m.id !== 'venty_welcome' && !m.isError && m.text.trim().length > 0)
+      .slice(-8)
+      .map((m) => ({
+        role: m.sender === 'user' ? ('user' as const) : ('assistant' as const),
+        content: m.text,
+      }));
+
+    setVentyMessages((prev) => [...prev, userMsg, placeholderAi]);
+    if (!customText) setVentyInput('');
+    setVentyLoading(true);
+    setTimeout(() => ventyScrollRef.current?.scrollToEnd({ animated: true }), 80);
+
+    try {
+      const finalReply = await askVentyAI({
+        question,
+        accountId: accountId || undefined,
+        branchId: branchId || undefined,
+        conversationHistory: historyPayload,
+        onChunk: (accumulatedText) => {
+          setVentyMessages((prev) =>
+            prev.map((m) => (m.id === streamAiId ? { ...m, text: accumulatedText } : m))
+          );
+          ventyScrollRef.current?.scrollToEnd({ animated: false });
+        },
+      });
+
+      const resolvedText = finalReply?.trim() || 'No se recibió respuesta de Venty IA.';
+      const looksLikeError =
+        resolvedText.startsWith('Sin conexión') ||
+        resolvedText.startsWith('Venty IA tardó') ||
+        resolvedText.startsWith('Venty IA no pudo') ||
+        resolvedText.startsWith('No se pudo validar') ||
+        resolvedText.startsWith('No se pudo identificar');
+
+      setVentyMessages((prev) =>
+        prev.map((m) =>
+          m.id === streamAiId ? { ...m, text: resolvedText, isError: looksLikeError } : m
+        )
+      );
+      if (looksLikeError) {
+        setVentyError(resolvedText);
+      }
+    } catch (err: any) {
+      const errText = err?.message || 'Ocurrió un error al consultar a Venty IA.';
+      setVentyError(errText);
+      setVentyMessages((prev) =>
+        prev.map((m) => (m.id === streamAiId ? { ...m, text: errText, isError: true } : m))
+      );
+    } finally {
+      setVentyLoading(false);
+      setTimeout(() => ventyScrollRef.current?.scrollToEnd({ animated: true }), 80);
     }
   };
 
@@ -1527,9 +2078,13 @@ export default function OperationsScreen() {
   const customerKeyExtractor = useCallback((item: CustomerData, index: number) => item.id || `cust_${index}`, []);
   const renderCustomerItem = useCallback(
     ({ item }: { item: CustomerData }) => (
-      <CustomerCardItem cust={item} onCollectDebt={handleCollectDebt} />
+      <CustomerCardItem
+        cust={item}
+        onCollectDebt={handleCollectDebt}
+        onOpenDetail={handleOpenCustomerDetail}
+      />
     ),
-    [handleCollectDebt]
+    [handleCollectDebt, handleOpenCustomerDetail]
   );
 
   const reservationKeyExtractor = useCallback(
@@ -1565,17 +2120,39 @@ export default function OperationsScreen() {
         <Text style={styles.compactHeaderTitle}>
           {activeTab === 'cash' ? 'Caja' : activeTab === 'crm' ? 'Clientes' : 'Pedidos'}
         </Text>
-        {canManageUsers ? (
+        <View style={styles.compactHeaderActions}>
           <TouchableOpacity
             style={styles.compactTeamButton}
-            onPress={() => setPayrollModalOpen(true)}
+            onPress={() => setVentyModalVisible(true)}
             accessibilityRole="button"
-            accessibilityLabel="Abrir equipo y planilla"
+            accessibilityLabel="Abrir asistente Venty IA"
           >
-            <UserCheck size={16} color={ui.primary} />
-            <Text style={styles.compactTeamButtonText}>Equipo</Text>
+            <Sparkles size={16} color={ui.primary} />
+            <Text style={styles.compactTeamButtonText}>Venty IA</Text>
           </TouchableOpacity>
-        ) : null}
+          {(canViewMargins || canViewReports) ? (
+            <TouchableOpacity
+              style={styles.compactTeamButton}
+              onPress={() => setPnlModalOpen(true)}
+              accessibilityRole="button"
+              accessibilityLabel="Abrir reporte financiero P&L"
+            >
+              <BarChart3 size={16} color={ui.primary} />
+              <Text style={styles.compactTeamButtonText}>P&L</Text>
+            </TouchableOpacity>
+          ) : null}
+          {canManageUsers ? (
+            <TouchableOpacity
+              style={styles.compactTeamButton}
+              onPress={() => setPayrollModalOpen(true)}
+              accessibilityRole="button"
+              accessibilityLabel="Abrir equipo y planilla"
+            >
+              <UserCheck size={16} color={ui.primary} />
+              <Text style={styles.compactTeamButtonText}>Equipo</Text>
+            </TouchableOpacity>
+          ) : null}
+        </View>
       </View>
 
       {/* Navegación entre áreas de operación centrada */}
@@ -1857,6 +2434,7 @@ export default function OperationsScreen() {
                     <TouchableOpacity
                       style={[styles.outlineActionButton, { borderColor: ui.primary }]}
                       onPress={() => {
+                        resetMovementForm();
                         setMovementType('income');
                         setMovementCategory('manual_income');
                         setMovementModalVisible(true);
@@ -1871,8 +2449,9 @@ export default function OperationsScreen() {
                     <TouchableOpacity
                       style={[styles.outlineActionButton, { borderColor: ui.danger }]}
                       onPress={() => {
+                        resetMovementForm();
                         setMovementType('expense');
-                        setMovementCategory('petty_cash');
+                        setMovementCategory('other');
                         setMovementModalVisible(true);
                       }}
                     >
@@ -1887,7 +2466,10 @@ export default function OperationsScreen() {
                   <TouchableOpacity
                     style={styles.closeZButton}
                     onPress={() => {
-                      setCountedAmountInput(String(activeCashSession?.expectedAmount ?? ''));
+                      setCountedAmountInput(
+                        isSupervisor ? String(activeCashSession?.expectedAmount ?? '') : ''
+                      );
+                      setCloseNotesInput('');
                       setCloseModalVisible(true);
                     }}
                   >
@@ -2308,101 +2890,325 @@ export default function OperationsScreen() {
       )}
 
       {/* ==================================================================== */}
-      {/* MODAL: REGISTRAR INGRESO / EGRESO MANUAL DE CAJA */}
+      {/* MODAL: REGISTRAR INGRESO / EGRESO MANUAL DE CAJA (PARIDAD WEB) */}
       {/* ==================================================================== */}
       {movementModalVisible && (
-        <Modal visible={movementModalVisible} transparent animationType="fade">
-        <KeyboardAvoidingView
-          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-          style={styles.modalOverlay}
+        <Modal
+          visible={movementModalVisible}
+          transparent
+          animationType="fade"
+          onRequestClose={() => {
+            if (!isSavingMovement) setMovementModalVisible(false);
+          }}
         >
-          <View style={styles.modalContent}>
-            <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>
-                {movementType === 'income' ? 'Registrar Ingreso Manual' : 'Registrar Egreso / Gasto'}
-              </Text>
-              <TouchableOpacity
-                onPress={() => setMovementModalVisible(false)}
-                style={styles.iconButton}
-                accessibilityRole="button"
-                accessibilityLabel="Cerrar registro de movimiento"
-              >
-                <X size={20} color={ui.textSecondary} />
-              </TouchableOpacity>
-            </View>
-
-            <View style={styles.inputGroup}>
-              <Text style={styles.label}>Importe (S/)</Text>
-              <TextInput
-                style={styles.input}
-                placeholder="0.00"
-                placeholderTextColor={ui.textMuted}
-                keyboardType="decimal-pad"
-                value={movementAmount}
-                onChangeText={setMovementAmount}
-              />
-            </View>
-
-            <View style={styles.inputGroup}>
-              <Text style={styles.label}>Concepto o Descripción</Text>
-              <TextInput
-                style={styles.input}
-                placeholder={movementType === 'income' ? 'Ej. Cambio adicional' : 'Ej. Compra de bolsas, pasajes'}
-                placeholderTextColor={ui.textMuted}
-                value={movementReason}
-                onChangeText={setMovementReason}
-              />
-            </View>
-
-            <View style={styles.inputGroup}>
-              <Text style={styles.label}>Categoría</Text>
-              <View style={styles.categoryPickerRow}>
-                {['petty_cash', 'services', 'supplies', 'payroll_advance'].map((cat) => (
-                  <TouchableOpacity
-                    key={cat}
-                    style={[
-                      styles.catChip,
-                      movementCategory === cat && styles.catChipActive,
-                    ]}
-                    onPress={() => setMovementCategory(cat)}
-                  >
-                    <Text
-                      style={[
-                        styles.catChipText,
-                        movementCategory === cat && styles.catChipTextActive,
-                      ]}
-                    >
-                      {cat === 'petty_cash'
-                        ? 'Caja Chica'
-                        : cat === 'services'
-                        ? 'Servicios'
-                        : cat === 'supplies'
-                        ? 'Insumos'
-                        : 'Adelanto'}
-                    </Text>
-                  </TouchableOpacity>
-                ))}
-              </View>
-            </View>
-
-            <TouchableOpacity
-              style={[styles.primaryButton, isSavingMovement && styles.buttonDisabled]}
-              onPress={handleRegisterMovement}
-              disabled={isSavingMovement}
+          <SafeAreaView edges={['top', 'bottom']} style={styles.modalSafe}>
+            <KeyboardAvoidingView
+              behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+              style={styles.modalOverlay}
             >
-              {isSavingMovement ? (
-                <ActivityIndicator color={ui.onPrimary} />
-              ) : (
-                <Text style={styles.primaryButtonText}>Guardar Movimiento</Text>
-              )}
-            </TouchableOpacity>
-          </View>
-        </KeyboardAvoidingView>
-      </Modal>
+              <View style={[styles.modalContent, { maxHeight: '92%' }]}>
+                <View style={styles.modalHeader}>
+                  <Text style={styles.modalTitle}>
+                    {movementType === 'income' ? 'Registrar Ingreso Manual' : 'Registrar Egreso / Gasto'}
+                  </Text>
+                  <TouchableOpacity
+                    onPress={() => {
+                      if (!isSavingMovement) setMovementModalVisible(false);
+                    }}
+                    style={styles.iconButton}
+                    accessibilityRole="button"
+                    accessibilityLabel="Cerrar registro de movimiento"
+                  >
+                    <X size={20} color={ui.textSecondary} />
+                  </TouchableOpacity>
+                </View>
+
+                <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
+                  <View style={styles.inputGroup}>
+                    <Text style={styles.label}>Importe (S/)</Text>
+                    <TextInput
+                      style={styles.input}
+                      placeholder="0.00"
+                      placeholderTextColor={ui.textMuted}
+                      keyboardType="decimal-pad"
+                      value={movementAmount}
+                      onChangeText={setMovementAmount}
+                    />
+                  </View>
+
+                  {movementType === 'expense' && (
+                    <View style={styles.inputGroup}>
+                      <Text style={styles.label}>Categoría de Gasto</Text>
+                      <View style={styles.categoryPickerRow}>
+                        {DEFAULT_EXPENSE_CATEGORIES.map((cat) => (
+                          <TouchableOpacity
+                            key={cat.id}
+                            style={[
+                              styles.catChip,
+                              movementCategory === cat.id && styles.catChipActive,
+                            ]}
+                            onPress={() => {
+                              setMovementCategory(cat.id);
+                              if (cat.id !== EMPLOYEE_ADVANCE_CATEGORY_ID) {
+                                setMovementEmployeeId('');
+                              }
+                            }}
+                          >
+                            <Text
+                              style={[
+                                styles.catChipText,
+                                movementCategory === cat.id && styles.catChipTextActive,
+                              ]}
+                            >
+                              {cat.label}
+                            </Text>
+                          </TouchableOpacity>
+                        ))}
+                      </View>
+                      {movementCategory === EMPLOYEE_ADVANCE_CATEGORY_ID && (
+                        <Text style={styles.helperText}>
+                          Los adelantos se descuentan en Planilla y no reducen la utilidad operativa del P&L.
+                        </Text>
+                      )}
+                    </View>
+                  )}
+
+                  {movementType === 'expense' && movementCategory === EMPLOYEE_ADVANCE_CATEGORY_ID && (
+                    <View style={styles.inputGroup}>
+                      <Text style={styles.label}>Trabajador que recibe el adelanto *</Text>
+                      {loadingEmployees ? (
+                        <ActivityIndicator size="small" color={ui.primary} style={{ marginVertical: 8 }} />
+                      ) : teamEmployees.length === 0 ? (
+                        <Text style={styles.helperText}>
+                          No hay colaboradores activos registrados en la cuenta.
+                        </Text>
+                      ) : (
+                        <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+                          <View style={styles.employeeSelectorRow}>
+                            {teamEmployees.map((emp) => {
+                              const selected = movementEmployeeId === emp.id;
+                              return (
+                                <TouchableOpacity
+                                  key={emp.id}
+                                  style={[styles.catChip, selected && styles.catChipActive]}
+                                  onPress={() => setMovementEmployeeId(emp.id)}
+                                >
+                                  <Text style={[styles.catChipText, selected && styles.catChipTextActive]}>
+                                    {emp.name} ({emp.roleLabel})
+                                  </Text>
+                                </TouchableOpacity>
+                              );
+                            })}
+                          </View>
+                        </ScrollView>
+                      )}
+                    </View>
+                  )}
+
+                  {movementType === 'expense' && (
+                    <>
+                      <View style={styles.inputGroup}>
+                        <Text style={styles.label}>Comprobante</Text>
+                        <View style={styles.categoryPickerRow}>
+                          {(
+                            [
+                              { id: 'ninguno', label: 'Sin comprobante' },
+                              { id: 'recibo', label: 'Recibo' },
+                              { id: 'boleta', label: 'Boleta' },
+                              { id: 'factura', label: 'Factura' },
+                            ] as Array<{ id: ExpenseReceiptType; label: string }>
+                          ).map((rt) => (
+                            <TouchableOpacity
+                              key={rt.id}
+                              style={[
+                                styles.catChip,
+                                movementReceiptType === rt.id && styles.catChipActive,
+                              ]}
+                              onPress={() => {
+                                setMovementReceiptType(rt.id);
+                                if (rt.id === 'ninguno') setMovementReceiptNumber('');
+                              }}
+                            >
+                              <Text
+                                style={[
+                                  styles.catChipText,
+                                  movementReceiptType === rt.id && styles.catChipTextActive,
+                                ]}
+                              >
+                                {rt.label}
+                              </Text>
+                            </TouchableOpacity>
+                          ))}
+                        </View>
+                      </View>
+
+                      {movementReceiptType !== 'ninguno' && (
+                        <View style={styles.inputGroup}>
+                          <Text style={styles.label}>N.º de Comprobante (opcional)</Text>
+                          <TextInput
+                            style={styles.input}
+                            placeholder="Ej. B001-00142"
+                            placeholderTextColor={ui.textMuted}
+                            value={movementReceiptNumber}
+                            onChangeText={setMovementReceiptNumber}
+                          />
+                        </View>
+                      )}
+                    </>
+                  )}
+
+                  <View style={styles.inputGroup}>
+                    <Text style={styles.label}>
+                      {movementType === 'income' ? 'Motivo o Descripción' : 'Detalle o Motivo'}
+                    </Text>
+                    <TextInput
+                      style={styles.input}
+                      placeholder={
+                        movementType === 'income'
+                          ? 'Ej. Cambio adicional'
+                          : movementCategory === EMPLOYEE_ADVANCE_CATEGORY_ID
+                          ? 'Ej. Adelanto quincena'
+                          : 'Ej. Compra de bolsas, pasajes, agua'
+                      }
+                      placeholderTextColor={ui.textMuted}
+                      value={movementReason}
+                      onChangeText={setMovementReason}
+                    />
+                  </View>
+
+                  {movementType === 'expense' &&
+                    isCashier &&
+                    Number(activeCashSession?.cashierExpenseLimit ?? accountExpenseLimit ?? 0) > 0 && (
+                      <View style={styles.limitNoticeBox}>
+                        <Lock size={14} color={ui.warning} />
+                        <Text style={styles.limitNoticeText}>
+                          Límite de cajero sin PIN: {formatPEN(Number(activeCashSession?.cashierExpenseLimit ?? accountExpenseLimit ?? 0))}. Montos mayores solicitan PIN de autorización.
+                        </Text>
+                      </View>
+                    )}
+                </ScrollView>
+
+                <TouchableOpacity
+                  style={[styles.primaryButton, isSavingMovement && styles.buttonDisabled]}
+                  onPress={handleRegisterMovement}
+                  disabled={isSavingMovement}
+                >
+                  {isSavingMovement ? (
+                    <ActivityIndicator color={ui.onPrimary} />
+                  ) : (
+                    <Text style={styles.primaryButtonText}>Guardar Movimiento</Text>
+                  )}
+                </TouchableOpacity>
+              </View>
+            </KeyboardAvoidingView>
+          </SafeAreaView>
+        </Modal>
       )}
 
       {/* ==================================================================== */}
-      {/* MODAL: ARQUEO Y CIERRE Z DE CAJA */}
+      {/* MODAL: AUTORIZACIÓN CON PIN DE SUPERVISOR PARA EGRESO DE CAJERO */}
+      {/* ==================================================================== */}
+      {pinModalVisible && (
+        <Modal
+          visible={pinModalVisible}
+          transparent
+          animationType="fade"
+          onRequestClose={() => {
+            if (!isAuthorizingPin) {
+              setPinModalVisible(false);
+              setPendingPinExpense(null);
+              setPinInput('');
+              setPinError('');
+            }
+          }}
+        >
+          <SafeAreaView edges={['top', 'bottom']} style={styles.modalSafe}>
+            <KeyboardAvoidingView
+              behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+              style={styles.modalOverlay}
+            >
+              <View style={styles.modalContent}>
+                <View style={styles.modalHeader}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                    <Lock size={20} color={ui.warning} />
+                    <Text style={styles.modalTitle}>Autorizar Egreso</Text>
+                  </View>
+                  <TouchableOpacity
+                    onPress={() => {
+                      if (!isAuthorizingPin) {
+                        setPinModalVisible(false);
+                        setPendingPinExpense(null);
+                        setPinInput('');
+                        setPinError('');
+                      }
+                    }}
+                    style={styles.iconButton}
+                    accessibilityRole="button"
+                    accessibilityLabel="Cerrar autorización de PIN"
+                  >
+                    <X size={20} color={ui.textSecondary} />
+                  </TouchableOpacity>
+                </View>
+
+                <Text style={styles.pinSubtitle}>
+                  Este retiro de {formatPEN(pendingPinExpense?.amount ?? 0)} supera el tope permitido para cajeros. Ingresa el PIN de autorización (4 a 8 dígitos).
+                </Text>
+
+                <View style={styles.inputGroup}>
+                  <Text style={styles.label}>PIN Numérico</Text>
+                  <TextInput
+                    style={[styles.input, { fontSize: 20, letterSpacing: 6, textAlign: 'center', fontWeight: '700' }]}
+                    placeholder="••••"
+                    placeholderTextColor={ui.textMuted}
+                    keyboardType="number-pad"
+                    secureTextEntry
+                    maxLength={8}
+                    value={pinInput}
+                    onChangeText={(txt) => {
+                      setPinInput(txt.replace(/\D/g, '').slice(0, 8));
+                      if (pinError) setPinError('');
+                    }}
+                  />
+                  {pinError ? <Text style={styles.pinErrorText}>{pinError}</Text> : null}
+                </View>
+
+                <View style={styles.pinActionsRow}>
+                  <TouchableOpacity
+                    style={[styles.secondaryActionButton, { flex: 1 }]}
+                    onPress={() => {
+                      setPinModalVisible(false);
+                      setPinInput('');
+                      setPinError('');
+                      setMovementModalVisible(true);
+                    }}
+                    disabled={isAuthorizingPin}
+                  >
+                    <Text style={styles.secondaryActionText}>Volver</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[
+                      styles.primaryButton,
+                      { flex: 1.4 },
+                      (isAuthorizingPin || pinInput.length < 4) && styles.buttonDisabled,
+                    ]}
+                    onPress={handleAuthorizeExpenseWithPin}
+                    disabled={isAuthorizingPin || pinInput.length < 4}
+                  >
+                    {isAuthorizingPin ? (
+                      <ActivityIndicator color={ui.onPrimary} />
+                    ) : (
+                      <Text style={styles.primaryButtonText}>Autorizar</Text>
+                    )}
+                  </TouchableOpacity>
+                </View>
+              </View>
+            </KeyboardAvoidingView>
+          </SafeAreaView>
+        </Modal>
+      )}
+
+      {/* ==================================================================== */}
+      {/* MODAL: ARQUEO Y CIERRE Z DE CAJA (CIERRE CIEGO PARA NO SUPERVISORES) */}
       {/* ==================================================================== */}
       {Boolean(completionTarget) && (
         <ReservationCompletionModal
@@ -2427,165 +3233,174 @@ export default function OperationsScreen() {
         />
       )}
       {closeModalVisible && (
-        <Modal visible={closeModalVisible} transparent animationType="fade">
-        <KeyboardAvoidingView
-          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-          style={styles.modalOverlay}
+        <Modal
+          visible={closeModalVisible}
+          transparent
+          animationType="fade"
+          onRequestClose={() => {
+            if (!isClosingSession) setCloseModalVisible(false);
+          }}
         >
-          <View style={styles.modalContent}>
-            <View style={styles.modalHeader}>
-              <View>
-                <Text style={styles.modalTitle}>Arqueo y Cierre Z</Text>
-                <Text style={styles.modalSub}>Cuadre final de gaveta de efectivo</Text>
-              </View>
-              <TouchableOpacity
-                onPress={() => setCloseModalVisible(false)}
-                style={styles.iconButton}
-                accessibilityRole="button"
-                accessibilityLabel="Cerrar arqueo de caja"
-              >
-                <X size={20} color={ui.textSecondary} />
-              </TouchableOpacity>
-            </View>
-
-            <View style={styles.auditSummaryBox}>
-              <Text style={styles.auditLabel}>Efectivo Esperado Según Sistema:</Text>
-              <Text style={styles.auditAmount}>
-                {formatPEN(activeCashSession?.expectedAmount ?? 0)}
-              </Text>
-            </View>
-
-            {openFiados.length > 0 && (
-              <View style={styles.inputGroup}>
-                <Text style={styles.label}>Fiado que desea abonar</Text>
-                <ScrollView horizontal showsHorizontalScrollIndicator={false}>
-                  {openFiados.map((fiado) => (
-                    <TouchableOpacity
-                      key={fiado.id}
-                      style={[styles.methodChip, selectedFiado?.id === fiado.id && styles.methodChipActive]}
-                      onPress={() => {
-                        setSelectedFiado(fiado);
-                        setPaymentAmount(String(fiado.remainingAmount));
-                      }}
-                    >
-                      <Text style={[styles.methodChipText, selectedFiado?.id === fiado.id && styles.methodChipTextActive]}>
-                        #{fiado.reservationNumber ?? fiado.id.slice(-6)} · {formatPEN(fiado.remainingAmount)}
-                      </Text>
-                    </TouchableOpacity>
-                  ))}
-                </ScrollView>
-              </View>
-            )}
-
-            <View style={styles.inputGroup}>
-              <Text style={styles.label}>Efectivo Físico Recontado (Billetes y Monedas S/)</Text>
-              <TextInput
-                style={[styles.input, { fontSize: 20, fontWeight: 'bold' }]}
-                placeholder="0.00"
-                placeholderTextColor={ui.textMuted}
-                keyboardType="decimal-pad"
-                value={countedAmountInput}
-                onChangeText={setCountedAmountInput}
-              />
-            </View>
-
-            {calculatedDifference !== null && (
-              <View
-                style={[
-                  styles.differenceResultBox,
-                  {
-                    backgroundColor:
-                      calculatedDifference === 0
-                        ? ui.primarySoft
-                        : calculatedDifference > 0
-                        ? ui.primarySoft
-                        : ui.dangerSoft,
-                  },
-                ]}
-              >
-                <Text style={styles.diffLabel}>Resultado del Arqueo:</Text>
-                <Text
-                  style={[
-                    styles.diffValue,
-                    {
-                      color:
-                        calculatedDifference === 0
-                          ? ui.primary
-                          : calculatedDifference > 0
-                          ? ui.primary
-                          : ui.danger,
-                    },
-                  ]}
-                >
-                  {calculatedDifference === 0
-                    ? 'Cuadre Exacto (S/ 0.00)'
-                    : calculatedDifference > 0
-                    ? `Sobrante: +${formatPEN(calculatedDifference)}`
-                    : `Faltante: ${formatPEN(calculatedDifference)}`}
-                </Text>
-              </View>
-            )}
-
-            <View style={styles.inputGroup}>
-              <Text style={styles.label}>Observaciones de Cierre (Opcional)</Text>
-              <TextInput
-                style={[styles.input, { height: 60, textAlignVertical: 'top' }]}
-                placeholder="Comentarios sobre el cuadre..."
-                placeholderTextColor={ui.textMuted}
-                multiline
-                value={closeNotesInput}
-                onChangeText={setCloseNotesInput}
-              />
-            </View>
-
-            <TouchableOpacity
-              style={[styles.closeZConfirmButton, isClosingSession && styles.buttonDisabled]}
-              onPress={handleCloseCash}
-              disabled={isClosingSession}
+          <SafeAreaView edges={['top', 'bottom']} style={styles.modalSafe}>
+            <KeyboardAvoidingView
+              behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+              style={styles.modalOverlay}
             >
-              {isClosingSession ? (
-                <ActivityIndicator color={ui.onPrimary} />
-              ) : (
-                <>
-                  <Check size={20} color={ui.onPrimary} />
-                  <Text style={styles.closeZConfirmButtonText}>Confirmar y Cerrar Turno</Text>
-                </>
-              )}
-            </TouchableOpacity>
-          </View>
-        </KeyboardAvoidingView>
-      </Modal>
+              <View style={styles.modalContent}>
+                <View style={styles.modalHeader}>
+                  <View>
+                    <Text style={styles.modalTitle}>Arqueo y Cierre Z</Text>
+                    <Text style={styles.modalSub}>
+                      {isSupervisor
+                        ? 'Cuadre final de gaveta de efectivo'
+                        : 'Arqueo ciego de efectivo en gaveta'}
+                    </Text>
+                  </View>
+                  <TouchableOpacity
+                    onPress={() => {
+                      if (!isClosingSession) setCloseModalVisible(false);
+                    }}
+                    style={styles.iconButton}
+                    accessibilityRole="button"
+                    accessibilityLabel="Cerrar arqueo de caja"
+                  >
+                    <X size={20} color={ui.textSecondary} />
+                  </TouchableOpacity>
+                </View>
+
+                {isSupervisor ? (
+                  <View style={styles.auditSummaryBox}>
+                    <Text style={styles.auditLabel}>Efectivo Esperado Según Sistema:</Text>
+                    <Text style={styles.auditAmount}>
+                      {formatPEN(activeCashSession?.expectedAmount ?? 0)}
+                    </Text>
+                  </View>
+                ) : (
+                  <View style={styles.blindNoticeBox}>
+                    <Lock size={16} color={ui.primary} />
+                    <Text style={styles.blindNoticeText}>
+                      Arqueo ciego activo: cuenta el efectivo físico de la gaveta e ingresa el total encontrado.
+                    </Text>
+                  </View>
+                )}
+
+                <View style={styles.inputGroup}>
+                  <Text style={styles.label}>Efectivo Físico Recontado (Billetes y Monedas S/)</Text>
+                  <TextInput
+                    style={[styles.input, { fontSize: 20, fontWeight: 'bold' }]}
+                    placeholder="0.00"
+                    placeholderTextColor={ui.textMuted}
+                    keyboardType="decimal-pad"
+                    value={countedAmountInput}
+                    onChangeText={setCountedAmountInput}
+                  />
+                </View>
+
+                {isSupervisor && calculatedDifference !== null && (
+                  <View
+                    style={[
+                      styles.differenceResultBox,
+                      {
+                        backgroundColor:
+                          calculatedDifference === 0
+                            ? ui.primarySoft
+                            : calculatedDifference > 0
+                            ? ui.primarySoft
+                            : ui.dangerSoft,
+                      },
+                    ]}
+                  >
+                    <Text style={styles.diffLabel}>Resultado del Arqueo:</Text>
+                    <Text
+                      style={[
+                        styles.diffValue,
+                        {
+                          color:
+                            calculatedDifference === 0
+                              ? ui.primary
+                              : calculatedDifference > 0
+                              ? ui.primary
+                              : ui.danger,
+                        },
+                      ]}
+                    >
+                      {calculatedDifference === 0
+                        ? 'Cuadre Exacto (S/ 0.00)'
+                        : calculatedDifference > 0
+                        ? `Sobrante: +${formatPEN(calculatedDifference)}`
+                        : `Faltante: ${formatPEN(calculatedDifference)}`}
+                    </Text>
+                  </View>
+                )}
+
+                <View style={styles.inputGroup}>
+                  <Text style={styles.label}>Observaciones de Cierre (Opcional)</Text>
+                  <TextInput
+                    style={[styles.input, { height: 60, textAlignVertical: 'top' }]}
+                    placeholder="Comentarios sobre el cuadre..."
+                    placeholderTextColor={ui.textMuted}
+                    multiline
+                    value={closeNotesInput}
+                    onChangeText={setCloseNotesInput}
+                  />
+                </View>
+
+                <TouchableOpacity
+                  style={[styles.closeZConfirmButton, isClosingSession && styles.buttonDisabled]}
+                  onPress={handleCloseCash}
+                  disabled={isClosingSession}
+                >
+                  {isClosingSession ? (
+                    <ActivityIndicator color={ui.onPrimary} />
+                  ) : (
+                    <>
+                      <Check size={20} color={ui.onPrimary} />
+                      <Text style={styles.closeZConfirmButtonText}>Confirmar y Cerrar Turno</Text>
+                    </>
+                  )}
+                </TouchableOpacity>
+              </View>
+            </KeyboardAvoidingView>
+          </SafeAreaView>
+        </Modal>
       )}
 
       {/* ==================================================================== */}
       {/* MODAL: CIERRE EXITOSO Y TICKET TÉRMICO */}
       {/* ==================================================================== */}
       {closureSuccessModal && (
-        <Modal visible={closureSuccessModal} transparent animationType="fade">
-          <View style={styles.modalOverlay}>
-            <View style={styles.modalContent}>
-              <View style={{ alignItems: 'center', marginVertical: 12 }}>
-                <CheckCircle2 size={48} color={ui.primary} />
-                <Text style={[styles.modalTitle, { marginTop: 8 }]}>¡Turno Cerrado con Éxito!</Text>
-                <Text style={styles.modalSub}>El reporte de Cierre Z ha sido guardado.</Text>
+        <Modal
+          visible={closureSuccessModal}
+          transparent
+          animationType="fade"
+          onRequestClose={() => setClosureSuccessModal(false)}
+        >
+          <SafeAreaView edges={['top', 'bottom']} style={styles.modalSafe}>
+            <View style={styles.modalOverlay}>
+              <View style={styles.modalContent}>
+                <View style={{ alignItems: 'center', marginVertical: 12 }}>
+                  <CheckCircle2 size={48} color={ui.primary} />
+                  <Text style={[styles.modalTitle, { marginTop: 8 }]}>¡Turno Cerrado con Éxito!</Text>
+                  <Text style={styles.modalSub}>El reporte de Cierre Z ha sido guardado.</Text>
+                </View>
+
+                <TouchableOpacity
+                  style={styles.printTicketButton}
+                  onPress={handlePrintClosureTicket}
+                >
+                  <Printer size={20} color={ui.onPrimary} />
+                  <Text style={styles.printTicketButtonText}>Imprimir Ticket Térmico Z</Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={styles.secondaryDismissButton}
+                  onPress={() => setClosureSuccessModal(false)}
+                >
+                  <Text style={styles.secondaryDismissText}>Finalizar</Text>
+                </TouchableOpacity>
               </View>
-
-              <TouchableOpacity
-                style={styles.printTicketButton}
-                onPress={handlePrintClosureTicket}
-              >
-                <Printer size={20} color={ui.onPrimary} />
-                <Text style={styles.printTicketButtonText}>Imprimir Ticket Térmico Z</Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity
-                style={styles.secondaryDismissButton}
-                onPress={() => setClosureSuccessModal(false)}
-              >
-                <Text style={styles.secondaryDismissText}>Finalizar</Text>
-              </TouchableOpacity>
             </View>
-          </View>
+          </SafeAreaView>
         </Modal>
       )}
 
@@ -2593,447 +3408,1047 @@ export default function OperationsScreen() {
       {/* MODAL: CREAR NUEVO CLIENTE (CON CONSULTA DNI/RUC) */}
       {/* ==================================================================== */}
       {newCustomerModalVisible && (
-        <Modal visible={newCustomerModalVisible} transparent animationType="slide">
-        <KeyboardAvoidingView
-          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-          style={styles.modalOverlay}
+        <Modal
+          visible={newCustomerModalVisible}
+          transparent
+          animationType="slide"
+          onRequestClose={() => {
+            if (!isSavingCustomer) setNewCustomerModalVisible(false);
+          }}
         >
-          <View style={[styles.modalContent, { maxHeight: '90%' }]}>
-            <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>Nuevo Cliente en Cartera</Text>
-              <TouchableOpacity
-                onPress={() => setNewCustomerModalVisible(false)}
-                style={styles.iconButton}
-                accessibilityRole="button"
-                accessibilityLabel="Cerrar formulario de cliente"
-              >
-                <X size={20} color={ui.textSecondary} />
-              </TouchableOpacity>
-            </View>
-
-            <ScrollView showsVerticalScrollIndicator={false}>
-              {/* Tipo y Consulta */}
-              <View style={styles.docTypeRow}>
-                <TouchableOpacity
-                  style={[styles.docTypeBtn, docType === 'DNI' && styles.docTypeBtnActive]}
-                  onPress={() => setDocType('DNI')}
-                >
-                  <Text style={[styles.docTypeText, docType === 'DNI' && styles.docTypeTextActive]}>
-                    DNI (RENIEC)
-                  </Text>
-                </TouchableOpacity>
-
-                <TouchableOpacity
-                  style={[styles.docTypeBtn, docType === 'RUC' && styles.docTypeBtnActive]}
-                  onPress={() => setDocType('RUC')}
-                >
-                  <Text style={[styles.docTypeText, docType === 'RUC' && styles.docTypeTextActive]}>
-                    RUC (SUNAT)
-                  </Text>
-                </TouchableOpacity>
-              </View>
-
-              <View style={styles.inputGroup}>
-                <Text style={styles.label}>Número de Documento</Text>
-                <View style={styles.lookupInputRow}>
-                  <TextInput
-                    style={[styles.input, { flex: 1 }]}
-                    placeholder={docType === 'DNI' ? '8 dígitos' : '11 dígitos'}
-                    placeholderTextColor={ui.textMuted}
-                    keyboardType="numeric"
-                    value={docNumber}
-                    onChangeText={setDocNumber}
-                  />
+          <SafeAreaView edges={['top', 'bottom']} style={styles.modalSafe}>
+            <KeyboardAvoidingView
+              behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+              style={styles.modalOverlay}
+            >
+              <View style={[styles.modalContent, { maxHeight: '90%' }]}>
+                <View style={styles.modalHeader}>
+                  <Text style={styles.modalTitle}>Nuevo Cliente en Cartera</Text>
                   <TouchableOpacity
-                    style={styles.lookupButton}
-                    onPress={handleLookupDoc}
-                    disabled={isLookingUpDoc}
+                    onPress={() => {
+                      if (!isSavingCustomer) setNewCustomerModalVisible(false);
+                    }}
+                    style={styles.iconButton}
+                    accessibilityRole="button"
+                    accessibilityLabel="Cerrar formulario de cliente"
                   >
-                    {isLookingUpDoc ? (
-                      <ActivityIndicator color={ui.onPrimary} size="small" />
-                    ) : (
-                      <Text style={styles.lookupButtonText}>Consultar</Text>
-                    )}
+                    <X size={20} color={ui.textSecondary} />
                   </TouchableOpacity>
                 </View>
-              </View>
 
-              <View style={styles.inputGroup}>
-                <Text style={styles.label}>Nombre o Razón Social</Text>
-                <TextInput
-                  style={styles.input}
-                  placeholder="Nombre completo"
-                  placeholderTextColor={ui.textMuted}
-                  value={customerName}
-                  onChangeText={setCustomerName}
-                />
-              </View>
+                <ScrollView showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
+                  {/* Tipo y Consulta */}
+                  <View style={styles.docTypeRow}>
+                    <TouchableOpacity
+                      style={[styles.docTypeBtn, docType === 'DNI' && styles.docTypeBtnActive]}
+                      onPress={() => setDocType('DNI')}
+                    >
+                      <Text style={[styles.docTypeText, docType === 'DNI' && styles.docTypeTextActive]}>
+                        DNI (RENIEC)
+                      </Text>
+                    </TouchableOpacity>
 
-              <View style={styles.inputGroup}>
-                <Text style={styles.label}>Teléfono / WhatsApp</Text>
-                <TextInput
-                  style={styles.input}
-                  placeholder="987654321"
-                  placeholderTextColor={ui.textMuted}
-                  keyboardType="phone-pad"
-                  value={customerPhone}
-                  onChangeText={setCustomerPhone}
-                />
-              </View>
+                    <TouchableOpacity
+                      style={[styles.docTypeBtn, docType === 'RUC' && styles.docTypeBtnActive]}
+                      onPress={() => setDocType('RUC')}
+                    >
+                      <Text style={[styles.docTypeText, docType === 'RUC' && styles.docTypeTextActive]}>
+                        RUC (SUNAT)
+                      </Text>
+                    </TouchableOpacity>
+                  </View>
 
-              <View style={styles.inputGroup}>
-                <Text style={styles.label}>Dirección Fiscal / Entrega</Text>
-                <TextInput
-                  style={styles.input}
-                  placeholder="Av. Principal 123"
-                  placeholderTextColor={ui.textMuted}
-                  value={customerAddress}
-                  onChangeText={setCustomerAddress}
-                />
-              </View>
+                  <View style={styles.inputGroup}>
+                    <Text style={styles.label}>Número de Documento</Text>
+                    <View style={styles.lookupInputRow}>
+                      <TextInput
+                        style={[styles.input, { flex: 1 }]}
+                        placeholder={docType === 'DNI' ? '8 dígitos' : '11 dígitos'}
+                        placeholderTextColor={ui.textMuted}
+                        keyboardType="numeric"
+                        value={docNumber}
+                        onChangeText={setDocNumber}
+                      />
+                      <TouchableOpacity
+                        style={styles.lookupButton}
+                        onPress={handleLookupDoc}
+                        disabled={isLookingUpDoc}
+                      >
+                        {isLookingUpDoc ? (
+                          <ActivityIndicator color={ui.onPrimary} size="small" />
+                        ) : (
+                          <Text style={styles.lookupButtonText}>Consultar</Text>
+                        )}
+                      </TouchableOpacity>
+                    </View>
+                  </View>
 
-              <View style={styles.inputGroup}>
-                <Text style={styles.label}>Línea de Crédito Máxima (S/)</Text>
-                <TextInput
-                  style={styles.input}
-                  placeholder="200.00"
-                  placeholderTextColor={ui.textMuted}
-                  keyboardType="decimal-pad"
-                  value={creditLimitInput}
-                  onChangeText={setCreditLimitInput}
-                />
-              </View>
-            </ScrollView>
+                  <View style={styles.inputGroup}>
+                    <Text style={styles.label}>Nombre o Razón Social</Text>
+                    <TextInput
+                      style={styles.input}
+                      placeholder="Nombre completo"
+                      placeholderTextColor={ui.textMuted}
+                      value={customerName}
+                      onChangeText={setCustomerName}
+                    />
+                  </View>
 
-            <TouchableOpacity
-              style={[styles.primaryButton, isSavingCustomer && styles.buttonDisabled]}
-              onPress={handleSaveCustomer}
-              disabled={isSavingCustomer}
-            >
-              {isSavingCustomer ? (
-                <ActivityIndicator color={ui.onPrimary} />
-              ) : (
-                <Text style={styles.primaryButtonText}>Guardar Cliente</Text>
-              )}
-            </TouchableOpacity>
-          </View>
-        </KeyboardAvoidingView>
-      </Modal>
+                  <View style={styles.inputGroup}>
+                    <Text style={styles.label}>Teléfono / WhatsApp</Text>
+                    <TextInput
+                      style={styles.input}
+                      placeholder="987654321"
+                      placeholderTextColor={ui.textMuted}
+                      keyboardType="phone-pad"
+                      value={customerPhone}
+                      onChangeText={setCustomerPhone}
+                    />
+                  </View>
+
+                  <View style={styles.inputGroup}>
+                    <Text style={styles.label}>Dirección Fiscal / Entrega</Text>
+                    <TextInput
+                      style={styles.input}
+                      placeholder="Av. Principal 123"
+                      placeholderTextColor={ui.textMuted}
+                      value={customerAddress}
+                      onChangeText={setCustomerAddress}
+                    />
+                  </View>
+
+                  <View style={styles.inputGroup}>
+                    <Text style={styles.label}>Línea de Crédito Máxima (S/)</Text>
+                    <TextInput
+                      style={styles.input}
+                      placeholder="200.00"
+                      placeholderTextColor={ui.textMuted}
+                      keyboardType="decimal-pad"
+                      value={creditLimitInput}
+                      onChangeText={setCreditLimitInput}
+                    />
+                  </View>
+                </ScrollView>
+
+                <TouchableOpacity
+                  style={[styles.primaryButton, isSavingCustomer && styles.buttonDisabled]}
+                  onPress={handleSaveCustomer}
+                  disabled={isSavingCustomer}
+                >
+                  {isSavingCustomer ? (
+                    <ActivityIndicator color={ui.onPrimary} />
+                  ) : (
+                    <Text style={styles.primaryButtonText}>Guardar Cliente</Text>
+                  )}
+                </TouchableOpacity>
+              </View>
+            </KeyboardAvoidingView>
+          </SafeAreaView>
+        </Modal>
       )}
 
       {/* ==================================================================== */}
       {/* MODAL: REGISTRAR ABONO DE FIADO */}
       {/* ==================================================================== */}
       {paymentModalVisible && (
-        <Modal visible={paymentModalVisible} transparent animationType="fade">
-        <KeyboardAvoidingView
-          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-          style={styles.modalOverlay}
+        <Modal
+          visible={paymentModalVisible}
+          transparent
+          animationType="fade"
+          onRequestClose={() => {
+            if (!isProcessingPayment) setPaymentModalVisible(false);
+          }}
         >
-          <View style={styles.modalContent}>
-            <View style={styles.modalHeader}>
-              <View>
-                <Text style={styles.modalTitle}>Abonar a Deuda</Text>
-                <Text style={styles.modalSub}>{selectedDebtor?.name}</Text>
-              </View>
-              <TouchableOpacity
-                onPress={() => setPaymentModalVisible(false)}
-                style={styles.iconButton}
-                accessibilityRole="button"
-                accessibilityLabel="Cerrar abono de deuda"
-              >
-                <X size={20} color={ui.textSecondary} />
-              </TouchableOpacity>
-            </View>
-
-            <View style={styles.auditSummaryBox}>
-              <Text style={styles.auditLabel}>Deuda Total Pendiente:</Text>
-              <Text style={[styles.auditAmount, { color: ui.warning }]}>
-                {formatPEN(selectedDebtor?.currentDebt ?? 0)}
-              </Text>
-            </View>
-
-            <View style={styles.inputGroup}>
-              <Text style={styles.label}>Monto a Cobrar (S/)</Text>
-              <TextInput
-                style={[styles.input, { fontSize: 20, fontWeight: 'bold' }]}
-                placeholder="0.00"
-                placeholderTextColor={ui.textMuted}
-                keyboardType="decimal-pad"
-                value={paymentAmount}
-                onChangeText={setPaymentAmount}
-              />
-            </View>
-
-            <View style={styles.inputGroup}>
-              <Text style={styles.label}>Método de Pago</Text>
-              <View style={styles.paymentMethodRow}>
-                {[
-                  { id: 'efectivo', label: 'Efectivo' },
-                  { id: 'yape', label: 'Yape' },
-                  { id: 'plin', label: 'Plin' },
-                  { id: 'tarjeta', label: 'Tarjeta' },
-                  { id: 'transferencia', label: 'Transf.' },
-                ].map((m) => (
-                  <TouchableOpacity
-                    key={m.id}
-                    style={[
-                      styles.methodChip,
-                      paymentMethod === m.id && styles.methodChipActive,
-                    ]}
-                    onPress={() => setPaymentMethod(m.id as any)}
-                  >
-                    <Text
-                      style={[
-                        styles.methodChipText,
-                        paymentMethod === m.id && styles.methodChipTextActive,
-                      ]}
-                    >
-                      {m.label}
-                    </Text>
-                  </TouchableOpacity>
-                ))}
-              </View>
-            </View>
-
-            <View style={styles.inputGroup}>
-              <Text style={styles.label}>Notas / Referencia</Text>
-              <TextInput
-                style={styles.input}
-                placeholder="Ej. Recibo manual 0023"
-                placeholderTextColor={ui.textMuted}
-                value={paymentNotes}
-                onChangeText={setPaymentNotes}
-              />
-            </View>
-
-            <TouchableOpacity
-              style={[styles.primaryButton, isProcessingPayment && styles.buttonDisabled]}
-              onPress={handleRegisterPayment}
-              disabled={isProcessingPayment}
+          <SafeAreaView edges={['top', 'bottom']} style={styles.modalSafe}>
+            <KeyboardAvoidingView
+              behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+              style={styles.modalOverlay}
             >
-              {isProcessingPayment ? (
-                <ActivityIndicator color={ui.onPrimary} />
-              ) : (
-                <Text style={styles.primaryButtonText}>Registrar Cobro de Abono</Text>
-              )}
-            </TouchableOpacity>
-          </View>
-        </KeyboardAvoidingView>
-      </Modal>
+              <View style={[styles.modalContent, { maxHeight: '90%' }]}>
+                <View style={styles.modalHeader}>
+                  <View>
+                    <Text style={styles.modalTitle}>Abonar a Deuda</Text>
+                    <Text style={styles.modalSub}>{selectedDebtor?.name}</Text>
+                  </View>
+                  <TouchableOpacity
+                    onPress={() => {
+                      if (!isProcessingPayment) setPaymentModalVisible(false);
+                    }}
+                    style={styles.iconButton}
+                    accessibilityRole="button"
+                    accessibilityLabel="Cerrar abono de deuda"
+                  >
+                    <X size={20} color={ui.textSecondary} />
+                  </TouchableOpacity>
+                </View>
+
+                <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
+                  <View style={styles.auditSummaryBox}>
+                    <Text style={styles.auditLabel}>Deuda Total Pendiente:</Text>
+                    <Text style={[styles.auditAmount, { color: ui.warning }]}>
+                      {formatPEN(selectedDebtor?.currentDebt ?? 0)}
+                    </Text>
+                  </View>
+
+                  {openFiados.length > 0 && (
+                    <View style={[styles.inputGroup, { marginTop: 10 }]}>
+                      <Text style={styles.label}>Fiado que desea abonar</Text>
+                      <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+                        <View style={{ flexDirection: 'row', gap: 6 }}>
+                          {openFiados.map((fiado) => (
+                            <TouchableOpacity
+                              key={fiado.id}
+                              style={[styles.methodChip, selectedFiado?.id === fiado.id && styles.methodChipActive]}
+                              onPress={() => {
+                                setSelectedFiado(fiado);
+                                setPaymentAmount(String(fiado.remainingAmount));
+                              }}
+                            >
+                              <Text style={[styles.methodChipText, selectedFiado?.id === fiado.id && styles.methodChipTextActive]}>
+                                #{fiado.reservationNumber ?? fiado.id.slice(-6)} · {formatPEN(fiado.remainingAmount)}
+                              </Text>
+                            </TouchableOpacity>
+                          ))}
+                        </View>
+                      </ScrollView>
+                    </View>
+                  )}
+
+                  <View style={styles.inputGroup}>
+                    <Text style={styles.label}>Monto a Cobrar (S/)</Text>
+                    <TextInput
+                      style={[styles.input, { fontSize: 20, fontWeight: 'bold' }]}
+                      placeholder="0.00"
+                      placeholderTextColor={ui.textMuted}
+                      keyboardType="decimal-pad"
+                      value={paymentAmount}
+                      onChangeText={setPaymentAmount}
+                    />
+                  </View>
+
+                  <View style={styles.inputGroup}>
+                    <Text style={styles.label}>Método de Pago</Text>
+                    <View style={styles.paymentMethodRow}>
+                      {[
+                        { id: 'efectivo', label: 'Efectivo' },
+                        { id: 'yape', label: 'Yape' },
+                        { id: 'plin', label: 'Plin' },
+                        { id: 'tarjeta', label: 'Tarjeta' },
+                        { id: 'transferencia', label: 'Transf.' },
+                      ].map((m) => (
+                        <TouchableOpacity
+                          key={m.id}
+                          style={[
+                            styles.methodChip,
+                            paymentMethod === m.id && styles.methodChipActive,
+                          ]}
+                          onPress={() => setPaymentMethod(m.id as any)}
+                        >
+                          <Text
+                            style={[
+                              styles.methodChipText,
+                              paymentMethod === m.id && styles.methodChipTextActive,
+                            ]}
+                          >
+                            {m.label}
+                          </Text>
+                        </TouchableOpacity>
+                      ))}
+                    </View>
+                  </View>
+
+                  <View style={styles.inputGroup}>
+                    <Text style={styles.label}>Notas / Referencia</Text>
+                    <TextInput
+                      style={styles.input}
+                      placeholder="Ej. Recibo manual 0023"
+                      placeholderTextColor={ui.textMuted}
+                      value={paymentNotes}
+                      onChangeText={setPaymentNotes}
+                    />
+                  </View>
+                </ScrollView>
+
+                <TouchableOpacity
+                  style={[styles.primaryButton, isProcessingPayment && styles.buttonDisabled]}
+                  onPress={handleRegisterPayment}
+                  disabled={isProcessingPayment}
+                >
+                  {isProcessingPayment ? (
+                    <ActivityIndicator color={ui.onPrimary} />
+                  ) : (
+                    <Text style={styles.primaryButtonText}>Registrar Cobro de Abono</Text>
+                  )}
+                </TouchableOpacity>
+              </View>
+            </KeyboardAvoidingView>
+          </SafeAreaView>
+        </Modal>
       )}
 
       {/* ==================================================================== */}
       {/* MODAL: NUEVA RESERVA O PEDIDO */}
       {/* ==================================================================== */}
       {newReservationModalVisible && (
-        <Modal visible={newReservationModalVisible} transparent animationType="slide">
-        <KeyboardAvoidingView
-          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-          style={styles.modalOverlay}
+        <Modal
+          visible={newReservationModalVisible}
+          transparent
+          animationType="slide"
+          onRequestClose={() => {
+            if (!isSavingReservation) setNewReservationModalVisible(false);
+          }}
         >
-          <View style={[styles.modalContent, { maxHeight: '92%' }]}>
-            <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>Nueva Reserva / Pedido</Text>
+          <SafeAreaView edges={['top', 'bottom']} style={styles.modalSafe}>
+            <KeyboardAvoidingView
+              behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+              style={styles.modalOverlay}
+            >
+              <View style={[styles.modalContent, { maxHeight: '92%' }]}>
+                <View style={styles.modalHeader}>
+                  <Text style={styles.modalTitle}>Nueva Reserva / Pedido</Text>
+                  <TouchableOpacity
+                    onPress={() => {
+                      if (!isSavingReservation) setNewReservationModalVisible(false);
+                    }}
+                    style={styles.iconButton}
+                    accessibilityRole="button"
+                    accessibilityLabel="Cerrar formulario de reserva o pedido"
+                  >
+                    <X size={20} color={ui.textSecondary} />
+                  </TouchableOpacity>
+                </View>
+
+                <ScrollView showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
+                  {/* Selector de Tipo */}
+                  <View style={styles.docTypeRow}>
+                    <TouchableOpacity
+                      style={[styles.docTypeBtn, orderType === 'reservation' && styles.docTypeBtnActive]}
+                      onPress={() => setOrderType('reservation')}
+                    >
+                      <Text style={[styles.docTypeText, orderType === 'reservation' && styles.docTypeTextActive]}>
+                        Reserva (Apartado)
+                      </Text>
+                    </TouchableOpacity>
+
+                    <TouchableOpacity
+                      style={[styles.docTypeBtn, orderType === 'order' && styles.docTypeBtnActive]}
+                      onPress={() => setOrderType('order')}
+                    >
+                      <Text style={[styles.docTypeText, orderType === 'order' && styles.docTypeTextActive]}>
+                        Pedido con Entrega
+                      </Text>
+                    </TouchableOpacity>
+                  </View>
+
+                  {/* Datos del Cliente */}
+                  <View style={{ flexDirection: 'row', gap: 10 }}>
+                    <View style={[styles.inputGroup, { flex: 1 }]}>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+                        <Text style={styles.label}>DNI / Doc (opcional)</Text>
+                        {isSearchingOrderDni && (
+                          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 2 }}>
+                            <ActivityIndicator size="small" color={ui.primary} style={{ transform: [{ scale: 0.7 }] }} />
+                            <Text style={{ fontSize: 10, color: ui.primary }}>RENIEC...</Text>
+                          </View>
+                        )}
+                      </View>
+                      <TextInput
+                        style={styles.input}
+                        placeholder="8 dígitos"
+                        placeholderTextColor={ui.textMuted}
+                        keyboardType="numeric"
+                        maxLength={8}
+                        value={orderCustomerDoc}
+                        onChangeText={setOrderCustomerDoc}
+                      />
+                    </View>
+
+                    <View style={[styles.inputGroup, { flex: 1 }]}>
+                      <Text style={styles.label}>Teléfono</Text>
+                      <TextInput
+                        style={styles.input}
+                        placeholder="987654321"
+                        placeholderTextColor={ui.textMuted}
+                        keyboardType="phone-pad"
+                        value={orderCustomerPhone}
+                        onChangeText={setOrderCustomerPhone}
+                      />
+                    </View>
+                  </View>
+
+                  <View style={styles.inputGroup}>
+                    <Text style={styles.label}>Nombre del Cliente</Text>
+                    <TextInput
+                      style={styles.input}
+                      placeholder="Nombre completo"
+                      placeholderTextColor={ui.textMuted}
+                      value={orderCustomerName}
+                      onChangeText={setOrderCustomerName}
+                    />
+                  </View>
+
+                  {/* Selector de Productos */}
+                  <View style={styles.inputGroup}>
+                    <Text style={styles.label}>Seleccionar Productos a Retener</Text>
+                    <TextInput
+                      style={styles.input}
+                      placeholder="Buscar en inventario..."
+                      placeholderTextColor={ui.textMuted}
+                      value={productSearchQuery}
+                      onChangeText={setProductSearchQuery}
+                    />
+
+                    {filteredCatalogSuggestions.length > 0 && (
+                      <View style={styles.searchProductDropdown}>
+                        {filteredCatalogSuggestions.map((p: any) => (
+                          <TouchableOpacity
+                            key={p.id}
+                            style={styles.dropdownItem}
+                            onPress={() => {
+                              handleAddProductToReservation(p);
+                              setProductSearchQuery('');
+                            }}
+                          >
+                            <Text style={styles.dropdownName}>{p.name}</Text>
+                            <Text style={styles.dropdownPrice}>
+                              {formatPEN(p.price || p.suggestedPrice || 0)}
+                            </Text>
+                          </TouchableOpacity>
+                        ))}
+                      </View>
+                    )}
+                  </View>
+
+                  {/* Lista de Ítems en la Reserva */}
+                  {orderItems.length > 0 && (
+                    <View style={styles.orderItemsList}>
+                      {orderItems.map((it) => (
+                        <View key={`${it.id || it.productId || it.productName}-${it.variantId || 'base'}-${it.presentationId || 'base'}`} style={styles.orderItemCard}>
+                          <View style={{ flex: 1 }}>
+                            <Text style={styles.orderItemName}>{it.productName}</Text>
+                            <Text style={styles.orderItemSub}>
+                              {it.quantity} x {formatPEN(it.price)} = {formatPEN(it.price * it.quantity)}
+                            </Text>
+                          </View>
+                          <TouchableOpacity
+                            onPress={() => {
+                              const productId = it.productId || it.id;
+                              if (productId) handleRemoveItemFromReservation(productId);
+                            }}
+                            style={styles.iconButton}
+                            accessibilityRole="button"
+                            accessibilityLabel={`Quitar ${it.productName} de la reserva`}
+                          >
+                            <X size={18} color={ui.danger} />
+                          </TouchableOpacity>
+                        </View>
+                      ))}
+                      <View style={styles.totalRow}>
+                        <Text style={styles.totalText}>TOTAL RESERVA:</Text>
+                        <Text style={styles.totalAmount}>{formatPEN(reservationOrderTotal)}</Text>
+                      </View>
+                    </View>
+                  )}
+
+                  {/* Adelanto y Fechas */}
+                  <View style={styles.inputGroup}>
+                    <Text style={styles.label}>Adelanto Pagado Hoy (S/)</Text>
+                    <TextInput
+                      style={styles.input}
+                      placeholder="0.00"
+                      placeholderTextColor={ui.textMuted}
+                      keyboardType="decimal-pad"
+                      value={orderDeposit}
+                      onChangeText={setOrderDeposit}
+                    />
+                  </View>
+
+                  <View style={styles.inputGroup}>
+                    <Text style={styles.label}>Fecha Programada de Entrega / Recojo</Text>
+                    <TextInput
+                      style={styles.input}
+                      placeholder="Ej. Mañana a las 4pm / 15/11/2026"
+                      placeholderTextColor={ui.textMuted}
+                      value={orderPickupDate}
+                      onChangeText={setOrderPickupDate}
+                    />
+                  </View>
+
+                  <View style={styles.inputGroup}>
+                    <Text style={styles.label}>Notas Adicionales</Text>
+                    <TextInput
+                      style={[styles.input, { height: 60, textAlignVertical: 'top' }]}
+                      placeholder="Detalles sobre empaque, color o indicaciones..."
+                      placeholderTextColor={ui.textMuted}
+                      multiline
+                      value={orderNotes}
+                      onChangeText={setOrderNotes}
+                    />
+                  </View>
+                </ScrollView>
+
+                <TouchableOpacity
+                  style={[styles.primaryButton, isSavingReservation && styles.buttonDisabled]}
+                  onPress={handleCreateReservationOrder}
+                  disabled={isSavingReservation}
+                >
+                  {isSavingReservation ? (
+                    <ActivityIndicator color={ui.onPrimary} />
+                  ) : (
+                    <Text style={styles.primaryButtonText}>Crear y Retener Stock</Text>
+                  )}
+                </TouchableOpacity>
+              </View>
+            </KeyboardAvoidingView>
+          </SafeAreaView>
+        </Modal>
+      )}
+
+      {/* ==================================================================== */}
+      {/* MODAL: DETALLE DE CLIENTE, FIADOS, DEVOLUCIÓN, CASTIGO Y RECÁLCULO */}
+      {/* ==================================================================== */}
+      {customerDetailModalVisible && detailCustomer && (
+        <Modal
+          visible={customerDetailModalVisible && !returnFiadoTarget && !writeOffTarget && !paymentModalVisible}
+          animationType="slide"
+          presentationStyle="pageSheet"
+          onRequestClose={() => setCustomerDetailModalVisible(false)}
+        >
+          <SafeAreaView edges={['top', 'bottom']} style={styles.fullSheetContainer}>
+            <View style={styles.fullSheetHeader}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.modalTitle} numberOfLines={1}>{detailCustomer.name}</Text>
+                <Text style={styles.modalSub}>
+                  {detailCustomer.documentType || 'DOC'}: {detailCustomer.documentNumber || 'Sin número'}
+                  {detailCustomer.phone ? ` · ${detailCustomer.phone}` : ''}
+                </Text>
+              </View>
               <TouchableOpacity
-                onPress={() => setNewReservationModalVisible(false)}
+                onPress={() => setCustomerDetailModalVisible(false)}
                 style={styles.iconButton}
                 accessibilityRole="button"
-                accessibilityLabel="Cerrar formulario de reserva o pedido"
+                accessibilityLabel="Cerrar detalle del cliente"
               >
                 <X size={20} color={ui.textSecondary} />
               </TouchableOpacity>
             </View>
 
-            <ScrollView showsVerticalScrollIndicator={false}>
-              {/* Selector de Tipo */}
-              <View style={styles.docTypeRow}>
-                <TouchableOpacity
-                  style={[styles.docTypeBtn, orderType === 'reservation' && styles.docTypeBtnActive]}
-                  onPress={() => setOrderType('reservation')}
-                >
-                  <Text style={[styles.docTypeText, orderType === 'reservation' && styles.docTypeTextActive]}>
-                    Reserva (Apartado)
-                  </Text>
-                </TouchableOpacity>
+            <ScrollView contentContainerStyle={styles.fullSheetContent} showsVerticalScrollIndicator={false}>
+              {(detailCustomer.email || detailCustomer.address) ? (
+                <View style={styles.detailInfoCard}>
+                  {detailCustomer.email ? (
+                    <Text style={styles.detailInfoLine}>Correo: {detailCustomer.email}</Text>
+                  ) : null}
+                  {detailCustomer.address ? (
+                    <Text style={styles.detailInfoLine}>Dirección: {detailCustomer.address}</Text>
+                  ) : null}
+                </View>
+              ) : null}
 
-                <TouchableOpacity
-                  style={[styles.docTypeBtn, orderType === 'order' && styles.docTypeBtnActive]}
-                  onPress={() => setOrderType('order')}
-                >
-                  <Text style={[styles.docTypeText, orderType === 'order' && styles.docTypeTextActive]}>
-                    Pedido con Entrega
+              <View style={styles.detailKpiGrid}>
+                <View style={styles.detailKpiTile}>
+                  <Text style={styles.detailKpiLabel}>DEUDA ACTUAL</Text>
+                  <Text style={[styles.detailKpiValue, { color: (detailCustomer.currentDebt || 0) > 0 ? ui.danger : ui.success }]}>
+                    {formatPEN(Number(detailCustomer.currentDebt) || 0)}
                   </Text>
-                </TouchableOpacity>
+                </View>
+                <View style={styles.detailKpiTile}>
+                  <Text style={styles.detailKpiLabel}>CRÉDITOS</Text>
+                  <Text style={[styles.detailKpiValue, { color: ui.primary }]}>
+                    {formatPEN(Number(detailCustomer.credits) || 0)}
+                  </Text>
+                </View>
+                <View style={styles.detailKpiTile}>
+                  <Text style={styles.detailKpiLabel}>LÍMITE CRÉDITO</Text>
+                  <Text style={styles.detailKpiValue}>
+                    {formatPEN(Number(detailCustomer.maxCreditLimit ?? detailCustomer.creditLimit) || 0)}
+                  </Text>
+                </View>
               </View>
 
-              {/* Datos del Cliente */}
-              <View style={{ flexDirection: 'row', gap: 10 }}>
-                <View style={[styles.inputGroup, { flex: 1 }]}>
-                  <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
-                    <Text style={styles.label}>DNI / Doc (opcional)</Text>
-                    {isSearchingOrderDni && (
-                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 2 }}>
-                        <ActivityIndicator size="small" color={ui.primary} style={{ transform: [{ scale: 0.7 }] }} />
-                        <Text style={{ fontSize: 10, color: ui.primary }}>RENIEC...</Text>
-                      </View>
+              <View style={styles.detailActionsBar}>
+                {(Number(detailCustomer.currentDebt) || 0) > 0 && (
+                  <TouchableOpacity
+                    style={[styles.primaryButton, { flex: 1 }]}
+                    onPress={() => handleCollectDebt(detailCustomer)}
+                  >
+                    <Receipt size={16} color={ui.onPrimary} />
+                    <Text style={styles.primaryButtonText}>Abonar Deuda</Text>
+                  </TouchableOpacity>
+                )}
+
+                {isSupervisor && canManageCustomers && (
+                  <TouchableOpacity
+                    style={[styles.recalcButton, { flex: 1 }, isRecalculatingDebt && styles.buttonDisabled]}
+                    onPress={handleRecalculateDebt}
+                    disabled={isRecalculatingDebt}
+                  >
+                    {isRecalculatingDebt ? (
+                      <ActivityIndicator size="small" color={ui.primary} />
+                    ) : (
+                      <>
+                        <RotateCcw size={15} color={ui.primary} />
+                        <Text style={styles.recalcButtonText}>Recalcular deuda</Text>
+                      </>
                     )}
-                  </View>
-                  <TextInput
-                    style={styles.input}
-                    placeholder="8 dígitos"
-                    placeholderTextColor={ui.textMuted}
-                    keyboardType="numeric"
-                    maxLength={8}
-                    value={orderCustomerDoc}
-                    onChangeText={setOrderCustomerDoc}
-                  />
-                </View>
-
-                <View style={[styles.inputGroup, { flex: 1 }]}>
-                  <Text style={styles.label}>Teléfono</Text>
-                  <TextInput
-                    style={styles.input}
-                    placeholder="987654321"
-                    placeholderTextColor={ui.textMuted}
-                    keyboardType="phone-pad"
-                    value={orderCustomerPhone}
-                    onChangeText={setOrderCustomerPhone}
-                  />
-                </View>
-              </View>
-
-              <View style={styles.inputGroup}>
-                <Text style={styles.label}>Nombre del Cliente</Text>
-                <TextInput
-                  style={styles.input}
-                  placeholder="Nombre completo"
-                  placeholderTextColor={ui.textMuted}
-                  value={orderCustomerName}
-                  onChangeText={setOrderCustomerName}
-                />
-              </View>
-
-              {/* Selector de Productos */}
-              <View style={styles.inputGroup}>
-                <Text style={styles.label}>Seleccionar Productos a Retener</Text>
-                <TextInput
-                  style={styles.input}
-                  placeholder="Buscar en inventario..."
-                  placeholderTextColor={ui.textMuted}
-                  value={productSearchQuery}
-                  onChangeText={setProductSearchQuery}
-                />
-
-                {filteredCatalogSuggestions.length > 0 && (
-                  <View style={styles.searchProductDropdown}>
-                    {filteredCatalogSuggestions.map((p: any) => (
-                      <TouchableOpacity
-                        key={p.id}
-                        style={styles.dropdownItem}
-                        onPress={() => {
-                          handleAddProductToReservation(p);
-                          setProductSearchQuery('');
-                        }}
-                      >
-                        <Text style={styles.dropdownName}>{p.name}</Text>
-                        <Text style={styles.dropdownPrice}>
-                          {formatPEN(p.price || p.suggestedPrice || 0)}
-                        </Text>
-                      </TouchableOpacity>
-                    ))}
-                  </View>
+                  </TouchableOpacity>
                 )}
               </View>
 
-              {/* Lista de Ítems en la Reserva */}
-              {orderItems.length > 0 && (
-                <View style={styles.orderItemsList}>
-                  {orderItems.map((it) => (
-                    <View key={`${it.id || it.productId || it.productName}-${it.variantId || 'base'}-${it.presentationId || 'base'}`} style={styles.orderItemCard}>
-                      <View style={{ flex: 1 }}>
-                        <Text style={styles.orderItemName}>{it.productName}</Text>
-                        <Text style={styles.orderItemSub}>
-                          {it.quantity} x {formatPEN(it.price)} = {formatPEN(it.price * it.quantity)}
-                        </Text>
-                      </View>
-                      <TouchableOpacity
-                        onPress={() => {
-                          const productId = it.productId || it.id;
-                          if (productId) handleRemoveItemFromReservation(productId);
-                        }}
-                        style={styles.iconButton}
-                        accessibilityRole="button"
-                        accessibilityLabel={`Quitar ${it.productName} de la reserva`}
-                      >
-                        <X size={18} color={ui.danger} />
-                      </TouchableOpacity>
-                    </View>
-                  ))}
-                  <View style={styles.totalRow}>
-                    <Text style={styles.totalText}>TOTAL RESERVA:</Text>
-                    <Text style={styles.totalAmount}>{formatPEN(reservationOrderTotal)}</Text>
-                  </View>
+              <Text style={styles.detailSectionTitle}>
+                Fiados Pendientes ({detailOpenFiados.length})
+              </Text>
+
+              {loadingCustomerDetail ? (
+                <ActivityIndicator color={ui.primary} style={{ marginVertical: 20 }} />
+              ) : detailOpenFiados.length === 0 ? (
+                <View style={styles.detailEmptyBox}>
+                  <Text style={styles.emptyText}>Este cliente no tiene fiados pendientes.</Text>
                 </View>
-              )}
-
-              {/* Adelanto y Fechas */}
-              <View style={styles.inputGroup}>
-                <Text style={styles.label}>Adelanto Pagado Hoy (S/)</Text>
-                <TextInput
-                  style={styles.input}
-                  placeholder="0.00"
-                  placeholderTextColor={ui.textMuted}
-                  keyboardType="decimal-pad"
-                  value={orderDeposit}
-                  onChangeText={setOrderDeposit}
-                />
-              </View>
-
-              <View style={styles.inputGroup}>
-                <Text style={styles.label}>Fecha Programada de Entrega / Recojo</Text>
-                <TextInput
-                  style={styles.input}
-                  placeholder="Ej. Mañana a las 4pm / 15/11/2026"
-                  placeholderTextColor={ui.textMuted}
-                  value={orderPickupDate}
-                  onChangeText={setOrderPickupDate}
-                />
-              </View>
-
-              <View style={styles.inputGroup}>
-                <Text style={styles.label}>Notas Adicionales</Text>
-                <TextInput
-                  style={[styles.input, { height: 60, textAlignVertical: 'top' }]}
-                  placeholder="Detalles sobre empaque, color o indicaciones..."
-                  placeholderTextColor={ui.textMuted}
-                  multiline
-                  value={orderNotes}
-                  onChangeText={setOrderNotes}
-                />
-              </View>
-            </ScrollView>
-
-            <TouchableOpacity
-              style={[styles.primaryButton, isSavingReservation && styles.buttonDisabled]}
-              onPress={handleCreateReservationOrder}
-              disabled={isSavingReservation}
-            >
-              {isSavingReservation ? (
-                <ActivityIndicator color={ui.onPrimary} />
               ) : (
-                <Text style={styles.primaryButtonText}>Crear y Retener Stock</Text>
+                detailOpenFiados.map((fiado) => {
+                  const canReturnItems =
+                    (fiado.items?.length || 0) > 0 &&
+                    (canProcessReturn || isSupervisor || role === 'manager' || isCashier);
+                  return (
+                    <View key={fiado.id} style={styles.fiadoDetailCard}>
+                      <View style={styles.fiadoDetailHeader}>
+                        <View>
+                          <Text style={styles.fiadoDetailTitle}>
+                            Fiado #{fiado.reservationNumber ?? fiado.id.slice(-6).toUpperCase()}
+                          </Text>
+                          <Text style={styles.fiadoDetailDate}>{formatDatePE(fiado.date)}</Text>
+                        </View>
+                        <View style={{ alignItems: 'flex-end' }}>
+                          <Text style={styles.fiadoBalanceLabel}>PENDIENTE</Text>
+                          <Text style={styles.fiadoBalanceValue}>{formatPEN(fiado.remainingAmount)}</Text>
+                        </View>
+                      </View>
+
+                      <View style={styles.fiadoMetricsRow}>
+                        <Text style={styles.fiadoMetricText}>Total: {formatPEN(fiado.total)}</Text>
+                        <Text style={styles.fiadoMetricText}>Pagado: {formatPEN(fiado.paidAmount)}</Text>
+                        {(fiado.returnedAmount || 0) > 0 && (
+                          <Text style={styles.fiadoMetricText}>Devuelto: {formatPEN(fiado.returnedAmount || 0)}</Text>
+                        )}
+                      </View>
+
+                      {Array.isArray(fiado.items) && fiado.items.length > 0 && (
+                        <View style={styles.fiadoItemsBox}>
+                          {fiado.items.map((it, idx) => (
+                            <View key={`${it.productId || it.id || idx}`} style={styles.fiadoItemLine}>
+                              <Text style={styles.fiadoItemName} numberOfLines={1}>
+                                {it.quantity}x {it.productName || it.name || 'Producto'}
+                              </Text>
+                              <Text style={styles.fiadoItemPrice}>
+                                {formatPEN((Number(it.price) || 0) * (Number(it.quantity) || 0))}
+                              </Text>
+                            </View>
+                          ))}
+                        </View>
+                      )}
+
+                      <View style={styles.fiadoButtonsRow}>
+                        <TouchableOpacity
+                          style={styles.fiadoActionPrimary}
+                          onPress={() => {
+                            setSelectedDebtor(detailCustomer);
+                            setOpenFiados(detailOpenFiados);
+                            setSelectedFiado(fiado);
+                            setPaymentAmount(String(fiado.remainingAmount));
+                            setPaymentModalVisible(true);
+                          }}
+                        >
+                          <Receipt size={14} color={ui.onPrimary} />
+                          <Text style={styles.fiadoActionPrimaryText}>Abonar</Text>
+                        </TouchableOpacity>
+
+                        {canReturnItems && (
+                          <TouchableOpacity
+                            style={styles.fiadoActionOutline}
+                            onPress={() => handleOpenReturnFiado(fiado)}
+                          >
+                            <RotateCcw size={14} color={ui.primary} />
+                            <Text style={styles.fiadoActionOutlineText}>Devolver</Text>
+                          </TouchableOpacity>
+                        )}
+
+                        {isSupervisor && (
+                          <TouchableOpacity
+                            style={styles.fiadoActionDanger}
+                            onPress={() => handleOpenWriteOff(fiado)}
+                          >
+                            <ShieldAlert size={14} color={ui.danger} />
+                            <Text style={styles.fiadoActionDangerText}>Castigar</Text>
+                          </TouchableOpacity>
+                        )}
+                      </View>
+                    </View>
+                  );
+                })
               )}
-            </TouchableOpacity>
-          </View>
-        </KeyboardAvoidingView>
-      </Modal>
+
+              <Text style={[styles.detailSectionTitle, { marginTop: 8 }]}>
+                Historial de Abonos y Créditos ({detailFiadoHistory.length})
+              </Text>
+              {detailFiadoHistory.length === 0 ? (
+                <View style={styles.detailEmptyBox}>
+                  <Text style={styles.emptyText}>Sin movimientos registrados aún.</Text>
+                </View>
+              ) : (
+                detailFiadoHistory.slice(0, 15).map((entry) => (
+                  <View key={entry.id} style={styles.historyRowItem}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.historyRowTitle}>
+                        {entry.paymentMethod || 'Abono'} · {entry.createdByName || 'Operador'}
+                      </Text>
+                      <Text style={styles.historyRowSub}>
+                        {formatDatePE(entry.date)}
+                        {entry.notes ? ` · ${entry.notes}` : ''}
+                      </Text>
+                    </View>
+                    <Text style={styles.historyRowAmt}>+{formatPEN(entry.amount)}</Text>
+                  </View>
+                ))
+              )}
+            </ScrollView>
+          </SafeAreaView>
+        </Modal>
+      )}
+
+      {/* ==================================================================== */}
+      {/* MODAL: DEVOLVER MERCADERÍA DE FIADO                                  */}
+      {/* ==================================================================== */}
+      {Boolean(returnFiadoTarget) && returnFiadoTarget && (
+        <Modal
+          visible={Boolean(returnFiadoTarget)}
+          transparent
+          animationType="fade"
+          onRequestClose={() => {
+            if (!isSubmittingFiadoReturn) setReturnFiadoTarget(null);
+          }}
+        >
+          <SafeAreaView edges={['top', 'bottom']} style={styles.modalSafe}>
+            <KeyboardAvoidingView
+              behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+              style={styles.modalOverlay}
+            >
+              <View style={[styles.modalContent, { maxHeight: '90%' }]}>
+                <View style={styles.modalHeader}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.modalTitle}>Devolver Mercadería</Text>
+                    <Text style={styles.modalSub}>
+                      Fiado #{returnFiadoTarget.reservationNumber ?? returnFiadoTarget.id.slice(-6).toUpperCase()}
+                    </Text>
+                  </View>
+                  <TouchableOpacity
+                    onPress={() => {
+                      if (!isSubmittingFiadoReturn) setReturnFiadoTarget(null);
+                    }}
+                    style={styles.iconButton}
+                    accessibilityRole="button"
+                    accessibilityLabel="Cerrar devolución de fiado"
+                  >
+                    <X size={20} color={ui.textSecondary} />
+                  </TouchableOpacity>
+                </View>
+
+                <Text style={styles.helperText}>
+                  El stock reingresa hoy al inventario. No se entrega efectivo: cualquier excedente se abona a créditos del cliente.
+                </Text>
+
+                <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
+                  {(returnFiadoTarget.items || []).map((it, idx) => {
+                    const pid = String(it.productId || it.id || '');
+                    const alreadyReturned = (returnFiadoTarget.returnHistory || [])
+                      .flatMap((h) => h.items || [])
+                      .filter((line) => String(line.productId || '') === pid)
+                      .reduce((sum, line) => sum + (Number(line.quantity) || 0), 0);
+                    const maxQty = Math.max(0, (Number(it.quantity) || 0) - alreadyReturned);
+                    return (
+                      <View key={`${pid}_${idx}`} style={styles.returnItemRow}>
+                        <View style={{ flex: 1, marginRight: 10 }}>
+                          <Text style={styles.returnItemName} numberOfLines={2}>
+                            {it.productName || it.name || 'Producto'}
+                          </Text>
+                          <Text style={styles.returnItemMeta}>
+                            P.U. {formatPEN(Number(it.price) || 0)} · Máx. devolvible: {maxQty}
+                          </Text>
+                        </View>
+                        <TextInput
+                          style={styles.returnQtyInput}
+                          placeholder="0"
+                          placeholderTextColor={ui.textMuted}
+                          keyboardType="decimal-pad"
+                          value={returnQtyMap[pid] ?? ''}
+                          editable={maxQty > 0}
+                          onChangeText={(txt) =>
+                            setReturnQtyMap((prev) => ({
+                              ...prev,
+                              [pid]: txt.replace(/[^\d.,]/g, ''),
+                            }))
+                          }
+                        />
+                      </View>
+                    );
+                  })}
+
+                  <View style={[styles.inputGroup, { marginTop: 10 }]}>
+                    <Text style={styles.label}>Motivo de la devolución *</Text>
+                    <TextInput
+                      style={[styles.input, { height: 70, textAlignVertical: 'top' }]}
+                      placeholder="Ej. Producto con falla o cliente desistió"
+                      placeholderTextColor={ui.textMuted}
+                      multiline
+                      value={returnReasonInput}
+                      onChangeText={setReturnReasonInput}
+                    />
+                  </View>
+                </ScrollView>
+
+                <TouchableOpacity
+                  style={[styles.primaryButton, isSubmittingFiadoReturn && styles.buttonDisabled]}
+                  onPress={handleSubmitReturnFiado}
+                  disabled={isSubmittingFiadoReturn}
+                >
+                  {isSubmittingFiadoReturn ? (
+                    <ActivityIndicator color={ui.onPrimary} />
+                  ) : (
+                    <Text style={styles.primaryButtonText}>Confirmar Devolución</Text>
+                  )}
+                </TouchableOpacity>
+              </View>
+            </KeyboardAvoidingView>
+          </SafeAreaView>
+        </Modal>
+      )}
+
+      {/* ==================================================================== */}
+      {/* MODAL: CASTIGAR DEUDA INCOBRABLE (OWNER / ADMIN)                     */}
+      {/* ==================================================================== */}
+      {Boolean(writeOffTarget) && writeOffTarget && (
+        <Modal
+          visible={Boolean(writeOffTarget)}
+          transparent
+          animationType="fade"
+          onRequestClose={() => {
+            if (!isSubmittingWriteOff) setWriteOffTarget(null);
+          }}
+        >
+          <SafeAreaView edges={['top', 'bottom']} style={styles.modalSafe}>
+            <KeyboardAvoidingView
+              behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+              style={styles.modalOverlay}
+            >
+              <View style={styles.modalContent}>
+                <View style={styles.modalHeader}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                    <AlertTriangle size={20} color={ui.danger} />
+                    <Text style={styles.modalTitle}>Castigar Deuda Incobrable</Text>
+                  </View>
+                  <TouchableOpacity
+                    onPress={() => {
+                      if (!isSubmittingWriteOff) setWriteOffTarget(null);
+                    }}
+                    style={styles.iconButton}
+                    accessibilityRole="button"
+                    accessibilityLabel="Cerrar castigo de deuda"
+                  >
+                    <X size={20} color={ui.textSecondary} />
+                  </TouchableOpacity>
+                </View>
+
+                <Text style={styles.pinSubtitle}>
+                  Se excluirán {formatPEN(writeOffTarget.remainingAmount)} de la deuda del cliente sin mover inventario ni caja.
+                </Text>
+
+                <View style={styles.inputGroup}>
+                  <Text style={styles.label}>Motivo del castigo *</Text>
+                  <TextInput
+                    style={[styles.input, { height: 80, textAlignVertical: 'top' }]}
+                    placeholder="Indica por qué esta deuda es incobrable..."
+                    placeholderTextColor={ui.textMuted}
+                    multiline
+                    value={writeOffReasonInput}
+                    onChangeText={setWriteOffReasonInput}
+                  />
+                </View>
+
+                <TouchableOpacity
+                  style={styles.confirmCheckboxRow}
+                  onPress={() => setWriteOffConfirmed((v) => !v)}
+                  accessibilityRole="checkbox"
+                  accessibilityState={{ checked: writeOffConfirmed }}
+                >
+                  <View style={[styles.confirmCheckboxBox, writeOffConfirmed && styles.confirmCheckboxBoxChecked]}>
+                    {writeOffConfirmed && <Check size={13} color={ui.onPrimary} />}
+                  </View>
+                  <Text style={styles.confirmCheckboxText}>
+                    Confirmo que esta deuda es incobrable y el castigo quedará registrado a mi nombre.
+                  </Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={[
+                    styles.closeZConfirmButton,
+                    (isSubmittingWriteOff || !writeOffConfirmed || writeOffReasonInput.trim().length < 3) && styles.buttonDisabled,
+                  ]}
+                  onPress={handleSubmitWriteOff}
+                  disabled={isSubmittingWriteOff || !writeOffConfirmed || writeOffReasonInput.trim().length < 3}
+                >
+                  {isSubmittingWriteOff ? (
+                    <ActivityIndicator color={ui.onPrimary} />
+                  ) : (
+                    <Text style={styles.closeZConfirmButtonText}>Castigar Deuda</Text>
+                  )}
+                </TouchableOpacity>
+              </View>
+            </KeyboardAvoidingView>
+          </SafeAreaView>
+        </Modal>
+      )}
+
+      {/* ==================================================================== */}
+      {/* MODAL: ASISTENTE VENTY IA (STREAMING PROGRESIVO Y ESTADO OFFLINE)    */}
+      {/* ==================================================================== */}
+      {ventyModalVisible && (
+        <Modal
+          visible={ventyModalVisible}
+          animationType="slide"
+          presentationStyle="pageSheet"
+          onRequestClose={() => setVentyModalVisible(false)}
+        >
+          <SafeAreaView edges={['top', 'bottom']} style={styles.fullSheetContainer}>
+            <View style={styles.fullSheetHeader}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, flex: 1 }}>
+                <Sparkles size={20} color={ui.primary} />
+                <View>
+                  <Text style={styles.modalTitle}>Venty IA</Text>
+                  <Text style={styles.modalSub}>Asistente operativo en tiempo real</Text>
+                </View>
+              </View>
+              <TouchableOpacity
+                onPress={() => setVentyModalVisible(false)}
+                style={styles.iconButton}
+                accessibilityRole="button"
+                accessibilityLabel="Cerrar Venty IA"
+              >
+                <X size={20} color={ui.textSecondary} />
+              </TouchableOpacity>
+            </View>
+
+            {!isOnline && (
+              <View style={styles.ventyOfflineBanner}>
+                <AlertTriangle size={16} color={ui.warning} />
+                <Text style={styles.ventyOfflineText}>
+                  Sin conexión a internet. Conéctate para consultar a Venty IA.
+                </Text>
+              </View>
+            )}
+
+            {ventyError && isOnline ? (
+              <View style={styles.ventyErrorBanner}>
+                <AlertCircle size={16} color={ui.danger} />
+                <Text style={styles.ventyErrorText} numberOfLines={2}>
+                  {ventyError}
+                </Text>
+              </View>
+            ) : null}
+
+            <KeyboardAvoidingView
+              style={{ flex: 1 }}
+              behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+            >
+              <ScrollView
+                ref={ventyScrollRef}
+                style={{ flex: 1 }}
+                contentContainerStyle={styles.ventyMessagesContainer}
+                keyboardShouldPersistTaps="handled"
+              >
+                {ventyMessages.map((msg) => {
+                  const isAi = msg.sender === 'ai';
+                  return (
+                    <View
+                      key={msg.id}
+                      style={[
+                        styles.ventyBubble,
+                        isAi ? styles.ventyBubbleAi : styles.ventyBubbleUser,
+                        msg.isError && styles.ventyBubbleError,
+                      ]}
+                    >
+                      <Text
+                        style={[
+                          styles.ventyBubbleText,
+                          isAi ? styles.ventyBubbleTextAi : styles.ventyBubbleTextUser,
+                          msg.isError && { color: ui.danger },
+                        ]}
+                      >
+                        {msg.text || (isAi && ventyLoading ? 'Analizando datos en tiempo real...' : '')}
+                      </Text>
+                    </View>
+                  );
+                })}
+
+                <View style={styles.ventyChipsWrap}>
+                  {[
+                    '¿Cuánto efectivo hay en caja?',
+                    '¿Quiénes tienen fiados pendientes?',
+                    'Resumen de ventas del turno',
+                  ].map((chip) => (
+                    <TouchableOpacity
+                      key={chip}
+                      style={styles.ventyQuickChip}
+                      onPress={() => void handleSendVentyMessage(chip)}
+                      disabled={ventyLoading}
+                    >
+                      <Text style={styles.ventyQuickChipText}>{chip}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              </ScrollView>
+
+              <View style={styles.ventyInputBar}>
+                <TextInput
+                  style={styles.ventyTextInput}
+                  placeholder="Pregúntale a Venty IA..."
+                  placeholderTextColor={ui.textMuted}
+                  value={ventyInput}
+                  onChangeText={setVentyInput}
+                  onSubmitEditing={() => void handleSendVentyMessage()}
+                  returnKeyType="send"
+                />
+                <TouchableOpacity
+                  style={[
+                    styles.ventySendBtn,
+                    (!ventyInput.trim() || ventyLoading) && styles.buttonDisabled,
+                  ]}
+                  onPress={() => void handleSendVentyMessage()}
+                  disabled={!ventyInput.trim() || ventyLoading}
+                >
+                  {ventyLoading ? (
+                    <ActivityIndicator size="small" color={ui.onPrimary} />
+                  ) : (
+                    <Send size={18} color={ui.onPrimary} />
+                  )}
+                </TouchableOpacity>
+              </View>
+            </KeyboardAvoidingView>
+          </SafeAreaView>
+        </Modal>
       )}
 
       {payrollModalOpen && (
         <PayrollUsersModal
           visible={payrollModalOpen}
           onClose={() => setPayrollModalOpen(false)}
+          onLoadSaleRequestToPos={() => router.replace('/(tabs)')}
+        />
+      )}
+
+      {pnlModalOpen && (
+        <FinancialPnlModal
+          visible={pnlModalOpen}
+          onClose={() => setPnlModalOpen(false)}
         />
       )}
 
@@ -4176,5 +5591,520 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '700',
     color: ui.primary,
+  },
+  compactHeaderActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  modalSafe: {
+    flex: 1,
+  },
+  creditWalletRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: ui.primarySoft,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 8,
+    alignSelf: 'flex-start',
+  },
+  creditWalletText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: ui.primary,
+  },
+  customerActionsRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  detailButton: {
+    flex: 1,
+    minHeight: 48,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: ui.primarySoft,
+    borderWidth: 1,
+    borderColor: ui.primary,
+    paddingVertical: 10,
+    borderRadius: theme.borderRadius.md,
+    gap: 6,
+  },
+  detailButtonText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: ui.primary,
+  },
+  employeeSelectorRow: {
+    flexDirection: 'row',
+    gap: 8,
+    paddingVertical: 2,
+  },
+  limitNoticeBox: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: ui.warningSoft,
+    borderRadius: theme.borderRadius.md,
+    padding: 10,
+    marginTop: 8,
+  },
+  limitNoticeText: {
+    flex: 1,
+    fontSize: 12,
+    color: ui.warning,
+    fontWeight: '600',
+  },
+  pinSubtitle: {
+    fontSize: 13,
+    color: ui.textSecondary,
+    lineHeight: 19,
+  },
+  pinErrorText: {
+    fontSize: 12,
+    color: ui.danger,
+    fontWeight: '600',
+    marginTop: 4,
+  },
+  pinActionsRow: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  secondaryActionButton: {
+    minHeight: 48,
+    borderRadius: theme.borderRadius.md,
+    borderWidth: 1,
+    borderColor: ui.border,
+    backgroundColor: ui.surfaceMuted,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 12,
+  },
+  secondaryActionText: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: ui.textSecondary,
+  },
+  blindNoticeBox: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    backgroundColor: ui.primarySoft,
+    borderRadius: theme.borderRadius.md,
+    padding: 12,
+    borderWidth: 1,
+    borderColor: ui.primary,
+  },
+  blindNoticeText: {
+    flex: 1,
+    fontSize: 12.5,
+    color: ui.primary,
+    fontWeight: '600',
+    lineHeight: 18,
+  },
+  fullSheetContainer: {
+    flex: 1,
+    backgroundColor: ui.background,
+  },
+  fullSheetHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 20,
+    paddingVertical: 14,
+    backgroundColor: ui.surface,
+    borderBottomWidth: 1,
+    borderBottomColor: ui.border,
+  },
+  fullSheetContent: {
+    padding: 20,
+    gap: 14,
+    paddingBottom: 40,
+  },
+  detailInfoCard: {
+    backgroundColor: ui.surface,
+    borderRadius: 12,
+    padding: 12,
+    borderWidth: 1,
+    borderColor: ui.border,
+    gap: 4,
+  },
+  detailInfoLine: {
+    fontSize: 13,
+    color: ui.textSecondary,
+  },
+  detailKpiGrid: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  detailKpiTile: {
+    flex: 1,
+    backgroundColor: ui.surface,
+    borderRadius: 12,
+    padding: 10,
+    borderWidth: 1,
+    borderColor: ui.border,
+  },
+  detailKpiLabel: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: ui.textMuted,
+  },
+  detailKpiValue: {
+    fontSize: 15,
+    fontWeight: '800',
+    color: ui.text,
+    marginTop: 4,
+  },
+  detailActionsBar: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  recalcButton: {
+    minHeight: 48,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    borderRadius: theme.borderRadius.md,
+    borderWidth: 1,
+    borderColor: ui.primary,
+    backgroundColor: ui.primarySoft,
+    paddingHorizontal: 12,
+  },
+  recalcButtonText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: ui.primary,
+  },
+  detailSectionTitle: {
+    fontSize: 15,
+    fontWeight: '800',
+    color: ui.text,
+  },
+  detailEmptyBox: {
+    backgroundColor: ui.surface,
+    borderRadius: 12,
+    padding: 16,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: ui.border,
+  },
+  fiadoDetailCard: {
+    backgroundColor: ui.surface,
+    borderRadius: 14,
+    padding: 14,
+    borderWidth: 1,
+    borderColor: ui.border,
+    gap: 10,
+  },
+  fiadoDetailHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+  },
+  fiadoDetailTitle: {
+    fontSize: 14,
+    fontWeight: '800',
+    color: ui.text,
+  },
+  fiadoDetailDate: {
+    fontSize: 11,
+    color: ui.textSecondary,
+    marginTop: 2,
+  },
+  fiadoBalanceLabel: {
+    fontSize: 9,
+    fontWeight: '700',
+    color: ui.danger,
+  },
+  fiadoBalanceValue: {
+    fontSize: 16,
+    fontWeight: '900',
+    color: ui.danger,
+  },
+  fiadoMetricsRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 12,
+  },
+  fiadoMetricText: {
+    fontSize: 12,
+    color: ui.textSecondary,
+    fontWeight: '600',
+  },
+  fiadoItemsBox: {
+    backgroundColor: ui.surfaceMuted,
+    borderRadius: 10,
+    padding: 10,
+    gap: 4,
+  },
+  fiadoItemLine: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  fiadoItemName: {
+    flex: 1,
+    fontSize: 12,
+    color: ui.text,
+  },
+  fiadoItemPrice: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: ui.text,
+  },
+  fiadoButtonsRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  fiadoActionPrimary: {
+    flex: 1,
+    minHeight: 42,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 5,
+    backgroundColor: ui.primary,
+    borderRadius: 10,
+    paddingHorizontal: 10,
+  },
+  fiadoActionPrimaryText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: ui.onPrimary,
+  },
+  fiadoActionOutline: {
+    flex: 1,
+    minHeight: 42,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 5,
+    backgroundColor: ui.primarySoft,
+    borderWidth: 1,
+    borderColor: ui.primary,
+    borderRadius: 10,
+    paddingHorizontal: 10,
+  },
+  fiadoActionOutlineText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: ui.primary,
+  },
+  fiadoActionDanger: {
+    flex: 1,
+    minHeight: 42,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 5,
+    backgroundColor: ui.dangerSoft,
+    borderWidth: 1,
+    borderColor: ui.danger,
+    borderRadius: 10,
+    paddingHorizontal: 10,
+  },
+  fiadoActionDangerText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: ui.danger,
+  },
+  historyRowItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: ui.surface,
+    borderRadius: 10,
+    padding: 12,
+    borderWidth: 1,
+    borderColor: ui.border,
+  },
+  historyRowTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: ui.text,
+  },
+  historyRowSub: {
+    fontSize: 11,
+    color: ui.textSecondary,
+    marginTop: 2,
+  },
+  historyRowAmt: {
+    fontSize: 14,
+    fontWeight: '800',
+    color: ui.success,
+  },
+  returnItemRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: ui.border,
+  },
+  returnItemName: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: ui.text,
+  },
+  returnItemMeta: {
+    fontSize: 11,
+    color: ui.textMuted,
+    marginTop: 2,
+  },
+  returnQtyInput: {
+    width: 72,
+    minHeight: 44,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: ui.border,
+    backgroundColor: ui.surfaceMuted,
+    textAlign: 'center',
+    fontSize: 15,
+    fontWeight: '700',
+    color: ui.text,
+  },
+  confirmCheckboxRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 10,
+    paddingVertical: 4,
+  },
+  confirmCheckboxBox: {
+    width: 22,
+    height: 22,
+    borderRadius: 6,
+    borderWidth: 1.5,
+    borderColor: ui.border,
+    backgroundColor: ui.surface,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 1,
+  },
+  confirmCheckboxBoxChecked: {
+    backgroundColor: ui.danger,
+    borderColor: ui.danger,
+  },
+  confirmCheckboxText: {
+    flex: 1,
+    fontSize: 12.5,
+    color: ui.textSecondary,
+    lineHeight: 18,
+  },
+  ventyOfflineBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: ui.warningSoft,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+  },
+  ventyOfflineText: {
+    flex: 1,
+    fontSize: 12,
+    fontWeight: '600',
+    color: ui.warning,
+  },
+  ventyErrorBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: ui.dangerSoft,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+  },
+  ventyErrorText: {
+    flex: 1,
+    fontSize: 12,
+    fontWeight: '600',
+    color: ui.danger,
+  },
+  ventyMessagesContainer: {
+    padding: 16,
+    gap: 12,
+    paddingBottom: 24,
+  },
+  ventyBubble: {
+    maxWidth: '88%',
+    borderRadius: 14,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+  },
+  ventyBubbleAi: {
+    alignSelf: 'flex-start',
+    backgroundColor: ui.surface,
+    borderWidth: 1,
+    borderColor: ui.border,
+  },
+  ventyBubbleUser: {
+    alignSelf: 'flex-end',
+    backgroundColor: ui.primary,
+  },
+  ventyBubbleError: {
+    backgroundColor: ui.dangerSoft,
+    borderColor: ui.danger,
+  },
+  ventyBubbleText: {
+    fontSize: 14,
+    lineHeight: 20,
+  },
+  ventyBubbleTextAi: {
+    color: ui.text,
+  },
+  ventyBubbleTextUser: {
+    color: ui.onPrimary,
+  },
+  ventyChipsWrap: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginTop: 8,
+  },
+  ventyQuickChip: {
+    backgroundColor: ui.primarySoft,
+    borderWidth: 1,
+    borderColor: ui.primary,
+    borderRadius: 16,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  ventyQuickChipText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: ui.primary,
+  },
+  ventyInputBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    backgroundColor: ui.surface,
+    borderTopWidth: 1,
+    borderTopColor: ui.border,
+  },
+  ventyTextInput: {
+    flex: 1,
+    minHeight: 46,
+    maxHeight: 100,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: ui.border,
+    backgroundColor: ui.surfaceMuted,
+    paddingHorizontal: 12,
+    fontSize: 14,
+    color: ui.text,
+  },
+  ventySendBtn: {
+    width: 46,
+    height: 46,
+    borderRadius: 12,
+    backgroundColor: ui.primary,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
 });

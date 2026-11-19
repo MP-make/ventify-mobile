@@ -25,9 +25,11 @@ import {
   ActivityIndicator,
   Share,
   Platform,
+  KeyboardAvoidingView,
 } from 'react-native';
 import { FlashList } from '@shopify/flash-list';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { doc, updateDoc, serverTimestamp } from 'firebase/firestore';
 import {
   X,
   Search,
@@ -49,12 +51,18 @@ import {
   MapPin,
   Check,
   RefreshCw,
+  Edit3,
+  Plus,
+  Minus,
 } from 'lucide-react-native';
 import * as Haptics from 'expo-haptics';
 
+import { db } from '@/lib/firebase';
 import { useAuth } from '@/context/AuthContext';
 import { useSettings } from '@/context/SettingsContext';
 import { useCart } from '@/context/CartContext';
+import { useProducts } from '@/context/ProductsContext';
+import { parseNormalizedDecimal } from '@/lib/product-search';
 import { theme, ui, formatPEN, formatDatePE } from '@/lib/theme';
 import { ScreenHeading, SectionHeading } from '@/components/ui';
 import {
@@ -69,6 +77,16 @@ import {
 } from '@/services/enterprise-ops-service';
 import { shareTicketWhatsApp } from '@/services/thermal-printer-service';
 import type { Product, Customer } from '@/types';
+
+const escapeHtml = (value: unknown): string =>
+  String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
+const roundQuoteMoney = (value: number): number => Math.round((value + Number.EPSILON) * 100) / 100;
 
 export interface QuotesManagerModalProps {
   visible?: boolean;
@@ -185,8 +203,9 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
   const insets = useSafeAreaInsets();
   const isVisible = visible !== undefined ? visible : Boolean(isOpen);
 
-  const { accountId, branchId } = useAuth();
+  const { accountId, branchId, userProfile } = useAuth();
   const { businessSettings, activeBranchName } = useSettings();
+  const { products } = useProducts();
   const { clearCart, addItem, setCustomer, setNotes, setSourceQuoteId, setSaleRequestId, setDiscount, setShippingAmount } = useCart();
 
   // Estados de lista y filtros
@@ -195,9 +214,17 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [statusFilter, setStatusFilter] = useState<QuoteStatus | 'all'>('all');
 
-  // Estado de cotización seleccionada para ver detalles
+  // Estado de cotización seleccionada para ver detalles y edición
   const [selectedQuote, setSelectedQuote] = useState<Quote | null>(null);
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
+  const [editModalOpen, setEditModalOpen] = useState<boolean>(false);
+  const [editItems, setEditItems] = useState<Array<QuoteItem & { qtyText: string; priceText: string }>>([]);
+  const [editDiscountText, setEditDiscountText] = useState<string>('0');
+  const [editShippingText, setEditShippingText] = useState<string>('0');
+  const [editNotesText, setEditNotesText] = useState<string>('');
+  const canEditQuotes = ['owner', 'admin', 'manager'].includes(
+    String(userProfile?.role || '').toLowerCase()
+  );
 
   // 1. Suscripción en tiempo real a las cotizaciones
   useEffect(() => {
@@ -298,9 +325,17 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
           setCustomer(clientObj);
         } else setCustomer(null);
 
-        // 3. Cargar ítems al carrito resolviendo presentaciones/variantes
+        // 3. Cargar ítems al carrito resolviendo catálogo real, presentaciones y variantes
         quote.items.forEach((item) => {
-          const productStub: Product = {
+          const catalogProduct = products.find((p) => p.id === item.id);
+          const catalogPresentation = item.presentationId
+            ? catalogProduct?.presentations?.find((pr) => pr.id === item.presentationId)
+            : undefined;
+          const catalogVariant = item.variantId
+            ? catalogProduct?.variants?.find((vr) => vr.id === item.variantId)
+            : undefined;
+
+          const baseProduct: Product = catalogProduct || {
             id: item.id,
             name: item.name,
             category: item.category || 'General',
@@ -313,12 +348,13 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
             accountId: quote.accountId || accountId || '',
           };
 
-          addItem(productStub, {
+          addItem(baseProduct, {
             quantity: item.quantity,
-            customPrice: item.price,
+            customPrice: item.isGift ? 0 : item.price,
+            isGift: item.isGift,
             notes: item.hint,
             presentation: item.presentationId
-              ? {
+              ? catalogPresentation || {
                   id: item.presentationId,
                   name: item.presentationName || '',
                   conversionFactor: item.presentationQty || 1,
@@ -326,7 +362,7 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
                 }
               : undefined,
             variant: item.variantId
-              ? {
+              ? catalogVariant || {
                   id: item.variantId,
                   name: item.variantName || '',
                   stock: {},
@@ -370,8 +406,137 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
         setIsProcessing(false);
       }
     },
-    [clearCart, setCustomer, addItem, setNotes, setSourceQuoteId, setSaleRequestId, setDiscount, setShippingAmount, accountId, onLoadQuoteToPos, onClose]
+    [
+      products,
+      clearCart,
+      setCustomer,
+      addItem,
+      setNotes,
+      setSourceQuoteId,
+      setSaleRequestId,
+      setDiscount,
+      setShippingAmount,
+      accountId,
+      onLoadQuoteToPos,
+      onClose,
+    ]
   );
+
+  const handleOpenEditQuote = useCallback(
+    (quote: Quote) => {
+      if (quote.status !== 'pending') return;
+      if (!canEditQuotes) {
+        Alert.alert(
+          'Permisos insuficientes',
+          'Solo administradores o gerentes pueden editar cotizaciones pendientes.'
+        );
+        return;
+      }
+      setEditItems(
+        quote.items.map((it) => ({
+          ...it,
+          qtyText: String(it.quantity ?? 1),
+          priceText: String(it.price ?? 0),
+        }))
+      );
+      setEditDiscountText(String(quote.discountAmount ?? 0));
+      setEditShippingText(String(quote.shippingAmount ?? 0));
+      setEditNotesText(quote.notes || '');
+      setEditModalOpen(true);
+    },
+    [canEditQuotes]
+  );
+
+  const editDraftTotals = useMemo(() => {
+    const subtotal = roundQuoteMoney(
+      editItems.reduce((sum, it) => {
+        const qty = Math.max(0, parseNormalizedDecimal(it.qtyText) ?? it.quantity ?? 0);
+        const unitPrice = it.isGift
+          ? 0
+          : Math.max(0, parseNormalizedDecimal(it.priceText) ?? it.price ?? 0);
+        return sum + qty * unitPrice;
+      }, 0)
+    );
+    const discountAmount = Math.max(0, roundQuoteMoney(parseNormalizedDecimal(editDiscountText) ?? 0));
+    const shippingAmount = Math.max(0, roundQuoteMoney(parseNormalizedDecimal(editShippingText) ?? 0));
+    const total = Math.max(0, roundQuoteMoney(subtotal - discountAmount + shippingAmount));
+    return { subtotal, discountAmount, shippingAmount, total };
+  }, [editItems, editDiscountText, editShippingText]);
+
+  const handleSaveQuoteEdit = useCallback(async () => {
+    if (!selectedQuote) return;
+    if (editItems.length === 0) {
+      Alert.alert('Cotización vacía', 'Debe mantener al menos un producto en la cotización.');
+      return;
+    }
+
+    const sanitizedItems: QuoteItem[] = [];
+    for (const draftItem of editItems) {
+      const qty = parseNormalizedDecimal(draftItem.qtyText);
+      const unitPrice = draftItem.isGift ? 0 : parseNormalizedDecimal(draftItem.priceText);
+      if (qty === null || !Number.isFinite(qty) || qty <= 0) {
+        Alert.alert('Cantidad inválida', `Revisa la cantidad de "${draftItem.name}".`);
+        return;
+      }
+      if (unitPrice === null || !Number.isFinite(unitPrice) || unitPrice < 0) {
+        Alert.alert('Precio inválido', `Revisa el precio unitario de "${draftItem.name}".`);
+        return;
+      }
+      const { qtyText: _qt, priceText: _pt, ...cleanItem } = draftItem;
+      sanitizedItems.push({
+        ...cleanItem,
+        quantity: roundQuoteMoney(qty),
+        price: roundQuoteMoney(unitPrice),
+      });
+    }
+
+    const { subtotal, discountAmount, shippingAmount, total } = editDraftTotals;
+    const trimmedNotes = editNotesText.trim();
+
+    try {
+      setIsProcessing(true);
+      await updateDoc(doc(db, 'quotes', selectedQuote.id), {
+        items: sanitizedItems,
+        subtotal,
+        discountAmount,
+        shippingAmount,
+        tax: 0,
+        total,
+        notes: trimmedNotes,
+        updatedAt: serverTimestamp(),
+      });
+
+      setSelectedQuote((prev) =>
+        prev && prev.id === selectedQuote.id
+          ? {
+              ...prev,
+              items: sanitizedItems,
+              subtotal,
+              discountAmount,
+              shippingAmount,
+              tax: 0,
+              total,
+              notes: trimmedNotes,
+            }
+          : prev
+      );
+      setEditModalOpen(false);
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+      Alert.alert('Cotización actualizada', `Se guardaron los cambios en ${selectedQuote.formattedNumber}.`);
+    } catch (err: any) {
+      const code = String(err?.code || '');
+      if (code.includes('permission-denied')) {
+        Alert.alert(
+          'Permisos insuficientes',
+          'Solo administradores o gerentes pueden editar cotizaciones.'
+        );
+      } else {
+        Alert.alert('Error al guardar', err?.message || 'No se pudieron guardar los cambios de la cotización.');
+      }
+    } finally {
+      setIsProcessing(false);
+    }
+  }, [selectedQuote, editItems, editDraftTotals, editNotesText]);
 
   // 4. ACCIÓN: Compartir Cotización PDF por WhatsApp
   const handleShareQuoteWhatsApp = useCallback(
@@ -391,25 +556,34 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
             (it) => `
             <tr>
               <td style="padding: 6px 4px; border-bottom: 1px solid #E5E7EB; text-align: left; font-size: 11px;">
-                <strong>${it.name}</strong>
-                ${it.presentationName ? `<br><small style="color:#6B7280;">Pres: ${it.presentationName}</small>` : ''}
+                <strong>${escapeHtml(it.name)}</strong>
+                ${it.presentationName ? `<br><small style="color:#6B7280;">Pres: ${escapeHtml(it.presentationName)}</small>` : ''}
+                ${it.variantName ? `<br><small style="color:#6B7280;">Var: ${escapeHtml(it.variantName)}</small>` : ''}
               </td>
-              <td style="padding: 6px 4px; border-bottom: 1px solid #E5E7EB; text-align: center; font-size: 11px;">${it.quantity}</td>
-              <td style="padding: 6px 4px; border-bottom: 1px solid #E5E7EB; text-align: right; font-size: 11px;">${formatPEN(it.price)}</td>
-              <td style="padding: 6px 4px; border-bottom: 1px solid #E5E7EB; text-align: right; font-size: 11px; font-weight: 600;">${formatPEN(
-                it.quantity * it.price
+              <td style="padding: 6px 4px; border-bottom: 1px solid #E5E7EB; text-align: center; font-size: 11px;">${escapeHtml(it.quantity)}</td>
+              <td style="padding: 6px 4px; border-bottom: 1px solid #E5E7EB; text-align: right; font-size: 11px;">${escapeHtml(formatPEN(it.price))}</td>
+              <td style="padding: 6px 4px; border-bottom: 1px solid #E5E7EB; text-align: right; font-size: 11px; font-weight: 600;">${escapeHtml(
+                formatPEN(it.quantity * it.price)
               )}</td>
             </tr>
           `
           )
           .join('');
 
+        const docLabel = quote.customerDni
+          ? `DNI: ${escapeHtml(quote.customerDni)}`
+          : `RUC: ${escapeHtml(quote.customerRuc)}`;
+        const discountVal = Number(quote.discountAmount || 0);
+        const shippingVal = Number(quote.shippingAmount || 0);
+        const defaultTerms =
+          'Precios expresados en Soles (PEN). Sujetos a disponibilidad de stock al momento de concretar la compra.';
+
         const quoteHtml = `
           <!DOCTYPE html>
           <html>
           <head>
             <meta charset="utf-8" />
-            <title>Cotización ${quote.formattedNumber}</title>
+            <title>Cotización ${escapeHtml(quote.formattedNumber)}</title>
             <style>
               body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; padding: 24px; color: #111827; max-width: 650px; margin: 0 auto; }
               .header { text-align: center; border-bottom: 2px dashed #9CA3AF; padding-bottom: 16px; margin-bottom: 16px; }
@@ -431,25 +605,25 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
           </head>
           <body>
             <div class="header">
-              <h1 class="biz-title">${bizName}</h1>
-              ${bizRuc ? `<p class="biz-detail">${bizRuc}</p>` : ''}
-              ${bizAddress ? `<p class="biz-detail">${bizAddress}</p>` : ''}
-              ${bizPhone ? `<p class="biz-detail">Tel/Cel: ${bizPhone}</p>` : ''}
+              <h1 class="biz-title">${escapeHtml(bizName)}</h1>
+              ${bizRuc ? `<p class="biz-detail">${escapeHtml(bizRuc)}</p>` : ''}
+              ${bizAddress ? `<p class="biz-detail">${escapeHtml(bizAddress)}</p>` : ''}
+              ${bizPhone ? `<p class="biz-detail">Tel/Cel: ${escapeHtml(bizPhone)}</p>` : ''}
               <div>
-                <span class="badge-box">COTIZACIÓN N° ${quote.formattedNumber}</span>
+                <span class="badge-box">COTIZACIÓN N° ${escapeHtml(quote.formattedNumber)}</span>
               </div>
             </div>
 
             <div class="info-section">
               <div class="info-row">
                 <span class="info-label">Cliente:</span>
-                <span class="info-val"><strong>${quote.customerName}</strong></span>
+                <span class="info-val"><strong>${escapeHtml(quote.customerName)}</strong></span>
               </div>
               ${
                 quote.customerDni || quote.customerRuc
                   ? `<div class="info-row">
                       <span class="info-label">Documento:</span>
-                      <span class="info-val">${quote.customerDni ? `DNI: ${quote.customerDni}` : `RUC: ${quote.customerRuc}`}</span>
+                      <span class="info-val">${docLabel}</span>
                     </div>`
                   : ''
               }
@@ -457,17 +631,17 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
                 quote.customerPhone
                   ? `<div class="info-row">
                       <span class="info-label">Teléfono:</span>
-                      <span class="info-val">${quote.customerPhone}</span>
+                      <span class="info-val">${escapeHtml(quote.customerPhone)}</span>
                     </div>`
                   : ''
               }
               <div class="info-row">
                 <span class="info-label">Fecha de Emisión:</span>
-                <span class="info-val">${formatDatePE(quote.date)}</span>
+                <span class="info-val">${escapeHtml(formatDatePE(quote.date))}</span>
               </div>
               <div class="info-row">
                 <span class="info-label">Fecha de Vencimiento:</span>
-                <span class="info-val"><strong>${formatDatePE(quote.expiryDate)}</strong> (Válido ${quote.validityDays} días)</span>
+                <span class="info-val"><strong>${escapeHtml(formatDatePE(quote.expiryDate))}</strong> (Válido ${escapeHtml(quote.validityDays)} días)</span>
               </div>
             </div>
 
@@ -488,26 +662,42 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
             <div class="totals-section">
               <div class="total-line">
                 <span>Subtotal:</span>
-                <span>${formatPEN(quote.subtotal)}</span>
+                <span>${escapeHtml(formatPEN(quote.subtotal))}</span>
               </div>
+              ${
+                discountVal > 0
+                  ? `<div class="total-line">
+                      <span>Descuento:</span>
+                      <span>-${escapeHtml(formatPEN(discountVal))}</span>
+                    </div>`
+                  : ''
+              }
+              ${
+                shippingVal > 0
+                  ? `<div class="total-line">
+                      <span>Envío / Delivery:</span>
+                      <span>${escapeHtml(formatPEN(shippingVal))}</span>
+                    </div>`
+                  : ''
+              }
               ${
                 quote.tax > 0
                   ? `<div class="total-line">
                       <span>IGV (18%):</span>
-                      <span>${formatPEN(quote.tax)}</span>
+                      <span>${escapeHtml(formatPEN(quote.tax))}</span>
                     </div>`
                   : ''
               }
               <div class="total-line grand-total" style="margin-top: 8px;">
                 <span>TOTAL:</span>
-                <span>${formatPEN(quote.total)}</span>
+                <span>${escapeHtml(formatPEN(quote.total))}</span>
               </div>
             </div>
 
             <div class="terms-box">
               <strong>Términos y Condiciones:</strong><br />
-              ${quote.termsAndConditions || 'Precios expresados en Soles (PEN). Sujetos a disponibilidad de stock al momento de concretar la compra.'}
-              ${quote.notes ? `<br /><br /><strong>Observaciones:</strong> ${quote.notes}` : ''}
+              ${escapeHtml(quote.termsAndConditions || defaultTerms)}
+              ${quote.notes ? `<br /><br /><strong>Observaciones:</strong> ${escapeHtml(quote.notes)}` : ''}
             </div>
 
             <div class="footer">
@@ -577,6 +767,7 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
   if (!isVisible) return null;
 
   return (
+    <>
     <Modal
       visible={isVisible}
       animationType="slide"
@@ -709,6 +900,22 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
                 <Text style={styles.summaryLabel}>Subtotal</Text>
                 <Text style={styles.summaryValue}>{formatPEN(selectedQuote.subtotal)}</Text>
               </View>
+              {Number(selectedQuote.discountAmount || 0) > 0 && (
+                <View style={styles.summaryRow}>
+                  <Text style={styles.summaryLabel}>Descuento</Text>
+                  <Text style={[styles.summaryValue, { color: ui.success }]}>
+                    -{formatPEN(Number(selectedQuote.discountAmount || 0))}
+                  </Text>
+                </View>
+              )}
+              {Number(selectedQuote.shippingAmount || 0) > 0 && (
+                <View style={styles.summaryRow}>
+                  <Text style={styles.summaryLabel}>Envío / Delivery</Text>
+                  <Text style={styles.summaryValue}>
+                    {formatPEN(Number(selectedQuote.shippingAmount || 0))}
+                  </Text>
+                </View>
+              )}
               {selectedQuote.tax > 0 && (
                 <View style={styles.summaryRow}>
                   <Text style={styles.summaryLabel}>IGV (18%)</Text>
@@ -765,27 +972,39 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
                 </Text>
               </TouchableOpacity>
 
-              {/* Cambiar Estado */}
+              {/* Editar y Cambiar Estado */}
               {selectedQuote.status === 'pending' && (
-                <View style={styles.statusButtonsRow}>
-                  <TouchableOpacity
-                    style={[styles.statusSmallBtn, { backgroundColor: ui.primarySoft, borderColor: ui.primary }]}
-                    onPress={() => handleChangeStatus(selectedQuote.id, 'accepted')}
-                    disabled={isProcessing}
-                  >
-                    <CheckCircle2 size={15} color={ui.primary} />
-                    <Text style={[styles.statusSmallBtnText, { color: ui.primary }]}>Marcar Aceptada</Text>
-                  </TouchableOpacity>
+                <>
+                  {canEditQuotes && (
+                    <TouchableOpacity
+                      style={[styles.editQuoteButton, isProcessing && styles.buttonDisabled]}
+                      onPress={() => handleOpenEditQuote(selectedQuote)}
+                      disabled={isProcessing}
+                    >
+                      <Edit3 size={17} color={ui.text} />
+                      <Text style={styles.editQuoteButtonText}>Editar Cotización Pendiente</Text>
+                    </TouchableOpacity>
+                  )}
+                  <View style={styles.statusButtonsRow}>
+                    <TouchableOpacity
+                      style={[styles.statusSmallBtn, { backgroundColor: ui.primarySoft, borderColor: ui.primary }]}
+                      onPress={() => handleChangeStatus(selectedQuote.id, 'accepted')}
+                      disabled={isProcessing}
+                    >
+                      <CheckCircle2 size={15} color={ui.primary} />
+                      <Text style={[styles.statusSmallBtnText, { color: ui.primary }]}>Marcar Aceptada</Text>
+                    </TouchableOpacity>
 
-                  <TouchableOpacity
-                    style={[styles.statusSmallBtn, { backgroundColor: ui.dangerSoft, borderColor: ui.danger }]}
-                    onPress={() => handleChangeStatus(selectedQuote.id, 'rejected')}
-                    disabled={isProcessing}
-                  >
-                    <XCircle size={15} color={ui.danger} />
-                    <Text style={[styles.statusSmallBtnText, { color: ui.danger }]}>Marcar Rechazada</Text>
-                  </TouchableOpacity>
-                </View>
+                    <TouchableOpacity
+                      style={[styles.statusSmallBtn, { backgroundColor: ui.dangerSoft, borderColor: ui.danger }]}
+                      onPress={() => handleChangeStatus(selectedQuote.id, 'rejected')}
+                      disabled={isProcessing}
+                    >
+                      <XCircle size={15} color={ui.danger} />
+                      <Text style={[styles.statusSmallBtnText, { color: ui.danger }]}>Marcar Rechazada</Text>
+                    </TouchableOpacity>
+                  </View>
+                </>
               )}
 
               {/* Eliminar Cotización */}
@@ -912,6 +1131,212 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
         )}
       </View>
     </Modal>
+
+    <Modal
+      visible={editModalOpen}
+      animationType="slide"
+      presentationStyle="pageSheet"
+      onRequestClose={() => setEditModalOpen(false)}
+    >
+      <KeyboardAvoidingView
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        style={[styles.container, { paddingTop: Platform.OS === 'ios' ? insets.top : 12 }]}
+      >
+        <View style={styles.header}>
+          <View>
+            <Text style={styles.headerTitle}>Editar Cotización</Text>
+            <Text style={styles.editModalSubtitle}>
+              {selectedQuote?.formattedNumber || ''} · Modifica precios, cantidades y recargos
+            </Text>
+          </View>
+          <TouchableOpacity
+            style={styles.closeButton}
+            onPress={() => setEditModalOpen(false)}
+            hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+          >
+            <X size={20} color={ui.textSecondary} />
+          </TouchableOpacity>
+        </View>
+
+        <ScrollView
+          style={styles.contentScroll}
+          contentContainerStyle={[styles.detailContentContainer, { paddingBottom: insets.bottom + 28 }]}
+          keyboardShouldPersistTaps="handled"
+        >
+          <View style={styles.itemsCard}>
+            <Text style={styles.itemsCardTitle}>Productos ({editItems.length})</Text>
+            {editItems.map((it, idx) => (
+              <View key={`${it.id}_${it.variantId || ''}_${it.presentationId || ''}_${idx}`} style={styles.editItemCard}>
+                <View style={styles.editItemHeader}>
+                  <View style={{ flex: 1, marginRight: 8 }}>
+                    <Text style={styles.itemNameText}>{it.name}</Text>
+                    {(it.presentationName || it.variantName) ? (
+                      <Text style={styles.itemSubText}>
+                        {[it.presentationName ? `Pres: ${it.presentationName}` : '', it.variantName ? `Var: ${it.variantName}` : '']
+                          .filter(Boolean)
+                          .join(' • ')}
+                      </Text>
+                    ) : null}
+                  </View>
+                  {editItems.length > 1 && (
+                    <TouchableOpacity
+                      onPress={() => setEditItems((prev) => prev.filter((_, i) => i !== idx))}
+                      hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                    >
+                      <Trash2 size={16} color={ui.danger} />
+                    </TouchableOpacity>
+                  )}
+                </View>
+
+                <View style={styles.editItemInputsRow}>
+                  <View style={styles.editQtyBox}>
+                    <Text style={styles.editFieldLabel}>Cantidad</Text>
+                    <View style={styles.editStepperRow}>
+                      <TouchableOpacity
+                        style={styles.editStepBtn}
+                        onPress={() =>
+                          setEditItems((prev) =>
+                            prev.map((row, i) => {
+                              if (i !== idx) return row;
+                              const curr = parseNormalizedDecimal(row.qtyText) ?? row.quantity ?? 1;
+                              const next = Math.max(1, roundQuoteMoney(curr - 1));
+                              return { ...row, quantity: next, qtyText: String(next) };
+                            })
+                          )
+                        }
+                      >
+                        <Minus size={14} color={ui.text} />
+                      </TouchableOpacity>
+                      <TextInput
+                        style={styles.editQtyInput}
+                        value={it.qtyText}
+                        onChangeText={(txt) =>
+                          setEditItems((prev) =>
+                            prev.map((row, i) => (i === idx ? { ...row, qtyText: txt } : row))
+                          )
+                        }
+                        keyboardType="decimal-pad"
+                      />
+                      <TouchableOpacity
+                        style={styles.editStepBtn}
+                        onPress={() =>
+                          setEditItems((prev) =>
+                            prev.map((row, i) => {
+                              if (i !== idx) return row;
+                              const curr = parseNormalizedDecimal(row.qtyText) ?? row.quantity ?? 1;
+                              const next = roundQuoteMoney(curr + 1);
+                              return { ...row, quantity: next, qtyText: String(next) };
+                            })
+                          )
+                        }
+                      >
+                        <Plus size={14} color={ui.text} />
+                      </TouchableOpacity>
+                    </View>
+                  </View>
+
+                  <View style={styles.editPriceBox}>
+                    <Text style={styles.editFieldLabel}>{it.isGift ? 'Regalo (S/ 0)' : 'P. Unit (S/)'}</Text>
+                    <TextInput
+                      style={[styles.editTextInput, it.isGift && { opacity: 0.6 }]}
+                      value={it.isGift ? '0' : it.priceText}
+                      editable={!it.isGift}
+                      onChangeText={(txt) =>
+                        setEditItems((prev) =>
+                          prev.map((row, i) => (i === idx ? { ...row, priceText: txt } : row))
+                        )
+                      }
+                      keyboardType="decimal-pad"
+                    />
+                  </View>
+                </View>
+              </View>
+            ))}
+          </View>
+
+          <View style={styles.itemsCard}>
+            <Text style={styles.itemsCardTitle}>Descuento, Envío y Notas</Text>
+            <View style={styles.editItemInputsRow}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.editFieldLabel}>Descuento (S/)</Text>
+                <TextInput
+                  style={styles.editTextInput}
+                  value={editDiscountText}
+                  onChangeText={setEditDiscountText}
+                  keyboardType="decimal-pad"
+                  placeholder="0.00"
+                  placeholderTextColor={ui.textMuted}
+                />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.editFieldLabel}>Envío / Delivery (S/)</Text>
+                <TextInput
+                  style={styles.editTextInput}
+                  value={editShippingText}
+                  onChangeText={setEditShippingText}
+                  keyboardType="decimal-pad"
+                  placeholder="0.00"
+                  placeholderTextColor={ui.textMuted}
+                />
+              </View>
+            </View>
+
+            <View style={{ marginTop: 10 }}>
+              <Text style={styles.editFieldLabel}>Observaciones</Text>
+              <TextInput
+                style={[styles.editTextInput, { minHeight: 72, textAlignVertical: 'top' }]}
+                value={editNotesText}
+                onChangeText={setEditNotesText}
+                multiline
+                placeholder="Condiciones, entrega u observaciones..."
+                placeholderTextColor={ui.textMuted}
+              />
+            </View>
+          </View>
+
+          <View style={styles.itemsCard}>
+            <View style={styles.summaryRow}>
+              <Text style={styles.summaryLabel}>Subtotal</Text>
+              <Text style={styles.summaryValue}>{formatPEN(editDraftTotals.subtotal)}</Text>
+            </View>
+            {editDraftTotals.discountAmount > 0 && (
+              <View style={styles.summaryRow}>
+                <Text style={styles.summaryLabel}>Descuento</Text>
+                <Text style={[styles.summaryValue, { color: ui.success }]}>
+                  -{formatPEN(editDraftTotals.discountAmount)}
+                </Text>
+              </View>
+            )}
+            {editDraftTotals.shippingAmount > 0 && (
+              <View style={styles.summaryRow}>
+                <Text style={styles.summaryLabel}>Envío / Delivery</Text>
+                <Text style={styles.summaryValue}>{formatPEN(editDraftTotals.shippingAmount)}</Text>
+              </View>
+            )}
+            <View style={[styles.summaryRow, styles.totalHighlightRow]}>
+              <Text style={styles.totalHighlightLabel}>NUEVO TOTAL</Text>
+              <Text style={styles.totalHighlightValue}>{formatPEN(editDraftTotals.total)}</Text>
+            </View>
+          </View>
+
+          <TouchableOpacity
+            style={[styles.primaryActionButton, isProcessing && styles.buttonDisabled]}
+            onPress={handleSaveQuoteEdit}
+            disabled={isProcessing}
+          >
+            {isProcessing ? (
+              <ActivityIndicator color="#FFFFFF" size="small" />
+            ) : (
+              <>
+                <Check size={18} color="#FFFFFF" />
+                <Text style={styles.primaryActionButtonText}>Guardar Cambios</Text>
+              </>
+            )}
+          </TouchableOpacity>
+        </ScrollView>
+      </KeyboardAvoidingView>
+    </Modal>
+    </>
   );
 });
 
@@ -1393,6 +1818,91 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     marginTop: 6,
     lineHeight: 18,
+  },
+  editQuoteButton: {
+    backgroundColor: ui.surfaceMuted,
+    borderWidth: 1,
+    borderColor: ui.border,
+    borderRadius: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 13,
+    minHeight: 48,
+    gap: 8,
+  },
+  editQuoteButtonText: {
+    color: ui.text,
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  editModalSubtitle: {
+    fontSize: 12,
+    color: ui.textSecondary,
+    marginTop: 2,
+  },
+  editItemCard: {
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: ui.border,
+    gap: 8,
+  },
+  editItemHeader: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    justifyContent: 'space-between',
+  },
+  editItemInputsRow: {
+    flexDirection: 'row',
+    gap: 10,
+    alignItems: 'flex-end',
+  },
+  editQtyBox: {
+    flex: 1,
+  },
+  editPriceBox: {
+    flex: 1,
+  },
+  editFieldLabel: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: ui.textSecondary,
+    marginBottom: 4,
+  },
+  editStepperRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: ui.border,
+    borderRadius: 8,
+    backgroundColor: ui.surface,
+    height: 40,
+  },
+  editStepBtn: {
+    width: 34,
+    height: 38,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  editQtyInput: {
+    flex: 1,
+    textAlign: 'center',
+    fontSize: 14,
+    fontWeight: '700',
+    color: ui.text,
+    paddingVertical: 0,
+  },
+  editTextInput: {
+    borderWidth: 1,
+    borderColor: ui.border,
+    borderRadius: 8,
+    backgroundColor: ui.surface,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    minHeight: 40,
+    fontSize: 14,
+    fontWeight: '600',
+    color: ui.text,
   },
 });
 

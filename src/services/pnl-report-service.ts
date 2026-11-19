@@ -7,9 +7,19 @@
  */
 
 import { apiRequest } from '@/lib/api-client';
+import { db } from '@/lib/firebase';
+import {
+  collection,
+  getDocs,
+  orderBy,
+  query,
+  Timestamp,
+  where,
+} from 'firebase/firestore';
 import * as Print from 'expo-print';
 import * as Sharing from 'expo-sharing';
 import { formatPEN, formatDatePE } from '@/lib/theme';
+import { classifyMovementForPnl } from './cash-register-service';
 import type { Product } from '@/types';
 
 // ============================================================================
@@ -206,12 +216,17 @@ export function getExpenseCategoryLabel(catId?: string | null): string {
     case 'suministros':
     case 'insumos':
       return 'Suministros y Empaques';
+    case 'employee_advance':
     case 'payroll':
     case 'payroll_advance':
     case 'planilla':
     case 'sueldos':
     case 'personal':
-      return 'Planilla y Personal';
+      return 'Adelantos y Personal';
+    case 'terminal_commissions':
+      return 'Comisiones POS / Pasarela';
+    case 'bad_debt':
+      return 'Cuentas Incobrables (Castigos)';
     case 'petty_cash':
     case 'caja_chica':
       return 'Gastos Menores de Caja Chica';
@@ -224,6 +239,318 @@ export function getExpenseCategoryLabel(catId?: string | null): string {
   }
 }
 
+export interface PnlDetailsInput {
+  sales: Array<Record<string, any>>;
+  fiados: Array<Record<string, any>>;
+  movements: Array<Record<string, any>>;
+  productsMap?: Map<string, Product> | Record<string, Product>;
+  terminalCommissions?: number;
+  badDebt?: number;
+}
+
+export interface PnlDetailsResult {
+  paymentBreakdown: PaymentBreakdownSummary;
+  topProductsByRevenue: TopProductMetric[];
+  topProductsByProfit: TopProductMetric[];
+  sellerPerformance: SellerPerformanceMetric[];
+  expensesByCategory: Record<string, number>;
+  expenseBreakdown: ExpenseCategoryBreakdown[];
+  transactionCount: number;
+}
+
+const lookupProduct = (
+  productsMap: Map<string, Product> | Record<string, Product> | undefined,
+  productId: string
+): Product | undefined => {
+  if (!productsMap || !productId) return undefined;
+  if (productsMap instanceof Map) return productsMap.get(productId);
+  return productsMap[productId];
+};
+
+const resolveItemUnitCost = (
+  item: Record<string, any>,
+  productsMap: Map<string, Product> | Record<string, Product> | undefined,
+  branchId?: string
+): number => {
+  const direct = Number(item.costPrice);
+  if (typeof item.costPrice === 'number' && Number.isFinite(direct)) return direct;
+  const pid = String(item.productId || item.id || '');
+  const product = lookupProduct(productsMap, pid) as any;
+  if (!product) return 0;
+  if (branchId && product.branchPricing?.[branchId]?.costPrice !== undefined) {
+    const bp = Number(product.branchPricing[branchId].costPrice);
+    if (Number.isFinite(bp)) return bp;
+  }
+  const fallback = Number(product.costPrice);
+  return Number.isFinite(fallback) ? fallback : 0;
+};
+
+type PaymentBucketKey = 'cash' | 'yape' | 'plin' | 'card' | 'transfer' | 'fiado' | 'other';
+
+const classifySplitPaymentBucket = (split: Record<string, any>): PaymentBucketKey => {
+  const cat = String(split.category || '').toLowerCase();
+  const provider = String(split.digitalProvider || split.method || '').toLowerCase();
+  if (cat === 'cash' || provider.includes('efectivo') || provider === 'cash') return 'cash';
+  if (cat === 'card' || provider.includes('tarjeta') || provider === 'card') return 'card';
+  if (cat === 'credit' || provider.includes('fiado') || provider === 'credit') return 'fiado';
+  if (provider.includes('yape')) return 'yape';
+  if (provider.includes('plin')) return 'plin';
+  if (cat === 'digital' || provider.includes('transfer')) return 'transfer';
+  return 'other';
+};
+
+const classifyLegacySaleBucket = (sale: Record<string, any>): PaymentBucketKey => {
+  const cat = String(sale.paymentCategory || '').toLowerCase();
+  const method = String(sale.paymentMethod || '').toLowerCase();
+  const provider = String(sale.digitalProvider || '').toLowerCase();
+  if (cat === 'cash' || method.includes('efectivo') || method === 'cash') return 'cash';
+  if (cat === 'credit' || method === 'fiado' || method === 'credit') return 'fiado';
+  if (provider === 'yape' || method === 'yape') return 'yape';
+  if (provider === 'plin' || method === 'plin') return 'plin';
+  if (cat === 'card' || method.includes('tarjeta') || method === 'card') return 'card';
+  if (cat === 'digital' || method.includes('transfer')) return 'transfer';
+  return 'other';
+};
+
+/** Pure calculation of P&L breakdowns (payment methods, products, sellers, expenses) matching web P&L scope. */
+export function buildPnlDetails(input: PnlDetailsInput): PnlDetailsResult {
+  const paymentSums: Record<PaymentBucketKey, number> = {
+    cash: 0,
+    yape: 0,
+    plin: 0,
+    card: 0,
+    transfer: 0,
+    fiado: 0,
+    other: 0,
+  };
+
+  const productAgg = new Map<string, {
+    productId: string;
+    productName: string;
+    sku?: string;
+    quantitySold: number;
+    revenue: number;
+    cogs: number;
+  }>();
+
+  const sellerAgg = new Map<string, {
+    sellerId: string;
+    sellerName: string;
+    transactionsCount: number;
+    revenue: number;
+    cogs: number;
+  }>();
+
+  let transactionCount = 0;
+
+  const accumulateDocument = (docItem: Record<string, any>, isFiadoDoc: boolean) => {
+    const status = String(docItem.status || '').toLowerCase();
+    if (status === 'cancelled' || docItem.isDepositPayment === true) return;
+
+    const isReturn = docItem.isReturn === true;
+    const branchId = typeof docItem.branchId === 'string' ? docItem.branchId : undefined;
+    const items: any[] = Array.isArray(docItem.items) ? docItem.items : [];
+    let docCogs = 0;
+
+    for (const rawItem of items) {
+      if (!rawItem) continue;
+      const pid = String(rawItem.productId || rawItem.id || rawItem.name || 'unknown');
+      const qty = Number(rawItem.quantity) || 0;
+      const factor = Number(rawItem.presentationQty) > 0
+        ? Number(rawItem.presentationQty)
+        : Number(rawItem.conversionFactor) > 0
+          ? Number(rawItem.conversionFactor)
+          : 1;
+      const units = qty * factor;
+      const unitCost = resolveItemUnitCost(rawItem, input.productsMap, branchId);
+      const lineCogs = roundToCents(unitCost * units);
+      const lineRev = roundToCents((Number(rawItem.price) || 0) * qty);
+      docCogs = roundToCents(docCogs + lineCogs);
+
+      const entry = productAgg.get(pid) || {
+        productId: pid,
+        productName: String(rawItem.name || rawItem.productName || 'Producto'),
+        sku: rawItem.sku || undefined,
+        quantitySold: 0,
+        revenue: 0,
+        cogs: 0,
+      };
+      if (isReturn) {
+        entry.quantitySold -= qty;
+        entry.revenue = roundToCents(entry.revenue - lineRev);
+        entry.cogs = roundToCents(entry.cogs - lineCogs);
+      } else {
+        entry.quantitySold += qty;
+        entry.revenue = roundToCents(entry.revenue + lineRev);
+        entry.cogs = roundToCents(entry.cogs + lineCogs);
+      }
+      productAgg.set(pid, entry);
+    }
+
+    const docTotal = Number(docItem.total) || 0;
+    if (!isReturn) {
+      transactionCount += 1;
+      if (isFiadoDoc) {
+        paymentSums.fiado = roundToCents(paymentSums.fiado + docTotal);
+      } else if (Array.isArray(docItem.payments) && docItem.payments.length > 0) {
+        for (const split of docItem.payments) {
+          const splitAmt = Number(split.amount ?? split.chargedAmount) || 0;
+          if (splitAmt <= 0) continue;
+          const bucket = classifySplitPaymentBucket(split);
+          paymentSums[bucket] = roundToCents(paymentSums[bucket] + splitAmt);
+        }
+      } else {
+        const bucket = classifyLegacySaleBucket(docItem);
+        paymentSums[bucket] = roundToCents(paymentSums[bucket] + docTotal);
+      }
+    }
+
+    if (docItem.isStaffConsumption !== true) {
+      const sellerKey = String(docItem.sellerId || docItem.cashierId || '__unassigned__');
+      const sellerName = String(
+        docItem.sellerName ||
+          docItem.cashierName ||
+          (docItem.sellerId || docItem.cashierId ? 'Vendedor sin nombre' : 'Sin vendedor asignado')
+      );
+      const sellerEntry = sellerAgg.get(sellerKey) || {
+        sellerId: sellerKey,
+        sellerName,
+        transactionsCount: 0,
+        revenue: 0,
+        cogs: 0,
+      };
+      if (isReturn) {
+        const returnedAmt = Math.abs(Number(docItem.refundAmount ?? docItem.total) || 0);
+        sellerEntry.revenue = roundToCents(sellerEntry.revenue - returnedAmt);
+        sellerEntry.cogs = roundToCents(sellerEntry.cogs - docCogs);
+      } else {
+        sellerEntry.transactionsCount += 1;
+        sellerEntry.revenue = roundToCents(sellerEntry.revenue + docTotal);
+        sellerEntry.cogs = roundToCents(sellerEntry.cogs + docCogs);
+      }
+      sellerAgg.set(sellerKey, sellerEntry);
+    }
+  };
+
+  for (const sale of input.sales) {
+    accumulateDocument(sale, false);
+  }
+  for (const fiado of input.fiados) {
+    accumulateDocument(fiado, true);
+  }
+
+  const paymentTotal = roundToCents(
+    paymentSums.cash +
+      paymentSums.yape +
+      paymentSums.plin +
+      paymentSums.card +
+      paymentSums.transfer +
+      paymentSums.fiado +
+      paymentSums.other
+  );
+  const toShare = (amt: number): PaymentMethodShare => ({
+    amount: roundToCents(amt),
+    percentage: paymentTotal > 0 ? roundToCents((amt / paymentTotal) * 100) : 0,
+  });
+
+  const paymentBreakdown: PaymentBreakdownSummary = {
+    cash: toShare(paymentSums.cash),
+    yape: toShare(paymentSums.yape),
+    plin: toShare(paymentSums.plin),
+    card: toShare(paymentSums.card),
+    transfer: toShare(paymentSums.transfer),
+    fiado: toShare(paymentSums.fiado),
+    other: toShare(paymentSums.other),
+    total: paymentTotal,
+  };
+
+  const productMetrics: TopProductMetric[] = [...productAgg.values()].map((p) => {
+    const profit = roundToCents(p.revenue - p.cogs);
+    return {
+      productId: p.productId,
+      productName: p.productName,
+      ...(p.sku ? { sku: p.sku } : {}),
+      quantitySold: roundToCents(p.quantitySold),
+      revenue: roundToCents(p.revenue),
+      cogs: roundToCents(p.cogs),
+      profit,
+      marginPercent: p.revenue > 0 ? roundToCents((profit / p.revenue) * 100) : 0,
+    };
+  });
+
+  const topProductsByProfit = [...productMetrics]
+    .sort((a, b) => b.profit - a.profit)
+    .slice(0, 10);
+  const topProductsByRevenue = [...productMetrics]
+    .sort((a, b) => b.revenue - a.revenue)
+    .slice(0, 10);
+
+  const sellerPerformance: SellerPerformanceMetric[] = [...sellerAgg.values()]
+    .filter((s) => s.transactionsCount > 0 || s.revenue !== 0)
+    .map((s) => {
+      const profit = roundToCents(s.revenue - s.cogs);
+      return {
+        sellerId: s.sellerId,
+        sellerName: s.sellerName,
+        transactionsCount: s.transactionsCount,
+        revenue: roundToCents(s.revenue),
+        cogs: roundToCents(s.cogs),
+        profit,
+        marginPercent: s.revenue > 0 ? roundToCents((profit / s.revenue) * 100) : 0,
+      };
+    })
+    .sort((a, b) => b.revenue - a.revenue);
+
+  const expensesByCategory: Record<string, number> = {};
+  for (const m of input.movements) {
+    const rawAmt = Number(m.amount) || 0;
+    if (rawAmt === 0) continue;
+    const pnlClass = classifyMovementForPnl({
+      type: m.type,
+      amount: rawAmt,
+      category: m.category,
+      expenseCategoryId: m.expenseCategoryId,
+      isEmployeeAdvance: m.isEmployeeAdvance,
+    });
+    if (pnlClass !== 'operating_expense') continue;
+    const catKey = String(m.expenseCategoryId || m.category || 'other').toLowerCase().trim() || 'other';
+    expensesByCategory[catKey] = roundToCents((expensesByCategory[catKey] || 0) + Math.abs(rawAmt));
+  }
+  if ((input.terminalCommissions || 0) > 0) {
+    expensesByCategory.terminal_commissions = roundToCents(
+      (expensesByCategory.terminal_commissions || 0) + Number(input.terminalCommissions)
+    );
+  }
+  if ((input.badDebt || 0) > 0) {
+    expensesByCategory.bad_debt = roundToCents(
+      (expensesByCategory.bad_debt || 0) + Number(input.badDebt)
+    );
+  }
+
+  const totalExpenseBreakdown = roundToCents(
+    Object.values(expensesByCategory).reduce((sum, v) => sum + v, 0)
+  );
+  const expenseBreakdown: ExpenseCategoryBreakdown[] = Object.entries(expensesByCategory)
+    .filter(([, amt]) => amt > 0)
+    .map(([category, amount]) => ({
+      category,
+      label: getExpenseCategoryLabel(category),
+      amount: roundToCents(amount),
+      percentage: totalExpenseBreakdown > 0 ? roundToCents((amount / totalExpenseBreakdown) * 100) : 0,
+    }))
+    .sort((a, b) => b.amount - a.amount);
+
+  return {
+    paymentBreakdown,
+    topProductsByRevenue,
+    topProductsByProfit,
+    sellerPerformance,
+    expensesByCategory,
+    expenseBreakdown,
+    transactionCount,
+  };
+}
+
 // ============================================================================
 // MOTOR DE CONSULTA Y CÁLCULO P&L
 // ============================================================================
@@ -232,12 +559,13 @@ export async function generatePnlReport(params: GeneratePnlReportParams): Promis
   if (!params.accountId) throw new Error('La cuenta es requerida para consultar el P&L.');
   const startMs = toMillis(params.startDate);
   const endMs = toMillis(params.endDate);
+  const effectiveBranchId = params.branchId && params.branchId !== 'all' ? params.branchId : undefined;
   const search = new URLSearchParams({
     accountId: params.accountId,
     from: new Date(startMs).toISOString(),
     to: new Date(endMs).toISOString(),
   });
-  if (params.branchId && params.branchId !== 'all') search.set('branchId', params.branchId);
+  if (effectiveBranchId) search.set('branchId', effectiveBranchId);
 
   let data: Record<string, any>;
   try {
@@ -256,31 +584,116 @@ export async function generatePnlReport(params: GeneratePnlReportParams): Promis
   const netProfit = requireReportAmount(data, 'netProfit');
   const grossSales = roundToCents(salesClosed + fiadosIssued);
   const canceled = requireReportAmount(data, 'returns');
+  const badDebt = requireReportAmount(data, 'badDebt');
+  const employeeAdvances = requireReportAmount(data, 'employeeAdvances');
+  const cashOperatingExpenses = requireReportAmount(data, 'cashOperatingExpenses');
+  const terminalCommissions = requireReportAmount(data, 'terminalCommissions');
+
+  const resolvedFromMs = Number(data.fromMs) || startMs;
+  const resolvedToMs = Number(data.toMs) || endMs;
+  const branchScope = data.branchId && data.branchId !== 'all' ? data.branchId : effectiveBranchId;
+
+  let details: PnlDetailsResult | null = null;
+  try {
+    const salesQuery = query(
+      collection(db, 'sales'),
+      where('accountId', '==', params.accountId),
+      ...(branchScope ? [where('branchId', '==', branchScope)] : []),
+      where('date', '>=', resolvedFromMs),
+      where('date', '<=', resolvedToMs),
+      orderBy('date', 'asc')
+    );
+    const reservationsQuery = query(
+      collection(db, 'reservations'),
+      where('accountId', '==', params.accountId),
+      ...(branchScope ? [where('branchId', '==', branchScope)] : []),
+      where('date', '>=', resolvedFromMs),
+      where('date', '<=', resolvedToMs),
+      orderBy('date', 'desc')
+    );
+    const movementsQuery = query(
+      collection(db, 'cash_register_movements'),
+      where('accountId', '==', params.accountId),
+      ...(branchScope ? [where('branchId', '==', branchScope)] : []),
+      where('createdAt', '>=', Timestamp.fromMillis(resolvedFromMs)),
+      where('createdAt', '<=', Timestamp.fromMillis(resolvedToMs)),
+      orderBy('createdAt', 'asc')
+    );
+
+    const [salesSnap, reservationsSnap, movementsSnap] = await Promise.all([
+      getDocs(salesQuery),
+      getDocs(reservationsQuery),
+      getDocs(movementsQuery),
+    ]);
+
+    const salesDocs: Array<Record<string, any>> = salesSnap.docs.map((d) => ({
+      id: d.id,
+      ...(d.data() as Record<string, any>),
+    }));
+    const reservationDocs: Array<Record<string, any>> = reservationsSnap.docs.map((d) => ({
+      id: d.id,
+      ...(d.data() as Record<string, any>),
+    }));
+    const fiadoDocs = reservationDocs.filter(
+      (r) => r.type === 'fiado' || r.isCreditSale === true
+    );
+    const movementDocs: Array<Record<string, any>> = movementsSnap.docs.map((d) => ({
+      id: d.id,
+      ...(d.data() as Record<string, any>),
+    }));
+
+    details = buildPnlDetails({
+      sales: salesDocs,
+      fiados: fiadoDocs,
+      movements: movementDocs,
+      productsMap: params.productsMap,
+      terminalCommissions,
+      badDebt,
+    });
+  } catch (detailErr) {
+    console.warn('[PnlReportService] No se pudieron cargar desgloses de Firestore:', detailErr);
+    details = null;
+  }
 
   return {
     accountId: params.accountId,
     branchId: data.branchId || params.branchId,
-    startDate: Number(data.fromMs) || startMs,
-    endDate: Number(data.toMs) || endMs,
+    startDate: resolvedFromMs,
+    endDate: resolvedToMs,
     generatedAt: Number(data.generatedAt) || Date.now(),
     grossSales,
     salesClosed,
     cancelledOrRefunded: canceled,
     netRevenue,
-    transactionCount: typeof data.transactionCount === 'number' ? data.transactionCount : undefined,
+    transactionCount:
+      typeof data.transactionCount === 'number'
+        ? data.transactionCount
+        : details?.transactionCount,
     cogs: requireReportAmount(data, 'cmv'),
     grossProfit,
     grossMarginPercent: netRevenue > 0 ? roundToCents((grossProfit / netRevenue) * 100) : 0,
     operatingExpenses,
+    ...(details
+      ? {
+          pettyCashExpenses: cashOperatingExpenses,
+          payrollExpenses: 0,
+          expensesByCategory: details.expensesByCategory,
+          expenseBreakdown: details.expenseBreakdown,
+          paymentBreakdown: details.paymentBreakdown,
+          topProductsByRevenue: details.topProductsByRevenue,
+          topProductsByProfit: details.topProductsByProfit,
+          sellerPerformance: details.sellerPerformance,
+        }
+      : {}),
     netProfit,
     netMarginPercent: netRevenue > 0 ? roundToCents((netProfit / netRevenue) * 100) : 0,
-    detailsAvailable: false,
+    detailsAvailable: details !== null,
     fiadosIssued,
     returns: canceled,
-    badDebt: requireReportAmount(data, 'badDebt'),
-    employeeAdvances: requireReportAmount(data, 'employeeAdvances'),
-    cashOperatingExpenses: requireReportAmount(data, 'cashOperatingExpenses'),
-    terminalCommissions: requireReportAmount(data, 'terminalCommissions'),
+    badDebt,
+    employeeAdvances,
+    cashOperatingExpenses,
+    terminalCommissions,
   };
 }
 

@@ -17,8 +17,12 @@ import {
   ProductVariant,
   PausedSale,
 } from '@/types';
-import { resolveEffectiveUnitPrice } from '@/lib/product-search';
+import {
+  getEffectiveProductPrice,
+  resolveCartItemMinPrice,
+} from '@/lib/product-search';
 import { useAuth } from './AuthContext';
+import { useSettings } from './SettingsContext';
 import { cartStorageKeys, canResumeCart } from '@/lib/cart-scope';
 import { normalizePresentation, presentationFactor } from '@/lib/presentation-parity';
 
@@ -43,7 +47,11 @@ export interface AddItemOptions {
   isWeightBased?: boolean;
   notes?: string;
   discount?: number;
+  isGift?: boolean;
+  enableMinSalePrice?: boolean;
 }
+
+export type CartInvoiceIntent = 'nota_venta' | 'boleta' | 'factura' | 'quote' | null;
 
 export interface CartContextType {
   items: CartItem[];
@@ -53,6 +61,7 @@ export interface CartContextType {
   saleRequestId: string | null;
   sourceQuoteId: string | null;
   shippingAmount: number;
+  invoiceIntent: CartInvoiceIntent;
   subtotal: number;
   discountAmount: number;
   taxAmount: number;
@@ -68,9 +77,11 @@ export interface CartContextType {
   setSaleRequestId: (requestId: string | null) => void;
   setSourceQuoteId: (quoteId: string | null) => void;
   setShippingAmount: (amount: number) => void;
+  setInvoiceIntent: (intent: CartInvoiceIntent) => void;
   addItem: (product: Product, options?: AddItemOptions) => void;
+  addGiftItem: (product: Product, options?: Omit<AddItemOptions, 'isGift' | 'customPrice'>) => void;
   updateQuantity: (cartItemId: string, newQty: number) => void;
-  updateItemPrice: (cartItemId: string, newPrice: number) => boolean;
+  updateItemPrice: (cartItemId: string, newPrice: number, enableMinSalePrice?: boolean) => boolean;
   removeItem: (cartItemId: string) => void;
   clearCart: () => void;
   pauseCurrentSale: (label?: string) => Promise<string | null>;
@@ -88,6 +99,7 @@ const CartContext = createContext<CartContextType>({
   saleRequestId: null,
   sourceQuoteId: null,
   shippingAmount: 0,
+  invoiceIntent: null,
   subtotal: 0,
   discountAmount: 0,
   taxAmount: 0,
@@ -103,7 +115,9 @@ const CartContext = createContext<CartContextType>({
   setSaleRequestId: () => {},
   setSourceQuoteId: () => {},
   setShippingAmount: () => {},
+  setInvoiceIntent: () => {},
   addItem: () => {},
+  addGiftItem: () => {},
   updateQuantity: () => {},
   updateItemPrice: () => false,
   removeItem: () => {},
@@ -116,14 +130,20 @@ const CartContext = createContext<CartContextType>({
 
 export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const { branchId, accountId, user } = useAuth();
+  const { posSettings } = useSettings();
+  const defaultMinPriceEnabled = posSettings?.enableMinSalePrice !== false;
   const storageKeys = useMemo(() => cartStorageKeys(accountId || "", branchId, user?.uid || ""), [accountId, branchId, user?.uid]);
 
   const [items, setItems] = useState<CartItem[]>([]);
   const [customer, setCustomer] = useState<Customer | null>(null);
-  const [discount, setDiscount] = useState<number>(0);
+  const [discount, setDiscountState] = useState<number>(0);
+  const setDiscount = useCallback((value: number) => {
+    setDiscountState(Number.isFinite(value) ? Math.max(0, Math.round(value * 100) / 100) : 0);
+  }, []);
   const [notes, setNotes] = useState<string>('');
   const [saleRequestId, setSaleRequestId] = useState<string | null>(null);
   const [sourceQuoteId, setSourceQuoteId] = useState<string | null>(null);
+  const [invoiceIntent, setInvoiceIntent] = useState<CartInvoiceIntent>(null);
   const [shippingAmount, setShippingAmountState] = useState(0);
   const setShippingAmount = useCallback((amount: number) => {
     setShippingAmountState(Number.isFinite(amount) ? Math.max(0, Math.round(amount * 100) / 100) : 0);
@@ -136,7 +156,15 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
   useEffect(() => {
     let alive = true;
     isRestored.current = false;
-    setItems([]); setCustomer(null); setDiscount(0); setNotes(''); setSaleRequestId(null); setSourceQuoteId(null); setShippingAmountState(0); setPausedSales([]);
+    setItems([]);
+    setCustomer(null);
+    setDiscountState(0);
+    setNotes('');
+    setSaleRequestId(null);
+    setSourceQuoteId(null);
+    setInvoiceIntent(null);
+    setShippingAmountState(0);
+    setPausedSales([]);
     async function restoreCartData() {
       try {
         const [savedCartRaw, savedPausedRaw] = await Promise.all([
@@ -151,6 +179,7 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
             ...item,
             presentation: item.presentation ? normalizePresentation(item.presentation) : item.presentation,
             presentationQty: item.presentationQty || item.conversionFactor || presentationFactor(item.presentation),
+            stockBranchId: item.stockBranchId || branchId || 'main',
           })));
           if (parsed.customer) setCustomer(parsed.customer);
           if (typeof parsed.discount === 'number') setDiscount(parsed.discount);
@@ -170,6 +199,7 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
                 ...item,
                 presentation: item.presentation ? normalizePresentation(item.presentation) : item.presentation,
                 presentationQty: item.presentationQty || item.conversionFactor || presentationFactor(item.presentation),
+                stockBranchId: item.stockBranchId || sale.branchId || branchId || 'main',
               })),
             })));
         }
@@ -182,7 +212,7 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     if (accountId && user) void restoreCartData();
     return () => { alive = false; };
-  }, [storageKeys.cart, storageKeys.paused, accountId, branchId, user?.uid, setShippingAmount]);
+  }, [storageKeys.cart, storageKeys.paused, accountId, branchId, user?.uid, setDiscount, setShippingAmount]);
 
   // 2. Persistir carrito actual reactivamente con debounce (350ms) y payload ligero
   useEffect(() => {
@@ -228,20 +258,26 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
     await cartKVStorage.setItem(storageKeys.paused, JSON.stringify(lightweightList)).catch(() => {});
   }, [storageKeys.paused]);
 
-  // 4. Agregar producto al carrito resolviendo reglas de precios
+  // 4. Agregar producto al carrito resolviendo reglas de precios por sucursal/escala
   const addItem = useCallback(
     (product: Product, options: AddItemOptions = {}) => {
       const quantityToAdd = options.quantity !== undefined ? options.quantity : 1;
-      const { presentation, variant, customPrice, isWeightBased } = options;
+      const { presentation, variant, customPrice, isWeightBased, isGift } = options;
       const activeBranch = branchId || 'main';
+      const minPriceEnabled =
+        options.enableMinSalePrice !== undefined
+          ? options.enableMinSalePrice
+          : defaultMinPriceEnabled;
 
       // Disparar feedback háptico ligero
       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
 
-      // Generar ID único del ítem en carrito según variantes y presentaciones
+      // Generar ID único del ítem en carrito según variantes, presentaciones y condición de regalo
       const presentationKey = presentation?.id || 'base';
       const variantKey = variant?.id || 'base';
-      const cartItemId = `${product.id}_${presentationKey}_${variantKey}`;
+      const cartItemId = isGift
+        ? `${product.id}_${presentationKey}_${variantKey}_gift`
+        : `${product.id}_${presentationKey}_${variantKey}`;
 
       setItems((prevItems) => {
         const existingIndex = prevItems.findIndex((i) => i.id === cartItemId);
@@ -253,18 +289,20 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
               ? Math.round((existingItem.quantity + quantityToAdd) * 1000) / 1000
               : existingItem.quantity + quantityToAdd;
 
-          // Si el precio fue modificado manualmente por el usuario, respetar customPrice
           let effectivePrice = existingItem.price;
-          if (customPrice !== undefined) {
+          if (isGift || existingItem.isGift) {
+            effectivePrice = 0;
+          } else if (customPrice !== undefined) {
             effectivePrice = customPrice;
           } else if (!existingItem.modifiedPrice) {
             // Recalcular según nueva cantidad por escalas mayoristas (tiered pricing)
-            effectivePrice = resolveEffectiveUnitPrice(
+            effectivePrice = getEffectiveProductPrice(
               product,
               activeBranch,
               newQty,
               presentation,
-              variant
+              variant,
+              minPriceEnabled
             );
           }
 
@@ -274,24 +312,29 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
             quantity: newQty,
             price: effectivePrice,
             lineTotal: Math.round(newQty * effectivePrice * 100) / 100,
+            stockBranchId: existingItem.stockBranchId || activeBranch,
             notes: options.notes || existingItem.notes,
           };
           return updatedItems;
         }
 
-        // Nuevo ítem en carrito
+        const regularUnitPrice = getEffectiveProductPrice(
+          product,
+          activeBranch,
+          quantityToAdd,
+          presentation,
+          variant,
+          minPriceEnabled
+        );
+
         let initialPrice: number;
-        if (customPrice !== undefined) {
-          const floor = Number(product.minSalePrice ?? 0);
+        if (isGift) {
+          initialPrice = 0;
+        } else if (customPrice !== undefined) {
+          const floor = minPriceEnabled ? Number(product.minSalePrice ?? 0) : 0;
           initialPrice = floor > 0 ? Math.max(customPrice, floor) : customPrice;
         } else {
-          initialPrice = resolveEffectiveUnitPrice(
-            product,
-            activeBranch,
-            quantityToAdd,
-            presentation,
-            variant
-          );
+          initialPrice = regularUnitPrice;
         }
 
         const isDecimalsAllowed =
@@ -314,12 +357,16 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
           presentation,
           variant,
           isWeightBased: Boolean(isWeightBased),
-          customPrice,
+          isGift: Boolean(isGift),
+          originalPrice: isGift ? regularUnitPrice : undefined,
+          priceModificationReason: isGift ? 'Regalo / Promoción' : undefined,
+          customPrice: isGift ? 0 : customPrice,
           suggestedPrice: product.suggestedPrice ?? product.price,
           minSalePrice: presentation?.minSalePrice ?? product.minSalePrice,
           category: product.category,
           costPrice: product.costPrice,
           stock: product.stock,
+          stockBranchId: activeBranch,
           imageUrl: product.thumbUrl || product.imageUrl,
           unitOfMeasure: product.unitOfMeasure || 'unit',
           allowDecimals: isDecimalsAllowed,
@@ -329,13 +376,21 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
           presentationQty: presentationFactor(presentation),
           variantId: variant?.id,
           variantName: variant?.name,
+          taxExemptionCode: product.taxExemptionCode,
           lineTotal: Math.round(quantityToAdd * initialPrice * 100) / 100,
         };
 
         return [...prevItems, newItem];
       });
     },
-    [branchId]
+    [branchId, defaultMinPriceEnabled]
+  );
+
+  const addGiftItem = useCallback(
+    (product: Product, options: Omit<AddItemOptions, 'isGift' | 'customPrice'> = {}) => {
+      addItem(product, { ...options, isGift: true, customPrice: 0 });
+    },
+    [addItem]
   );
 
   // 5. Actualizar cantidad de un ítem existente
@@ -348,11 +403,12 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
         return prevItems.map((item) => {
           if (item.id === cartItemId) {
-            const activeBranch = branchId || 'main';
+            const activeBranch = item.stockBranchId || branchId || 'main';
 
-            // Si el precio no fue editado a mano, recalcular escalas de precio
             let unitPrice = item.price;
-            if (!item.modifiedPrice) {
+            if (item.isGift) {
+              unitPrice = 0;
+            } else if (!item.modifiedPrice) {
               const productToUse: Product = item.product
                 ? {
                     ...item.product,
@@ -374,12 +430,13 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
                     presentations: (item as any).presentations,
                   };
 
-              unitPrice = resolveEffectiveUnitPrice(
+              unitPrice = getEffectiveProductPrice(
                 productToUse,
                 activeBranch,
                 newQty,
                 item.presentation,
-                item.variant
+                item.variant,
+                defaultMinPriceEnabled
               );
             }
 
@@ -394,38 +451,42 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
         });
       });
     },
-    [branchId, accountId]
+    [branchId, accountId, defaultMinPriceEnabled]
   );
 
-  // 6. Actualizar precio unitario de un ítem con validación de piso (minSalePrice)
+  // 6. Actualizar precio unitario de un ítem con validación de piso (minSalePrice o costPrice)
   const updateItemPrice = useCallback(
-    (cartItemId: string, newPrice: number): boolean => {
-      let success = true;
+    (cartItemId: string, newPrice: number, enableMinSalePrice: boolean = defaultMinPriceEnabled): boolean => {
+      if (!Number.isFinite(newPrice) || newPrice < 0) return false;
+      const target = items.find((i) => i.id === cartItemId);
+      if (!target) return false;
 
-      setItems((prevItems) => {
-        return prevItems.map((item) => {
-          if (item.id === cartItemId) {
-            const floor = Number(item.minSalePrice ?? 0);
-            if (floor > 0 && newPrice < floor) {
-              console.warn(`[CartContext] Precio S/ ${newPrice} inferior al piso permitido de S/ ${floor}`);
-              success = false;
-              return item;
-            }
+      if (!target.isGift) {
+        const floor = resolveCartItemMinPrice(target, enableMinSalePrice);
+        if (floor > 0 && newPrice < floor) {
+          console.warn(`[CartContext] Precio S/ ${newPrice} inferior al piso permitido de S/ ${floor}`);
+          Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error).catch(() => {});
+          return false;
+        }
+      }
 
-            return {
-              ...item,
-              price: newPrice,
-              modifiedPrice: newPrice,
-              lineTotal: Math.round(item.quantity * newPrice * 100) / 100,
-            };
-          }
-          return item;
-        });
-      });
-
-      return success;
+      const rounded = Math.round(newPrice * 100) / 100;
+      setItems((prevItems) =>
+        prevItems.map((item) =>
+          item.id === cartItemId
+            ? {
+                ...item,
+                price: rounded,
+                modifiedPrice: rounded,
+                lineTotal: Math.round(item.quantity * rounded * 100) / 100,
+              }
+            : item
+        )
+      );
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
+      return true;
     },
-    []
+    [items, defaultMinPriceEnabled]
   );
 
   // 7. Remover ítem del carrito
@@ -442,6 +503,7 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setNotes('');
     setSaleRequestId(null);
     setSourceQuoteId(null);
+    setInvoiceIntent(null);
     setShippingAmountState(0);
     cartKVStorage.removeItem(storageKeys.cart).catch(() => {});
   }, [storageKeys.cart]);
@@ -573,6 +635,7 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
       saleRequestId,
       sourceQuoteId,
       shippingAmount,
+      invoiceIntent,
       subtotal,
       discountAmount,
       taxAmount,
@@ -588,7 +651,9 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setSaleRequestId,
       setSourceQuoteId,
       setShippingAmount,
+      setInvoiceIntent,
       addItem,
+      addGiftItem,
       updateQuantity,
       updateItemPrice,
       removeItem,
@@ -606,6 +671,8 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
       saleRequestId,
       sourceQuoteId,
       shippingAmount,
+      invoiceIntent,
+      setDiscount,
       setShippingAmount,
       subtotal,
       discountAmount,
@@ -615,6 +682,7 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
       totalItemsCount,
       pausedSales,
       addItem,
+      addGiftItem,
       updateQuantity,
       updateItemPrice,
       removeItem,

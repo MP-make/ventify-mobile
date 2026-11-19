@@ -14,6 +14,10 @@ import * as Haptics from 'expo-haptics';
 import { Product } from '@/types';
 import { formatPEN, ui } from '@/lib/theme';
 import { ScreenHeading } from '@/components/ui';
+import { useAuth } from '@/context/AuthContext';
+import { useSettings } from '@/context/SettingsContext';
+import { getBranchPricingConfig } from '@/lib/product-search';
+import { calculateWeightEntry } from '@/services/inventory-kardex-service';
 
 export interface WeightQuantityModalProps {
   product: Product | null;
@@ -31,6 +35,9 @@ export const WeightQuantityModal: React.FC<WeightQuantityModalProps> = ({
   onConfirm,
 }) => {
   const insets = useSafeAreaInsets();
+  const { branchId } = useAuth();
+  const { posSettings } = useSettings();
+  const enableMinSalePrice = posSettings?.enableMinSalePrice !== false;
   const isModalVisible = visible !== undefined ? visible : Boolean(isOpen);
 
   // Modo: 'weight' (escribir kg/fracción) o 'amount' (escribir importe en Soles)
@@ -44,26 +51,35 @@ export const WeightQuantityModal: React.FC<WeightQuantityModalProps> = ({
     }
   }, [isModalVisible]);
 
-  if (!isModalVisible || !product) return null;
+  const branchPricing = useMemo(() => {
+    if (!product) return null;
+    return getBranchPricingConfig(product, branchId || undefined, enableMinSalePrice);
+  }, [product, branchId, enableMinSalePrice]);
 
-  const unitPrice = Number(product.suggestedPrice ?? product.price ?? 0);
-  const unitLabel = product.unitOfMeasure || 'kg';
+  const unitPrice = Number(
+    branchPricing?.suggestedPrice ?? product?.suggestedPrice ?? product?.price ?? 0
+  );
+  const effectiveMinSalePrice = enableMinSalePrice
+    ? Number(branchPricing?.minSalePrice ?? product?.minSalePrice ?? 0)
+    : 0;
+  const unitLabel = product?.unitOfMeasure || 'kg';
 
-  // Cálculos reactivos según el modo de entrada
-  const { calculatedWeight, calculatedSubtotal } = useMemo(() => {
+  // Cálculos reactivos según el modo de entrada (antes del early return para cumplir reglas de hooks)
+  const {
+    weight: calculatedWeight,
+    subtotal: calculatedSubtotal,
+    customPrice: calculatedCustomPrice,
+  } = useMemo(() => {
     const rawVal = parseFloat(valueString) || 0;
+    return calculateWeightEntry({
+      mode: entryMode,
+      rawValue: rawVal,
+      unitPrice,
+      minSalePrice: effectiveMinSalePrice > 0 ? effectiveMinSalePrice : undefined,
+    });
+  }, [valueString, entryMode, unitPrice, effectiveMinSalePrice]);
 
-    if (entryMode === 'weight') {
-      const weight = Math.max(0, rawVal);
-      const subtotal = Math.round(weight * unitPrice * 100) / 100;
-      return { calculatedWeight: weight, calculatedSubtotal: subtotal };
-    } else {
-      // Modo por dinero ("Quiero S/ 5.00 de queso")
-      const money = Math.max(0, rawVal);
-      const weight = unitPrice > 0 ? Math.round((money / unitPrice) * 1000) / 1000 : 0;
-      return { calculatedWeight: weight, calculatedSubtotal: money };
-    }
-  }, [valueString, entryMode, unitPrice]);
+  if (!isModalVisible || !product) return null;
 
   const handleDigit = (digit: string) => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
@@ -94,7 +110,7 @@ export const WeightQuantityModal: React.FC<WeightQuantityModalProps> = ({
   const handleConfirm = () => {
     if (calculatedWeight > 0) {
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
-      onConfirm(product, calculatedWeight);
+      onConfirm(product, calculatedWeight, calculatedCustomPrice);
       onClose();
     }
   };

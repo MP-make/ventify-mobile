@@ -20,12 +20,13 @@ import {
   serverTimestamp,
 } from 'firebase/firestore';
 import NetInfo from '@react-native-community/netinfo';
-import { db } from '@/lib/firebase';
+import { db, auth, APP_URL } from '@/lib/firebase';
 import { useAuth } from './AuthContext';
 import { hasAllBranchesAccess } from '@/lib/branch-access';
 import {
   Branch,
   BusinessSettings,
+  DiscountSettings,
   PosSettings,
   PosPaymentMethodConfig,
   CashRegisterSession,
@@ -35,15 +36,55 @@ import {
   getOfflineQueue,
 } from '@/services/offline-sync-service';
 
+import {
+  resolveAccountTaxProfile,
+  type AccountTaxProfile,
+} from '@/lib/invoicing/receipt-amounts';
+
 declare module '@/types' {
+  interface Branch {
+    description?: string;
+    email?: string;
+    receiptFooter?: string;
+    printedFormatResolution?: string;
+  }
   interface BusinessSettings {
     commercialAddress?: string;
     commercialPhone?: string;
+    description?: string;
+    fiscalAddress?: string;
+    receiptLogo?: string;
+    receiptLogoDataUrl?: string;
+    receiptFooter?: string;
+    consultUrl?: string;
+    printedFormatResolution?: string;
+    isAmazonExempt?: boolean;
+    taxExemptionCode?: string;
+    taxRate?: number;
   }
   interface PosSettings {
     ticketFooterMessage?: string;
     digitalPhone?: string;
     digitalName?: string;
+  }
+  interface Sale {
+    correlative?: string;
+    einvoiceId?: string;
+    sunatHash?: string;
+    hash?: string;
+    isAmazonExempt?: boolean;
+    taxExemptionCode?: string;
+    discountAmount?: number;
+    shippingAmount?: number;
+    completedByName?: string;
+    printedFormatResolution?: string;
+    receiptCustomer?: {
+      identityType?: string;
+      identityNumber?: string;
+      name?: string;
+      address?: string;
+      email?: string;
+    };
   }
 }
 
@@ -123,6 +164,11 @@ export const DEFAULT_BUSINESS_SETTINGS: BusinessSettings = {
   accountId: '',
 };
 
+export const DEFAULT_DISCOUNT_SETTINGS: DiscountSettings = {
+  promotions: [],
+  enableGifts: true,
+};
+
 export interface SettingsContextType {
   configurationReady: boolean;
   configurationError: string | null;
@@ -132,12 +178,20 @@ export interface SettingsContextType {
   businessSettings: BusinessSettings;
   businessData: BusinessSettings; // Alias para compatibilidad con vistas legacy
   posSettings: PosSettings;
+  discountSettings: DiscountSettings;
   branches: Branch[];
   activeBranchName: string;
   activeBranch: Branch | null;
   isCashOpen: boolean;
   activeCashSession: ActiveCashSessionData | null;
   invoicingEnabled: boolean;
+  taxProfile: AccountTaxProfile;
+  emitterInfo: {
+    ruc?: string;
+    razonSocial?: string;
+    nombreComercial?: string;
+    printedFormatResolution?: string | null;
+  } | null;
   paymentMethods: PosPaymentMethodConfig[];
   allPaymentMethods: PosPaymentMethodConfig[];
   isOnline: boolean;
@@ -150,6 +204,12 @@ export interface SettingsContextType {
   refreshCashStatus: () => void;
 }
 
+const DEFAULT_TAX_PROFILE: AccountTaxProfile = {
+  isAmazonExempt: false,
+  taxExemptionCode: '10',
+  taxRate: 18,
+};
+
 const SettingsContext = createContext<SettingsContextType>({
   configurationReady: false,
   configurationError: null,
@@ -159,12 +219,15 @@ const SettingsContext = createContext<SettingsContextType>({
   businessSettings: DEFAULT_BUSINESS_SETTINGS,
   businessData: DEFAULT_BUSINESS_SETTINGS,
   posSettings: DEFAULT_POS_SETTINGS,
+  discountSettings: DEFAULT_DISCOUNT_SETTINGS,
   branches: [],
   activeBranchName: 'Tienda Principal',
   activeBranch: null,
   isCashOpen: false,
   activeCashSession: null,
   invoicingEnabled: false,
+  taxProfile: DEFAULT_TAX_PROFILE,
+  emitterInfo: null,
   paymentMethods: DEFAULT_PAYMENT_METHODS,
   allPaymentMethods: DEFAULT_PAYMENT_METHODS,
   isOnline: true,
@@ -178,7 +241,16 @@ const SettingsContext = createContext<SettingsContextType>({
 });
 
 export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const { accountId, branchId, setBranchId, user, userProfile, role, allBranchesAccess } = useAuth();
+  const {
+    accountId,
+    branchId,
+    setBranchId,
+    syncAssignedBranchId,
+    user,
+    userProfile,
+    role,
+    allBranchesAccess,
+  } = useAuth();
   const configurationScope = `${user?.uid || ''}:${accountId || ''}`;
   const [configuration, setConfiguration] = useState({ scope: configurationScope, pos: false, account: false, posError: null as string | null, accountError: null as string | null });
   const configurationReady = configuration.scope === configurationScope && configuration.pos && configuration.account && !configuration.posError && !configuration.accountError;
@@ -194,10 +266,20 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const [primaryColor, setPrimaryColor] = useState<string>('#10B981');
   const [businessSettings, setBusinessSettings] = useState<BusinessSettings>(DEFAULT_BUSINESS_SETTINGS);
   const [posSettings, setPosSettings] = useState<PosSettings>(DEFAULT_POS_SETTINGS);
+  const [discountSettings, setDiscountSettings] = useState<DiscountSettings>(DEFAULT_DISCOUNT_SETTINGS);
   const [branches, setBranches] = useState<Branch[]>([]);
   const [isCashOpen, setIsCashOpen] = useState<boolean>(false);
   const [activeCashSession, setActiveCashSession] = useState<ActiveCashSessionData | null>(null);
   const [invoicingEnabled, setInvoicingEnabled] = useState<boolean>(false);
+  const [invoicingConfigRaw, setInvoicingConfigRaw] = useState<{
+    isAmazonExempt?: boolean;
+    taxExemptionCode?: string;
+    taxRate?: number;
+    printedFormatResolution?: string | null;
+    emitterRuc?: string;
+    emitterRazonSocial?: string;
+    emitterNombreComercial?: string;
+  } | null>(null);
   const [allPaymentMethods, setAllPaymentMethods] = useState<PosPaymentMethodConfig[]>(DEFAULT_PAYMENT_METHODS);
   const [isOnline, setIsOnline] = useState<boolean>(true);
   const [offlineQueueCount, setOfflineQueueCount] = useState<number>(0);
@@ -344,6 +426,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
             .filter((m: any) => m.kind !== 'mixed')
             .sort((a: any, b: any) => (a.order || 0) - (b.order || 0))
             .map((m: any, idx: number) => ({
+              ...m,
               id: m.id,
               name: m.name,
               kind: m.kind || 'digital',
@@ -394,13 +477,90 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       }
     );
 
+    // 3.5. Reglas de promociones y regalos (`settings/${accountId}_discounts`)
+    const discountsRef = doc(db, 'settings', `${accountId}_discounts`);
+    const applyDiscounts = (snap: any) => {
+      if (snap.exists()) {
+        const d = snap.data() || {};
+        setDiscountSettings({
+          enableGifts: d.enableGifts !== false,
+          giftProductIds: Array.isArray(d.giftProductIds) ? d.giftProductIds : undefined,
+          promotions: Array.isArray(d.promotions) ? d.promotions : [],
+          updatedAt: typeof d.updatedAt === 'number' ? d.updatedAt : undefined,
+        });
+      } else {
+        setDiscountSettings({
+          ...DEFAULT_DISCOUNT_SETTINGS,
+        });
+      }
+    };
+    const unsubDiscounts = subscribeLiveDocument(
+      discountsRef,
+      applyDiscounts,
+      (err) => console.warn('[SettingsContext] discounts snapshot error:', err)
+    );
+
     return () => {
       unsubAppearance();
       unsubBusiness();
       unsubPos();
       unsubAccount();
+      unsubDiscounts();
     };
   }, [accountId, configurationScope, configurationTick]);
+
+  // 3.5. Perfil tributario IGV/Amazonía y resolución SUNAT desde /api/invoicing/config
+  useEffect(() => {
+    if (!accountId || !user?.uid) {
+      setInvoicingConfigRaw(null);
+      return;
+    }
+    if (!isOnline || !APP_URL) {
+      // Preservar configuración cacheada cuando el dispositivo pierde conectividad temporalmente
+      return;
+    }
+
+    let cancelled = false;
+    const controller = new AbortController();
+
+    const loadInvoicingPublicConfig = async () => {
+      try {
+        const token = await auth?.currentUser?.getIdToken?.();
+        if (!token || cancelled) return;
+        const url = `${APP_URL}/api/invoicing/config?accountId=${encodeURIComponent(accountId)}`;
+        const res = await fetch(url, {
+          method: 'GET',
+          signal: controller.signal,
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'x-ventify-client': 'v3',
+          },
+        });
+        if (!res.ok || cancelled) return;
+        const data = await res.json().catch(() => null);
+        if (!cancelled && data?.success && data?.config) {
+          setInvoicingConfigRaw({
+            isAmazonExempt: data.config.isAmazonExempt,
+            taxExemptionCode: data.config.taxExemptionCode,
+            taxRate: data.config.taxRate,
+            printedFormatResolution: data.config.printedFormatResolution ?? null,
+            emitterRuc: data.config.emitter?.ruc,
+            emitterRazonSocial: data.config.emitter?.razonSocial,
+            emitterNombreComercial: data.config.emitter?.nombreComercial,
+          });
+        }
+      } catch {
+        // Silencioso: opera con fallback de businessSettings si no hay red o endpoint no configurado
+      }
+    };
+
+    loadInvoicingPublicConfig();
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [accountId, user?.uid, isOnline, invoicingEnabled, configurationTick]);
 
   // 4. Suscripción a sucursales de la cuenta
   useEffect(() => {
@@ -437,7 +597,10 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       const currentBranchId = branchIdRef.current;
       if (activeList.length > 0) {
         if (!hasAllBranchesAccess({ role, allBranchesAccess, branchId: currentBranchId }) && userProfile?.branchId) {
-          if (currentBranchId !== userProfile.branchId) {
+          const assignedExists = activeList.some((b) => b.id === userProfile.branchId);
+          if (currentBranchId === 'main' && assignedExists) {
+            syncAssignedBranchId(userProfile.branchId);
+          } else if (currentBranchId !== userProfile.branchId) {
             setBranchId(userProfile.branchId);
           }
         } else if (currentBranchId === 'main' || !activeList.some((b) => b.id === currentBranchId)) {
@@ -453,7 +616,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     );
 
     return () => unsubBranches();
-  }, [accountId, setBranchId, role, allBranchesAccess, userProfile?.branchId]);
+  }, [accountId, setBranchId, syncAssignedBranchId, role, allBranchesAccess, userProfile?.branchId]);
 
   // 5. Verificación y resolución determinista de la sesión activa de caja
   const checkActiveSession = useCallback(async (): Promise<ActiveCashSessionData | null> => {
@@ -708,9 +871,42 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     [activeBranch, businessSettings.businessName]
   );
 
-  const scopedBusinessSettings = useMemo(() => businessSettings.accountId === accountId
-    ? businessSettings
-    : { ...DEFAULT_BUSINESS_SETTINGS, accountId: accountId || '' }, [accountId, businessSettings]);
+  const scopedBusinessSettings = useMemo(() => {
+    const base =
+      businessSettings.accountId === accountId
+        ? businessSettings
+        : { ...DEFAULT_BUSINESS_SETTINGS, accountId: accountId || '' };
+    if (!invoicingConfigRaw) return base;
+    return {
+      ...base,
+      isAmazonExempt: invoicingConfigRaw.isAmazonExempt ?? base.isAmazonExempt,
+      taxExemptionCode: invoicingConfigRaw.taxExemptionCode ?? base.taxExemptionCode,
+      taxRate: invoicingConfigRaw.taxRate ?? base.taxRate,
+      printedFormatResolution:
+        invoicingConfigRaw.printedFormatResolution || base.printedFormatResolution,
+      ruc: base.ruc || invoicingConfigRaw.emitterRuc || '',
+    };
+  }, [accountId, businessSettings, invoicingConfigRaw]);
+
+  const taxProfile = useMemo(
+    () =>
+      resolveAccountTaxProfile({
+        isAmazonExempt: scopedBusinessSettings.isAmazonExempt,
+        taxExemptionCode: scopedBusinessSettings.taxExemptionCode,
+        taxRate: scopedBusinessSettings.taxRate,
+      }),
+    [scopedBusinessSettings]
+  );
+
+  const emitterInfo = useMemo(() => {
+    if (!invoicingConfigRaw) return null;
+    return {
+      ruc: invoicingConfigRaw.emitterRuc,
+      razonSocial: invoicingConfigRaw.emitterRazonSocial,
+      nombreComercial: invoicingConfigRaw.emitterNombreComercial,
+      printedFormatResolution: invoicingConfigRaw.printedFormatResolution ?? null,
+    };
+  }, [invoicingConfigRaw]);
 
   const contextValue = useMemo(
     () => ({
@@ -722,12 +918,15 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       businessSettings: scopedBusinessSettings,
       businessData: scopedBusinessSettings,
       posSettings,
+      discountSettings,
       branches,
       activeBranchName,
       activeBranch,
       isCashOpen,
       activeCashSession,
       invoicingEnabled,
+      taxProfile,
+      emitterInfo,
       paymentMethods,
       allPaymentMethods,
       isOnline,
@@ -746,12 +945,15 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       primaryColor,
       scopedBusinessSettings,
       posSettings,
+      discountSettings,
       branches,
       activeBranchName,
       activeBranch,
       isCashOpen,
       activeCashSession,
       invoicingEnabled,
+      taxProfile,
+      emitterInfo,
       paymentMethods,
       allPaymentMethods,
       isOnline,

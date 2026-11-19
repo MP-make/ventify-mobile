@@ -19,7 +19,6 @@ import {
   ActivityIndicator,
   KeyboardAvoidingView,
   Platform,
-  SafeAreaView,
   FlatList,
 } from 'react-native';
 import { FlashList } from '@shopify/flash-list';
@@ -63,15 +62,22 @@ import { useProducts } from '@/context/ProductsContext';
 import { formatPEN, formatDatePE } from '@/lib/theme';
 import { ui } from '@/lib/theme';
 import { BrandLogo, SectionHeading } from '@/components/ui';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { lookupDocument, DocumentLookupResult } from '@/lib/dni-ruc-service';
+import { getAllPresentations } from '@/lib/product-search';
 import {
   SuppliersPOService,
   Supplier,
   PurchaseOrder,
   PurchaseOrderItem,
   PurchaseOrderStatus,
+  ReceivedProductCostChange,
   calculatePurchaseOrderStats,
+  roundToCents,
+  resolvePackagingFactor,
+  suggestedSalePriceAfterCostChange,
+  suggestedPresentationPrices,
+  applyProductSuggestedPrices,
 } from '@/services/suppliers-po-service';
 import type { Product } from '@/types';
 
@@ -174,6 +180,21 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
   const [selectedProductToAdd, setSelectedProductToAdd] = useState<Product | null>(null);
   const [itemQuantityInput, setItemQuantityInput] = useState<string>('1');
   const [itemUnitCostInput, setItemUnitCostInput] = useState<string>('');
+  const [itemPackagingId, setItemPackagingId] = useState<string>('unit');
+  const [itemPackagingCustomFactor, setItemPackagingCustomFactor] = useState<string>('12');
+
+  // --------------------------------------------------------------------------
+  // SUB-MODAL: RECEPCIÓN PARCIAL / COMPLETA & SUGERENCIA DE PRECIOS
+  // --------------------------------------------------------------------------
+  const [receiveModalOrder, setReceiveModalOrder] = useState<PurchaseOrder | null>(null);
+  const [receiveQtyInputs, setReceiveQtyInputs] = useState<Record<string, string>>({});
+  const [priceSuggestionModalVisible, setPriceSuggestionModalVisible] = useState<boolean>(false);
+  const [priceSuggestionItems, setPriceSuggestionItems] = useState<Array<{
+    change: ReceivedProductCostChange;
+    unitPriceInput: string;
+    selected: boolean;
+  }>>([]);
+  const [isApplyingPriceSuggestions, setIsApplyingPriceSuggestions] = useState<boolean>(false);
 
   // --------------------------------------------------------------------------
   // SUB-MODAL: NUEVO / EDITAR PROVEEDOR
@@ -254,7 +275,7 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
         orderStatusFilter === 'all'
           ? true
           : orderStatusFilter === 'pending'
-          ? order.status === 'pending' || order.status === 'ordered'
+          ? order.status === 'pending' || order.status === 'ordered' || order.status === 'partial'
           : order.status === orderStatusFilter;
 
       if (!matchesStatus) return false;
@@ -298,65 +319,135 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
   }, [products, productSearchQuery]);
 
   // --------------------------------------------------------------------------
-  // ACCIÓN: RECIBIR MERCADERÍA EN ALMACÉN (KARDEX & CPP)
+  // ACCIÓN: RECIBIR MERCADERÍA EN ALMACÉN (PARCIAL / COMPLETA + KARDEX + CPP)
   // --------------------------------------------------------------------------
-  const handleReceiveOrder = useCallback(
-    async (order: PurchaseOrder) => {
-      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+  const handleReceiveOrder = useCallback((order: PurchaseOrder) => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    const initialInputs: Record<string, string> = {};
+    (order.items || []).forEach((it, idx) => {
+      const remaining = Math.max(0, Math.round(((Number(it.quantity) || 0) - (Number(it.receivedQuantity) || 0)) * 10000) / 10000);
+      initialInputs[`${it.productId}:${idx}`] = String(remaining);
+    });
+    setReceiveQtyInputs(initialInputs);
+    setReceiveModalOrder(order);
+  }, []);
 
-      Alert.alert(
-        'Recibir Mercadería en Almacén',
-        `¿Deseas confirmar la recepción de la orden ${order.orderNumber} con ${order.items.length} productos?\n\n` +
-          `• Se sumará el stock a los productos en esta sucursal.\n` +
-          `• Se recalculará automáticamente el Costo Promedio Ponderado (CPP).\n` +
-          `• Se registrará el movimiento de entrada en el Kardex oficial.`,
-        [
-          { text: 'Cancelar', style: 'cancel' },
-          {
-            text: 'Confirmar Recepción',
-            style: 'default',
-            onPress: async () => {
-              setIsReceivingId(order.id);
-              try {
-                const result = await SuppliersPOService.receivePurchaseOrder(
-                  order,
-                  userProfile,
-                  branchId,
-                  activeBranchName
-                );
+  const handleConfirmReceipt = useCallback(async () => {
+    if (!receiveModalOrder) return;
+    const order = receiveModalOrder;
 
-                Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    // Agrupar cantidades ingresadas por productId respetando el saldo pendiente por línea
+    const partialTotals = new Map<string, number>();
+    let totalEntered = 0;
+    let isFullReceipt = true;
 
-                let summaryMsg = `La orden ${order.orderNumber} ha sido ingresada al almacén y registrada en el Kardex.`;
-                if (result.costChanges.length > 0) {
-                  summaryMsg += `\n\nSe actualizaron los costos promedio ponderados de ${result.costChanges.length} producto(s).`;
-                }
-
-                Alert.alert('¡Recepción Exitosa!', summaryMsg, [
-                  {
-                    text: 'Aceptar',
-                    onPress: () => {
-                      onStockUpdated?.();
-                    },
-                  },
-                ]);
-              } catch (err: any) {
-                Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-                console.error('[SuppliersPurchaseModal] Error al recibir orden:', err);
-                Alert.alert(
-                  'Error en Recepción',
-                  err?.message || 'No se pudo completar la recepción de la orden de compra.'
-                );
-              } finally {
-                setIsReceivingId(null);
-              }
-            },
-          },
-        ]
+    (order.items || []).forEach((it, idx) => {
+      const remaining = Math.max(
+        0,
+        Math.round(((Number(it.quantity) || 0) - (Number(it.receivedQuantity) || 0)) * 10000) / 10000
       );
-    },
-    [userProfile, branchId, onStockUpdated]
-  );
+      const rawStr = receiveQtyInputs[`${it.productId}:${idx}`] ?? String(remaining);
+      const parsed = Math.max(0, Math.min(remaining, parseFloat(rawStr) || 0));
+      if (parsed + 0.00001 < remaining) {
+        isFullReceipt = false;
+      }
+      totalEntered += parsed;
+      partialTotals.set(it.productId, (partialTotals.get(it.productId) || 0) + parsed);
+    });
+
+    if (totalEntered <= 0) {
+      Alert.alert('Cantidad inválida', 'Ingresa al menos una cantidad mayor a 0 para recibir.');
+      return;
+    }
+
+    const partialItems = Array.from(partialTotals.entries()).map(([productId, receivedQty]) => ({
+      productId,
+      receivedQty,
+    }));
+
+    setIsReceivingId(order.id);
+    try {
+      const result = await SuppliersPOService.receivePurchaseOrder(
+        order,
+        userProfile,
+        branchId,
+        activeBranchName,
+        isFullReceipt ? undefined : { partialItems }
+      );
+
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      setReceiveModalOrder(null);
+      onStockUpdated?.();
+
+      if (result.costChanges.length > 0) {
+        const prepared = result.costChanges.map((change) => {
+          const suggestion = suggestedSalePriceAfterCostChange({
+            previousCost: change.previousCost,
+            newCost: change.newCost,
+            currentSalePrice: change.suggestedPrice || 0,
+            minSalePrice: change.minSalePrice,
+          });
+          return {
+            change,
+            unitPriceInput: suggestion.unit.toFixed(2),
+            selected: true,
+          };
+        });
+        setPriceSuggestionItems(prepared);
+        setPriceSuggestionModalVisible(true);
+      } else {
+        const isPartialResult = result.status === 'partial';
+        Alert.alert(
+          isPartialResult ? 'Recepción Parcial Guardada' : '¡Recepción Exitosa!',
+          isPartialResult
+            ? `Se ingresaron las cantidades seleccionadas de la orden ${order.orderNumber} al almacén y al Kardex. Podrás completar el resto luego.`
+            : `La orden ${order.orderNumber} ha sido ingresada completamente al almacén y registrada en el Kardex.`
+        );
+      }
+    } catch (err: any) {
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+      console.error('[SuppliersPurchaseModal] Error al recibir orden:', err);
+      Alert.alert(
+        'Error en Recepción',
+        err?.message || 'No se pudo completar la recepción de la orden de compra.'
+      );
+    } finally {
+      setIsReceivingId(null);
+    }
+  }, [receiveModalOrder, receiveQtyInputs, userProfile, branchId, activeBranchName, onStockUpdated]);
+
+  const handleApplySuggestedPrices = useCallback(async () => {
+    const selectedEntries = priceSuggestionItems.filter((entry) => entry.selected);
+    if (selectedEntries.length === 0) {
+      setPriceSuggestionModalVisible(false);
+      return;
+    }
+
+    setIsApplyingPriceSuggestions(true);
+    try {
+      for (const entry of selectedEntries) {
+        const parsedUnit = roundToCents(parseFloat(entry.unitPriceInput) || 0);
+        if (parsedUnit <= 0) continue;
+        const { change } = entry;
+        const costRose = change.newCost > change.previousCost;
+        const updatedPresentations = Array.isArray(change.presentations) && change.presentations.length > 0
+          ? suggestedPresentationPrices(change.presentations, parsedUnit, {
+              previousUnitPrice: change.suggestedPrice,
+              costRose,
+            })
+          : undefined;
+        await applyProductSuggestedPrices(change.productId, parsedUnit, updatedPresentations);
+      }
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      setPriceSuggestionModalVisible(false);
+      onStockUpdated?.();
+      Alert.alert('Precios actualizados', 'Se actualizaron los precios de venta sugeridos.');
+    } catch (err: any) {
+      Alert.alert('Error', err?.message || 'No se pudieron actualizar algunos precios.');
+    } finally {
+      setIsApplyingPriceSuggestions(false);
+    }
+  }, [priceSuggestionItems, onStockUpdated]);
 
   // --------------------------------------------------------------------------
   // ACCIÓN: CANCELAR ORDEN DE COMPRA
@@ -401,14 +492,56 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
     setSelectedProductToAdd(null);
     setItemQuantityInput('1');
     setItemUnitCostInput('');
+    setItemPackagingId('unit');
+    setItemPackagingCustomFactor('12');
     setCreateOrderModalVisible(true);
   };
+
+  const packagingOptionsForSelected = useMemo(() => {
+    if (!selectedProductToAdd) return [];
+    const customNum = Math.max(1, parseInt(itemPackagingCustomFactor, 10) || 1);
+    const presentationOpts = getAllPresentations(selectedProductToAdd)
+      .filter((p) => p.active !== false && Number(p.conversionFactor ?? p.quantity) > 1)
+      .map((p) => ({
+        id: p.id,
+        label: p.name,
+        factor: Number(p.conversionFactor ?? p.quantity) || 1,
+      }));
+    return [
+      { id: 'unit', label: 'Unidad', factor: 1 },
+      ...presentationOpts,
+      {
+        id: 'custom',
+        label: customNum > 1 ? `Caja x${customNum}` : 'Caja personalizada',
+        factor: customNum,
+      },
+    ];
+  }, [selectedProductToAdd, itemPackagingCustomFactor]);
+
+  const activePackagingOption = useMemo(() => {
+    return (
+      packagingOptionsForSelected.find((opt) => opt.id === itemPackagingId) ||
+      packagingOptionsForSelected[0] || { id: 'unit', label: 'Unidad', factor: 1 }
+    );
+  }, [packagingOptionsForSelected, itemPackagingId]);
 
   const handleSelectProductForOrder = (product: Product) => {
     setSelectedProductToAdd(product);
     setProductSearchQuery(product.name);
     setItemQuantityInput('1');
+    setItemPackagingId('unit');
+    setItemPackagingCustomFactor('12');
     setItemUnitCostInput(product.costPrice ? String(product.costPrice) : '0');
+  };
+
+  const handleSelectPackagingForOrder = (opt: { id: string; label: string; factor: number }) => {
+    setItemPackagingId(opt.id);
+    if (selectedProductToAdd) {
+      const baseCost = Number(selectedProductToAdd.costPrice) || 0;
+      if (baseCost > 0) {
+        setItemUnitCostInput(String(roundToCents(baseCost * Math.max(1, opt.factor))));
+      }
+    }
   };
 
   const handleAddItemToOrder = () => {
@@ -417,31 +550,48 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
       return;
     }
 
-    const qty = parseFloat(itemQuantityInput);
-    if (isNaN(qty) || qty <= 0) {
+    const packs = parseFloat(itemQuantityInput);
+    if (isNaN(packs) || packs <= 0) {
       Alert.alert('Cantidad inválida', 'Ingresa una cantidad mayor a 0.');
       return;
     }
 
-    const unitCost = parseFloat(itemUnitCostInput);
-    if (isNaN(unitCost) || unitCost < 0) {
-      Alert.alert('Costo inválido', 'Ingresa un costo unitario válido.');
+    const packCost = parseFloat(itemUnitCostInput);
+    if (isNaN(packCost) || packCost < 0) {
+      Alert.alert('Costo inválido', 'Ingresa un costo válido.');
       return;
     }
 
-    const subtotal = Math.round(qty * unitCost * 100) / 100;
+    if (itemPackagingId === 'custom') {
+      const parsedCustom = parseInt(itemPackagingCustomFactor, 10);
+      if (!Number.isFinite(parsedCustom) || parsedCustom < 2) {
+        Alert.alert('Factor inválido', 'Ingresa cuántas unidades trae el bulto/caja (mínimo 2).');
+        return;
+      }
+    }
 
-    // Si ya existe el producto en la lista, actualizar cantidad o agregar
-    const existingIndex = orderItems.findIndex((it) => it.productId === selectedProductToAdd.id);
+    const factor = resolvePackagingFactor(activePackagingOption.factor);
+    const totalUnits = Math.round(packs * factor * 10000) / 10000;
+    const unitCost = roundToCents(factor > 1 ? packCost / factor : packCost);
+    const subtotal = roundToCents(packs * packCost);
+
+    const existingIndex = orderItems.findIndex(
+      (it) => it.productId === selectedProductToAdd.id && resolvePackagingFactor(it.packagingFactor) === factor
+    );
     if (existingIndex >= 0) {
       const updated = [...orderItems];
-      const newQty = updated[existingIndex].quantity + qty;
-      const newSub = Math.round(newQty * unitCost * 100) / 100;
+      const prev = updated[existingIndex];
+      const newTotalUnits = Math.round((prev.quantity + totalUnits) * 10000) / 10000;
+      const newPacks = factor > 1 ? newTotalUnits / factor : newTotalUnits;
       updated[existingIndex] = {
-        ...updated[existingIndex],
-        quantity: newQty,
+        ...prev,
+        quantity: newTotalUnits,
         unitCost,
-        subtotal: newSub,
+        subtotal: roundToCents(newPacks * packCost),
+        packagingId: activePackagingOption.id,
+        packagingLabel: factor > 1 ? activePackagingOption.label : undefined,
+        packagingFactor: factor > 1 ? factor : undefined,
+        packagingTotalCost: factor > 1 ? roundToCents(packCost) : undefined,
       };
       setOrderItems(updated);
     } else {
@@ -449,19 +599,24 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
         productId: selectedProductToAdd.id,
         productName: selectedProductToAdd.name,
         sku: selectedProductToAdd.sku || '',
-        quantity: qty,
+        quantity: totalUnits,
         unitCost,
         subtotal,
+        packagingId: activePackagingOption.id,
+        packagingLabel: factor > 1 ? activePackagingOption.label : undefined,
+        packagingFactor: factor > 1 ? factor : undefined,
+        packagingTotalCost: factor > 1 ? roundToCents(packCost) : undefined,
+        receivedQuantity: 0,
       };
       setOrderItems([...orderItems, newItem]);
     }
 
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    // Limpiar selección de producto para el siguiente
     setSelectedProductToAdd(null);
     setProductSearchQuery('');
     setItemQuantityInput('1');
     setItemUnitCostInput('');
+    setItemPackagingId('unit');
   };
 
   const handleRemoveItemFromOrder = (index: number) => {
@@ -762,6 +917,7 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
           {[
             { id: 'all', label: 'Todas' },
             { id: 'pending', label: 'Pendientes' },
+            { id: 'partial', label: 'Parciales' },
             { id: 'received', label: 'Recibidas' },
             { id: 'cancelled', label: 'Canceladas' },
           ].map((chip) => {
@@ -819,8 +975,10 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
             renderItem={({ item: order }) => {
               const isExpanded = expandedOrderId === order.id;
               const isPending = order.status === 'pending' || order.status === 'ordered';
+              const isPartial = order.status === 'partial';
               const isReceived = order.status === 'received';
               const isCancelled = order.status === 'cancelled';
+              const canReceive = isPending || isPartial;
               const isReceiving = isReceivingId === order.id;
 
               return (
@@ -833,6 +991,7 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
                         style={[
                           styles.statusBadge,
                           isPending && styles.statusBadgePending,
+                          isPartial && styles.statusBadgePartial,
                           isReceived && styles.statusBadgeReceived,
                           isCancelled && styles.statusBadgeCancelled,
                         ]}
@@ -841,12 +1000,15 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
                           style={[
                             styles.statusBadgeText,
                             isPending && styles.statusBadgeTextPending,
+                            isPartial && styles.statusBadgeTextPartial,
                             isReceived && styles.statusBadgeTextReceived,
                             isCancelled && styles.statusBadgeTextCancelled,
                           ]}
                         >
                           {isPending
                             ? 'PENDIENTE'
+                            : isPartial
+                            ? 'PARCIAL'
                             : isReceived
                             ? 'RECIBIDA EN ALMACÉN'
                             : 'CANCELADA'}
@@ -894,24 +1056,31 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
 
                   {isExpanded && (
                     <View style={styles.expandedItemsContainer}>
-                      {order.items.map((it, idx) => (
-                        <View key={`${it.productId}-${idx}`} style={styles.expandedItemRow}>
-                          <View style={{ flex: 1 }}>
-                            <Text style={styles.expandedItemName}>{it.productName}</Text>
-                            <Text style={styles.expandedItemSku}>
-                              {it.quantity} un. x {formatPEN(it.unitCost)}
-                            </Text>
+                      {order.items.map((it, idx) => {
+                        const factor = resolvePackagingFactor(it.packagingFactor);
+                        const recQty = Number(it.receivedQuantity) || 0;
+                        return (
+                          <View key={`${it.productId}-${idx}`} style={styles.expandedItemRow}>
+                            <View style={{ flex: 1 }}>
+                              <Text style={styles.expandedItemName}>{it.productName}</Text>
+                              <Text style={styles.expandedItemSku}>
+                                {it.quantity} un. x {formatPEN(it.unitCost)}
+                                {factor > 1 ? ` • ${it.packagingLabel || `Caja x${factor}`}` : ''}
+                                {recQty > 0 ? ` • Recibido: ${recQty}/${it.quantity}` : ''}
+                              </Text>
+                            </View>
+                            <Text style={styles.expandedItemSubtotal}>{formatPEN(it.subtotal)}</Text>
                           </View>
-                          <Text style={styles.expandedItemSubtotal}>{formatPEN(it.subtotal)}</Text>
-                        </View>
-                      ))}
+                        );
+                      })}
 
-                      {isReceived && order.receivedByName && (
+                      {(isReceived || isPartial) && order.receivedByName && (
                         <View style={styles.auditReceivedRow}>
                           <CheckCircle2 size={14} color={ui.primary} />
                           <Text style={styles.auditReceivedText}>
-                            Recibido por {order.receivedByName} el{' '}
-                            {formatDatePE(order.receivedAt || order.receivedDate)}
+                            {isPartial ? 'Última recepción por ' : 'Recibido por '}
+                            {order.receivedByName} el{' '}
+                            {formatDatePE(order.receivedAt || order.receivedDate || order.partialReceivedAt)}
                           </Text>
                         </View>
                       )}
@@ -919,7 +1088,7 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
                   )}
 
                   {/* ACCIONES DE LA TARJETA */}
-                  {isPending && (
+                  {canReceive && (
                     <View style={styles.orderActionsRow}>
                       <TouchableOpacity
                         style={[styles.receiveButton, isReceiving && styles.btnDisabled]}
@@ -931,19 +1100,23 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
                         ) : (
                           <>
                             <ArrowDownLeft size={16} color={ui.surface} />
-                            <Text style={styles.receiveButtonText}>Recibir Mercadería</Text>
+                            <Text style={styles.receiveButtonText}>
+                              {isPartial ? 'Completar Recepción' : 'Recibir Mercadería'}
+                            </Text>
                           </>
                         )}
                       </TouchableOpacity>
 
-                      <TouchableOpacity
-                        style={styles.cancelOrderButton}
-                        onPress={() => handleCancelOrder(order)}
-                        disabled={isReceiving}
-                      >
-                        <Ban size={15} color={ui.danger} />
-                        <Text style={styles.cancelOrderButtonText}>Cancelar</Text>
-                      </TouchableOpacity>
+                      {!isPartial && (
+                        <TouchableOpacity
+                          style={styles.cancelOrderButton}
+                          onPress={() => handleCancelOrder(order)}
+                          disabled={isReceiving}
+                        >
+                          <Ban size={15} color={ui.danger} />
+                          <Text style={styles.cancelOrderButtonText}>Cancelar</Text>
+                        </TouchableOpacity>
+                      )}
                     </View>
                   )}
                 </View>
@@ -1329,7 +1502,7 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
                   </View>
                 )}
 
-                {/* Si se seleccionó un producto, configurar cantidad y costo unitario */}
+                {/* Si se seleccionó un producto, configurar empaque, cantidad y costo */}
                 {selectedProductToAdd && (
                   <View style={styles.selectedProductConfigCard}>
                     <Text style={styles.selectedProductConfigTitle}>
@@ -1339,9 +1512,58 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
                       SKU: {selectedProductToAdd.sku || 'N/A'}
                     </Text>
 
+                    {/* Selector de Empaque / Presentación de compra */}
+                    <Text style={styles.inputMiniLabel}>Empaque de compra</Text>
+                    <ScrollView
+                      horizontal
+                      showsHorizontalScrollIndicator={false}
+                      style={{ marginTop: 4, marginBottom: 10 }}
+                    >
+                      <View style={styles.packagingChipsRow}>
+                        {packagingOptionsForSelected.map((opt) => {
+                          const selected = itemPackagingId === opt.id;
+                          return (
+                            <TouchableOpacity
+                              key={opt.id}
+                              style={[styles.packagingChip, selected && styles.packagingChipActive]}
+                              onPress={() => handleSelectPackagingForOrder(opt)}
+                            >
+                              <Text
+                                style={[
+                                  styles.packagingChipText,
+                                  selected && styles.packagingChipTextActive,
+                                ]}
+                              >
+                                {opt.label}
+                                {opt.factor > 1 && opt.id !== 'custom' ? ` (×${opt.factor})` : ''}
+                              </Text>
+                            </TouchableOpacity>
+                          );
+                        })}
+                      </View>
+                    </ScrollView>
+
+                    {itemPackagingId === 'custom' && (
+                      <View style={{ marginBottom: 10 }}>
+                        <Text style={styles.inputMiniLabel}>Unidades por caja/bulto</Text>
+                        <TextInput
+                          style={styles.inputMini}
+                          keyboardType="number-pad"
+                          value={itemPackagingCustomFactor}
+                          onChangeText={setItemPackagingCustomFactor}
+                          placeholder="Ej: 12 o 24"
+                          placeholderTextColor={ui.textMuted}
+                        />
+                      </View>
+                    )}
+
                     <View style={styles.qtyCostRow}>
                       <View style={{ flex: 1, marginRight: 8 }}>
-                        <Text style={styles.inputMiniLabel}>Cantidad a pedir</Text>
+                        <Text style={styles.inputMiniLabel}>
+                          {activePackagingOption.factor > 1
+                            ? `Bultos (${activePackagingOption.label})`
+                            : 'Cantidad (un.)'}
+                        </Text>
                         <TextInput
                           style={styles.inputMini}
                           keyboardType="numeric"
@@ -1351,7 +1573,11 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
                       </View>
 
                       <View style={{ flex: 1, marginLeft: 8 }}>
-                        <Text style={styles.inputMiniLabel}>Costo Unitario (S/)</Text>
+                        <Text style={styles.inputMiniLabel}>
+                          {activePackagingOption.factor > 1
+                            ? 'Costo por bulto (S/)'
+                            : 'Costo Unitario (S/)'}
+                        </Text>
                         <TextInput
                           style={styles.inputMini}
                           keyboardType="numeric"
@@ -1360,6 +1586,16 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
                         />
                       </View>
                     </View>
+
+                    {activePackagingOption.factor > 1 && (
+                      <Text style={styles.packagingHintText}>
+                        Ingresará {(parseFloat(itemQuantityInput) || 0) * activePackagingOption.factor} un. base •{' '}
+                        {formatPEN(
+                          (parseFloat(itemUnitCostInput) || 0) / activePackagingOption.factor
+                        )}{' '}
+                        c/u
+                      </Text>
+                    )}
 
                     <View style={styles.subtotalAddRow}>
                       <Text style={styles.subtotalAddText}>
@@ -1395,23 +1631,27 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
                   </View>
                 ) : (
                   <View style={styles.orderItemsList}>
-                    {orderItems.map((it, idx) => (
-                      <View key={`${it.productId}-${idx}`} style={styles.orderItemRow}>
-                        <View style={{ flex: 1 }}>
-                          <Text style={styles.orderItemName}>{it.productName}</Text>
-                          <Text style={styles.orderItemDetails}>
-                            {it.quantity} un. x {formatPEN(it.unitCost)}
-                          </Text>
+                    {orderItems.map((it, idx) => {
+                      const factor = resolvePackagingFactor(it.packagingFactor);
+                      return (
+                        <View key={`${it.productId}-${idx}`} style={styles.orderItemRow}>
+                          <View style={{ flex: 1 }}>
+                            <Text style={styles.orderItemName}>{it.productName}</Text>
+                            <Text style={styles.orderItemDetails}>
+                              {it.quantity} un. x {formatPEN(it.unitCost)}
+                              {factor > 1 ? ` • ${it.packagingLabel || `Caja x${factor}`}` : ''}
+                            </Text>
+                          </View>
+                          <Text style={styles.orderItemTotal}>{formatPEN(it.subtotal)}</Text>
+                          <TouchableOpacity
+                            style={styles.deleteItemBtn}
+                            onPress={() => handleRemoveItemFromOrder(idx)}
+                          >
+                            <Trash2 size={16} color={ui.danger} />
+                          </TouchableOpacity>
                         </View>
-                        <Text style={styles.orderItemTotal}>{formatPEN(it.subtotal)}</Text>
-                        <TouchableOpacity
-                          style={styles.deleteItemBtn}
-                          onPress={() => handleRemoveItemFromOrder(idx)}
-                        >
-                          <Trash2 size={16} color={ui.danger} />
-                        </TouchableOpacity>
-                      </View>
-                    ))}
+                      );
+                    })}
                   </View>
                 )}
 
@@ -1687,6 +1927,261 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
             </View>
           </KeyboardAvoidingView>
         </Modal>
+
+        {/* ================================================================== */}
+        {/* SUB-MODAL 3: RECEPCIÓN PARCIAL / COMPLETA EN ALMACÉN               */}
+        {/* ================================================================== */}
+        <Modal
+          visible={receiveModalOrder !== null}
+          animationType="slide"
+          transparent={true}
+          onRequestClose={() => {
+            if (!isReceivingId) setReceiveModalOrder(null);
+          }}
+        >
+          <KeyboardAvoidingView
+            style={styles.modalOverlay}
+            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+          >
+            <View style={[styles.modalSheetContainer, { paddingBottom: Math.max(12, insets.bottom) }]}>
+              <View style={styles.subModalHeader}>
+                <View>
+                  <Text style={styles.subModalTitle}>
+                    Recibir {receiveModalOrder?.orderNumber || 'Orden'}
+                  </Text>
+                  <Text style={styles.subModalSubtitle}>
+                    Ingresa la cantidad recibida por ítem (sucursal: {activeBranchName || branchId})
+                  </Text>
+                </View>
+                <TouchableOpacity
+                  style={styles.closeSubModalBtn}
+                  onPress={() => {
+                    if (!isReceivingId) setReceiveModalOrder(null);
+                  }}
+                >
+                  <X size={20} color={ui.textSecondary} />
+                </TouchableOpacity>
+              </View>
+
+              <ScrollView style={styles.subModalBody} keyboardShouldPersistTaps="handled">
+                {(receiveModalOrder?.items || []).map((it, idx) => {
+                  const ordered = Number(it.quantity) || 0;
+                  const alreadyRec = Number(it.receivedQuantity) || 0;
+                  const remaining = Math.max(0, Math.round((ordered - alreadyRec) * 10000) / 10000);
+                  const factor = resolvePackagingFactor(it.packagingFactor);
+                  const key = `${it.productId}:${idx}`;
+                  const val = receiveQtyInputs[key] ?? String(remaining);
+                  const isLegacyPack = factor > 1 && it.packagingTotalCost == null;
+
+                  return (
+                    <View key={key} style={styles.receiveItemCard}>
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.orderItemName}>{it.productName}</Text>
+                        <Text style={styles.orderItemDetails}>
+                          Pedido: {ordered}
+                          {alreadyRec > 0 ? ` • Ya recibido: ${alreadyRec}` : ''} • Pendiente: {remaining}
+                          {factor > 1 ? ` (${it.packagingLabel || `×${factor}`})` : ''}
+                        </Text>
+                        {isLegacyPack && (
+                          <Text style={styles.packagingHintText}>
+                            Convertirá {(parseFloat(val) || 0) * factor} u. al confirmar
+                          </Text>
+                        )}
+                      </View>
+                      {remaining > 0 ? (
+                        <View style={{ width: 92 }}>
+                          <TextInput
+                            style={styles.inputMini}
+                            keyboardType="numeric"
+                            value={val}
+                            onChangeText={(txt) =>
+                              setReceiveQtyInputs((prev) => ({ ...prev, [key]: txt }))
+                            }
+                          />
+                        </View>
+                      ) : (
+                        <Text style={[styles.statusBadgeText, styles.statusBadgeTextReceived]}>
+                          Completo
+                        </Text>
+                      )}
+                    </View>
+                  );
+                })}
+              </ScrollView>
+
+              <View style={styles.subModalFooter}>
+                <TouchableOpacity
+                  style={styles.subModalCancelBtn}
+                  onPress={() => {
+                    if (!receiveModalOrder) return;
+                    const reset: Record<string, string> = {};
+                    receiveModalOrder.items.forEach((it, idx) => {
+                      const rem = Math.max(
+                        0,
+                        Math.round(((Number(it.quantity) || 0) - (Number(it.receivedQuantity) || 0)) * 10000) / 10000
+                      );
+                      reset[`${it.productId}:${idx}`] = String(rem);
+                    });
+                    setReceiveQtyInputs(reset);
+                  }}
+                  disabled={Boolean(isReceivingId)}
+                >
+                  <Text style={styles.subModalCancelBtnText}>Todo restante</Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={[styles.saveSupplierSubmitBtn, Boolean(isReceivingId) && styles.btnDisabled]}
+                  onPress={handleConfirmReceipt}
+                  disabled={Boolean(isReceivingId)}
+                >
+                  {isReceivingId ? (
+                    <ActivityIndicator size="small" color={ui.surface} />
+                  ) : (
+                    <>
+                      <Check size={18} color={ui.surface} />
+                      <Text style={styles.saveSupplierSubmitBtnText}>Confirmar Recepción</Text>
+                    </>
+                  )}
+                </TouchableOpacity>
+              </View>
+            </View>
+          </KeyboardAvoidingView>
+        </Modal>
+
+        {/* ================================================================== */}
+        {/* SUB-MODAL 4: SUGERENCIA DE PRECIOS POR CAMBIO DE COSTO CPP         */}
+        {/* ================================================================== */}
+        <Modal
+          visible={priceSuggestionModalVisible}
+          animationType="slide"
+          transparent={true}
+          onRequestClose={() => {
+            if (!isApplyingPriceSuggestions) setPriceSuggestionModalVisible(false);
+          }}
+        >
+          <KeyboardAvoidingView
+            style={styles.modalOverlay}
+            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+          >
+            <View style={[styles.modalSheetContainer, { paddingBottom: Math.max(12, insets.bottom) }]}>
+              <View style={styles.subModalHeader}>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.subModalTitle}>Actualizar Precios de Venta</Text>
+                  <Text style={styles.subModalSubtitle}>
+                    El costo CPP cambió al recibir. Revisa los precios unitarios sugeridos:
+                  </Text>
+                </View>
+                <TouchableOpacity
+                  style={styles.closeSubModalBtn}
+                  onPress={() => {
+                    if (!isApplyingPriceSuggestions) setPriceSuggestionModalVisible(false);
+                  }}
+                >
+                  <X size={20} color={ui.textSecondary} />
+                </TouchableOpacity>
+              </View>
+
+              <ScrollView style={styles.subModalBody} keyboardShouldPersistTaps="handled">
+                {priceSuggestionItems.map((entry, idx) => {
+                  const { change } = entry;
+                  const parsedUnit = roundToCents(parseFloat(entry.unitPriceInput) || 0);
+                  const costRose = change.newCost > change.previousCost;
+                  const previewPres = Array.isArray(change.presentations)
+                    ? suggestedPresentationPrices(change.presentations, parsedUnit, {
+                        previousUnitPrice: change.suggestedPrice,
+                        costRose,
+                      })
+                    : [];
+
+                  return (
+                    <View key={change.productId} style={styles.receiveItemCard}>
+                      <View style={{ flex: 1 }}>
+                        <TouchableOpacity
+                          style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 4 }}
+                          onPress={() =>
+                            setPriceSuggestionItems((prev) =>
+                              prev.map((item, i) =>
+                                i === idx ? { ...item, selected: !item.selected } : item
+                              )
+                            )
+                          }
+                        >
+                          <View
+                            style={[
+                              styles.suggestionCheck,
+                              entry.selected && styles.suggestionCheckActive,
+                            ]}
+                          >
+                            {entry.selected && <Check size={12} color={ui.surface} />}
+                          </View>
+                          <Text style={styles.orderItemName}>{change.productName}</Text>
+                        </TouchableOpacity>
+
+                        <Text style={styles.orderItemDetails}>
+                          Costo CPP: {formatPEN(change.previousCost)} → {formatPEN(change.newCost)}
+                        </Text>
+                        <Text style={styles.orderItemDetails}>
+                          Venta actual: {formatPEN(change.suggestedPrice || 0)}
+                          {change.minSalePrice ? ` • Piso: ${formatPEN(change.minSalePrice)}` : ''}
+                        </Text>
+
+                        {previewPres.length > 0 && (
+                          <Text style={styles.packagingHintText}>
+                            Presentaciones:{' '}
+                            {previewPres
+                              .map((p) => `${p.name}: ${formatPEN(p.price)}`)
+                              .join(' • ')}
+                          </Text>
+                        )}
+                      </View>
+
+                      <View style={{ width: 96 }}>
+                        <Text style={styles.inputMiniLabel}>Nuevo S/</Text>
+                        <TextInput
+                          style={styles.inputMini}
+                          keyboardType="numeric"
+                          value={entry.unitPriceInput}
+                          onChangeText={(txt) =>
+                            setPriceSuggestionItems((prev) =>
+                              prev.map((item, i) =>
+                                i === idx ? { ...item, unitPriceInput: txt, selected: true } : item
+                              )
+                            )
+                          }
+                        />
+                      </View>
+                    </View>
+                  );
+                })}
+              </ScrollView>
+
+              <View style={styles.subModalFooter}>
+                <TouchableOpacity
+                  style={styles.subModalCancelBtn}
+                  onPress={() => setPriceSuggestionModalVisible(false)}
+                  disabled={isApplyingPriceSuggestions}
+                >
+                  <Text style={styles.subModalCancelBtnText}>Mantener Actuales</Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={[styles.saveSupplierSubmitBtn, isApplyingPriceSuggestions && styles.btnDisabled]}
+                  onPress={handleApplySuggestedPrices}
+                  disabled={isApplyingPriceSuggestions}
+                >
+                  {isApplyingPriceSuggestions ? (
+                    <ActivityIndicator size="small" color={ui.surface} />
+                  ) : (
+                    <>
+                      <Check size={18} color={ui.surface} />
+                      <Text style={styles.saveSupplierSubmitBtnText}>Aplicar Precios</Text>
+                    </>
+                  )}
+                </TouchableOpacity>
+              </View>
+            </View>
+          </KeyboardAvoidingView>
+        </Modal>
       </SafeAreaView>
     </Modal>
   );
@@ -1952,6 +2447,9 @@ const styles = StyleSheet.create({
   statusBadgePending: {
     backgroundColor: ui.warningSoft,
   },
+  statusBadgePartial: {
+    backgroundColor: ui.primarySoft,
+  },
   statusBadgeReceived: {
     backgroundColor: ui.successSoft,
   },
@@ -1964,6 +2462,9 @@ const styles = StyleSheet.create({
   },
   statusBadgeTextPending: {
     color: ui.warning,
+  },
+  statusBadgeTextPartial: {
+    color: ui.primary,
   },
   statusBadgeTextReceived: {
     color: ui.success,
@@ -2699,6 +3200,63 @@ const styles = StyleSheet.create({
   },
   btnDisabled: {
     opacity: 0.5,
+  },
+  packagingChipsRow: {
+    flexDirection: 'row',
+    gap: 8,
+    paddingVertical: 2,
+  },
+  packagingChip: {
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: 8,
+    backgroundColor: ui.surfaceMuted,
+    borderWidth: 1,
+    borderColor: ui.border,
+  },
+  packagingChipActive: {
+    backgroundColor: ui.primarySoft,
+    borderColor: ui.primary,
+  },
+  packagingChipText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: ui.textSecondary,
+  },
+  packagingChipTextActive: {
+    color: ui.primary,
+    fontWeight: '700',
+  },
+  packagingHintText: {
+    fontSize: 11,
+    color: ui.primary,
+    fontWeight: '600',
+    marginTop: 6,
+  },
+  receiveItemCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    padding: 12,
+    marginBottom: 10,
+    backgroundColor: ui.surface,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: ui.border,
+  },
+  suggestionCheck: {
+    width: 18,
+    height: 18,
+    borderRadius: 5,
+    borderWidth: 1,
+    borderColor: ui.border,
+    backgroundColor: ui.surface,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  suggestionCheckActive: {
+    backgroundColor: ui.primary,
+    borderColor: ui.primary,
   },
 });
 

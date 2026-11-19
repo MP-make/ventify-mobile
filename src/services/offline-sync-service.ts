@@ -144,11 +144,19 @@ export const classifySyncError = (
     };
   }
 
-  // Precios mínimos o reglas de margen
+  // Precios mínimos, reglas de margen o discrepancia de total comercial
   if (
     lower.includes('precio mínimo') ||
     lower.includes('precio no permitido') ||
-    lower.includes('min price')
+    lower.includes('min price') ||
+    lower.includes('modificar precios') ||
+    lower.includes('total no coincide') ||
+    lower.includes('presentación ya no está disponible') ||
+    lower.includes('factor de stock') ||
+    lower.includes('ruc válido') ||
+    lower.includes('venta incompatible') ||
+    lower.includes('créditos suficientes') ||
+    lower.includes('límite de crédito')
   ) {
     return {
       category: 'price_rejected',
@@ -162,6 +170,8 @@ export const classifySyncError = (
     lower.includes('sesión de caja') ||
     lower.includes('sesion de caja') ||
     lower.includes('caja abierta') ||
+    lower.includes('caja cerrada') ||
+    lower.includes('abre tu caja') ||
     lower.includes('cash session')
   ) {
     return {
@@ -176,7 +186,8 @@ export const classifySyncError = (
     lower.includes('permission-denied') ||
     lower.includes('permiso') ||
     lower.includes('unauthenticated') ||
-    lower.includes('no autorizado')
+    lower.includes('no autorizado') ||
+    lower.includes('atribución por vendedor')
   ) {
     return {
       category: 'permission_denied',
@@ -190,6 +201,7 @@ export const classifySyncError = (
     lower.includes('network') ||
     lower.includes('fetch') ||
     lower.includes('timeout') ||
+    lower.includes('abort') ||
     lower.includes('unavailable') ||
     lower.includes('failed-precondition') ||
     lower.includes('deadline-exceeded') ||
@@ -327,7 +339,7 @@ class OfflineSyncService {
 
       // Disparar procesamiento si hay internet
       const net = await NetInfo.fetch();
-      if (net.isConnected) {
+      if (net.isConnected && net.isInternetReachable !== false) {
         this.processOfflineQueue().catch((e) =>
           console.warn('[OfflineSync] Error in background retry trigger:', e)
         );
@@ -370,7 +382,7 @@ class OfflineSyncService {
 
     // 1. Verificar estado de red
     const netState = await NetInfo.fetch();
-    if (!netState.isConnected) {
+    if (!netState.isConnected || netState.isInternetReachable === false) {
       console.log('[OfflineSync] Sin conexión a internet. Omitiendo sincronización.');
       return summary;
     }

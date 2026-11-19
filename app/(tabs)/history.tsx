@@ -52,6 +52,7 @@ import {
 } from 'lucide-react-native';
 import { CameraView, useCameraPermissions, BarcodeScanningResult } from 'expo-camera';
 import * as Haptics from 'expo-haptics';
+import { type Href, useRouter } from 'expo-router';
 
 import { useAuth } from '@/context/AuthContext';
 import { useSettings } from '@/context/SettingsContext';
@@ -59,6 +60,8 @@ import { usePermissions } from '@/hooks/usePermissions';
 import { Header } from '@/components/Header';
 import { ui, theme, formatPEN, formatDatePE } from '@/lib/theme';
 import { ScreenHeading, SectionHeading } from '@/components/ui';
+import { apiRequest } from '@/lib/api-client';
+import { parseNormalizedDecimal } from '@/lib/product-search';
 import { db } from '@/lib/firebase';
 import {
   collection,
@@ -80,13 +83,24 @@ import {
   completeOrCancelReservation,
 } from '@/services/crm-operations-service';
 import { getHistoryDateBounds, toEpochMillis } from '@/services/crm-compat';
+import {
+  emitEinvoiceDocument,
+  fetchEinvoices,
+  retryEinvoiceDocument,
+  type PublicEinvoice,
+} from '@/services/dashboard-reports-service';
 
 import {
   buildSaleReceiptEscPos,
+  getPrinterConfig,
   printRawEscPos,
   printTicketPDF,
   shareTicketWhatsApp,
 } from '@/services/thermal-printer-service';
+import { resolveReceiptDocumentMeta } from '@/lib/printing/escpos-builder';
+import { ReceiptTicketPreview } from '@/components/ReceiptTicketPreview';
+import { receiptAmountsForSale } from '@/lib/invoicing/receipt-amounts';
+import { EinvoiceActionsModal } from '@/components/EinvoiceActionsModal';
 import { FinancialPnlModal } from '@/components/FinancialPnlModal';
 import { ReservationReceiptModal } from '@/components/ReservationReceiptModal';
 import { ReservationCancellationModal } from '@/components/ReservationCancellationModal';
@@ -108,7 +122,6 @@ interface DocBadgeProps {
 }
 
 const DocBadge = React.memo<DocBadgeProps>(({ sale }) => {
-  const typeStr = String(sale.documentType || '').toLowerCase();
   const isCancelled = sale.status === 'cancelled';
 
   if (isCancelled) {
@@ -121,7 +134,8 @@ const DocBadge = React.memo<DocBadgeProps>(({ sale }) => {
     );
   }
 
-  if (typeStr.includes('factura') || typeStr === '01') {
+  const meta = resolveReceiptDocumentMeta(sale);
+  if (meta.isFacturaAccepted) {
     return (
       <View style={[styles.badge, { backgroundColor: ui.accentSoft }]}>
         <Text style={[styles.badgeText, { color: ui.accent }]}>FACTURA</Text>
@@ -129,10 +143,34 @@ const DocBadge = React.memo<DocBadgeProps>(({ sale }) => {
     );
   }
 
-  if (typeStr.includes('boleta') || typeStr === '03') {
+  if (meta.isBoletaDoc) {
     return (
       <View style={[styles.badge, { backgroundColor: ui.primarySoft }]}>
         <Text style={[styles.badgeText, { color: ui.primary }]}>BOLETA</Text>
+      </View>
+    );
+  }
+
+  if (meta.isCreditNote) {
+    return (
+      <View style={[styles.badge, { backgroundColor: ui.warningSoft }]}>
+        <Text style={[styles.badgeText, { color: ui.warning }]}>NOTA CRÉDITO</Text>
+      </View>
+    );
+  }
+
+  if (meta.isDebitNote) {
+    return (
+      <View style={[styles.badge, { backgroundColor: ui.warningSoft }]}>
+        <Text style={[styles.badgeText, { color: ui.warning }]}>NOTA DÉBITO</Text>
+      </View>
+    );
+  }
+
+  if (meta.isQuote) {
+    return (
+      <View style={[styles.badge, { backgroundColor: ui.surfaceMuted }]}>
+        <Text style={[styles.badgeText, { color: ui.textSecondary }]}>COTIZACIÓN</Text>
       </View>
     );
   }
@@ -184,8 +222,8 @@ interface SaleCardItemProps {
 
 const SaleCardItem = React.memo<SaleCardItemProps>(({ sale, onPress }) => {
   const isCancelled = sale.status === 'cancelled';
-  const docNumber =
-    sale.documentNumber || `V-${String(sale.saleNumber || 1).padStart(6, '0')}`;
+  const docMeta = resolveReceiptDocumentMeta(sale);
+  const docNumber = docMeta.docNumber;
 
   return (
     <TouchableOpacity
@@ -213,7 +251,7 @@ const SaleCardItem = React.memo<SaleCardItemProps>(({ sale, onPress }) => {
             {formatPEN(sale.total)}
           </Text>
           <Text style={styles.salePaymentMethod}>
-            {(sale.paymentMethod || 'Efectivo').toUpperCase()}
+            {((sale as any).paymentMethodName || sale.paymentMethod || 'Efectivo').toUpperCase()}
           </Text>
         </View>
       </View>
@@ -231,16 +269,61 @@ const SaleCardItem = React.memo<SaleCardItemProps>(({ sale, onPress }) => {
 
 export default function HistoryScreen() {
   const insets = useSafeAreaInsets();
+  const router = useRouter();
   const { user, userProfile, accountId, branchId, role } = useAuth();
-  const { canViewReports, canProcessReturn } = usePermissions();
+  const { canViewReports, canProcessReturn, canCreateCreditNotes } = usePermissions();
   const {
     businessSettings,
+    businessData,
     activeBranch,
+    branches,
     isCashOpen,
     activeCashSession,
     refreshCashStatus,
     posSettings,
+    invoicingEnabled,
+    taxProfile,
+    emitterInfo,
   } = useSettings();
+
+  const receiptBusiness = useMemo(
+    () => ({
+      ...(businessData || {}),
+      ...(businessSettings || {}),
+      ...(emitterInfo || {}),
+      printedFormatResolution: emitterInfo?.printedFormatResolution || undefined,
+      businessName:
+        emitterInfo?.nombreComercial ||
+        emitterInfo?.razonSocial ||
+        businessSettings?.businessName ||
+        businessData?.businessName ||
+        'VENTIFY',
+      ruc: emitterInfo?.ruc || businessSettings?.ruc || businessData?.ruc || '',
+      address:
+        (businessSettings as any)?.commercialAddress ||
+        businessSettings?.address ||
+        activeBranch?.address ||
+        '',
+      phone:
+        activeBranch?.phone ||
+        (businessSettings as any)?.commercialPhone ||
+        businessSettings?.phone ||
+        '',
+      consultUrl:
+        (businessSettings as any)?.consultUrl ||
+        (businessData as any)?.consultUrl ||
+        'https://ventify.com.pe/comprobantes',
+    }),
+    [businessData, businessSettings, emitterInfo, activeBranch]
+  );
+
+  const resolveSaleBranch = useCallback(
+    (sale?: Sale | null) => {
+      if (!sale?.branchId) return activeBranch || null;
+      return branches?.find((b) => b.id === sale.branchId) || activeBranch || null;
+    },
+    [branches, activeBranch]
+  );
 
   const [activeTab, setActiveTab] = useState<HistoryTab>('sales');
   const [pnlModalOpen, setPnlModalOpen] = useState<boolean>(false);
@@ -269,6 +352,28 @@ export default function HistoryScreen() {
   // Modal de Detalle de Comprobante
   const [selectedSale, setSelectedSale] = useState<Sale | null>(null);
   const [saleDetailModalVisible, setSaleDetailModalVisible] = useState<boolean>(false);
+  const [detailViewMode, setDetailViewMode] = useState<'ticket' | 'summary'>('ticket');
+  const [detailPaperWidth, setDetailPaperWidth] = useState<58 | 80>(80);
+
+  // Gestión SUNAT (NC / ND / Sustituto / Consultar / Reintentar / XML-CDR)
+  const [einvoiceModalVisible, setEinvoiceModalVisible] = useState<boolean>(false);
+  const [activeEinvoice, setActiveEinvoice] = useState<PublicEinvoice | null>(null);
+  const [allAccountEinvoices, setAllAccountEinvoices] = useState<PublicEinvoice[]>([]);
+  const [loadingSunatAction, setLoadingSunatAction] = useState<boolean>(false);
+
+  useEffect(() => {
+    let active = true;
+    getPrinterConfig()
+      .then((cfg) => {
+        if (active && (cfg?.paperWidth === 58 || cfg?.paperWidth === 80)) {
+          setDetailPaperWidth(cfg.paperWidth);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, []);
 
   // Modal de Anulación
   const [cancelModalVisible, setCancelModalVisible] = useState<boolean>(false);
@@ -616,7 +721,7 @@ export default function HistoryScreen() {
             collection(db, 'reservations'),
             where('accountId', '==', accountId),
             where('branchId', '==', branchId),
-            orderBy('createdAt', 'desc'),
+            orderBy('date', 'desc'),
             limit(50)
           )
         : query(
@@ -636,8 +741,8 @@ export default function HistoryScreen() {
           });
           if (!useOrderedQuery) {
             list.sort((a, b) => {
-              const tA = a.createdAt?.toMillis ? a.createdAt.toMillis() : (a.createdAt || 0);
-              const tB = b.createdAt?.toMillis ? b.createdAt.toMillis() : (b.createdAt || 0);
+              const tA = toEpochMillis(a.date || a.createdAt);
+              const tB = toEpochMillis(b.date || b.createdAt);
               return tB - tA;
             });
           }
@@ -691,7 +796,15 @@ export default function HistoryScreen() {
         const docTypeStr = String(sale.documentType || '').toLowerCase();
         if (docFilter === 'factura' && !docTypeStr.includes('factura') && docTypeStr !== '01') return false;
         if (docFilter === 'boleta' && !docTypeStr.includes('boleta') && docTypeStr !== '03') return false;
-        if (docFilter === 'nota_venta' && docTypeStr.includes('factura') && docTypeStr.includes('boleta')) return false;
+        if (
+          docFilter === 'nota_venta' &&
+          (docTypeStr.includes('factura') ||
+            docTypeStr === '01' ||
+            docTypeStr.includes('boleta') ||
+            docTypeStr === '03')
+        ) {
+          return false;
+        }
       }
 
       // 3. Filtro por Búsqueda
@@ -798,22 +911,47 @@ export default function HistoryScreen() {
   const handlePrintSale = async (sale: Sale) => {
     setIsPrinting(true);
     try {
-      const bytes = buildSaleReceiptEscPos(
-        sale,
-        { ...businessSettings, ...activeBranch },
-        { autoCut: true, openDrawer: false }
-      );
+      const cfg = await getPrinterConfig();
+      const saleBranch = resolveSaleBranch(sale);
+      const effectivePaperWidth: 58 | 80 =
+        detailPaperWidth || (cfg.paperWidth === 58 ? 58 : 80);
+      const docMeta = resolveReceiptDocumentMeta(sale);
+      const printOptions = {
+        paperWidth: effectivePaperWidth,
+        autoCut: cfg.autoCut !== false,
+        openDrawer: false,
+        branch: saleBranch,
+        taxProfile,
+        consultUrl: receiptBusiness.consultUrl,
+        receiptFooter:
+          posSettings?.ticketFooterMessage ||
+          businessSettings?.receiptFooter ||
+          '¡Gracias por su compra!',
+      };
 
-      const success = await printRawEscPos(bytes);
-      if (!success) {
-        // Fallback a impresión nativa PDF
-        await printTicketPDF({
-          title: `Ticket_${sale.documentNumber || sale.id}`,
-          sale,
-          business: { ...businessSettings, ...activeBranch },
-        });
+      let printedViaBluetooth = false;
+      if (cfg.connectionType === 'bluetooth' && cfg.selectedDevice?.address) {
+        const bytes = buildSaleReceiptEscPos(sale, receiptBusiness, printOptions);
+        printedViaBluetooth = await printRawEscPos(bytes, cfg.selectedDevice.address);
       }
-      Alert.alert('Ticket Enviado', 'El comprobante ha sido enviado a la impresora.');
+
+      if (!printedViaBluetooth) {
+        await printTicketPDF(
+          {
+            title: `Ticket_${docMeta.docNumber || sale.id}`,
+            sale,
+            business: receiptBusiness,
+            options: printOptions,
+          },
+          printOptions
+        );
+      }
+      Alert.alert(
+        printedViaBluetooth ? 'Ticket Impreso' : 'Ticket Generado',
+        printedViaBluetooth
+          ? 'El comprobante ha sido enviado a la impresora Bluetooth.'
+          : 'No hay impresora Bluetooth conectada; se generó el ticket en PDF para imprimir.'
+      );
     } catch (err: any) {
       Alert.alert('Error de Impresión', err?.message || 'No se pudo emitir el ticket.');
     } finally {
@@ -825,13 +963,197 @@ export default function HistoryScreen() {
     setIsSharing(true);
     try {
       const phone = sale.customerPhone || '';
-      await shareTicketWhatsApp(sale, { ...businessSettings, ...activeBranch }, phone);
+      const saleBranch = resolveSaleBranch(sale);
+      const shareConfig = {
+        phone,
+        paperWidth: detailPaperWidth,
+        branch: saleBranch,
+        taxProfile,
+        consultUrl: receiptBusiness.consultUrl,
+        receiptFooter:
+          posSettings?.ticketFooterMessage ||
+          businessSettings?.receiptFooter ||
+          '¡Gracias por su compra!',
+      };
+      await shareTicketWhatsApp(
+        {
+          sale,
+          business: receiptBusiness,
+          options: shareConfig,
+        },
+        receiptBusiness,
+        shareConfig
+      );
     } catch (err: any) {
       Alert.alert('Error al Compartir', err?.message || 'No se pudo generar el documento PDF.');
     } finally {
       setIsSharing(false);
     }
   };
+
+  const applyEinvoiceToSalesState = useCallback((saleId: string, einvoice: PublicEinvoice | null) => {
+    if (!einvoice) return;
+    const patch = (s: Sale): Sale =>
+      s.id !== saleId
+        ? s
+        : ({
+            ...s,
+            sunatStatus: einvoice.status as Sale['sunatStatus'],
+            documentNumber: einvoice.documentNumber || s.documentNumber,
+            cdrDescription: einvoice.cdr?.description || (s as any).cdrDescription,
+            sunatHash: (einvoice as any).sunatHash || (s as any).sunatHash,
+          } as Sale);
+    setSales((prev) => prev.map(patch));
+    setSelectedSale((prev) => (prev && prev.id === saleId ? patch(prev) : prev));
+  }, []);
+
+  const fetchSaleEinvoice = useCallback(
+    async (saleId: string): Promise<PublicEinvoice | null> => {
+      if (!accountId) return null;
+      const res = await apiRequest<{ success: boolean; einvoice: PublicEinvoice | null }>(
+        `/api/invoicing/status?accountId=${encodeURIComponent(accountId)}&saleId=${encodeURIComponent(saleId)}`,
+        { timeoutMs: 45000 }
+      );
+      return res?.einvoice || null;
+    },
+    [accountId]
+  );
+
+  const refreshSelectedSaleSunat = useCallback(
+    async (sale: Sale): Promise<PublicEinvoice | null> => {
+      const einvoice = await fetchSaleEinvoice(sale.id);
+      applyEinvoiceToSalesState(sale.id, einvoice);
+      if (einvoice) {
+        setActiveEinvoice(einvoice);
+      }
+      return einvoice;
+    },
+    [fetchSaleEinvoice, applyEinvoiceToSalesState]
+  );
+
+  const handleEmitMissingSunat = useCallback(
+    async (sale: Sale) => {
+      if (!accountId) return;
+      const meta = resolveReceiptDocumentMeta(sale);
+      const docType: '01' | '03' = meta.isFacturaDoc ? '01' : '03';
+      const cleanRuc = String(sale.customerRuc || sale.receiptCustomer?.identityNumber || '').trim();
+      const cleanDni = String(sale.customerDni || sale.receiptCustomer?.identityNumber || '').trim();
+      if (docType === '01' && !/^\d{11}$/.test(cleanRuc)) {
+        Alert.alert(
+          'RUC requerido',
+          'Esta venta no tiene un RUC válido de 11 dígitos. Puedes revisarlo en el módulo de Facturación.'
+        );
+        return;
+      }
+      setLoadingSunatAction(true);
+      try {
+        const customerPayload =
+          docType === '01'
+            ? {
+                identityType: '6' as const,
+                identityNumber: cleanRuc,
+                name: sale.customerName || 'Cliente',
+              }
+            : /^\d{8}$/.test(cleanDni)
+              ? {
+                  identityType: '1' as const,
+                  identityNumber: cleanDni,
+                  name: sale.customerName || 'Cliente',
+                }
+              : undefined;
+
+        const emitted = await emitEinvoiceDocument({
+          accountId,
+          saleId: sale.id,
+          documentType: docType,
+          customer: customerPayload,
+        });
+        applyEinvoiceToSalesState(sale.id, emitted);
+        setActiveEinvoice(emitted);
+        setEinvoiceModalVisible(true);
+      } catch (err: any) {
+        Alert.alert('Error SUNAT', err?.message || 'No se pudo emitir el comprobante.');
+      } finally {
+        setLoadingSunatAction(false);
+      }
+    },
+    [accountId, applyEinvoiceToSalesState]
+  );
+
+  const handleOpenSunatActions = useCallback(
+    async (sale: Sale) => {
+      if (!accountId) return;
+      setLoadingSunatAction(true);
+      try {
+        const [einvoice, allDocs] = await Promise.all([
+          refreshSelectedSaleSunat(sale),
+          fetchEinvoices(accountId, { branchId: sale.branchId || branchId || undefined }).catch(() => []),
+        ]);
+        if (einvoice) {
+          setActiveEinvoice(einvoice);
+          setAllAccountEinvoices(allDocs);
+          setEinvoiceModalVisible(true);
+          return;
+        }
+        Alert.alert(
+          'Sin registro SUNAT',
+          'Este comprobante aún no fue enviado a SUNAT. ¿Deseas emitirlo ahora o ir al módulo de Facturación?',
+          [
+            { text: 'Cancelar', style: 'cancel' },
+            {
+              text: 'Ir a Facturación',
+              onPress: () => {
+                setSaleDetailModalVisible(false);
+                router.push('/facturacion' as Href);
+              },
+            },
+            {
+              text: 'Emitir ahora',
+              onPress: () => void handleEmitMissingSunat(sale),
+            },
+          ]
+        );
+      } catch (err: any) {
+        Alert.alert('Error SUNAT', err?.message || 'No se pudo consultar el estado en SUNAT.');
+      } finally {
+        setLoadingSunatAction(false);
+      }
+    },
+    [accountId, branchId, refreshSelectedSaleSunat, router, handleEmitMissingSunat]
+  );
+
+  const handleQuickConsultOrRetrySunat = useCallback(
+    async (sale: Sale) => {
+      if (!accountId) return;
+      setLoadingSunatAction(true);
+      try {
+        const existing = await refreshSelectedSaleSunat(sale);
+        if (!existing) {
+          await handleEmitMissingSunat(sale);
+          return;
+        }
+        if (existing.status === 'accepted') {
+          Alert.alert(
+            'SUNAT Aceptado',
+            `${existing.documentNumber || 'Comprobante'} ya fue aceptado por SUNAT.`
+          );
+          return;
+        }
+        const retried = await retryEinvoiceDocument(accountId, existing.id);
+        applyEinvoiceToSalesState(sale.id, retried);
+        setActiveEinvoice(retried);
+        Alert.alert(
+          retried.status === 'accepted' ? 'Comprobante Aceptado' : 'Estado Actualizado',
+          retried.cdr?.description || retried.lastError || `Estado actual: ${retried.status}`
+        );
+      } catch (err: any) {
+        Alert.alert('Error SUNAT', err?.message || 'No se pudo consultar o reintentar el envío.');
+      } finally {
+        setLoadingSunatAction(false);
+      }
+    },
+    [accountId, refreshSelectedSaleSunat, handleEmitMissingSunat, applyEinvoiceToSalesState]
+  );
 
   const handleConfirmCancelSale = async () => {
     if (!selectedSale) return;
@@ -1010,16 +1332,31 @@ export default function HistoryScreen() {
         <Text style={styles.compactHeaderTitle}>
           {activeTab === 'sales' ? 'Ventas' : activeTab === 'reservations' ? 'Reservas' : 'Venty IA'}
         </Text>
-        {activeTab === 'sales' && canViewReports ? (
-          <TouchableOpacity
-            style={styles.compactPnlButton}
-            onPress={() => setPnlModalOpen(true)}
-            accessibilityRole="button"
-            accessibilityLabel="Abrir estado de resultados"
-          >
-            <TrendingUp size={15} color={ui.primary} />
-            <Text style={styles.compactPnlButtonText}>Estado de resultados</Text>
-          </TouchableOpacity>
+        {activeTab === 'sales' ? (
+          <View style={styles.compactHeaderActions}>
+            {(canViewReports || canCreateCreditNotes || ['owner', 'admin', 'manager'].includes(role || '')) && (
+              <TouchableOpacity
+                style={styles.compactSunatButton}
+                onPress={() => router.push('/facturacion' as Href)}
+                accessibilityRole="button"
+                accessibilityLabel="Ir a Facturación Electrónica SUNAT"
+              >
+                <FileText size={14} color={ui.primary} />
+                <Text style={styles.compactSunatButtonText}>Facturación</Text>
+              </TouchableOpacity>
+            )}
+            {canViewReports && (
+              <TouchableOpacity
+                style={styles.compactPnlButton}
+                onPress={() => setPnlModalOpen(true)}
+                accessibilityRole="button"
+                accessibilityLabel="Abrir estado de resultados"
+              >
+                <TrendingUp size={15} color={ui.primary} />
+                <Text style={styles.compactPnlButtonText}>Estado de resultados</Text>
+              </TouchableOpacity>
+            )}
+          </View>
         ) : null}
       </View>
 
@@ -1683,18 +2020,25 @@ export default function HistoryScreen() {
       {/* MODAL: DETALLE DEL COMPROBANTE Y ACCIONES */}
       {/* ==================================================================== */}
       {saleDetailModalVisible && (
-        <Modal visible={saleDetailModalVisible} transparent animationType="slide">
+        <Modal
+          visible={saleDetailModalVisible}
+          transparent
+          animationType="slide"
+          onRequestClose={() => setSaleDetailModalVisible(false)}
+        >
         <View style={styles.modalOverlay}>
           <View style={[styles.modalContent, { maxHeight: '90%' }]}>
-            {selectedSale && (
+            {selectedSale && (() => {
+              const detailMeta = resolveReceiptDocumentMeta(selectedSale);
+              return (
               <>
                 <View style={styles.modalHeader}>
                   <View>
                     <Text style={styles.modalTitle}>
-                      {selectedSale.documentType === 'factura' ? 'Factura Electrónica' : selectedSale.documentType === 'boleta' ? 'Boleta de Venta' : 'Nota de Venta'}
+                      {detailMeta.displayTitle}
                     </Text>
                     <Text style={styles.modalSub}>
-                      {selectedSale.documentNumber || `V-${String(selectedSale.saleNumber || 1).padStart(6, '0')}`}
+                      {detailMeta.docNumber}
                     </Text>
                   </View>
                   <TouchableOpacity
@@ -1712,92 +2056,243 @@ export default function HistoryScreen() {
                   keyboardShouldPersistTaps="handled"
                   keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
                 >
-                  {/* Datos del Cliente */}
-                  <View style={styles.detailSection}>
-                    <Text style={styles.detailSectionTitle}>DATOS DEL COMPROBANTE</Text>
-                    <View style={styles.detailRow}>
-                      <Text style={styles.detailLabel}>Fecha y Hora:</Text>
-                      <Text style={styles.detailValue}>{formatDatePE(selectedSale.date)}</Text>
+                  <View style={styles.detailSwitchRow}>
+                    <View style={styles.detailSegmentGroup}>
+                      {([
+                        { id: 'ticket', label: 'Ticket' },
+                        { id: 'summary', label: 'Detalle' },
+                      ] as const).map((tabOpt) => {
+                        const active = detailViewMode === tabOpt.id;
+                        return (
+                          <TouchableOpacity
+                            key={tabOpt.id}
+                            style={[styles.detailSegmentBtn, active && styles.detailSegmentBtnActive]}
+                            onPress={() => setDetailViewMode(tabOpt.id)}
+                          >
+                            <Text style={[styles.detailSegmentText, active && styles.detailSegmentTextActive]}>
+                              {tabOpt.label}
+                            </Text>
+                          </TouchableOpacity>
+                        );
+                      })}
                     </View>
-                    <View style={styles.detailRow}>
-                      <Text style={styles.detailLabel}>Cliente:</Text>
-                      <Text style={styles.detailValue}>
-                        {selectedSale.customerName || 'Cliente General'}
-                      </Text>
-                    </View>
-                    {selectedSale.customerRuc && (
-                      <View style={styles.detailRow}>
-                        <Text style={styles.detailLabel}>RUC:</Text>
-                        <Text style={styles.detailValue}>{selectedSale.customerRuc}</Text>
+
+                    {detailViewMode === 'ticket' ? (
+                      <View style={styles.detailPaperGroup}>
+                        {([80, 58] as const).map((width) => {
+                          const active = detailPaperWidth === width;
+                          return (
+                            <TouchableOpacity
+                              key={width}
+                              style={[styles.detailPaperChip, active && styles.detailPaperChipActive]}
+                              onPress={() => setDetailPaperWidth(width)}
+                            >
+                              <Text style={[styles.detailPaperText, active && styles.detailPaperTextActive]}>
+                                {width}mm
+                              </Text>
+                            </TouchableOpacity>
+                          );
+                        })}
                       </View>
-                    )}
-                    {selectedSale.customerDni && (
-                      <View style={styles.detailRow}>
-                        <Text style={styles.detailLabel}>DNI:</Text>
-                        <Text style={styles.detailValue}>{selectedSale.customerDni}</Text>
-                      </View>
-                    )}
-                    <View style={styles.detailRow}>
-                      <Text style={styles.detailLabel}>Forma de Pago:</Text>
-                      <Text style={styles.detailValue}>
-                        {(selectedSale.paymentMethod || 'Efectivo').toUpperCase()}
-                      </Text>
-                    </View>
+                    ) : null}
                   </View>
 
-                  {/* Ítems Vendidos */}
-                  <View style={styles.detailSection}>
-                    <Text style={styles.detailSectionTitle}>ÍTEMS VENDIDOS</Text>
-                    {selectedSale.items?.map((it, idx) => (
-                      <View key={idx} style={styles.itemRow}>
-                        <View style={{ flex: 1 }}>
-                          <Text style={styles.itemName}>{it.name}</Text>
-                          <Text style={styles.itemSub}>
-                            {it.quantity} x {formatPEN(it.price)}
+                  {detailViewMode === 'ticket' ? (
+                    <View style={{ alignItems: 'center', marginBottom: 14 }}>
+                      <ReceiptTicketPreview
+                        sale={selectedSale}
+                        business={receiptBusiness}
+                        branch={resolveSaleBranch(selectedSale)}
+                        taxProfile={taxProfile}
+                        receiptFooter={
+                          posSettings?.ticketFooterMessage ||
+                          businessSettings?.receiptFooter ||
+                          '¡Gracias por su compra!'
+                        }
+                        paperWidth={detailPaperWidth}
+                      />
+                    </View>
+                  ) : (
+                    <>
+                      {/* Datos del Cliente */}
+                      <View style={styles.detailSection}>
+                        <Text style={styles.detailSectionTitle}>DATOS DEL COMPROBANTE</Text>
+                        <View style={styles.detailRow}>
+                          <Text style={styles.detailLabel}>Fecha y Hora:</Text>
+                          <Text style={styles.detailValue}>{formatDatePE(selectedSale.date)}</Text>
+                        </View>
+                        <View style={styles.detailRow}>
+                          <Text style={styles.detailLabel}>Cliente:</Text>
+                          <Text style={styles.detailValue}>
+                            {selectedSale.customerName || 'Cliente General'}
                           </Text>
                         </View>
-                        <Text style={styles.itemTotal}>
-                          {formatPEN((it.lineTotal ?? it.quantity * it.price) || 0)}
-                        </Text>
+                        {selectedSale.customerRuc && (
+                          <View style={styles.detailRow}>
+                            <Text style={styles.detailLabel}>RUC:</Text>
+                            <Text style={styles.detailValue}>{selectedSale.customerRuc}</Text>
+                          </View>
+                        )}
+                        {selectedSale.customerDni && (
+                          <View style={styles.detailRow}>
+                            <Text style={styles.detailLabel}>DNI:</Text>
+                            <Text style={styles.detailValue}>{selectedSale.customerDni}</Text>
+                          </View>
+                        )}
+                        <View style={styles.detailRow}>
+                          <Text style={styles.detailLabel}>Forma de Pago:</Text>
+                          <Text style={styles.detailValue}>
+                            {((selectedSale as any).paymentMethodName || selectedSale.paymentMethod || 'Efectivo').toUpperCase()}
+                          </Text>
+                        </View>
                       </View>
-                    ))}
-                  </View>
 
-                  {/* Desglose Tributario */}
-                  <View style={styles.detailSection}>
-                    <View style={styles.detailRow}>
-                      <Text style={styles.detailLabel}>Op. Gravada:</Text>
-                      <Text style={styles.detailValue}>
-                        {formatPEN(selectedSale.fiscalAmounts?.taxed || selectedSale.subtotal || selectedSale.total / 1.18)}
-                      </Text>
-                    </View>
-                    <View style={styles.detailRow}>
-                      <Text style={styles.detailLabel}>IGV (18%):</Text>
-                      <Text style={styles.detailValue}>
-                        {formatPEN(selectedSale.fiscalAmounts?.igv || selectedSale.tax || selectedSale.total - (selectedSale.total / 1.18))}
-                      </Text>
-                    </View>
-                    <View style={[styles.detailRow, { borderTopWidth: 1, borderTopColor: ui.border, paddingTop: 6 }]}>
-                      <Text style={[styles.detailLabel, { fontWeight: 'bold', fontSize: 16, color: ui.text }]}>
-                        TOTAL:
-                      </Text>
-                      <Text style={[styles.detailValue, { fontWeight: 'bold', fontSize: 18, color: ui.primary }]}>
-                        {formatPEN(selectedSale.total)}
-                      </Text>
-                    </View>
-                  </View>
-
-                  {/* Estado SUNAT / CDR */}
-                  {selectedSale.sunatStatus && (
-                    <View style={styles.detailSection}>
-                      <Text style={styles.detailSectionTitle}>ESTADO TRIBUTARIO SUNAT</Text>
-                      <View style={styles.detailRow}>
-                        <Text style={styles.detailLabel}>Respuesta CDR:</Text>
-                        <Text style={[styles.detailValue, { color: ui.primary, fontWeight: 'bold' }]}>
-                          {selectedSale.sunatStatus === 'accepted' ? 'Comprobante Aceptado' : selectedSale.sunatStatus}
-                        </Text>
+                      {/* Ítems Vendidos */}
+                      <View style={styles.detailSection}>
+                        <Text style={styles.detailSectionTitle}>ÍTEMS VENDIDOS</Text>
+                        {selectedSale.items?.map((it, idx) => (
+                          <View key={idx} style={styles.itemRow}>
+                            <View style={{ flex: 1 }}>
+                              <Text style={styles.itemName}>{it.name}</Text>
+                              <Text style={styles.itemSub}>
+                                {it.quantity} x {formatPEN(it.price)}
+                              </Text>
+                            </View>
+                            <Text style={styles.itemTotal}>
+                              {formatPEN((it.lineTotal ?? it.quantity * it.price) || 0)}
+                            </Text>
+                          </View>
+                        ))}
                       </View>
-                    </View>
+
+                      {/* Desglose Tributario */}
+                      {(() => {
+                        const amounts = receiptAmountsForSale(
+                          selectedSale,
+                          selectedSale.fiscalAmounts,
+                          taxProfile
+                        );
+                        return (
+                          <View style={styles.detailSection}>
+                            {amounts.taxed > 0 && (
+                              <View style={styles.detailRow}>
+                                <Text style={styles.detailLabel}>Op. Gravada:</Text>
+                                <Text style={styles.detailValue}>{formatPEN(amounts.taxed)}</Text>
+                              </View>
+                            )}
+                            {amounts.exempt > 0 && (
+                              <View style={styles.detailRow}>
+                                <Text style={styles.detailLabel}>Op. Exonerada:</Text>
+                                <Text style={styles.detailValue}>{formatPEN(amounts.exempt)}</Text>
+                              </View>
+                            )}
+                            {amounts.unaffected > 0 && (
+                              <View style={styles.detailRow}>
+                                <Text style={styles.detailLabel}>Op. Inafecta:</Text>
+                                <Text style={styles.detailValue}>{formatPEN(amounts.unaffected)}</Text>
+                              </View>
+                            )}
+                            {(amounts.igv > 0 || amounts.taxed > 0) && (
+                              <View style={styles.detailRow}>
+                                <Text style={styles.detailLabel}>IGV:</Text>
+                                <Text style={styles.detailValue}>{formatPEN(amounts.igv)}</Text>
+                              </View>
+                            )}
+                            {(selectedSale.discountAmount || 0) > 0 && (
+                              <View style={styles.detailRow}>
+                                <Text style={styles.detailLabel}>Descuento:</Text>
+                                <Text style={styles.detailValue}>-{formatPEN(selectedSale.discountAmount || 0)}</Text>
+                              </View>
+                            )}
+                            <View style={[styles.detailRow, { borderTopWidth: 1, borderTopColor: ui.border, paddingTop: 6 }]}>
+                              <Text style={[styles.detailLabel, { fontWeight: 'bold', fontSize: 16, color: ui.text }]}>
+                                TOTAL:
+                              </Text>
+                              <Text style={[styles.detailValue, { fontWeight: 'bold', fontSize: 18, color: ui.primary }]}>
+                                {formatPEN(amounts.total || selectedSale.total)}
+                              </Text>
+                            </View>
+                          </View>
+                        );
+                      })()}
+
+                      {/* Estado y Acciones SUNAT / CDR */}
+                      {(() => {
+                        const meta = resolveReceiptDocumentMeta(selectedSale);
+                        const showSunatPanel =
+                          !meta.isQuote &&
+                          !meta.isOfflinePending &&
+                          (meta.isFiscal ||
+                            meta.isFacturaDoc ||
+                            Boolean(
+                              selectedSale.sunatStatus &&
+                                selectedSale.sunatStatus !== 'not_applicable'
+                            ));
+                        if (!showSunatPanel) return null;
+                        return (
+                          <View style={styles.detailSection}>
+                            <Text style={styles.detailSectionTitle}>ESTADO TRIBUTARIO SUNAT</Text>
+                            <View style={styles.detailRow}>
+                              <Text style={styles.detailLabel}>Estado / CDR:</Text>
+                              <Text
+                                style={[
+                                  styles.detailValue,
+                                  {
+                                    color:
+                                      selectedSale.sunatStatus === 'accepted'
+                                        ? ui.primary
+                                        : selectedSale.sunatStatus === 'rejected'
+                                          ? ui.danger
+                                          : ui.warning,
+                                    fontWeight: 'bold',
+                                  },
+                                ]}
+                              >
+                                {selectedSale.sunatStatus === 'accepted'
+                                  ? (selectedSale as any).cdrDescription || 'Comprobante Aceptado'
+                                  : (selectedSale as any).cdrDescription ||
+                                    selectedSale.sunatStatus ||
+                                    'Pendiente de envío'}
+                              </Text>
+                            </View>
+                            <View style={styles.sunatActionRow}>
+                              <TouchableOpacity
+                                style={[styles.sunatActionBtn, loadingSunatAction && styles.buttonDisabled]}
+                                onPress={() => void handleOpenSunatActions(selectedSale)}
+                                disabled={loadingSunatAction}
+                                accessibilityRole="button"
+                                accessibilityLabel="Gestionar comprobante SUNAT, notas y XML/CDR"
+                              >
+                                {loadingSunatAction ? (
+                                  <ActivityIndicator size="small" color={ui.onPrimary} />
+                                ) : (
+                                  <>
+                                    <FileText size={15} color={ui.onPrimary} />
+                                    <Text style={styles.sunatActionBtnText}>
+                                      {selectedSale.sunatStatus === 'accepted'
+                                        ? 'NC / ND / Sustituto / XML'
+                                        : 'Gestionar / Emitir SUNAT'}
+                                    </Text>
+                                  </>
+                                )}
+                              </TouchableOpacity>
+                              {selectedSale.sunatStatus !== 'accepted' && (
+                                <TouchableOpacity
+                                  style={[styles.sunatActionSecondaryBtn, loadingSunatAction && styles.buttonDisabled]}
+                                  onPress={() => void handleQuickConsultOrRetrySunat(selectedSale)}
+                                  disabled={loadingSunatAction}
+                                  accessibilityRole="button"
+                                  accessibilityLabel="Consultar o reintentar envío SUNAT"
+                                >
+                                  <RefreshCw size={15} color={ui.text} />
+                                  <Text style={styles.sunatActionSecondaryText}>Consultar / Reintentar</Text>
+                                </TouchableOpacity>
+                              )}
+                            </View>
+                          </View>
+                        );
+                      })()}
+                    </>
                   )}
                 </ScrollView>
 
@@ -1844,8 +2339,45 @@ export default function HistoryScreen() {
                   </TouchableOpacity>
                 </View>
 
+                {(() => {
+                  const meta = resolveReceiptDocumentMeta(selectedSale);
+                  const showSunatQuickBtn =
+                    detailViewMode === 'ticket' &&
+                    !meta.isQuote &&
+                    !meta.isOfflinePending &&
+                    (meta.isFiscal ||
+                      meta.isFacturaDoc ||
+                      Boolean(
+                        selectedSale.sunatStatus &&
+                          selectedSale.sunatStatus !== 'not_applicable'
+                      ));
+                  if (!showSunatQuickBtn) return null;
+                  return (
+                    <TouchableOpacity
+                      style={[styles.sunatActionSecondaryBtn, { marginBottom: 8, flex: undefined }]}
+                      onPress={() => void handleOpenSunatActions(selectedSale)}
+                      disabled={loadingSunatAction}
+                      accessibilityRole="button"
+                      accessibilityLabel="Gestionar comprobante SUNAT"
+                    >
+                      <FileText size={16} color={ui.primary} />
+                      <Text style={[styles.sunatActionSecondaryText, { color: ui.primary }]}>
+                        {selectedSale.sunatStatus === 'accepted'
+                          ? 'SUNAT: Emitir NC / ND / Sustituto / XML-CDR'
+                          : 'SUNAT: Consultar / Reintentar Comprobante'}
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                })()}
+
                 {/* Botón de Anulación si no está anulada y tiene permisos */}
-                {selectedSale.status === 'completed' && !(selectedSale as any).refundedLineIndices?.length && !Number((selectedSale as any).refundedAmount || 0) && canProcessReturn && ['owner', 'admin'].includes(role || '') && (
+                {selectedSale.status === 'completed' &&
+                  !(selectedSale as any).refundedLineIndices?.length &&
+                  !Number((selectedSale as any).refundedAmount || 0) &&
+                  canProcessReturn &&
+                  (['owner', 'admin'].includes(role || '') ||
+                    posSettings.enableSellerAttribution ||
+                    (selectedSale as any).attributionVersion === 1) && (
                   <TouchableOpacity
                     style={styles.cancelSaleBtn}
                     onPress={() => {
@@ -1859,7 +2391,10 @@ export default function HistoryScreen() {
                     <Text style={styles.cancelSaleText}>Anular Venta y Revertir Stock</Text>
                   </TouchableOpacity>
                 )}
-                {selectedSale.status === 'completed' && !selectedSale.isReturn && canProcessReturn && (posSettings.enableSellerAttribution || (selectedSale as any).attributionVersion === 1) && (
+                {selectedSale.status === 'completed' &&
+                  !selectedSale.isReturn &&
+                  !resolveReceiptDocumentMeta(selectedSale).isQuote &&
+                  canProcessReturn && (
                   <TouchableOpacity
                     style={[styles.cancelSaleBtn, { borderColor: ui.warning, marginTop: 8 }]}
                     onPress={() => {
@@ -1875,14 +2410,20 @@ export default function HistoryScreen() {
                   </TouchableOpacity>
                 )}
               </>
-            )}
+              );
+            })()}
           </View>
         </View>
       </Modal>
       )}
 
       {refundModalVisible && (
-        <Modal visible={refundModalVisible} transparent animationType="fade">
+        <Modal
+          visible={refundModalVisible}
+          transparent
+          animationType="fade"
+          onRequestClose={() => setRefundModalVisible(false)}
+        >
         <View style={styles.modalOverlay}>
           <View style={[styles.modalContent, { maxHeight: '85%' }]}>
             <View style={styles.modalHeader}>
@@ -1942,7 +2483,12 @@ export default function HistoryScreen() {
       {/* MODAL: CONFIRMACIÓN Y MOTIVO DE ANULACIÓN */}
       {/* ==================================================================== */}
       {cancelModalVisible && (
-        <Modal visible={cancelModalVisible} transparent animationType="fade">
+        <Modal
+          visible={cancelModalVisible}
+          transparent
+          animationType="fade"
+          onRequestClose={() => setCancelModalVisible(false)}
+        >
         <KeyboardAvoidingView
           behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
           style={styles.modalOverlay}
@@ -2009,7 +2555,12 @@ export default function HistoryScreen() {
 
       {/* Modal de Rango de Fechas Personalizado */}
       {customDateModalOpen && (
-        <Modal visible={customDateModalOpen} transparent animationType="fade">
+        <Modal
+          visible={customDateModalOpen}
+          transparent
+          animationType="fade"
+          onRequestClose={() => setCustomDateModalOpen(false)}
+        >
         <KeyboardAvoidingView
           behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
           style={styles.modalOverlay}
@@ -2142,7 +2693,12 @@ export default function HistoryScreen() {
 
       {/* Modal para Cobrar Saldo Pendiente de Reserva */}
       {paymentModalVisible && (
-        <Modal visible={paymentModalVisible} transparent animationType="fade">
+        <Modal
+          visible={paymentModalVisible}
+          transparent
+          animationType="fade"
+          onRequestClose={() => setPaymentModalVisible(false)}
+        >
         <KeyboardAvoidingView
           behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
           style={styles.modalOverlay}
@@ -2228,9 +2784,9 @@ export default function HistoryScreen() {
                       keyboardType="decimal-pad"
                       placeholder="0.00"
                     />
-                    {parseFloat(payCashReceived) > Math.max(0, Number(reservationToPay.total || 0) - Number(reservationToPay.depositAmount || 0)) ? (
+                    {(parseNormalizedDecimal(payCashReceived) ?? 0) > Math.max(0, Number(reservationToPay.total || 0) - Number(reservationToPay.depositAmount || 0)) ? (
                       <Text style={{ fontSize: 12, fontWeight: '700', color: ui.success, marginTop: 4 }}>
-                        Vuelto: {formatPEN(parseFloat(payCashReceived) - Math.max(0, Number(reservationToPay.total || 0) - Number(reservationToPay.depositAmount || 0)))}
+                        Vuelto: {formatPEN((parseNormalizedDecimal(payCashReceived) ?? 0) - Math.max(0, Number(reservationToPay.total || 0) - Number(reservationToPay.depositAmount || 0)))}
                       </Text>
                     ) : null}
                   </View>
@@ -2256,6 +2812,22 @@ export default function HistoryScreen() {
         </KeyboardAvoidingView>
       </Modal>
       )}
+
+      <EinvoiceActionsModal
+        visible={einvoiceModalVisible}
+        einvoice={activeEinvoice}
+        allEinvoices={allAccountEinvoices}
+        accountId={accountId || ''}
+        taxRate={taxProfile.taxRate}
+        invoicingEnabled={invoicingEnabled}
+        onClose={() => setEinvoiceModalVisible(false)}
+        onUpdated={() => {
+          void fetchSalesPage(true);
+          if (selectedSale) {
+            void refreshSelectedSaleSunat(selectedSale);
+          }
+        }}
+      />
     </View>
   );
 }
@@ -3223,5 +3795,119 @@ const styles = StyleSheet.create({
     fontSize: 11,
     color: '#FFF',
     fontWeight: '500',
+  },
+  detailSwitchRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 12,
+    gap: 8,
+  },
+  detailSegmentGroup: {
+    flexDirection: 'row',
+    backgroundColor: ui.surfaceMuted,
+    borderRadius: 9,
+    padding: 3,
+    gap: 4,
+  },
+  detailSegmentBtn: {
+    paddingHorizontal: 12,
+    paddingVertical: 5,
+    borderRadius: 7,
+  },
+  detailSegmentBtnActive: {
+    backgroundColor: ui.surface,
+  },
+  detailSegmentText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: ui.textSecondary,
+  },
+  detailSegmentTextActive: {
+    color: ui.text,
+  },
+  detailPaperGroup: {
+    flexDirection: 'row',
+    gap: 6,
+  },
+  detailPaperChip: {
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+    borderRadius: 7,
+    borderWidth: 1,
+    borderColor: ui.border,
+    backgroundColor: ui.surface,
+  },
+  detailPaperChipActive: {
+    backgroundColor: ui.text,
+    borderColor: ui.text,
+  },
+  detailPaperText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: ui.textSecondary,
+  },
+  detailPaperTextActive: {
+    color: ui.surface,
+  },
+  compactHeaderActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  compactSunatButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    borderRadius: 10,
+    backgroundColor: ui.surfaceMuted,
+    borderWidth: 1,
+    borderColor: ui.border,
+  },
+  compactSunatButtonText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: ui.text,
+  },
+  sunatActionRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 10,
+  },
+  sunatActionBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    paddingVertical: 10,
+    paddingHorizontal: 10,
+    borderRadius: 10,
+    backgroundColor: ui.primary,
+  },
+  sunatActionBtnText: {
+    fontSize: 12.5,
+    fontWeight: '700',
+    color: ui.onPrimary,
+  },
+  sunatActionSecondaryBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    paddingVertical: 10,
+    paddingHorizontal: 10,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: ui.border,
+    backgroundColor: ui.surface,
+  },
+  sunatActionSecondaryText: {
+    fontSize: 12.5,
+    fontWeight: '700',
+    color: ui.text,
   },
 });

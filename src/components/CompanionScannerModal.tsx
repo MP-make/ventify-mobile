@@ -73,6 +73,7 @@ import {
   triggerScanHaptic,
   formatSessionPurpose,
   generateScanId,
+  ScannerApiError,
   type CompanionSessionData,
   type ScannedCodeHistoryItem,
   type ProductPreview,
@@ -221,6 +222,16 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
     };
   });
 
+  const bannerHideTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (bannerHideTimeoutRef.current) {
+        clearTimeout(bannerHideTimeoutRef.current);
+      }
+    };
+  }, []);
+
   // Efecto visual para mostrar el HUD del producto recién detectado
   const showDetectedBanner = useCallback(() => {
     bannerOpacityAnim.setValue(0);
@@ -240,8 +251,10 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
       }),
     ]).start();
 
-    // Auto-ocultar después de 2.2 segundos
-    setTimeout(() => {
+    if (bannerHideTimeoutRef.current) {
+      clearTimeout(bannerHideTimeoutRef.current);
+    }
+    bannerHideTimeoutRef.current = setTimeout(() => {
       Animated.timing(bannerOpacityAnim, {
         toValue: 0,
         duration: 300,
@@ -263,7 +276,7 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
     }
   }, [visible, initialSessionId]);
 
-  // Suscripción a Firestore onSnapshot mientras la sesión esté activa
+  // Sondeo reactivo via /api/scanner/reader mientras la sesión esté activa
   useEffect(() => {
     if (!session?.sessionId || !visible) return;
 
@@ -279,7 +292,7 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
           return;
         }
 
-        // Actualizar datos de sesión si cambió el propósito o la respuesta de la PC (ignorar heartbeats puros)
+        // Actualizar datos de sesión si cambió el propósito o la respuesta de la PC
         setSession((prev) => {
           if (!prev) return updatedSession;
           if (
@@ -300,13 +313,18 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
 
         // Actualizar estado del historial cuando la PC procesa la lectura
         const lastScan = updatedSession.scan;
-        if (lastScan && lastScan.result !== 'pending') {
+        if (lastScan) {
           setScannedHistory((prev) =>
             prev.map((item) =>
-              item.code === lastScan.code
+              item.id === lastScan.id || item.code === lastScan.code
                 ? {
                     ...item,
-                    status: lastScan.result === 'rejected' ? 'rejected' : 'added',
+                    status:
+                      lastScan.result === 'rejected'
+                        ? 'rejected'
+                        : lastScan.result === 'pending'
+                        ? 'pending'
+                        : 'added',
                     message: lastScan.message || item.message,
                   }
                 : item
@@ -316,13 +334,14 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
       },
       (error) => {
         console.warn('[CompanionModal] Error en la conexión reactiva:', error);
-      }
+      },
+      session.baseUrl
     );
 
     return () => {
       unsubscribe();
     };
-  }, [session?.sessionId, visible]);
+  }, [session?.sessionId, session?.baseUrl, visible]);
 
   // ============================================================================
   // HANDLERS DE ACCIONES DE VINCULACIÓN
@@ -445,40 +464,64 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
         imageUrl: matchedProduct?.imageUrl || matchedProduct?.thumbUrl,
       };
 
-      // 2. Feedback háptico instantáneo al detectar código
-      void triggerScanHaptic('success');
+      const scanId = generateScanId();
 
-      // 3. Notificación HUD en pantalla con nombre y precio
-      setLastDetectedBanner({
-        name: productName,
-        price: productPrice,
-        code: trimmedCode,
-      });
-      showDetectedBanner();
-
-      // 4. Registro optimista en el historial de lecturas enviadas
+      // 2. Registro optimista en el historial de lecturas enviadas
       const newHistoryItem: ScannedCodeHistoryItem = {
-        id: generateScanId(),
+        id: scanId,
         code: trimmedCode,
         timestamp: now,
-        status: 'sent',
+        status: 'pending',
         productName,
         productPrice,
-        message: matchedProduct ? 'Transmitido a PC' : 'Código no catalogado (enviado)',
+        message: matchedProduct ? 'Enviando a PC...' : 'Enviando código...',
       };
 
       setScannedHistory((prev) => [newHistoryItem, ...prev]);
 
-      // 5. Transmisión en milisegundos a la PC
+      // 3. Transmisión oficial via /api/scanner/reader
       try {
-        await sendScannedCodeToDesktop(
+        const sentScan = await sendScannedCodeToDesktop(
           session.sessionId,
           trimmedCode,
           session.token,
-          preview
+          preview,
+          session.baseUrl,
+          scanId
         );
-      } catch (err) {
-        console.warn('[CompanionModal] Advertencia al transmitir lectura a PC:', err);
+        void triggerScanHaptic('success');
+        setLastDetectedBanner({
+          name: productName,
+          price: productPrice,
+          code: trimmedCode,
+        });
+        showDetectedBanner();
+        setScannedHistory((prev) =>
+          prev.map((item) =>
+            item.id === scanId
+              ? {
+                  ...item,
+                  status: sentScan.result === 'rejected' ? 'rejected' : sentScan.result === 'pending' ? 'sent' : 'added',
+                  message: sentScan.message || 'Transmitido a PC',
+                }
+              : item
+          )
+        );
+      } catch (err: any) {
+        void triggerScanHaptic('error');
+        const errMsg = err?.message || 'No se pudo transmitir la lectura a la PC.';
+        setScannedHistory((prev) =>
+          prev.map((item) =>
+            item.id === scanId ? { ...item, status: 'rejected', message: errMsg } : item
+          )
+        );
+        if (err instanceof ScannerApiError && (err.status === 401 || err.status === 403 || err.status === 410)) {
+          Alert.alert('Vínculo Finalizado', errMsg, [
+            { text: 'Entendido', onPress: () => setSession(null) },
+          ]);
+        } else {
+          Alert.alert('Lectura no procesada', errMsg);
+        }
       } finally {
         setTimeout(() => {
           isScanBusyRef.current = false;
@@ -514,21 +557,15 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
       barcode: code,
     };
 
-    setLastDetectedBanner({
-      name: prodName,
-      price: prodPrice,
-      code,
-    });
-    showDetectedBanner();
-
+    const scanId = generateScanId();
     const historyItem: ScannedCodeHistoryItem = {
-      id: generateScanId(),
+      id: scanId,
       code,
       timestamp: now,
-      status: 'sent',
+      status: 'pending',
       productName: prodName,
       productPrice: prodPrice,
-      message: 'Ingreso manual transmitido',
+      message: 'Enviando ingreso manual...',
     };
 
     setScannedHistory((prev) => [historyItem, ...prev]);
@@ -536,10 +573,47 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
     setManualBarcodeModalVisible(false);
 
     try {
-      await sendScannedCodeToDesktop(session.sessionId, code, session.token, preview);
+      const sentScan = await sendScannedCodeToDesktop(
+        session.sessionId,
+        code,
+        session.token,
+        preview,
+        session.baseUrl,
+        scanId
+      );
       void triggerScanHaptic('success');
-    } catch (err) {
-      console.warn('[CompanionModal] Error al enviar código manual:', err);
+      setLastDetectedBanner({
+        name: prodName,
+        price: prodPrice,
+        code,
+      });
+      showDetectedBanner();
+      setScannedHistory((prev) =>
+        prev.map((item) =>
+          item.id === scanId
+            ? {
+                ...item,
+                status: sentScan.result === 'rejected' ? 'rejected' : sentScan.result === 'pending' ? 'sent' : 'added',
+                message: sentScan.message || 'Ingreso manual transmitido',
+              }
+            : item
+        )
+      );
+    } catch (err: any) {
+      void triggerScanHaptic('error');
+      const errMsg = err?.message || 'No se pudo enviar el código manual.';
+      setScannedHistory((prev) =>
+        prev.map((item) =>
+          item.id === scanId ? { ...item, status: 'rejected', message: errMsg } : item
+        )
+      );
+      if (err instanceof ScannerApiError && (err.status === 401 || err.status === 403 || err.status === 410)) {
+        Alert.alert('Vínculo Finalizado', errMsg, [
+          { text: 'Entendido', onPress: () => setSession(null) },
+        ]);
+      } else {
+        Alert.alert('Error de Envío', errMsg);
+      }
     }
   };
 
@@ -966,7 +1040,7 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
         >
           <KeyboardAvoidingView
             style={styles.modalBackdrop}
-            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+            behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
           >
             <View style={styles.modalCard}>
               <View style={styles.modalCardHeader}>
@@ -1031,7 +1105,7 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
         >
           <KeyboardAvoidingView
             style={styles.modalBackdrop}
-            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+            behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
           >
             <View style={styles.modalCard}>
               <View style={styles.modalCardHeader}>

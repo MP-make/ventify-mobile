@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   Modal,
   View,
@@ -17,13 +17,21 @@ import {
   Minus,
   Barcode,
   Package,
+  AlertTriangle,
 } from 'lucide-react-native';
 import * as Haptics from 'expo-haptics';
 import { Product, ProductPresentation, ProductVariant } from '@/types';
 import { formatPEN, ui } from '@/lib/theme';
 import { SectionHeading } from '@/components/ui';
-import { getAllPresentations, getBranchStock } from '@/lib/product-search';
+import { getAllPresentations, getBranchPricingConfig } from '@/lib/product-search';
+import { presentationFactor } from '@/lib/presentation-parity';
 import { useAuth } from '@/context/AuthContext';
+import { useSettings } from '@/context/SettingsContext';
+import {
+  getVariantBranchStock,
+  resolvePresentationVariantPrice,
+  resolvePresentationVariantStock,
+} from '@/services/inventory-kardex-service';
 
 export interface PresentationVariantModalProps {
   product: Product | null;
@@ -49,63 +57,111 @@ export const PresentationVariantModal: React.FC<PresentationVariantModalProps> =
 }) => {
   const insets = useSafeAreaInsets();
   const { branchId } = useAuth();
+  const { posSettings } = useSettings();
+  const effectiveBranchId = branchId || 'main';
+  const enableMinSalePrice = posSettings?.enableMinSalePrice !== false;
   const isModalVisible = visible !== undefined ? visible : Boolean(isOpen);
 
   const [selectedPresentation, setSelectedPresentation] = useState<ProductPresentation | null>(null);
   const [selectedVariant, setSelectedVariant] = useState<ProductVariant | null>(null);
   const [quantity, setQuantity] = useState<number>(1);
 
+  const branchPricing = useMemo(() => {
+    if (!product) return null;
+    return getBranchPricingConfig(product, effectiveBranchId, enableMinSalePrice);
+  }, [product, effectiveBranchId, enableMinSalePrice]);
+
+  const presentations = useMemo(() => {
+    if (!product) return [];
+    const raw =
+      branchPricing?.presentations && branchPricing.presentations.length > 0
+        ? branchPricing.presentations
+        : getAllPresentations(product);
+    return raw.filter((p) => p.active !== false);
+  }, [product, branchPricing]);
+
   // Inicializar selecciones cuando se abre el modal
   useEffect(() => {
     if (isModalVisible && product) {
       setQuantity(1);
 
-      // Si tiene presentaciones, seleccionar la primera por defecto o dejar null para unidad
-      const presentations = getAllPresentations(product);
       if (presentations.length > 0) {
         setSelectedPresentation(presentations[0]);
       } else {
         setSelectedPresentation(null);
       }
 
-      // Si tiene variantes, seleccionar la primera
       if (Array.isArray(product.variants) && product.variants.length > 0) {
-        setSelectedVariant(product.variants[0]);
+        const firstInStock = product.variants.find(
+          (v) => getVariantBranchStock(v, effectiveBranchId) > 0
+        );
+        setSelectedVariant(firstInStock ?? product.variants[0]);
       } else {
         setSelectedVariant(null);
       }
     }
-  }, [isModalVisible, product]);
+  }, [isModalVisible, product, presentations, effectiveBranchId]);
+
+  const basePrice = Number(
+    branchPricing?.suggestedPrice ?? product?.suggestedPrice ?? product?.price ?? 0
+  );
+  const effectiveMinSalePrice = enableMinSalePrice
+    ? Number(branchPricing?.minSalePrice ?? product?.minSalePrice ?? 0)
+    : 0;
+
+  // Calcular precio unitario e importe total de la combinación presentación + variante
+  const { unitPrice, factor, effectivePresentation } = useMemo(
+    () =>
+      resolvePresentationVariantPrice({
+        basePrice,
+        presentation: selectedPresentation,
+        variant: selectedVariant,
+        minSalePrice: effectiveMinSalePrice > 0 ? effectiveMinSalePrice : undefined,
+        enableMinSalePrice,
+      }),
+    [basePrice, selectedPresentation, selectedVariant, effectiveMinSalePrice, enableMinSalePrice]
+  );
+
+  const lineTotal = Math.round(unitPrice * quantity * 100) / 100;
+
+  // Validar disponibilidad real considerando stock reservado y stock específico de la variante
+  const { productAvailable, variantStock, effectiveAvailable, maxUnits } = useMemo(
+    () =>
+      resolvePresentationVariantStock({
+        product: product ?? { stock: {} },
+        branchId: effectiveBranchId,
+        presentation: selectedPresentation,
+        variant: selectedVariant,
+      }),
+    [product, effectiveBranchId, selectedPresentation, selectedVariant]
+  );
+
+  const requiredUnits = Math.round(quantity * factor * 10000) / 10000;
+  const isStockInsufficient = effectiveAvailable <= 0 || requiredUnits > effectiveAvailable;
+
+  // Mantener quantity dentro de maxUnits cuando cambia de presentación/variante
+  useEffect(() => {
+    if (maxUnits >= 1 && quantity > maxUnits) {
+      setQuantity(maxUnits);
+    }
+  }, [maxUnits, quantity]);
 
   if (!isModalVisible || !product) return null;
 
-  const basePrice = Number(product.suggestedPrice ?? product.price ?? 0);
-  const physicalStock = getBranchStock(product, branchId || 'main');
-  const presentations = getAllPresentations(product);
   const hasVariants = Array.isArray(product.variants) && product.variants.length > 0;
-
-  // Calcular precio unitario e importe total de la selección actual
-  const { unitPrice, lineTotal } = (() => {
-    let price = basePrice;
-
-    if (selectedPresentation) {
-      price = Number(selectedPresentation.price ?? basePrice);
-    } else if (selectedVariant) {
-      if (selectedVariant.price && selectedVariant.price > 0) {
-        price = Number(selectedVariant.price);
-      } else if (selectedVariant.priceAdjustment) {
-        price += Number(selectedVariant.priceAdjustment);
-      }
-    }
-
-    const total = Math.round(price * quantity * 100) / 100;
-    return { unitPrice: price, lineTotal: total };
-  })();
+  const baseWithVariantPrice = resolvePresentationVariantPrice({
+    basePrice,
+    presentation: null,
+    variant: selectedVariant,
+    minSalePrice: effectiveMinSalePrice > 0 ? effectiveMinSalePrice : undefined,
+    enableMinSalePrice,
+  }).unitPrice;
 
   const handleConfirm = () => {
+    if (isStockInsufficient) return;
     Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
     onConfirm(product, {
-      presentation: selectedPresentation || undefined,
+      presentation: effectivePresentation,
       variant: selectedVariant || undefined,
       quantity,
     });
@@ -113,8 +169,9 @@ export const PresentationVariantModal: React.FC<PresentationVariantModalProps> =
   };
 
   const incrementQty = () => {
+    if (maxUnits <= 0 || quantity >= maxUnits) return;
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
-    setQuantity((q) => q + 1);
+    setQuantity((q) => Math.min(maxUnits, q + 1));
   };
 
   const decrementQty = () => {
@@ -123,8 +180,6 @@ export const PresentationVariantModal: React.FC<PresentationVariantModalProps> =
       setQuantity((q) => q - 1);
     }
   };
-
-  if (!isModalVisible || !product) return null;
 
   return (
     <Modal
@@ -160,7 +215,8 @@ export const PresentationVariantModal: React.FC<PresentationVariantModalProps> =
                   {product.name}
                 </Text>
                 <Text style={styles.productMeta}>
-                  Stock: {physicalStock} • Base: {formatPEN(basePrice)}
+                  Disp.: {productAvailable}
+                  {variantStock !== null ? ` • Var.: ${variantStock}` : ''} • Base: {formatPEN(basePrice)}
                 </Text>
               </View>
             </View>
@@ -180,13 +236,14 @@ export const PresentationVariantModal: React.FC<PresentationVariantModalProps> =
                   onPress={() => {
                     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
                     setSelectedPresentation(null);
+                    setQuantity(1);
                   }}
                   style={[
                     styles.optionCard,
                     selectedPresentation === null && styles.optionCardSelected,
                   ]}
                   accessibilityRole="button"
-                  accessibilityLabel={`Unidad base, ${formatPEN(basePrice)}`}
+                  accessibilityLabel={`Unidad base, ${formatPEN(baseWithVariantPrice)}`}
                   accessibilityState={{ selected: selectedPresentation === null }}
                   activeOpacity={0.7}
                 >
@@ -201,19 +258,26 @@ export const PresentationVariantModal: React.FC<PresentationVariantModalProps> =
                     </Text>
                     <Text style={styles.optionFactor}>Consume 1 unidad de stock</Text>
                   </View>
-                  <Text style={styles.optionPrice}>{formatPEN(basePrice)}</Text>
+                  <Text style={styles.optionPrice}>{formatPEN(baseWithVariantPrice)}</Text>
                 </TouchableOpacity>
 
                 {/* Opciones de Presentaciones (Packs, Cajas) */}
                 {presentations.map((pres) => {
                   const isSelected = selectedPresentation?.id === pres.id;
-                  const factor = pres.conversionFactor || pres.quantity || 1;
-                  const presPrice = Number(pres.price ?? 0);
+                  const presFactor = presentationFactor(pres);
+                  const presResolved = resolvePresentationVariantPrice({
+                    basePrice,
+                    presentation: pres,
+                    variant: selectedVariant,
+                    minSalePrice: effectiveMinSalePrice > 0 ? effectiveMinSalePrice : undefined,
+                    enableMinSalePrice,
+                  });
+                  const presPrice = presResolved.unitPrice;
 
-                  // Ahorro estimado por unidad comparado con precio base
-                  const singleEquivalent = factor > 0 ? presPrice / factor : presPrice;
-                  const savings = basePrice > singleEquivalent
-                    ? Math.round(((basePrice - singleEquivalent) / basePrice) * 100)
+                  // Ahorro estimado por unidad comparado con unidad base equivalente
+                  const singleEquivalent = presFactor > 0 ? presPrice / presFactor : presPrice;
+                  const savings = baseWithVariantPrice > singleEquivalent
+                    ? Math.round(((baseWithVariantPrice - singleEquivalent) / baseWithVariantPrice) * 100)
                     : 0;
 
                   return (
@@ -222,13 +286,14 @@ export const PresentationVariantModal: React.FC<PresentationVariantModalProps> =
                       onPress={() => {
                         Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
                         setSelectedPresentation(pres);
+                        setQuantity(1);
                       }}
                       style={[
                         styles.optionCard,
                         isSelected && styles.optionCardSelected,
                       ]}
                       accessibilityRole="button"
-                      accessibilityLabel={`${pres.name}, ${formatPEN(presPrice)}, ${factor} unidades`}
+                      accessibilityLabel={`${pres.name}, ${formatPEN(presPrice)}, ${presFactor} unidades`}
                       accessibilityState={{ selected: isSelected }}
                       activeOpacity={0.7}
                     >
@@ -249,7 +314,7 @@ export const PresentationVariantModal: React.FC<PresentationVariantModalProps> =
                           )}
                         </View>
                         <Text style={styles.optionFactor}>
-                          Consume {factor} unidades • {formatPEN(singleEquivalent)} c/u
+                          Consume {presFactor} unidades • {formatPEN(singleEquivalent)} c/u
                         </Text>
                         {pres.barcode ? (
                           <View style={styles.barcodeRow}>
@@ -273,7 +338,7 @@ export const PresentationVariantModal: React.FC<PresentationVariantModalProps> =
                 <View style={styles.variantsGrid}>
                   {product.variants!.map((v) => {
                     const isSelected = selectedVariant?.id === v.id;
-                    const vStock = v.stock?.[branchId || 'main'] ?? 0;
+                    const vStock = getVariantBranchStock(v, effectiveBranchId);
 
                     return (
                       <TouchableOpacity
@@ -285,6 +350,7 @@ export const PresentationVariantModal: React.FC<PresentationVariantModalProps> =
                         style={[
                           styles.variantChip,
                           isSelected && styles.variantChipSelected,
+                          vStock <= 0 && styles.variantChipOutOfStock,
                         ]}
                         accessibilityRole="button"
                         accessibilityLabel={`${v.name}${v.sizeLabel ? `, talla ${v.sizeLabel}` : ''}, stock ${vStock}`}
@@ -308,9 +374,9 @@ export const PresentationVariantModal: React.FC<PresentationVariantModalProps> =
                           >
                             {v.name}
                           </Text>
-                          <Text style={styles.variantStock}>
+                          <Text style={[styles.variantStock, vStock <= 0 && styles.variantStockEmpty]}>
                             {v.sizeLabel ? `Talla: ${v.sizeLabel} • ` : ''}
-                            Stock: {vStock}
+                            {vStock <= 0 ? 'Sin stock' : `Stock: ${vStock}`}
                           </Text>
                         </View>
                         {isSelected && (
@@ -324,9 +390,27 @@ export const PresentationVariantModal: React.FC<PresentationVariantModalProps> =
             )}
           </ScrollView>
 
+          {isStockInsufficient && (
+            <View style={styles.stockWarningBanner}>
+              <AlertTriangle size={15} color={ui.danger} />
+              <Text style={styles.stockWarningText}>
+                {effectiveAvailable <= 0
+                  ? 'Sin stock disponible para la selección actual en esta sucursal.'
+                  : `Stock insuficiente: requiere ${requiredUnits} u. y hay ${effectiveAvailable} u. disponibles (máx. ${maxUnits}).`}
+              </Text>
+            </View>
+          )}
+
           {/* Selector de Cantidad */}
           <View style={styles.quantityRow}>
-            <Text style={styles.quantityLabel}>Cantidad:</Text>
+            <View>
+              <Text style={styles.quantityLabel}>Cantidad:</Text>
+              {factor > 1 && (
+                <Text style={styles.quantitySubLabel}>
+                  Descuenta {requiredUnits} u. ({maxUnits} máx.)
+                </Text>
+              )}
+            </View>
             <View style={styles.quantityControls}>
               <TouchableOpacity
                 onPress={decrementQty}
@@ -339,8 +423,15 @@ export const PresentationVariantModal: React.FC<PresentationVariantModalProps> =
                 <Minus size={16} color={quantity <= 1 ? ui.textMuted : ui.text} />
               </TouchableOpacity>
               <Text style={styles.quantityValue}>{quantity}</Text>
-              <TouchableOpacity onPress={incrementQty} style={styles.qtyButton} accessibilityRole="button" accessibilityLabel="Aumentar cantidad">
-                <Plus size={16} color={ui.onPrimary} />
+              <TouchableOpacity
+                onPress={incrementQty}
+                style={[styles.qtyButton, (maxUnits <= 0 || quantity >= maxUnits) && styles.qtyButtonDisabled]}
+                disabled={maxUnits <= 0 || quantity >= maxUnits}
+                accessibilityRole="button"
+                accessibilityLabel="Aumentar cantidad"
+                accessibilityState={{ disabled: maxUnits <= 0 || quantity >= maxUnits }}
+              >
+                <Plus size={16} color={maxUnits <= 0 || quantity >= maxUnits ? ui.textMuted : ui.text} />
               </TouchableOpacity>
             </View>
           </View>
@@ -348,14 +439,22 @@ export const PresentationVariantModal: React.FC<PresentationVariantModalProps> =
           {/* Botón de Confirmación */}
           <TouchableOpacity
             onPress={handleConfirm}
-            style={styles.confirmButton}
+            disabled={isStockInsufficient}
+            style={[styles.confirmButton, isStockInsufficient && styles.confirmButtonDisabled]}
             activeOpacity={0.8}
             accessibilityRole="button"
-            accessibilityLabel={`Agregar ${quantity} al carrito por ${formatPEN(lineTotal)}`}
+            accessibilityLabel={
+              isStockInsufficient
+                ? 'Stock insuficiente'
+                : `Agregar ${quantity} al carrito por ${formatPEN(lineTotal)}`
+            }
+            accessibilityState={{ disabled: isStockInsufficient }}
           >
             <Check size={18} color={ui.onPrimary} style={{ marginRight: 6 }} />
             <Text style={styles.confirmButtonText}>
-              Agregar {formatPEN(lineTotal)} al Carrito
+              {isStockInsufficient
+                ? 'Stock insuficiente'
+                : `Agregar ${formatPEN(lineTotal)} al Carrito`}
             </Text>
           </TouchableOpacity>
         </View>
@@ -545,6 +644,32 @@ const styles = StyleSheet.create({
     color: ui.textSecondary,
     marginTop: 1,
   },
+  variantChipOutOfStock: {
+    opacity: 0.65,
+    borderStyle: 'dashed',
+  },
+  variantStockEmpty: {
+    color: ui.danger,
+    fontWeight: '600',
+  },
+  stockWarningBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: ui.dangerSoft,
+    borderWidth: 1,
+    borderColor: ui.danger,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    marginTop: 8,
+  },
+  stockWarningText: {
+    flex: 1,
+    fontSize: 12,
+    fontWeight: '600',
+    color: ui.danger,
+  },
   quantityRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -559,6 +684,11 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '600',
     color: ui.text,
+  },
+  quantitySubLabel: {
+    fontSize: 11,
+    color: ui.textSecondary,
+    marginTop: 2,
   },
   quantityControls: {
     flexDirection: 'row',
@@ -593,6 +723,10 @@ const styles = StyleSheet.create({
     backgroundColor: ui.primary,
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  confirmButtonDisabled: {
+    backgroundColor: ui.textMuted,
+    opacity: 0.65,
   },
   confirmButtonText: {
     fontSize: 14,

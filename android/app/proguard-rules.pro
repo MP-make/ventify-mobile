@@ -22,6 +22,9 @@
 # Ventify POS native modules & classes (ThermalPrinterModule, ThermalPrinterPackage, etc.)
 -keep class pe.com.ventify.pos.** { *; }
 
+# react-native-svg
+-keep class com.horcrux.svg.** { *; }
+
 # Expo Modules Core & Kotlin Modules
 -keep class expo.modules.** { *; }
 -keep class * extends expo.modules.kotlin.modules.Module { *; }

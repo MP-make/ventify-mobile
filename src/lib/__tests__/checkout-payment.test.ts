@@ -68,4 +68,30 @@ describe('resolveCheckoutPayment', () => {
     expect(result.payments[0]).toMatchObject({ methodId: 'qr-yape-local', digitalProvider: 'yape', chargedAmount: 20.5, surchargeAmount: 0.5, commissionAmount: 0.5 });
     expect(() => resolveCheckoutPayment({ methods, selectedMethodId: 'mix-method', category: 'mixed', total: 10, splits: [{ category: 'digital', digitalProvider: 'plin', amount: 10 }] })).toThrow();
   });
+
+  it('resolves mixed splits by configured methodId and supports transferencia digital provider', () => {
+    const result = resolveCheckoutPayment({
+      methods,
+      selectedMethodId: 'mix-method',
+      category: 'mixed',
+      total: 80,
+      splits: [
+        { category: 'cash', methodId: 'cash-main', amount: 30 },
+        { category: 'digital', digitalProvider: 'transferencia', amount: 50 },
+      ],
+    });
+    expect(result.payments).toHaveLength(2);
+    expect(result.payments[0]).toMatchObject({ methodId: 'cash-main', methodName: 'Caja', amount: 30 });
+    expect(result.payments[1]).toMatchObject({ methodId: 'bank-transfer', methodName: 'BCP', amount: 50 });
+
+    expect(() =>
+      resolveCheckoutPayment({
+        methods,
+        selectedMethodId: 'mix-method',
+        category: 'mixed',
+        total: 30,
+        splits: [{ category: 'cash', methodId: 'disabled-cash', amount: 30 }],
+      })
+    ).toThrow();
+  });
 });

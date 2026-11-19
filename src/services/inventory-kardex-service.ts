@@ -1,4 +1,4 @@
-import { normalizePresentation } from '@/lib/presentation-parity';
+import { normalizePresentation, presentationFactor } from '@/lib/presentation-parity';
 /**
  * Ventify Mobile - Inventory & Kardex Service
  * 
@@ -14,8 +14,15 @@ import { normalizePresentation } from '@/lib/presentation-parity';
  * - Transferencias con reserva de stock en pending y transición pending -> approved -> completed.
  */
 
-import { db } from '@/lib/firebase';
-import type { Product, InventoryMovement } from '@/types';
+import { db, app } from '@/lib/firebase';
+import type {
+  Product,
+  InventoryMovement,
+  ProductPresentation,
+  ProductVariant,
+  PriceTier,
+  BranchPriceConfig,
+} from '@/types';
 import {
   collection,
   doc,
@@ -31,8 +38,21 @@ import {
   updateDoc,
   Timestamp,
 } from 'firebase/firestore';
+import { getStorage, ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { cleanFirestoreData } from '@/lib/firebase-utils';
-import { findProductByBarcode, type ScannedProductMatch } from '@/lib/product-search';
+import { apiRequest } from '@/lib/api-client';
+import {
+  findProductByBarcode,
+  getAvailableStock,
+  getBranchPricingConfig,
+  type ScannedProductMatch,
+} from '@/lib/product-search';
+
+declare module '@/types' {
+  interface Product {
+    taxExemptionCode?: '10' | '20' | '30' | string;
+  }
+}
 
 // ============================================================================
 // CONSTANTES
@@ -41,10 +61,29 @@ import { findProductByBarcode, type ScannedProductMatch } from '@/lib/product-se
 export const PRODUCTS_COLLECTION = 'products';
 export const INVENTORY_MOVEMENTS_COLLECTION = 'inventory_movements';
 export const TRANSFERS_COLLECTION = 'transfers';
+export const INVENTORY_ADJUSTMENTS_COLLECTION = 'inventory_adjustments';
 
 export const LOW_STOCK_THRESHOLD = 5;
 export const LOW_STOCK_ANY = '__any__';
 export const DEFAULT_MIN_STOCK_THRESHOLD = LOW_STOCK_THRESHOLD;
+
+const MAX_PRODUCT_IMAGE_BYTES = 10 * 1024 * 1024; // 10 MB
+const ALLOWED_IMAGE_MIME_TYPES: Record<string, string> = {
+  'image/jpeg': 'jpg',
+  'image/jpg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp',
+  'image/gif': 'gif',
+  'image/avif': 'avif',
+};
+const EXTENSION_TO_MIME: Record<string, string> = {
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  png: 'image/png',
+  webp: 'image/webp',
+  gif: 'image/gif',
+  avif: 'image/avif',
+};
 
 import type { UserProfileInfo } from './sale-service';
 
@@ -57,13 +96,25 @@ export interface AdjustStockParams {
     stock?: Record<string, number>;
     reservedStock?: Record<string, number>;
     minStock?: number;
+    variants?: ProductVariant[];
   };
   branchId: string;
   branchName?: string;
   newStock: number;
+  variantId?: string;
+  variantName?: string;
   reason: 'adjustment' | 'damage' | 'loss' | 'count_audit' | 'restock' | 'return' | string;
   notes?: string;
   userProfile: UserProfileInfo;
+}
+
+export interface AdjustStockResult {
+  previousStock: number;
+  newStock: number;
+  diff: number;
+  before: Record<string, number>;
+  after: Record<string, number>;
+  variantId?: string;
 }
 
 export interface TransferItem {
@@ -71,6 +122,17 @@ export interface TransferItem {
   productName: string;
   sku?: string;
   quantity: number;
+  variantId?: string;
+  variantName?: string;
+}
+
+export interface TransferItem {
+  productId: string;
+  productName: string;
+  sku?: string;
+  quantity: number;
+  variantId?: string;
+  variantName?: string;
 }
 
 export interface CreateTransferParams {
@@ -107,6 +169,8 @@ export interface StockTransfer {
     name?: string;
     sku?: string;
     quantity: number;
+    variantId?: string;
+    variantName?: string;
   }>;
   status: 'pending' | 'approved' | 'in_transit' | 'completed' | 'cancelled' | 'rejected';
   notes?: string;
@@ -129,8 +193,354 @@ export interface StockTransfer {
 }
 
 // ============================================================================
-// HELPERS
+// HELPERS PUROS (COMPARTIDOS ENTRE UI Y TESTS)
 // ============================================================================
+
+const roundToCents = (value: number): number => {
+  const n = Number(value) || 0;
+  return Math.round((n + Number.EPSILON) * 100) / 100;
+};
+
+/** Detecta URIs locales del dispositivo que nunca deben persistirse crudas en Firestore. */
+export const isLocalFileUri = (uri?: string | null): boolean => {
+  if (!uri || typeof uri !== 'string') return false;
+  const trimmed = uri.trim();
+  if (!trimmed) return false;
+  if (/^https?:\/\//i.test(trimmed)) return false;
+  return (
+    /^(file|content|ph|assets-library):\/\//i.test(trimmed) ||
+    trimmed.startsWith('/') ||
+    trimmed.startsWith('data:')
+  );
+};
+
+/** Filtra galería conservando únicamente URLs remotas válidas. */
+export const sanitizeRemoteImageUrls = (urls?: string[] | null): string[] => {
+  if (!Array.isArray(urls)) return [];
+  return Array.from(
+    new Set(
+      urls
+        .map((u) => (typeof u === 'string' ? u.trim() : ''))
+        .filter((u) => u.length > 0 && !isLocalFileUri(u))
+    )
+  );
+};
+
+/**
+ * Calcula peso y precio unitario ajustado en el modal de pesables para evitar
+ * desvíos de S/ 0.01 cuando el cajero ingresa un monto exacto en Soles.
+ */
+export const calculateWeightEntry = (params: {
+  mode: 'weight' | 'amount';
+  rawValue: number;
+  unitPrice: number;
+  minSalePrice?: number;
+}): { weight: number; subtotal: number; customPrice?: number } => {
+  const safeRaw = Number.isFinite(params.rawValue) ? Math.max(0, params.rawValue) : 0;
+  const unitPrice = Number.isFinite(params.unitPrice) ? Math.max(0, params.unitPrice) : 0;
+
+  if (params.mode === 'weight') {
+    const weight = Math.round(safeRaw * 1000) / 1000;
+    const subtotal = roundToCents(weight * unitPrice);
+    return { weight, subtotal, customPrice: undefined };
+  }
+
+  const money = roundToCents(safeRaw);
+  if (money <= 0 || unitPrice <= 0) {
+    return { weight: 0, subtotal: money, customPrice: undefined };
+  }
+
+  const roundedWeight = Math.round((money / unitPrice) * 1000) / 1000;
+  const flooredWeight = Math.floor((money / unitPrice) * 1000) / 1000;
+  const rawMin = Number(params.minSalePrice ?? 0);
+  const safeFloor = rawMin > 0 && rawMin <= unitPrice ? rawMin : 0;
+
+  let weight = roundedWeight > 0 ? roundedWeight : 0.001;
+  if (safeFloor > 0 && money / weight < safeFloor) {
+    weight = flooredWeight > 0 ? flooredWeight : 0.001;
+  }
+
+  const exactUnitPrice = money / weight;
+  const candidate6 = Math.round(exactUnitPrice * 1_000_000) / 1_000_000;
+  const customPrice = roundToCents(weight * candidate6) === money ? candidate6 : exactUnitPrice;
+
+  return { weight, subtotal: money, customPrice };
+};
+
+/** Resuelve el stock físico de una variante en la sucursal dada. */
+export const getVariantBranchStock = (
+  variant: Pick<ProductVariant, 'stock'> | null | undefined,
+  branchId: string
+): number => {
+  if (!variant || variant.stock === undefined || variant.stock === null) return 0;
+  if (typeof variant.stock === 'number') return Math.max(0, Number(variant.stock) || 0);
+  if (branchId && variant.stock[branchId] !== undefined) {
+    return Math.max(0, Number(variant.stock[branchId] ?? 0));
+  }
+  if (!branchId || branchId === 'main') {
+    const firstVal = Object.values(variant.stock)[0];
+    return Math.max(0, Number(firstVal ?? 0));
+  }
+  return 0;
+};
+
+/**
+ * Calcula el precio combinado de presentación + variante y genera una presentación
+ * normalizada lista para carrito/checkout.
+ */
+export const resolvePresentationVariantPrice = (params: {
+  basePrice: number;
+  presentation?: (Partial<ProductPresentation> & { factor?: number }) | null;
+  variant?: Partial<ProductVariant> | null;
+  minSalePrice?: number;
+  enableMinSalePrice?: boolean;
+}): {
+  unitPrice: number;
+  factor: number;
+  effectivePresentation?: ProductPresentation;
+} => {
+  const basePrice = Math.max(0, Number(params.basePrice) || 0);
+  const pres = params.presentation || null;
+  const variant = params.variant || null;
+  const factor = pres ? presentationFactor(pres) : 1;
+  const enforceFloor = params.enableMinSalePrice !== false;
+  const baseMin = enforceFloor ? Math.max(0, Number(params.minSalePrice) || 0) : 0;
+
+  let variantDelta = 0;
+  if (variant) {
+    if (variant.price !== undefined && variant.price !== null && Number(variant.price) > 0) {
+      variantDelta = Number(variant.price) - basePrice;
+    } else if (variant.priceAdjustment !== undefined && variant.priceAdjustment !== null) {
+      variantDelta = Number(variant.priceAdjustment) || 0;
+    }
+  }
+
+  if (pres) {
+    const rawPresPrice = Number(pres.price ?? 0);
+    const presBasePrice = rawPresPrice > 0 ? rawPresPrice : roundToCents(basePrice * factor);
+    let combined = roundToCents(Math.max(0, presBasePrice + variantDelta * factor));
+    const presFloor = enforceFloor ? Math.max(0, Number(pres.minSalePrice ?? 0)) : 0;
+    if (presFloor > 0 && combined < presFloor) {
+      combined = presFloor;
+    }
+    const effectivePresentation: ProductPresentation = {
+      ...(pres as ProductPresentation),
+      id: String(pres.id || ''),
+      name: String(pres.name || ''),
+      conversionFactor: factor,
+      quantity: factor,
+      price: combined,
+      active: pres.active !== false,
+    };
+    return { unitPrice: combined, factor, effectivePresentation };
+  }
+
+  let unitPrice = roundToCents(Math.max(0, basePrice + variantDelta));
+  if (baseMin > 0 && unitPrice < baseMin) {
+    unitPrice = baseMin;
+  }
+  return { unitPrice, factor: 1, effectivePresentation: undefined };
+};
+
+/**
+ * Calcula disponibilidad real respetando stock del producto, stock reservado
+ * por transferencias/reservas y stock de la variante seleccionada.
+ */
+export const resolvePresentationVariantStock = (params: {
+  product: Pick<Product, 'stock' | 'reservedStock'>;
+  branchId: string;
+  presentation?: (Partial<ProductPresentation> & { factor?: number }) | null;
+  variant?: Pick<ProductVariant, 'stock'> | null;
+}): {
+  productAvailable: number;
+  variantStock: number | null;
+  effectiveAvailable: number;
+  factor: number;
+  maxUnits: number;
+} => {
+  const productAvailable = getAvailableStock(params.product as Product, params.branchId);
+  const factor = params.presentation ? presentationFactor(params.presentation) : 1;
+  const variantStock = params.variant ? getVariantBranchStock(params.variant, params.branchId) : null;
+  const effectiveAvailable = variantStock !== null
+    ? Math.min(productAvailable, variantStock)
+    : productAvailable;
+  const maxUnits = factor > 0 ? Math.floor(effectiveAvailable / factor) : 0;
+  return {
+    productAvailable,
+    variantStock,
+    effectiveAvailable,
+    factor,
+    maxUnits: Math.max(0, maxUnits),
+  };
+};
+
+/**
+ * Fusiona el stock editado desde el formulario de producto respetando cuentas
+ * mono-sucursal, multi-sucursal y agregación automática desde variantes.
+ */
+export const mergeSingleBranchStock = (params: {
+  existingStock?: Record<string, number> | null;
+  stockByBranch?: Record<string, number> | null;
+  singleBranchStock?: number;
+  branchId: string;
+  isMultiBranch: boolean;
+  variants?: Array<{ stock?: Record<string, number> | number }> | null;
+}): Record<string, number> => {
+  const targetBranch = params.branchId || 'main';
+  if (Array.isArray(params.variants) && params.variants.length > 0) {
+    const aggregated: Record<string, number> = {};
+    for (const v of params.variants) {
+      if (typeof v?.stock === 'number') {
+        aggregated[targetBranch] = (aggregated[targetBranch] || 0) + Math.max(0, Number(v.stock) || 0);
+      } else if (v?.stock && typeof v.stock === 'object') {
+        for (const [bId, qty] of Object.entries(v.stock)) {
+          if (bId) {
+            aggregated[bId] = (aggregated[bId] || 0) + Math.max(0, Number(qty) || 0);
+          }
+        }
+      }
+    }
+    if (Object.keys(aggregated).length > 0) {
+      return aggregated;
+    }
+  }
+
+  const base: Record<string, number> = { ...(params.existingStock || {}) };
+  const byBranch = params.stockByBranch || {};
+
+  if (params.isMultiBranch) {
+    for (const [bId, qty] of Object.entries(byBranch)) {
+      const num = Number(qty);
+      if (bId && Number.isFinite(num) && num >= 0) {
+        base[bId] = num;
+      }
+    }
+    if (Object.keys(base).length === 0 && targetBranch) {
+      base[targetBranch] = Math.max(0, Number(params.singleBranchStock) || 0);
+    }
+    return base;
+  }
+
+  for (const [bId, qty] of Object.entries(byBranch)) {
+    const num = Number(qty);
+    if (bId && bId !== targetBranch && Number.isFinite(num) && num >= 0) {
+      base[bId] = num;
+    }
+  }
+
+  const explicitSingle =
+    params.singleBranchStock !== undefined && Number.isFinite(Number(params.singleBranchStock))
+      ? Math.max(0, Number(params.singleBranchStock))
+      : undefined;
+  const existingKeys = Object.keys(base);
+  const activeKey =
+    base[targetBranch] !== undefined
+      ? targetBranch
+      : existingKeys.length === 1
+      ? existingKeys[0]
+      : targetBranch;
+
+  if (explicitSingle !== undefined) {
+    base[activeKey] = explicitSingle;
+  } else if (byBranch[activeKey] !== undefined && Number.isFinite(Number(byBranch[activeKey]))) {
+    base[activeKey] = Math.max(0, Number(byBranch[activeKey]));
+  } else if (base[activeKey] === undefined) {
+    base[activeKey] = 0;
+  }
+
+  return base;
+};
+
+/** Sincroniza campos Web (`minQty`/`price`) y Mobile (`minQuantity`/`unitPrice`) en escalas. */
+export const normalizePriceTiers = (tiers?: PriceTier[] | null): PriceTier[] => {
+  if (!Array.isArray(tiers)) return [];
+  return tiers
+    .map((t) => {
+      const minQuantity = Math.max(1, Math.round(Number(t.minQuantity ?? t.minQty ?? 0)));
+      const unitPrice = roundToCents(Math.max(0, Number(t.unitPrice ?? t.price ?? 0)));
+      return {
+        minQuantity,
+        unitPrice,
+        minQty: minQuantity,
+        price: unitPrice,
+      };
+    })
+    .filter((t) => t.minQuantity >= 1)
+    .sort((a, b) => a.minQuantity - b.minQuantity);
+};
+
+/** Sincroniza presentaciones para lectura bidireccional Web (`quantity`) y Mobile (`conversionFactor`). */
+export const normalizePresentationBidirectional = <T extends Partial<ProductPresentation> & { factor?: number }>(
+  presentation: T
+): T & { conversionFactor: number; quantity: number; active: boolean } => {
+  const normalized = normalizePresentation(presentation);
+  return {
+    ...normalized,
+    quantity: normalized.conversionFactor,
+    active: presentation.active !== false,
+  };
+};
+
+/** Limpia overrides de precios por sucursal replicando `serializeBranchPrices` de Ventify Web. */
+export const serializeBranchPrices = (
+  editors: Record<string, BranchPriceConfig> | undefined | null,
+  options: { baseSuggested: number; baseCost: number; showMinSalePrice: boolean }
+): Record<string, BranchPriceConfig> => {
+  if (!editors || typeof editors !== 'object') return {};
+  const entries = Object.entries(editors)
+    .map(([bId, cfg]) => {
+      const sPrice = cfg?.suggestedPrice === undefined ? undefined : Number(cfg.suggestedPrice);
+      const cPrice = cfg?.costPrice === undefined ? undefined : Number(cfg.costPrice);
+      let mPrice = !options.showMinSalePrice
+        ? undefined
+        : cfg?.minSalePrice === undefined
+        ? undefined
+        : Number(cfg.minSalePrice);
+      const effPrice = sPrice ?? options.baseSuggested;
+      const effCost = cPrice ?? options.baseCost;
+
+      if (options.showMinSalePrice) {
+        if (mPrice === undefined && cPrice !== undefined) {
+          mPrice = cPrice;
+        }
+        if (mPrice !== undefined && effCost > 0 && mPrice < effCost) {
+          mPrice = effCost;
+        }
+        if (mPrice !== undefined && effPrice > 0 && mPrice > effPrice) {
+          mPrice = effCost > 0 && effCost <= effPrice ? effCost : undefined;
+        }
+      } else {
+        mPrice = undefined;
+      }
+
+      const cleanedTiers = Array.isArray(cfg?.priceTiers) && cfg.priceTiers.length > 0
+        ? normalizePriceTiers(cfg.priceTiers)
+        : undefined;
+      const cleanedPres = Array.isArray(cfg?.presentations) && cfg.presentations.length > 0
+        ? cfg.presentations.map(normalizePresentationBidirectional)
+        : undefined;
+
+      return [
+        bId,
+        {
+          ...(sPrice !== undefined && Number.isFinite(sPrice) ? { suggestedPrice: roundToCents(sPrice) } : {}),
+          ...(cPrice !== undefined && Number.isFinite(cPrice) ? { costPrice: roundToCents(cPrice) } : {}),
+          ...(mPrice !== undefined && Number.isFinite(mPrice) ? { minSalePrice: roundToCents(mPrice) } : {}),
+          ...(cleanedTiers ? { priceTiers: cleanedTiers } : {}),
+          ...(cleanedPres ? { presentations: cleanedPres } : {}),
+        } as BranchPriceConfig,
+      ] as const;
+    })
+    .filter(([, cfg]) =>
+      (cfg.suggestedPrice !== undefined && cfg.suggestedPrice > 0) ||
+      (cfg.costPrice !== undefined && cfg.costPrice > 0) ||
+      (cfg.minSalePrice !== undefined && cfg.minSalePrice > 0) ||
+      (Array.isArray(cfg.priceTiers) && cfg.priceTiers.length > 0) ||
+      (Array.isArray(cfg.presentations) && cfg.presentations.length > 0)
+    );
+
+  return Object.fromEntries(entries);
+};
 
 /**
  * Deriva el campo denormalizado branchIds de un producto a partir de su mapa de stock.
@@ -165,16 +575,28 @@ export const calculateLowStockBranches = (
 
 export const deriveLowStockBranches = calculateLowStockBranches;
 
-const aggregateTransferItems = <T extends { productId: string; productName?: string; name?: string; sku?: string; quantity: number }>(
+const aggregateTransferItems = <T extends { productId: string; productName?: string; name?: string; sku?: string; quantity: number; variantId?: string; variantName?: string }>(
   items: T[]
 ): Array<T & { quantity: number }> => {
   const aggregated = new Map<string, T & { quantity: number }>();
   for (const item of items) {
-    const existing = aggregated.get(item.productId);
+    const key = item.variantId ? `${item.productId}::${item.variantId}` : item.productId;
+    const existing = aggregated.get(key);
     if (existing) existing.quantity += Number(item.quantity) || 0;
-    else aggregated.set(item.productId, { ...item, quantity: Number(item.quantity) || 0 });
+    else aggregated.set(key, { ...item, quantity: Number(item.quantity) || 0 });
   }
   return [...aggregated.values()];
+};
+
+const aggregateTransferQuantitiesByProduct = (
+  items: Array<{ productId: string; quantity: number }>
+): Map<string, number> => {
+  const totals = new Map<string, number>();
+  for (const item of items) {
+    if (!item.productId) continue;
+    totals.set(item.productId, (totals.get(item.productId) || 0) + (Number(item.quantity) || 0));
+  }
+  return totals;
 };
 
 /**
@@ -217,6 +639,75 @@ export const normalizeInventoryMovement = (data: any, id: string): any => {
 };
 
 // ============================================================================
+// FIREBASE STORAGE - SUBIDA DE IMÁGENES DE PRODUCTOS
+// ============================================================================
+
+/**
+ * Sube una imagen local (`file://` / `content://`) a Firebase Storage bajo
+ * `products/{accountId}/{file}` cumpliendo estrictamente `storage.rules`.
+ */
+export const uploadProductImageToStorage = async (
+  localUri: string,
+  accountId: string,
+  productId?: string
+): Promise<string> => {
+  const cleanUri = (localUri || '').trim();
+  if (!cleanUri) {
+    throw new Error('La URI de la imagen es obligatoria.');
+  }
+  if (/^https?:\/\//i.test(cleanUri)) {
+    return cleanUri;
+  }
+  if (!accountId) {
+    throw new Error('El identificador de cuenta (accountId) es obligatorio para subir imágenes.');
+  }
+
+  const response = await fetch(cleanUri);
+  if (!response.ok) {
+    throw new Error('No se pudo leer la imagen seleccionada desde el dispositivo.');
+  }
+
+  const blob = await response.blob();
+  try {
+    if (!blob || blob.size <= 0) {
+      throw new Error('La imagen seleccionada está vacía o dañada.');
+    }
+    if (blob.size > MAX_PRODUCT_IMAGE_BYTES) {
+      throw new Error('La imagen supera el límite permitido de 10 MB.');
+    }
+
+    const rawMime = (blob.type || '').toLowerCase().trim();
+    const uriExt = cleanUri.split('?')[0].split('.').pop()?.toLowerCase() || '';
+    let contentType = rawMime === 'image/jpg' ? 'image/jpeg' : rawMime;
+    if (!contentType || contentType === 'application/octet-stream') {
+      contentType = EXTENSION_TO_MIME[uriExt] || 'image/jpeg';
+    }
+    const ext = ALLOWED_IMAGE_MIME_TYPES[contentType];
+    if (!ext) {
+      throw new Error('Formato de imagen no permitido. Usa JPG, PNG, WebP, GIF o AVIF.');
+    }
+
+    const safePrefix = productId ? `${productId.replace(/[^a-zA-Z0-9_-]/g, '')}-` : '';
+    const fileName = `${safePrefix}${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+    // Debe mantener un solo segmento tras accountId para cumplir storage.rules (`match /products/{accountId}/{file}`).
+    const storagePath = `products/${accountId}/${fileName}`;
+    const storage = app ? getStorage(app) : getStorage();
+    const storageRef = ref(storage, storagePath);
+
+    const snapshot = await uploadBytes(storageRef, blob, { contentType });
+    return await getDownloadURL(snapshot.ref);
+  } finally {
+    if (typeof (blob as any)?.close === 'function') {
+      try {
+        (blob as any).close();
+      } catch {
+        // Ignorar en entornos sin Blob.close()
+      }
+    }
+  }
+};
+
+// ============================================================================
 // SERVICIOS DE INVENTARIO
 // ============================================================================
 
@@ -240,10 +731,16 @@ export const saveProduct = async (
     reservedStock?: Record<string, number>;
     presentations?: any[];
     variants?: any[];
+    priceTiers?: PriceTier[];
+    branchPrices?: Record<string, BranchPriceConfig>;
+    attributes?: Array<{ name: string; value: string }>;
+    galleryImages?: string[];
     allowDecimals?: boolean;
     unitOfMeasure?: string;
+    taxExemptionCode?: '10' | '20' | '30' | string;
     category?: string;
     imageUrl?: string;
+    thumbUrl?: string;
     barcode?: string;
     barcodes?: string[];
   },
@@ -256,6 +753,19 @@ export const saveProduct = async (
 
   if (!productData.accountId) {
     throw new Error('El identificador de cuenta (accountId) es obligatorio.');
+  }
+
+  if (isLocalFileUri(productData.imageUrl) || isLocalFileUri(productData.thumbUrl)) {
+    throw new Error('La imagen principal debe subirse a Firebase Storage antes de guardar.');
+  }
+  if (Array.isArray(productData.galleryImages) && productData.galleryImages.some((u) => isLocalFileUri(u))) {
+    throw new Error('Todas las imágenes de la galería deben subirse a Firebase Storage antes de guardar.');
+  }
+  if (
+    Array.isArray(productData.variants) &&
+    productData.variants.some((v) => Array.isArray(v?.images) && v.images.some((u: string) => isLocalFileUri(u)))
+  ) {
+    throw new Error('Las imágenes de variantes deben subirse a Firebase Storage antes de guardar.');
   }
 
   const creating = isNew || !productData.id;
@@ -281,22 +791,58 @@ export const saveProduct = async (
   const payload: any = {
     ...productData,
     name: productData.name.trim(),
-    sku: productData.sku ? productData.sku.trim() : `SKU-${Date.now().toString().slice(-6)}`,
-    costPrice: typeof productData.costPrice === 'number' ? Math.round(productData.costPrice * 100) / 100 : 0,
-    minSalePrice: typeof productData.minSalePrice === 'number' ? Math.round(productData.minSalePrice * 100) / 100 : 0,
-    suggestedPrice: typeof productData.suggestedPrice === 'number' ? Math.round(productData.suggestedPrice * 100) / 100 : 0,
+    sku: productData.sku ? productData.sku.trim() : (existingData.sku || `SKU-${Date.now().toString().slice(-6)}`),
     stock: stockMap,
     branchIds,
     lowStockBranches,
     minStock,
-    presentations: Array.isArray(productData.presentations) ? productData.presentations.map(normalizePresentation) : [],
-    unitOfMeasure: productData.unitOfMeasure || 'unit',
-    category: productData.category || 'General',
-    imageUrl: productData.imageUrl || '',
-    barcode: productData.barcode || '',
-    barcodes: Array.isArray(productData.barcodes) ? productData.barcodes : [],
     updatedAt: serverTimestamp(),
   };
+
+  if (creating || productData.costPrice !== undefined) {
+    payload.costPrice = typeof productData.costPrice === 'number' ? roundToCents(productData.costPrice) : 0;
+  }
+  if (creating || productData.minSalePrice !== undefined) {
+    payload.minSalePrice = typeof productData.minSalePrice === 'number' ? roundToCents(productData.minSalePrice) : 0;
+  }
+  if (creating || productData.suggestedPrice !== undefined) {
+    const sp = typeof productData.suggestedPrice === 'number' ? roundToCents(productData.suggestedPrice) : 0;
+    payload.suggestedPrice = sp;
+    payload.price = sp;
+  }
+  if (creating || productData.unitOfMeasure !== undefined) {
+    payload.unitOfMeasure = productData.unitOfMeasure || 'unit';
+  }
+  if (creating || productData.category !== undefined) {
+    payload.category = productData.category || 'General';
+  }
+  if (creating || productData.imageUrl !== undefined) {
+    payload.imageUrl = productData.imageUrl || '';
+  }
+  if (creating || productData.barcode !== undefined) {
+    payload.barcode = productData.barcode || '';
+  }
+  if (creating || productData.barcodes !== undefined) {
+    payload.barcodes = Array.isArray(productData.barcodes) ? productData.barcodes : [];
+  }
+  if (creating || productData.presentations !== undefined) {
+    payload.presentations = Array.isArray(productData.presentations)
+      ? productData.presentations.map(normalizePresentationBidirectional)
+      : [];
+  }
+  if (productData.priceTiers !== undefined) {
+    payload.priceTiers = normalizePriceTiers(productData.priceTiers);
+  }
+  if (productData.galleryImages !== undefined) {
+    payload.galleryImages = sanitizeRemoteImageUrls(productData.galleryImages);
+  }
+  if (productData.attributes !== undefined) {
+    payload.attributes = Array.isArray(productData.attributes)
+      ? productData.attributes
+          .map((a) => ({ name: (a.name || '').trim(), value: (a.value || '').trim() }))
+          .filter((a) => a.name.length > 0 && a.value.length > 0)
+      : [];
+  }
 
   // Edición es parcial: la ausencia de un campo significa “no fue editado”.
   // En particular, reservas solo cambian por operaciones de inventario y no
@@ -446,8 +992,8 @@ export const findByBarcodeRemote = async (
  */
 export const adjustProductStock = async (
   params: AdjustStockParams
-): Promise<void> => {
-  const { product, branchId, branchName, newStock, reason, notes, userProfile } = params;
+): Promise<AdjustStockResult> => {
+  const { product, branchId, branchName, newStock, variantId, variantName, reason, notes, userProfile } = params;
 
   if (!product.id || !branchId) {
     throw new Error('Parámetros de producto y sucursal requeridos para ajuste de stock.');
@@ -460,6 +1006,15 @@ export const adjustProductStock = async (
   const productRef = doc(db, PRODUCTS_COLLECTION, product.id);
   const normalizedNewStock = Math.round(newStock * 10000) / 10000;
 
+  let resultSnapshot: AdjustStockResult = {
+    previousStock: 0,
+    newStock: normalizedNewStock,
+    diff: 0,
+    before: {},
+    after: {},
+    variantId,
+  };
+
   await runTransaction(db, async (tx) => {
     const productSnap = await tx.get(productRef);
     if (!productSnap.exists()) {
@@ -467,15 +1022,71 @@ export const adjustProductStock = async (
     }
 
     const pData = productSnap.data();
-    const currentStockMap = { ...(pData.stock || {}) };
-    const previousStock = currentStockMap[branchId] || 0;
-    const diff = Math.round((normalizedNewStock - previousStock) * 10000) / 10000;
+    const beforeStockSnapshot: Record<string, number> = { ...(pData.stock || {}) };
+    const currentStockMap: Record<string, number> = { ...beforeStockSnapshot };
 
-    if (diff === 0) {
-      return; // Sin cambios reales en stock
+    let previousQty = Number(currentStockMap[branchId]) || 0;
+    let diff = Math.round((normalizedNewStock - previousQty) * 10000) / 10000;
+    let updatedVariants: any[] | undefined;
+
+    if (variantId) {
+      const variantsList = Array.isArray(pData.variants) ? pData.variants : [];
+      const targetVariant = variantsList.find((v: any) => v.id === variantId);
+      if (!targetVariant) {
+        throw new Error(`La variante "${variantName || variantId}" no existe en el producto.`);
+      }
+
+      previousQty = getVariantBranchStock(targetVariant, branchId);
+      diff = Math.round((normalizedNewStock - previousQty) * 10000) / 10000;
+
+      if (diff === 0) {
+        resultSnapshot = {
+          previousStock: previousQty,
+          newStock: normalizedNewStock,
+          diff: 0,
+          before: beforeStockSnapshot,
+          after: beforeStockSnapshot,
+          variantId,
+        };
+        return;
+      }
+
+      updatedVariants = variantsList.map((v: any) => {
+        if (v.id !== variantId) return v;
+        if (typeof v.stock === 'object' && v.stock !== null) {
+          return {
+            ...v,
+            stock: {
+              ...v.stock,
+              [branchId]: normalizedNewStock,
+            },
+          };
+        }
+        return {
+          ...v,
+          stock: { [branchId]: normalizedNewStock },
+        };
+      });
+
+      const aggregatedBranchStock = updatedVariants.reduce(
+        (sum: number, v: any) => sum + getVariantBranchStock(v, branchId),
+        0
+      );
+      currentStockMap[branchId] = Math.round(aggregatedBranchStock * 10000) / 10000;
+    } else {
+      if (diff === 0) {
+        resultSnapshot = {
+          previousStock: previousQty,
+          newStock: normalizedNewStock,
+          diff: 0,
+          before: beforeStockSnapshot,
+          after: beforeStockSnapshot,
+        };
+        return;
+      }
+      currentStockMap[branchId] = normalizedNewStock;
     }
 
-    currentStockMap[branchId] = normalizedNewStock;
     const lowStockBranches = calculateLowStockBranches(
       currentStockMap,
       pData.reservedStock || {},
@@ -484,11 +1095,15 @@ export const adjustProductStock = async (
     const branchIds = deriveBranchIds(currentStockMap, pData.branchIds || [branchId]);
 
     // 1. Actualizar producto únicamente en campos permitidos para cajeros SIN updatedAt
-    tx.update(productRef, {
+    const productUpdate: Record<string, any> = {
       stock: currentStockMap,
       branchIds,
       lowStockBranches,
-    });
+    };
+    if (updatedVariants !== undefined) {
+      productUpdate.variants = updatedVariants;
+    }
+    tx.update(productRef, productUpdate);
 
     // 2. Registrar movimiento en Kardex con campos Web canónicos y alias Mobile
     const movementRef = doc(collection(db, INVENTORY_MOVEMENTS_COLLECTION));
@@ -499,9 +1114,10 @@ export const adjustProductStock = async (
       productId: product.id,
       productName: product.name || pData.name,
       productSku: product.sku || pData.sku || '',
+      ...(variantId ? { variantId, variantName: variantName || '' } : {}),
       // Campos canónicos Web
       movementType: diff > 0 ? 'add' : 'edit',
-      quantityBefore: previousStock,
+      quantityBefore: previousQty,
       quantityAfter: normalizedNewStock,
       quantityChanged: diff,
       userId: userProfile.uid,
@@ -509,7 +1125,7 @@ export const adjustProductStock = async (
       userRole: (userProfile as any)?.role || 'user',
       // Campos alias Mobile
       type: diff > 0 ? 'in' : 'out',
-      previousStock,
+      previousStock: previousQty,
       newStock: normalizedNewStock,
       quantity: Math.abs(diff),
       reason: reason || 'adjustment',
@@ -517,12 +1133,54 @@ export const adjustProductStock = async (
       createdAt: serverTimestamp(),
       date: Date.now(),
     }));
+
+    resultSnapshot = {
+      previousStock: previousQty,
+      newStock: normalizedNewStock,
+      diff,
+      before: beforeStockSnapshot,
+      after: { ...currentStockMap },
+      variantId,
+    };
   });
+
+  // Registro de auditoría en inventory_adjustments (solo admins por firestore.rules)
+  if (resultSnapshot.diff !== 0 && ((userProfile as any)?.role === 'owner' || (userProfile as any)?.role === 'admin')) {
+    try {
+      const adjRef = doc(collection(db, INVENTORY_ADJUSTMENTS_COLLECTION));
+      await setDoc(adjRef, cleanFirestoreData({
+        accountId: product.accountId,
+        productId: product.id,
+        productName: product.name,
+        ...(variantId ? { variantId, variantName: variantName || '' } : {}),
+        before: resultSnapshot.before,
+        after: resultSnapshot.after,
+        mode: resultSnapshot.diff > 0 ? 'add' : 'edit',
+        reason: reason || 'adjustment',
+        notes: notes || '',
+        changedAt: Date.now(),
+        user: {
+          uid: userProfile.uid,
+          name: userProfile.displayName || userProfile.email || 'Usuario',
+          role: (userProfile as any)?.role || 'admin',
+        },
+      }));
+    } catch (auditErr) {
+      console.warn('[InventoryService] No se pudo registrar inventory_adjustments:', auditErr);
+    }
+  }
+
+  return resultSnapshot;
 };
 
 /**
  * Consulta los movimientos del Kardex oficial en `inventory_movements`
  * normalizando automáticamente campos bidireccionales Web y Mobile.
+ * Usa las combinaciones cubiertas por los índices compuestos de firestore.indexes.json:
+ * - (accountId, branchId, productId, createdAt DESC)
+ * - (accountId, branchId, createdAt DESC)
+ * - (accountId, productId, createdAt DESC)
+ * - (accountId, createdAt DESC)
  */
 export const getProductKardex = async (
   accountId: string,
@@ -534,8 +1192,11 @@ export const getProductKardex = async (
     const coll = collection(db, INVENTORY_MOVEMENTS_COLLECTION);
     const constraints: any[] = [
       where('accountId', '==', accountId),
-      where('branchId', '==', branchId),
     ];
+
+    if (branchId && branchId !== 'all') {
+      constraints.push(where('branchId', '==', branchId));
+    }
 
     if (productId) {
       constraints.push(where('productId', '==', productId));
@@ -557,8 +1218,10 @@ export const getProductKardex = async (
       const coll = collection(db, INVENTORY_MOVEMENTS_COLLECTION);
       const constraints: any[] = [
         where('accountId', '==', accountId),
-        where('branchId', '==', branchId),
       ];
+      if (branchId && branchId !== 'all') {
+        constraints.push(where('branchId', '==', branchId));
+      }
       if (productId) constraints.push(where('productId', '==', productId));
 
       const fallbackQuery = query(coll, ...constraints, firestoreLimit(limitCount));
@@ -621,27 +1284,55 @@ export const createStockTransfer = async (
 
   const transferDocRef = doc(collection(db, TRANSFERS_COLLECTION));
   const transferId = transferDocRef.id;
-  const reservationItems = aggregateTransferItems(items);
+  const aggregatedLines = aggregateTransferItems(items);
+  const productTotals = aggregateTransferQuantitiesByProduct(aggregatedLines);
+  const uniqueProductIds = Array.from(productTotals.keys());
 
   await runTransaction(db, async (tx) => {
     // Firestore requiere completar todas las lecturas antes de la primera escritura.
-    const productReads: Array<{ item: TransferItem; ref: ReturnType<typeof doc>; snap: Awaited<ReturnType<typeof tx.get>> }> = [];
-    for (const item of reservationItems) {
-      if (item.quantity <= 0) {
-        throw new Error(`La cantidad a transferir de "${item.productName}" debe ser mayor a cero.`);
+    for (const line of aggregatedLines) {
+      if (line.quantity <= 0) {
+        throw new Error(`La cantidad a transferir de "${line.productName}" debe ser mayor a cero.`);
       }
-      const pRef = doc(db, PRODUCTS_COLLECTION, item.productId);
-      const pSnap = await tx.get(pRef);
-      productReads.push({ item, ref: pRef, snap: pSnap });
     }
 
-    // 1. Validar y reservar stock en sucursal origen
-    for (const { item, ref: pRef, snap: pSnap } of productReads) {
-      if (!pSnap.exists()) {
-        throw new Error(`El producto "${item.productName}" no fue encontrado.`);
-      }
+    const productReads = new Map<string, { ref: ReturnType<typeof doc>; snap: Awaited<ReturnType<typeof tx.get>> }>();
+    for (const productId of uniqueProductIds) {
+      const pRef = doc(db, PRODUCTS_COLLECTION, productId);
+      const pSnap = await tx.get(pRef);
+      productReads.set(productId, { ref: pRef, snap: pSnap });
+    }
 
-      const pData = pSnap.data() as Record<string, any>;
+    // Validar stock por variante cuando se transfieren variantes específicas
+    for (const line of aggregatedLines) {
+      const read = productReads.get(line.productId);
+      if (!read?.snap.exists()) {
+        throw new Error(`El producto "${line.productName}" no fue encontrado.`);
+      }
+      if (line.variantId) {
+        const pData = read.snap.data() as Record<string, any>;
+        const variants = Array.isArray(pData.variants) ? pData.variants : [];
+        const variant = variants.find((v: any) => v.id === line.variantId);
+        if (!variant) {
+          throw new Error(`La variante "${line.variantName || line.variantId}" de "${line.productName}" no fue encontrada.`);
+        }
+        const varStock = getVariantBranchStock(variant, srcBranchId);
+        if (varStock < line.quantity) {
+          throw new Error(
+            `Stock insuficiente en variante "${variant.name || line.variantName}" de "${line.productName}". Disponible: ${varStock}, Requerido: ${line.quantity}.`
+          );
+        }
+      }
+    }
+
+    // 1. Validar y reservar stock total por producto en sucursal origen
+    for (const [productId, totalQty] of productTotals.entries()) {
+      const read = productReads.get(productId)!;
+      const pRef = read.ref;
+      const pData = read.snap.data() as Record<string, any>;
+      const firstLine = aggregatedLines.find((l) => l.productId === productId);
+      const productLabel = firstLine?.productName || pData.name || productId;
+
       const currentStockMap = { ...(pData.stock || {}) };
       const currentReservedMap = { ...(pData.reservedStock || {}) };
 
@@ -649,13 +1340,13 @@ export const createStockTransfer = async (
       const currentOriginReserved = Number(currentReservedMap[srcBranchId]) || 0;
       const availableOrigin = currentOriginStock - currentOriginReserved;
 
-      if (availableOrigin < item.quantity) {
+      if (availableOrigin < totalQty) {
         throw new Error(
-          `Stock insuficiente en sucursal origen para "${item.productName}". Disponible: ${availableOrigin}, Requerido: ${item.quantity}.`
+          `Stock insuficiente en sucursal origen para "${productLabel}". Disponible: ${availableOrigin}, Requerido: ${totalQty}.`
         );
       }
 
-      const newReservedOrigin = Math.round((currentOriginReserved + item.quantity) * 10000) / 10000;
+      const newReservedOrigin = Math.round((currentOriginReserved + totalQty) * 10000) / 10000;
       currentReservedMap[srcBranchId] = newReservedOrigin;
 
       const lowStockBranches = calculateLowStockBranches(
@@ -683,18 +1374,20 @@ export const createStockTransfer = async (
       fromBranchName: srcBranchName,
       toBranchId: dstBranchId,
       toBranchName: dstBranchName,
-      items: items.map((it) => ({
+      items: aggregatedLines.map((it) => ({
         productId: it.productId,
         productName: it.productName,
         sku: it.sku || '',
         quantity: it.quantity,
+        ...(it.variantId ? { variantId: it.variantId, variantName: it.variantName || '' } : {}),
       })),
-      products: items.map((it) => ({
+      products: aggregatedLines.map((it) => ({
         productId: it.productId,
         name: it.productName,
         productName: it.productName,
         sku: it.sku || '',
         quantity: it.quantity,
+        ...(it.variantId ? { variantId: it.variantId, variantName: it.variantName || '' } : {}),
       })),
       status: 'pending',
       requestedBy: userProfile.uid,
@@ -758,6 +1451,26 @@ export const sendStockTransfer = async (
 };
 
 /**
+ * Emite la Guía de Remisión Electrónica (09) de una transferencia en tránsito
+ * a través del endpoint del servidor (`/api/invoicing/despatch`).
+ */
+export const emitTransferDespatchGuide = async (
+  accountId: string,
+  transferId: string
+): Promise<{ success: boolean; einvoice?: { id?: string; documentNumber?: string; status?: string } | null }> => {
+  if (!accountId || !transferId) {
+    throw new Error('accountId y transferId son obligatorios para emitir la Guía de Remisión.');
+  }
+  return apiRequest<{ success: boolean; einvoice?: { id?: string; documentNumber?: string; status?: string } | null }>(
+    '/api/invoicing/despatch',
+    {
+      method: 'POST',
+      body: { accountId, transferId },
+    }
+  );
+};
+
+/**
  * Cancela una transferencia pendiente o aprobada y libera el stock reservado en la sucursal de origen.
  */
 export const cancelStockTransfer = async (
@@ -792,24 +1505,22 @@ export const cancelStockTransfer = async (
 
     const srcBranchId = tData.sourceBranchId || tData.fromBranchId;
     if (!srcBranchId) throw new Error('La transferencia no tiene una sucursal de origen válida.');
-    const rawItems = aggregateTransferItems(tData.products || tData.items || []);
+    const productTotals = aggregateTransferQuantitiesByProduct(tData.products || tData.items || []);
 
     // Leer productos antes de liberar reservas para respetar el protocolo de Firestore.
-    const productReads: Array<{ item: any; ref: ReturnType<typeof doc>; snap: Awaited<ReturnType<typeof tx.get>> }> = [];
-    for (const item of rawItems) {
-      if (!item.productId) continue;
-      const pRef = doc(db, PRODUCTS_COLLECTION, item.productId);
+    const productReads: Array<{ productId: string; qty: number; ref: ReturnType<typeof doc>; snap: Awaited<ReturnType<typeof tx.get>> }> = [];
+    for (const [productId, qty] of productTotals.entries()) {
+      const pRef = doc(db, PRODUCTS_COLLECTION, productId);
       const pSnap = await tx.get(pRef);
-      productReads.push({ item, ref: pRef, snap: pSnap });
+      productReads.push({ productId, qty, ref: pRef, snap: pSnap });
     }
 
     // Liberar reserva de stock en origen
-    for (const { item, ref: pRef, snap: pSnap } of productReads) {
+    for (const { qty, ref: pRef, snap: pSnap } of productReads) {
       if (pSnap.exists()) {
         const pData = pSnap.data() as Record<string, any>;
         const currentReservedMap = { ...(pData.reservedStock || {}) };
         const currentSrcReserved = Number(currentReservedMap[srcBranchId]) || 0;
-        const qty = Number(item.quantity) || 0;
         const newReserved = Math.max(0, currentSrcReserved - qty);
         if (newReserved > 0) {
           currentReservedMap[srcBranchId] = newReserved;
@@ -850,9 +1561,9 @@ export const rejectStockTransfer = (
 /**
  * Completa la recepción de una transferencia en la sucursal de destino.
  * Cumple con el flujo de firestore.rules (pending -> approved -> completed):
- * Si la transferencia está en 'pending', primero se aprueba y luego se completa atómicamente.
- * Acredita el stock físico en destino, descuenta y libera el reservado en origen,
- * y genera ambos registros de Kardex oficial (`movementType: 'transfer'`).
+ * Acredita el stock físico en destino (y en variantes si aplica),
+ * descuenta y libera el reservado en origen, y genera ambos registros
+ * de Kardex oficial (`movementType: 'transfer'`).
  */
 export const completeStockTransfer = async (
   transferId: string,
@@ -912,46 +1623,60 @@ export const completeStockTransfer = async (
       productName: item.productName || item.name || 'Producto',
       sku: item.sku || '',
       quantity: Number(item.quantity) || 0,
+      variantId: item.variantId,
+      variantName: item.variantName,
     }));
+
+    // Agrupar líneas por productId para leer/actualizar cada producto exactamente una vez
+    const linesByProduct = new Map<string, typeof transferItems>();
+    for (const item of transferItems) {
+      if (!item.productId) continue;
+      const list = linesByProduct.get(item.productId) || [];
+      list.push(item);
+      linesByProduct.set(item.productId, list);
+    }
 
     // FASE 1: LECTURAS (todos los gets antes de updates)
     const productReads: Array<{
+      productId: string;
       ref: ReturnType<typeof doc>;
       snap: Awaited<ReturnType<typeof tx.get>>;
-      item: (typeof transferItems)[0];
+      lines: typeof transferItems;
     }> = [];
 
-    for (const item of transferItems) {
-      if (!item.productId) continue;
-      const pRef = doc(db, PRODUCTS_COLLECTION, item.productId);
+    for (const [productId, lines] of linesByProduct.entries()) {
+      const pRef = doc(db, PRODUCTS_COLLECTION, productId);
       const pSnap = await tx.get(pRef);
-      productReads.push({ ref: pRef, snap: pSnap, item });
+      productReads.push({ productId, ref: pRef, snap: pSnap, lines });
     }
 
     // FASE 2: ESCRITURAS
-    for (const { ref: pRef, snap: pSnap, item } of productReads) {
+    const effectiveTransferNumber = tData.transferNumber || `TRF-${transferId.slice(-4).toUpperCase()}`;
+
+    for (const { productId, ref: pRef, snap: pSnap, lines } of productReads) {
       if (!pSnap.exists()) {
-        throw new Error(`El producto "${item.productName}" no fue encontrado.`);
+        throw new Error(`El producto "${lines[0]?.productName || productId}" no fue encontrado.`);
       }
 
       const pData = pSnap.data() as Record<string, any>;
       const currentStockMap = { ...(pData.stock || {}) };
       const currentReservedMap = { ...(pData.reservedStock || {}) };
 
+      const totalProductQty = lines.reduce((sum, l) => sum + l.quantity, 0);
       const currentSrcStock = Number(currentStockMap[srcBranchId]) || 0;
       const currentDstStock = Number(currentStockMap[dstBranchId]) || 0;
       const currentSrcReserved = Number(currentReservedMap[srcBranchId]) || 0;
 
-      if (currentSrcStock < item.quantity || currentSrcReserved < item.quantity) {
+      if (currentSrcStock < totalProductQty || currentSrcReserved < totalProductQty) {
         throw new Error('La reserva del producto ya no está disponible para recibir la transferencia.');
       }
 
       // 1. Restar stock físico en origen
-      const newSrcStock = Math.max(0, Math.round((currentSrcStock - item.quantity) * 10000) / 10000);
+      const newSrcStock = Math.max(0, Math.round((currentSrcStock - totalProductQty) * 10000) / 10000);
       currentStockMap[srcBranchId] = newSrcStock;
 
       // 2. Liberar stock reservado en origen
-      const newSrcReserved = Math.max(0, Math.round((currentSrcReserved - item.quantity) * 10000) / 10000);
+      const newSrcReserved = Math.max(0, Math.round((currentSrcReserved - totalProductQty) * 10000) / 10000);
       if (newSrcReserved > 0) {
         currentReservedMap[srcBranchId] = newSrcReserved;
       } else {
@@ -959,8 +1684,39 @@ export const completeStockTransfer = async (
       }
 
       // 3. Sumar stock físico en destino
-      const newDstStock = Math.round((currentDstStock + item.quantity) * 10000) / 10000;
+      const newDstStock = Math.round((currentDstStock + totalProductQty) * 10000) / 10000;
       currentStockMap[dstBranchId] = newDstStock;
+
+      // 4. Actualizar stock de variantes si las líneas incluyen variantId
+      let updatedVariants: any[] | undefined;
+      const variantLines = lines.filter((l) => Boolean(l.variantId));
+      if (variantLines.length > 0 && Array.isArray(pData.variants)) {
+        const qtyByVariant = new Map<string, number>();
+        for (const vl of variantLines) {
+          qtyByVariant.set(vl.variantId!, (qtyByVariant.get(vl.variantId!) || 0) + vl.quantity);
+        }
+        updatedVariants = pData.variants.map((variant: any) => {
+          const vQty = qtyByVariant.get(variant.id) || 0;
+          if (!vQty) return variant;
+          const vSrcBefore = getVariantBranchStock(variant, srcBranchId);
+          if (vSrcBefore < vQty) {
+            throw new Error(
+              `Stock insuficiente para la variante "${variant.name || variant.id}" en sucursal origen.`
+            );
+          }
+          const vDstBefore = getVariantBranchStock(variant, dstBranchId);
+          const baseStockObj =
+            typeof variant.stock === 'object' && variant.stock !== null ? { ...variant.stock } : {};
+          return {
+            ...variant,
+            stock: {
+              ...baseStockObj,
+              [srcBranchId]: Math.max(0, Math.round((vSrcBefore - vQty) * 10000) / 10000),
+              [dstBranchId]: Math.round((vDstBefore + vQty) * 10000) / 10000,
+            },
+          };
+        });
+      }
 
       const lowStockBranches = calculateLowStockBranches(
         currentStockMap,
@@ -970,69 +1726,82 @@ export const completeStockTransfer = async (
 
       const branchIds = deriveBranchIds(currentStockMap, pData.branchIds || [srcBranchId, dstBranchId]);
 
-      // 4. Actualizar producto SIN updatedAt (cumple firestore.rules para rol cajero)
-      tx.update(pRef, {
+      // 5. Actualizar producto SIN updatedAt (cumple firestore.rules para rol cajero)
+      const productUpdate: Record<string, any> = {
         stock: currentStockMap,
         reservedStock: currentReservedMap,
         branchIds,
         lowStockBranches,
-      });
+      };
+      if (updatedVariants !== undefined) {
+        productUpdate.variants = updatedVariants;
+      }
+      tx.update(pRef, productUpdate);
 
-      const effectiveTransferNumber = tData.transferNumber || `TRF-${transferId.slice(-4).toUpperCase()}`;
+      // 6. Kardex salida en origen y entrada en destino por línea
+      let runningSrc = currentSrcStock;
+      let runningDst = currentDstStock;
+      for (const line of lines) {
+        const lineSrcAfter = Math.max(0, Math.round((runningSrc - line.quantity) * 10000) / 10000);
+        const lineDstAfter = Math.round((runningDst + line.quantity) * 10000) / 10000;
 
-      // 5. Kardex salida en origen
-      const mvOutRef = doc(collection(db, INVENTORY_MOVEMENTS_COLLECTION));
-      tx.set(mvOutRef, cleanFirestoreData({
-        accountId,
-        branchId: srcBranchId,
-        branchName: srcBranchName,
-        productId: item.productId,
-        productName: item.productName,
-        productSku: item.sku || pData.sku || '',
-        movementType: 'transfer',
-        quantityBefore: currentSrcStock,
-        quantityAfter: newSrcStock,
-        quantityChanged: -item.quantity,
-        referenceNumber: effectiveTransferNumber,
-        userId: userProfile.uid,
-        userName: userProfile.displayName || userProfile.email || 'Usuario',
-        userRole: (userProfile as any)?.role || 'user',
-        type: 'out',
-        previousStock: currentSrcStock,
-        newStock: newSrcStock,
-        quantity: item.quantity,
-        reason: 'transfer_out',
-        notes: `Transferencia #${transferId} hacia ${dstBranchName}`,
-        createdAt: serverTimestamp(),
-        date: Date.now(),
-      }));
+        const mvOutRef = doc(collection(db, INVENTORY_MOVEMENTS_COLLECTION));
+        tx.set(mvOutRef, cleanFirestoreData({
+          accountId,
+          branchId: srcBranchId,
+          branchName: srcBranchName,
+          productId: line.productId,
+          productName: line.productName,
+          productSku: line.sku || pData.sku || '',
+          ...(line.variantId ? { variantId: line.variantId, variantName: line.variantName || '' } : {}),
+          movementType: 'transfer',
+          quantityBefore: runningSrc,
+          quantityAfter: lineSrcAfter,
+          quantityChanged: -line.quantity,
+          referenceNumber: effectiveTransferNumber,
+          userId: userProfile.uid,
+          userName: userProfile.displayName || userProfile.email || 'Usuario',
+          userRole: (userProfile as any)?.role || 'user',
+          type: 'out',
+          previousStock: runningSrc,
+          newStock: lineSrcAfter,
+          quantity: line.quantity,
+          reason: 'transfer_out',
+          notes: `Transferencia #${transferId} hacia ${dstBranchName}`,
+          createdAt: serverTimestamp(),
+          date: Date.now(),
+        }));
 
-      // 6. Kardex entrada en destino
-      const mvInRef = doc(collection(db, INVENTORY_MOVEMENTS_COLLECTION));
-      tx.set(mvInRef, cleanFirestoreData({
-        accountId,
-        branchId: dstBranchId,
-        branchName: dstBranchName,
-        productId: item.productId,
-        productName: item.productName,
-        productSku: item.sku || pData.sku || '',
-        movementType: 'transfer',
-        quantityBefore: currentDstStock,
-        quantityAfter: newDstStock,
-        quantityChanged: item.quantity,
-        referenceNumber: effectiveTransferNumber,
-        userId: userProfile.uid,
-        userName: userProfile.displayName || userProfile.email || 'Usuario',
-        userRole: (userProfile as any)?.role || 'user',
-        type: 'in',
-        previousStock: currentDstStock,
-        newStock: newDstStock,
-        quantity: item.quantity,
-        reason: 'transfer_in',
-        notes: `Recepción de transferencia #${transferId} desde ${srcBranchName}`,
-        createdAt: serverTimestamp(),
-        date: Date.now(),
-      }));
+        const mvInRef = doc(collection(db, INVENTORY_MOVEMENTS_COLLECTION));
+        tx.set(mvInRef, cleanFirestoreData({
+          accountId,
+          branchId: dstBranchId,
+          branchName: dstBranchName,
+          productId: line.productId,
+          productName: line.productName,
+          productSku: line.sku || pData.sku || '',
+          ...(line.variantId ? { variantId: line.variantId, variantName: line.variantName || '' } : {}),
+          movementType: 'transfer',
+          quantityBefore: runningDst,
+          quantityAfter: lineDstAfter,
+          quantityChanged: line.quantity,
+          referenceNumber: effectiveTransferNumber,
+          userId: userProfile.uid,
+          userName: userProfile.displayName || userProfile.email || 'Usuario',
+          userRole: (userProfile as any)?.role || 'user',
+          type: 'in',
+          previousStock: runningDst,
+          newStock: lineDstAfter,
+          quantity: line.quantity,
+          reason: 'transfer_in',
+          notes: `Recepción de transferencia #${transferId} desde ${srcBranchName}`,
+          createdAt: serverTimestamp(),
+          date: Date.now(),
+        }));
+
+        runningSrc = lineSrcAfter;
+        runningDst = lineDstAfter;
+      }
     }
 
     // 7. Marcar transferencia como 'completed'
@@ -1079,6 +1848,7 @@ export const getStockTransfers = async (
         productName: it.productName || it.name || 'Producto',
         sku: it.sku || '',
         quantity: Number(it.quantity) || 0,
+        ...(it.variantId ? { variantId: it.variantId, variantName: it.variantName || '' } : {}),
       }));
 
       const normalizedProducts = rawItems.map((it: any) => ({
@@ -1087,6 +1857,7 @@ export const getStockTransfers = async (
         productName: it.productName || it.name || 'Producto',
         sku: it.sku || '',
         quantity: Number(it.quantity) || 0,
+        ...(it.variantId ? { variantId: it.variantId, variantName: it.variantName || '' } : {}),
       }));
 
       return {
@@ -1141,6 +1912,7 @@ export const getStockTransfers = async (
 
 export const InventoryKardexService = {
   saveProduct,
+  uploadProductImageToStorage,
   findByBarcodeRemote,
   adjustProductStock,
   getProductKardex,
@@ -1149,12 +1921,19 @@ export const InventoryKardexService = {
   rejectStockTransfer,
   cancelStockTransfer,
   sendStockTransfer,
+  emitTransferDespatchGuide,
   completeStockTransfer,
   getStockTransfers,
   calculateLowStockBranches,
   deriveLowStockBranches,
   deriveBranchIds,
   normalizeInventoryMovement,
+  calculateWeightEntry,
+  resolvePresentationVariantPrice,
+  resolvePresentationVariantStock,
+  mergeSingleBranchStock,
+  normalizePriceTiers,
+  serializeBranchPrices,
 };
 
 export default InventoryKardexService;

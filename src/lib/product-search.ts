@@ -10,6 +10,9 @@ import {
   ProductVariant,
   PriceTier,
   BranchPriceConfig,
+  CartItem,
+  DiscountSettings,
+  PromotionRule,
 } from '../types';
 
 // ============================================================================
@@ -321,10 +324,12 @@ export function resolveEffectiveUnitPrice(
     // Check if branch has presentation override
     const branchPresentations = pricing.presentations || [];
     const overridePres = branchPresentations.find((p) => p.id === presentation.id);
-    const presPrice = overridePres?.price ?? presentation.price;
-    const presMin = overridePres?.minSalePrice ?? presentation.minSalePrice ?? 0;
+    const presPrice = Number(overridePres?.price ?? presentation.price ?? 0);
+    const presMin = Number(overridePres?.minSalePrice ?? presentation.minSalePrice ?? 0);
 
-    return Math.max(presPrice, presMin);
+    const resolvedPresPrice =
+      enableMinSalePrice && presMin > 0 ? Math.max(presPrice, presMin) : presPrice;
+    return Math.round(resolvedPresPrice * 100) / 100;
   }
 
   // 2. Base price from branch or product
@@ -366,4 +371,302 @@ export function resolveEffectiveUnitPrice(
   }
 
   return Math.round(unitPrice * 100) / 100;
+}
+
+/**
+ * Alias de paridad Web (`getEffectiveProductPrice`) para resolver el precio unitario vigente
+ * según sucursal (`branchPrices`), escalas por volumen (`priceTiers`) y presentación/variante.
+ */
+export function getEffectiveProductPrice(
+  product: Product,
+  branchId: string,
+  quantity: number = 1,
+  presentation?: ProductPresentation,
+  variant?: ProductVariant,
+  enableMinSalePrice: boolean = true
+): number {
+  return resolveEffectiveUnitPrice(
+    product,
+    branchId,
+    quantity,
+    presentation,
+    variant,
+    enableMinSalePrice
+  );
+}
+
+/**
+ * Resuelve el precio mínimo permitido para una línea del carrito con paridad Web (`resolveMinSalePriceFloor`):
+ * - Si `enableMinSalePrice !== false` y `minSalePrice > 0`: usa `Math.max(minSalePrice, costPrice)`.
+ * - Si `minSalePrice` es 0 o no está configurado: respalda con `costPrice` para nunca vender debajo del costo.
+ */
+export function resolveCartItemMinPrice(
+  item: {
+    minSalePrice?: number;
+    costPrice?: number;
+    product?: { minSalePrice?: number; costPrice?: number };
+    presentation?: { minSalePrice?: number; conversionFactor?: number; costPrice?: number };
+  },
+  enableMinSalePrice: boolean = true
+): number {
+  const presFactor = Math.max(1, Number(item.presentation?.conversionFactor ?? 1) || 1);
+  const rawCost =
+    item.presentation?.costPrice ??
+    item.costPrice ??
+    item.product?.costPrice;
+  const cost =
+    rawCost !== undefined && rawCost !== null && Number.isFinite(Number(rawCost))
+      ? Number(rawCost) * (item.presentation && item.presentation.costPrice === undefined ? presFactor : 1)
+      : undefined;
+
+  const rawMin =
+    item.presentation?.minSalePrice ??
+    item.minSalePrice ??
+    item.product?.minSalePrice;
+
+  if (enableMinSalePrice && rawMin !== undefined && rawMin !== null) {
+    const configured = Number(rawMin);
+    if (Number.isFinite(configured) && configured > 0) {
+      if (cost !== undefined && cost > configured) {
+        return Math.round(cost * 100) / 100;
+      }
+      return Math.round(configured * 100) / 100;
+    }
+  }
+
+  if (cost !== undefined && Number.isFinite(cost) && cost >= 0) {
+    return Math.round(cost * 100) / 100;
+  }
+
+  return 0;
+}
+
+// ============================================================================
+// 6. PROMOTIONS, GIFTS, ICBPER & DECIMAL HELPERS
+// ============================================================================
+
+export const ICBPER_BAG_FEE = 0.5;
+export const ICBPER_CART_ITEM_ID = 'icbper_plastic_bag_fee';
+
+/**
+ * Parses decimal inputs normalizing Peru comma separators (`12,50` -> `12.50`).
+ */
+export function parseNormalizedDecimal(raw: string | number | undefined | null): number {
+  if (typeof raw === 'number') return Number.isFinite(raw) ? raw : 0;
+  const cleaned = String(raw || '').trim().replace(',', '.');
+  const parsed = parseFloat(cleaned);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/**
+ * Resolves available physical stock for a product in the given branch (with legacy Principal fallback).
+ */
+export function resolveProductBranchStock(product: Product, branchId: string = 'main'): number {
+  const stockMap = product.stock;
+  if (typeof stockMap === 'number') return Number(stockMap) || 0;
+  if (!stockMap || typeof stockMap !== 'object') return 0;
+  if (typeof stockMap[branchId] === 'number') return Number(stockMap[branchId]) || 0;
+  const fallbackKey = Object.keys(stockMap).find(
+    (k) => k.toLowerCase().includes('principal') || k.toLowerCase().includes('main')
+  );
+  return fallbackKey ? Number(stockMap[fallbackKey] || 0) : 0;
+}
+
+/**
+ * Checks whether any item in the cart is marked as ICBPER / plastic bag product.
+ */
+export function cartHasPlasticBagProducts(items: readonly CartItem[]): boolean {
+  return items.some((item) => {
+    if (item.id.startsWith(ICBPER_CART_ITEM_ID) || item.productId === ICBPER_CART_ITEM_ID) {
+      return false;
+    }
+    const raw = item as any;
+    const prod = raw.product as any;
+    if (raw.icbper === true || prod?.icbper === true) return true;
+    const text = normalizeSearchText(
+      [
+        item.name,
+        item.category,
+        ...(Array.isArray(prod?.tags) ? prod.tags : []),
+        ...(Array.isArray(raw.tags) ? raw.tags : []),
+      ]
+        .filter(Boolean)
+        .join(' ')
+    );
+    return (
+      text.includes('icbper') ||
+      text.includes('bolsa') ||
+      text.includes('plastica') ||
+      text.includes('plastic')
+    );
+  });
+}
+
+/**
+ * Returns eligible gift products respecting Web rules:
+ * - `enableGifts === false` -> `[]`
+ * - `giftProductIds` defined as `[]` -> `[]` (no gifts permitted)
+ * - `giftProductIds === undefined` -> all active in-stock products for the branch
+ */
+export function getEligibleGiftProducts(
+  products: readonly Product[],
+  discountSettings: DiscountSettings | null | undefined,
+  branchId: string = 'main'
+): Product[] {
+  if (discountSettings?.enableGifts === false) return [];
+  const configuredIds = discountSettings?.giftProductIds;
+  if (Array.isArray(configuredIds) && configuredIds.length === 0) return [];
+  const allowedSet = Array.isArray(configuredIds) ? new Set(configuredIds) : null;
+
+  return products.filter((p) => {
+    if (p.active === false) return false;
+    if (allowedSet && !allowedSet.has(p.id)) return false;
+    return resolveProductBranchStock(p, branchId) > 0;
+  });
+}
+
+export interface PromotionSuggestion {
+  promotionId: string;
+  name: string;
+  type: 'percentage' | 'fixed' | 'buy_x_get_y' | 'free_product' | string;
+  description: string;
+  suggestedDiscountAmount: number;
+  freeProduct?: Product;
+  freeQuantity?: number;
+}
+
+const getBaseProductIdFromCartItem = (item: CartItem): string => {
+  if (item.productId) return item.productId;
+  if (item.product?.id) return item.product.id;
+  return item.id.includes('_') ? item.id.split('_')[0] : item.id;
+};
+
+/**
+ * Evaluates active promotion rules against current cart lines and catalog products
+ * to produce actionable discount or free-gift suggestions.
+ */
+export function evaluateCartPromotions(
+  items: readonly CartItem[],
+  promotions: readonly PromotionRule[] | undefined | null,
+  products: readonly Product[] = []
+): PromotionSuggestion[] {
+  if (!Array.isArray(promotions) || promotions.length === 0 || items.length === 0) {
+    return [];
+  }
+
+  const paidItems = items.filter((item) => !item.isGift && item.price > 0 && item.quantity > 0);
+  const giftItems = items.filter((item) => item.isGift);
+  const suggestions: PromotionSuggestion[] = [];
+
+  for (const promo of promotions) {
+    if (!promo || promo.active === false) continue;
+
+    const promoType = String(promo.type || '').toLowerCase();
+    const cond = (promo.conditions || {}) as Record<string, any>;
+    const ben = (promo.benefits || {}) as Record<string, any>;
+
+    const targetIds = new Set<string>(
+      [
+        promo.productId,
+        cond.productId,
+        ...(Array.isArray(cond.productIds) ? cond.productIds : []),
+        ...(Array.isArray(cond.targetProductIds) ? cond.targetProductIds : []),
+      ].filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+    );
+    const targetCategory = normalizeSearchText(cond.category || cond.targetCategory);
+
+    const matchingPaid = paidItems.filter((item) => {
+      const baseId = getBaseProductIdFromCartItem(item);
+      if (targetIds.size > 0 && !targetIds.has(baseId)) return false;
+      if (targetCategory && normalizeSearchText(item.category) !== targetCategory) return false;
+      return true;
+    });
+
+    if (matchingPaid.length === 0) continue;
+
+    const matchedQty = matchingPaid.reduce((sum, it) => sum + Number(it.quantity || 0), 0);
+    const matchedSubtotal = matchingPaid.reduce(
+      (sum, it) => sum + Number(it.price || 0) * Number(it.quantity || 0),
+      0
+    );
+
+    if (promoType === 'percentage' || promoType === 'fixed') {
+      const minQty = Number(promo.minQuantity ?? cond.minQuantity ?? 0);
+      const minAmount = Number(cond.minAmount ?? 0);
+      if (minQty > 0 && matchedQty < minQty) continue;
+      if (minAmount > 0 && matchedSubtotal < minAmount) continue;
+
+      const pct = Number(promo.discountPercent ?? ben.discountPercent ?? 0);
+      const fixed = Number(ben.discountAmount ?? ben.amount ?? 0);
+      const rawDiscount =
+        promoType === 'percentage' ? (matchedSubtotal * pct) / 100 : fixed;
+      const suggestedDiscountAmount = Math.min(
+        matchedSubtotal,
+        Math.max(0, Math.round(rawDiscount * 100) / 100)
+      );
+      if (suggestedDiscountAmount > 0) {
+        suggestions.push({
+          promotionId: promo.id,
+          name: promo.name,
+          type: promoType,
+          description:
+            promo.description ||
+            (promoType === 'percentage'
+              ? `${pct}% de descuento (${matchingPaid.length} ${matchingPaid.length === 1 ? 'línea' : 'líneas'})`
+              : `Descuento fijo de S/ ${suggestedDiscountAmount.toFixed(2)}`),
+          suggestedDiscountAmount,
+        });
+      }
+      continue;
+    }
+
+    if (promoType === 'buy_x_get_y' || promoType === 'free_product') {
+      const minQty = Math.max(
+        1,
+        Number(promo.minQuantity ?? cond.minQuantity ?? cond.buyQuantity ?? cond.buyQty ?? 1)
+      );
+      if (matchedQty < minQty) continue;
+
+      const sets = Math.floor(matchedQty / minQty);
+      const perSetGiftQty = Math.max(
+        1,
+        Number(promo.freeQuantity ?? ben.freeQuantity ?? ben.getQuantity ?? ben.getQty ?? 1)
+      );
+      const totalRewardQty = sets * perSetGiftQty;
+
+      const preferredGiftId =
+        promo.freeProductId ||
+        ben.freeProductId ||
+        promo.productId ||
+        Array.from(targetIds)[0] ||
+        getBaseProductIdFromCartItem(matchingPaid[0]);
+
+      const freeProduct =
+        products.find((p) => p.id === preferredGiftId && p.active !== false) ||
+        matchingPaid.find((it) => getBaseProductIdFromCartItem(it) === preferredGiftId)?.product;
+
+      if (!freeProduct) continue;
+
+      const alreadyGifted = giftItems
+        .filter((g) => getBaseProductIdFromCartItem(g) === freeProduct.id)
+        .reduce((sum, g) => sum + Number(g.quantity || 0), 0);
+      const remainingGiftQty = Math.max(0, totalRewardQty - alreadyGifted);
+
+      if (remainingGiftQty > 0) {
+        suggestions.push({
+          promotionId: promo.id,
+          name: promo.name,
+          type: promoType,
+          description:
+            promo.description ||
+            `Califica a ${remainingGiftQty}x ${freeProduct.name} gratis (compra ${minQty}+).`,
+          suggestedDiscountAmount: 0,
+          freeProduct,
+          freeQuantity: remainingGiftQty,
+        });
+      }
+    }
+  }
+
+  return suggestions;
 }

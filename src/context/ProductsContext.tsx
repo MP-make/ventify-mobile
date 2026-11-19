@@ -10,8 +10,10 @@ import React, {
 } from 'react';
 import { InteractionManager } from 'react-native';
 import { collection, query, where, onSnapshot } from 'firebase/firestore';
+import NetInfo from '@react-native-community/netinfo';
 import { catalogKVStorage } from '@/lib/native-kv-storage';
 import { db } from '@/lib/firebase';
+import { apiRequest } from '@/lib/api-client';
 import { useAuth } from './AuthContext';
 import { Product } from '@/types';
 import {
@@ -41,6 +43,10 @@ import {
   productCatalogCacheKey,
   writeProductCatalogCache,
 } from '@/lib/product-catalog-cache';
+import {
+  normalizePriceTiers,
+  sanitizeRemoteImageUrls,
+} from '@/services/inventory-kardex-service';
 
 export interface InventoryStats {
   totalProducts: number;
@@ -49,6 +55,21 @@ export interface InventoryStats {
   valuation: number;
   lowStockCount: number;
   outOfStockCount: number;
+}
+
+export interface ProductPlanLimitSummary {
+  current: number;
+  max: number;
+  type: 'hard' | 'soft';
+  isAtLimit: boolean;
+  isNearLimit: boolean;
+}
+
+export interface ProductPlanValidationResult {
+  allowed: boolean;
+  reason?: string;
+  current?: number;
+  max?: number;
 }
 
 export interface ProductsContextType {
@@ -60,12 +81,14 @@ export interface ProductsContextType {
   categories: string[];
   stats: InventoryStats;
   criticalAlerts: Array<{ productId: string; name: string; currentStock: number; minStock: number }>;
+  productPlanLimit: ProductPlanLimitSummary | null;
   findByBarcode: (code: string) => ScannedProductMatch | null;
   findByBarcodeRemote: (code: string) => Promise<ScannedProductMatch | null>;
   getProductStock: (product: Product, branchIdOverride?: string) => number;
   getProductAvailableStock: (product: Product, branchIdOverride?: string) => number;
   refreshProducts: () => void;
   upsertProduct: (product: Product) => void;
+  validateProductCreation: () => Promise<ProductPlanValidationResult>;
 }
 
 const DEFAULT_STATS: InventoryStats = {
@@ -86,16 +109,18 @@ const ProductsContext = createContext<ProductsContextType>({
   categories: ['Todos'],
   stats: DEFAULT_STATS,
   criticalAlerts: [],
+  productPlanLimit: null,
   findByBarcode: () => null,
   findByBarcodeRemote: async () => null,
   getProductStock: () => 0,
   getProductAvailableStock: () => 0,
   refreshProducts: () => {},
   upsertProduct: () => {},
+  validateProductCreation: async () => ({ allowed: true }),
 });
 
 export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const { user, accountId, branchId } = useAuth();
+  const { user, accountId, branchId, limits, isOnline, refreshAccess } = useAuth();
   const [products, setProducts] = useState<Product[]>([]);
   const [productsScopeKey, setProductsScopeKey] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState<boolean>(false);
@@ -109,6 +134,8 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   }>({ stats: DEFAULT_STATS, alerts: [] });
 
   const previousAlertCount = useRef<number>(0);
+  const isOnlineRef = useRef<boolean>(isOnline);
+  isOnlineRef.current = isOnline;
   const localRecentProductsRef = useRef<Map<string, Product>>(new Map());
   const productMapRef = useRef<Map<string, Product>>(new Map());
   const barcodeIndexRef = useRef(new ProductCatalogIndex());
@@ -158,8 +185,20 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         const baseCost = Number(data.costPrice ?? 0);
         const baseSuggested = Number(data.suggestedPrice ?? data.price ?? 0);
         const baseMin = Number(data.minSalePrice ?? baseCost);
+        const sanitizedGallery = sanitizeRemoteImageUrls(
+          Array.isArray(data.galleryImages)
+            ? data.galleryImages
+            : data.imageUrl
+            ? [data.imageUrl]
+            : []
+        );
+        const safeImageUrl =
+          typeof data.imageUrl === 'string' && data.imageUrl.trim() && sanitizedGallery.includes(data.imageUrl.trim())
+            ? data.imageUrl.trim()
+            : sanitizedGallery[0] || (typeof data.imageUrl === 'string' ? data.imageUrl : '');
 
         return {
+          ...data,
           id: docSnap.id,
           name: data.name || 'Sin nombre',
           category: data.category || 'General',
@@ -177,19 +216,29 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
               : {},
           branchIds: Array.isArray(data.branchIds) ? data.branchIds : [],
           lowStockBranches: Array.isArray(data.lowStockBranches) ? data.lowStockBranches : [],
-          branchPrices: data.branchPrices || {},
+          branchPrices:
+            typeof data.branchPrices === 'object' && data.branchPrices !== null
+              ? data.branchPrices
+              : {},
           variants: Array.isArray(data.variants) ? data.variants : [],
-          priceTiers: Array.isArray(data.priceTiers) ? data.priceTiers : [],
-          imageUrl: data.imageUrl || '',
-          thumbUrl: data.thumbUrl || data.imageUrl || '',
+          priceTiers: Array.isArray(data.priceTiers) ? normalizePriceTiers(data.priceTiers) : [],
+          presentations: Array.isArray(data.presentations)
+            ? data.presentations.map(normalizePresentation)
+            : [],
+          galleryImages: sanitizedGallery,
+          attributes:
+            typeof data.attributes === 'object' && data.attributes !== null
+              ? data.attributes
+              : {},
+          taxExemptionCode: data.taxExemptionCode || '10',
+          imageUrl: safeImageUrl,
+          thumbUrl: data.thumbUrl || safeImageUrl || '',
           hint: data.hint || '',
           unitOfMeasure: data.unitOfMeasure || 'unit',
           allowDecimals: Boolean(data.allowDecimals),
           stepDecimal: data.stepDecimal ? Number(data.stepDecimal) : undefined,
           active: data.active !== false,
           accountId: accountId || data.accountId || '',
-          ...data,
-          presentations: Array.isArray(data.presentations) ? data.presentations.map(normalizePresentation) : [],
         };
       },
     [accountId]
@@ -286,10 +335,15 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     };
     cacheWriterRef.current = (nextProducts) => scheduleCacheWrite(nextProducts);
 
+    let serverSnapshotApplied = false;
+    let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
+    let latestCachedDocs: any[] | null = null;
+
     const applySnapshotChanges = async (
       changes: any[],
       authoritativeDocs: any[],
-      completesFirstSnapshot: boolean
+      completesFirstSnapshot: boolean,
+      isServerAuthoritative: boolean
     ) => {
       await processCatalogInBatches(changes, (batch) => {
         if (!isCurrent()) return;
@@ -309,7 +363,7 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       });
 
       if (!isCurrent()) return;
-      if (completesFirstSnapshot) {
+      if (completesFirstSnapshot && isServerAuthoritative) {
         const serverIds = new Set<string>();
         await processCatalogInBatches(authoritativeDocs, (batch) => {
           if (!isCurrent()) return;
@@ -329,20 +383,33 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
             }
           }
         });
+      } else if (completesFirstSnapshot) {
+        await processCatalogInBatches(authoritativeDocs, (batch) => {
+          if (!isCurrent()) return;
+          for (const docSnap of batch) {
+            upsertMapped(mapSnapshotDoc(docSnap));
+          }
+        });
       }
       if (!isCurrent()) return;
       publishMap();
       if (completesFirstSnapshot) {
-        // A cache entry represents a complete catalog only after Firestore's initial full snapshot.
+        // Solo el snapshot real del servidor se considera autoritativo y actualiza el caché completo.
         setCatalogComplete(true);
-        authoritativeSnapshotReadyRef.current = true;
+        if (isServerAuthoritative) {
+          authoritativeSnapshotReadyRef.current = true;
+        }
         setInventorySummary(inventoryIndexRef.current.snapshot());
         setRefreshing(false);
         setError(null);
-        scheduleCacheWrite();
+        if (isServerAuthoritative) {
+          scheduleCacheWrite();
+        }
       } else if (catalogCompleteRef.current) {
         setInventorySummary(inventoryIndexRef.current.snapshot());
-        scheduleCacheWrite();
+        if (isServerAuthoritative) {
+          scheduleCacheWrite();
+        }
       }
     };
 
@@ -354,25 +421,77 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         (snapshot) => {
           if (!isCurrent()) return;
           const fromCache = snapshot.metadata?.fromCache === true;
-          const allowOffline = productMapRef.current.size === 0;
-          if (!isAuthoritativeCatalogSnapshot(fromCache, { allowOffline })) return;
-          const completesFirstSnapshot = firstSnapshot;
-          firstSnapshot = false;
-          const changes = completesFirstSnapshot ? [] : snapshot.docChanges();
-          processing = processing.then(() => applySnapshotChanges(
-            changes,
-            completesFirstSnapshot ? snapshot.docs : [],
-            completesFirstSnapshot
-          )).catch((processingError) => {
-            if (!isCurrent()) return;
-            const message = processingError instanceof Error ? processingError.message : String(processingError);
-            setError(message);
-            setRefreshing(false);
-            console.error('[ProductsContext] Error processing products snapshot:', processingError);
-          });
+
+          if (!fromCache) {
+            if (fallbackTimer) {
+              clearTimeout(fallbackTimer);
+              fallbackTimer = undefined;
+            }
+            latestCachedDocs = null;
+            const isFirstServerSnapshot = !serverSnapshotApplied;
+            serverSnapshotApplied = true;
+            const changes = isFirstServerSnapshot ? [] : snapshot.docChanges();
+            processing = processing
+              .then(() =>
+                applySnapshotChanges(
+                  changes,
+                  isFirstServerSnapshot ? snapshot.docs : [],
+                  isFirstServerSnapshot,
+                  true
+                )
+              )
+              .catch((processingError) => {
+                if (!isCurrent()) return;
+                const message =
+                  processingError instanceof Error ? processingError.message : String(processingError);
+                setError(message);
+                setRefreshing(false);
+                console.error('[ProductsContext] Error processing products snapshot:', processingError);
+              });
+            return;
+          }
+
+          latestCachedDocs = snapshot.docs;
+          const allowOfflineNow = !isOnlineRef.current;
+          if (isAuthoritativeCatalogSnapshot(fromCache, { allowOffline: allowOfflineNow })) {
+            if (fallbackTimer) {
+              clearTimeout(fallbackTimer);
+              fallbackTimer = undefined;
+            }
+            processing = processing
+              .then(() => applySnapshotChanges([], snapshot.docs, true, false))
+              .catch((processingError) => {
+                if (!isCurrent()) return;
+                const message =
+                  processingError instanceof Error ? processingError.message : String(processingError);
+                setError(message);
+                setRefreshing(false);
+              });
+            return;
+          }
+
+          if (!fallbackTimer && !serverSnapshotApplied) {
+            fallbackTimer = setTimeout(async () => {
+              fallbackTimer = undefined;
+              if (!isCurrent() || serverSnapshotApplied) return;
+              const net = await NetInfo.fetch().catch(() => null);
+              const stillOffline = net ? !(net.isConnected && net.isInternetReachable !== false) : !isOnlineRef.current;
+              if (stillOffline && latestCachedDocs) {
+                processing = processing
+                  .then(() => applySnapshotChanges([], latestCachedDocs || [], true, false))
+                  .catch(() => setRefreshing(false));
+              } else {
+                setRefreshing(false);
+              }
+            }, 4500);
+          }
         },
         (snapshotError) => {
           if (!isCurrent()) return;
+          if (fallbackTimer) {
+            clearTimeout(fallbackTimer);
+            fallbackTimer = undefined;
+          }
           const message = snapshotError instanceof Error ? snapshotError.message : String(snapshotError);
           setError(message);
           setRefreshing(false);
@@ -436,6 +555,7 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     return () => {
       if (effectGenerationRef.current === generation) effectGenerationRef.current += 1;
       if (cacheTimer) clearTimeout(cacheTimer);
+      if (fallbackTimer) clearTimeout(fallbackTimer);
       if (interactionTask?.cancel) interactionTask.cancel();
       unsubscribe?.();
       cacheWriterRef.current = () => {};
@@ -513,6 +633,94 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     setRefreshTick((t) => t + 1);
   }, []);
 
+  const productPlanLimit = useMemo<ProductPlanLimitSummary | null>(() => {
+    const entry = limits?.products;
+    if (!entry) return null;
+    const max = Number(entry.max ?? 0);
+    if (max <= 0) {
+      return {
+        current: visibleProducts.length || Number(entry.current ?? 0),
+        max: 0,
+        type: entry.type || 'soft',
+        isAtLimit: false,
+        isNearLimit: false,
+      };
+    }
+    const current = Math.max(Number(entry.current ?? 0), visibleProducts.length);
+    return {
+      current,
+      max,
+      type: entry.type || 'soft',
+      isAtLimit: current >= max,
+      isNearLimit: current >= Math.floor(max * 0.8) && current < max,
+    };
+  }, [limits?.products, visibleProducts.length]);
+
+  const validateProductCreation = useCallback(async (): Promise<ProductPlanValidationResult> => {
+    if (!accountId) {
+      return { allowed: false, reason: 'Cuenta no detectada.' };
+    }
+
+    if (isOnlineRef.current) {
+      try {
+        const res = await apiRequest<{
+          allowed?: boolean;
+          reason?: string;
+          current?: number;
+          max?: number;
+          currentCount?: number;
+          limit?: number;
+        }>('/api/plan-limits/validate', {
+          method: 'POST',
+          body: { accountId, operation: 'createProduct' },
+        });
+        const allowed = res?.allowed !== false;
+        const current = res?.current ?? res?.currentCount ?? productPlanLimit?.current;
+        const max = res?.max ?? res?.limit ?? productPlanLimit?.max;
+        if (!allowed) {
+          void refreshAccess?.().catch(() => {});
+          return {
+            allowed: false,
+            reason:
+              res?.reason ||
+              (max
+                ? `Alcanzaste el límite de ${max} productos de tu plan actual. Mejora tu plan para agregar más.`
+                : 'Alcanzaste el límite de productos de tu plan actual.'),
+            current,
+            max,
+          };
+        }
+        return { allowed: true, current, max };
+      } catch (err) {
+        const status = (err as { status?: number })?.status;
+        if (status === 403 || status === 402) {
+          return {
+            allowed: false,
+            reason:
+              err instanceof Error
+                ? err.message
+                : 'Alcanzaste el límite de productos de tu plan actual.',
+          };
+        }
+      }
+    }
+
+    if (productPlanLimit && productPlanLimit.type === 'hard' && productPlanLimit.isAtLimit) {
+      return {
+        allowed: false,
+        reason: `Alcanzaste el límite de ${productPlanLimit.max} productos de tu plan actual.`,
+        current: productPlanLimit.current,
+        max: productPlanLimit.max,
+      };
+    }
+
+    return {
+      allowed: true,
+      current: productPlanLimit?.current,
+      max: productPlanLimit?.max,
+    };
+  }, [accountId, productPlanLimit, refreshAccess]);
+
   const contextValue = useMemo(
     () => ({
       products: visibleProducts,
@@ -523,12 +731,14 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       categories: visibleCategories,
       stats,
       criticalAlerts,
+      productPlanLimit,
       findByBarcode,
       findByBarcodeRemote,
       getProductStock: getProductStockHelper,
       getProductAvailableStock: getProductAvailableStockHelper,
       refreshProducts,
       upsertProduct,
+      validateProductCreation,
     }),
     [
       visibleProducts,
@@ -540,12 +750,14 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       visibleCategories,
       stats,
       criticalAlerts,
+      productPlanLimit,
       findByBarcode,
       findByBarcodeRemote,
       getProductStockHelper,
       getProductAvailableStockHelper,
       refreshProducts,
       upsertProduct,
+      validateProductCreation,
     ]
   );
 

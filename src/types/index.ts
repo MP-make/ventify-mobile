@@ -142,7 +142,7 @@ export interface Product {
   sizes?: string[];
   accountId: string;
   active?: boolean;
-  attributes?: ProductAttribute[];
+  attributes?: ProductAttribute[] | Record<string, string>;
   galleryImages?: string[];
   isFeatured?: boolean;
   modelUrl?: string;
@@ -156,6 +156,8 @@ export interface Product {
   minStock?: number;
   allowDecimals?: boolean;
   stepDecimal?: number;
+  taxExemptionCode?: '10' | '20' | '30' | '40' | string;
+  isAmazonExempt?: boolean;
   /** Internal search string index */
   _searchStr?: string;
 }
@@ -208,6 +210,9 @@ export interface CartItem {
   allowDecimals?: boolean;
   stepDecimal?: number;
   lineTotal?: number;
+  stockBranchId?: string;
+  notes?: string;
+  taxExemptionCode?: string;
 }
 
 /** Alias for CartItem in Sales */
@@ -225,6 +230,10 @@ export interface PausedSale {
     reservation?: Reservation | null;
     order?: Order | null;
   };
+  sourceSaleRequestId?: string | null;
+  sourceQuoteId?: string | null;
+  shippingAmount?: number;
+  discountAmount?: number;
   note?: string;
   branchId?: string;
   accountId?: string;
@@ -296,27 +305,55 @@ export type SunatStatus =
 export interface Sale {
   id: string;
   saleNumber?: number;
+  correlative?: string;
   date: number;
   items: CartItem[];
   subtotal: number;
   tax: number;
   total: number;
   paymentMethod: SalePaymentMethod | string;
+  paymentMethodName?: string;
   payments?: SalePaymentSplit[];
+  paymentSplits?: SalePaymentSplit[];
+  mixedPayments?: SalePaymentSplit[];
   branchId: string;
   accountId?: string;
   status?: 'completed' | 'cancelled' | 'refunded' | 'pending';
   statusNotes?: string;
   documentType?: DocumentType;
   documentNumber?: string;
+  einvoiceId?: string;
   sunatStatus?: SunatStatus;
   sunatError?: string;
   sunatCdr?: any;
+  sunatHash?: string;
+  hash?: string;
+  cdrDescription?: string;
+  xmlUrl?: string;
+  pdfUrl?: string;
+  printedFormatResolution?: string;
+  receiptCustomer?: {
+    identityType?: string;
+    identityNumber?: string;
+    name?: string;
+    address?: string;
+    email?: string;
+  };
+  taxExemptionCode?: string;
+  isAmazonExempt?: boolean;
+  isQuote?: boolean;
   isOptimistic?: boolean;
   isOfflinePending?: boolean;
+  offlineQueued?: boolean;
+  offlineId?: string;
   isElectronicInvoice?: boolean;
   cashReceived?: number;
   changeGiven?: number;
+  cashAmount?: number;
+  cardAmount?: number;
+  creditAmount?: number;
+  discountAmount?: number;
+  shippingAmount?: number;
   customerId?: string;
   customerName?: string;
   customerDni?: string;
@@ -328,6 +365,9 @@ export interface Sale {
   sellerName?: string;
   cashierId?: string;
   cashierUsername?: string;
+  userId?: string;
+  userName?: string;
+  completedByName?: string;
   sessionId?: string;
   totalCost?: number;
   totalMargin?: number;
@@ -349,8 +389,11 @@ export interface Sale {
   linkedSaleId?: string;
   isReturn?: boolean;
   refundAmount?: number;
+  refundedAmount?: number;
+  refundedLineIndices?: number[];
   amountReceived?: number;
   originalSaleId?: string;
+  creditMode?: 'prepaid' | 'receivable';
   digitalAmount?: number;
   digitalProvider?: 'yape' | 'plin';
   paymentMethodId?: string;
@@ -368,6 +411,12 @@ export interface Sale {
   qrContent?: string;
   consultUrl?: string;
   footerNote?: string;
+  sourceQuoteId?: string;
+  sourceSaleRequestId?: string;
+  cancelledBy?: string;
+  cancelledByName?: string;
+  cancelledAt?: any;
+  cancellationReason?: string;
   reference?: {
     type?: string;
     number?: string;
@@ -382,6 +431,8 @@ export interface Sale {
     otherTaxes?: number;
     total: number;
   };
+  createdAt?: any;
+  updatedAt?: any;
   lastModified?: any;
 }
 
@@ -666,6 +717,10 @@ export interface Branch {
   commercialPhone?: string;
   receiptFooter?: string;
   consultUrl?: string;
+  printedFormatResolution?: string;
+  isAmazonExempt?: boolean;
+  taxExemptionCode?: string;
+  taxRate?: number;
   createdAt?: number;
   updatedAt?: number;
   totalSales?: number;
@@ -684,6 +739,19 @@ export interface BusinessSettings {
   website?: string;
   enableFractionalUnits?: boolean;
   enableMinSalePrice?: boolean;
+  commercialAddress?: string;
+  commercialPhone?: string;
+  fiscalAddress?: string;
+  receiptLogo?: string;
+  receiptLogoDataUrl?: string;
+  receiptLogoUrl?: string;
+  logoUrl?: string;
+  receiptFooter?: string;
+  consultUrl?: string;
+  printedFormatResolution?: string;
+  isAmazonExempt?: boolean;
+  taxExemptionCode?: string;
+  taxRate?: number;
   accountId: string;
   createdAt?: any;
   updatedAt?: any;
@@ -709,6 +777,7 @@ export interface PosSettings {
   accountId: string;
   methods: PosPaymentMethodConfig[];
   allowMixedPayment?: boolean;
+  enableMinSalePrice?: boolean;
   enableQuickSale?: boolean;
   enableLinkedScanner?: boolean;
   enableDeviceCameraScanner?: boolean;
@@ -718,6 +787,9 @@ export interface PosSettings {
   requireSellerSelection?: boolean;
   defaultMethodId?: string;
   ticketTemplate?: 'standard' | 'compact';
+  ticketFooterMessage?: string;
+  digitalPhone?: string;
+  digitalName?: string;
   createdAt?: any;
   updatedAt?: any;
 }
@@ -731,6 +803,9 @@ export interface UserProfile {
   role?: 'owner' | 'admin' | 'manager' | 'cashier' | 'seller';
   accountId?: string;
   branchId?: string;
+  allBranchesAccess?: boolean;
+  customPermissions?: { granted?: string[]; revoked?: string[] } | null;
+  isActive?: boolean;
   createdAt?: number;
 }
 
@@ -744,4 +819,84 @@ export interface OfflineSaleQueueItem {
   branchId: string;
   accountId: string;
   status: 'pending' | 'syncing' | 'failed' | 'quarantined';
+}
+
+// ============================================================================
+// 8. PROMOTIONS, E-INVOICING (SUNAT) & NOTIFICATIONS
+// ============================================================================
+
+export interface PromotionRule {
+  id: string;
+  name: string;
+  type: 'buy_x_get_y' | 'free_product' | 'percentage' | 'fixed' | string;
+  description?: string;
+  conditions?: Record<string, any>;
+  benefits?: Record<string, any>;
+  productId?: string;
+  minQuantity?: number;
+  discountPercent?: number;
+  freeProductId?: string;
+  freeQuantity?: number;
+  active?: boolean;
+}
+
+export interface DiscountSettings {
+  promotions?: PromotionRule[];
+  giftProductIds?: string[];
+  enableGifts?: boolean;
+  updatedAt?: number;
+}
+
+export interface EinvoiceRecord {
+  id: string;
+  accountId: string;
+  branchId: string;
+  saleId: string;
+  documentType: '01' | '03' | '07' | '08' | '09';
+  series?: string;
+  correlative?: string;
+  documentNumber: string;
+  status: 'pending' | 'sending' | 'accepted' | 'rejected' | 'error';
+  customer?: {
+    identityType?: string;
+    identityNumber?: string;
+    name?: string;
+    address?: string;
+    email?: string;
+  };
+  receiptAmounts?: Sale['fiscalAmounts'];
+  receiptCustomer?: Sale['receiptCustomer'];
+  cdr?: {
+    code?: string;
+    description?: string;
+    notes?: string[];
+  } | null;
+  digestValue?: string | null;
+  hash?: string | null;
+  fileName?: string;
+  xmlUrl?: string | null;
+  pdfUrl?: string | null;
+  reference?: Sale['reference'];
+  replacesInvoiceId?: string;
+  creditNoteId?: string;
+  total?: number;
+  issuedAt?: any;
+  createdAt?: any;
+  updatedAt?: any;
+  error?: string | null;
+}
+
+export interface AccountNotification {
+  id: string;
+  accountId: string;
+  branchId?: string | null;
+  title: string;
+  message: string;
+  type?: string;
+  severity?: 'info' | 'warning' | 'critical' | string;
+  read?: boolean;
+  readBy?: string[];
+  createdAt: any;
+  link?: string;
+  metadata?: Record<string, any>;
 }

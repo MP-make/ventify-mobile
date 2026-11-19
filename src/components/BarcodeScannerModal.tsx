@@ -11,7 +11,7 @@ import {
   KeyboardAvoidingView,
   AppState,
 } from 'react-native';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   CameraView,
   useCameraPermissions,
@@ -57,7 +57,7 @@ const FeedbackBanner = React.memo<FeedbackBannerProps>(({ feedback }) => {
   if (feedback) {
     return (
       <View style={styles.feedbackBadge}>
-        <Check size={14} color={ui.primary} />
+        <Check size={14} color={ui.onPrimary} />
         <Text style={styles.feedbackText}>{feedback}</Text>
       </View>
     );
@@ -95,6 +95,15 @@ export const BarcodeScannerModal: React.FC<BarcodeScannerModalProps> = React.mem
   const lastScannedCode = useRef<string>('');
   const lastScannedTime = useRef<number>(0);
   const isCooldownActive = useRef<boolean>(false);
+  const feedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (feedbackTimerRef.current) {
+        clearTimeout(feedbackTimerRef.current);
+      }
+    };
+  }, []);
 
   // Manejo de lectura de código por la cámara nativa
   const handleBarcodeScanned = useCallback(
@@ -122,7 +131,10 @@ export const BarcodeScannerModal: React.FC<BarcodeScannerModalProps> = React.mem
 
       // Notificación flotante de confirmación de lectura
       setLastScannedFeedback(`Código detectado: ${trimmed}`);
-      setTimeout(() => {
+      if (feedbackTimerRef.current) {
+        clearTimeout(feedbackTimerRef.current);
+      }
+      feedbackTimerRef.current = setTimeout(() => {
         setLastScannedFeedback(null);
       }, 1500);
 
@@ -172,12 +184,20 @@ export const BarcodeScannerModal: React.FC<BarcodeScannerModalProps> = React.mem
       <View style={styles.container}>
         {/* Vista de Cámara o Solicitud de Permisos */}
         {!permission ? (
-          <View style={styles.centerContainer}>
+          <SafeAreaView style={styles.centerContainer}>
             <ActivityIndicator size="large" color={ui.primary} />
             <Text style={styles.permissionText}>Comprobando permisos de cámara...</Text>
-          </View>
+            <TouchableOpacity
+              onPress={onClose}
+              style={styles.secondaryCloseButton}
+              accessibilityRole="button"
+              accessibilityLabel="Cerrar escáner"
+            >
+              <Text style={styles.secondaryCloseText}>Cerrar</Text>
+            </TouchableOpacity>
+          </SafeAreaView>
         ) : !permission.granted ? (
-          <View style={styles.centerContainer}>
+          <SafeAreaView style={styles.centerContainer}>
             <View style={styles.permissionIconBadge}>
               <Camera size={36} color={ui.primary} />
             </View>
@@ -189,10 +209,19 @@ export const BarcodeScannerModal: React.FC<BarcodeScannerModalProps> = React.mem
               onPress={requestPermission}
               style={styles.permissionButton}
               activeOpacity={0.8}
+              accessibilityRole="button"
             >
               <Text style={styles.permissionButtonText}>Conceder Acceso</Text>
             </TouchableOpacity>
-          </View>
+            <TouchableOpacity
+              onPress={onClose}
+              style={styles.secondaryCloseButton}
+              accessibilityRole="button"
+              accessibilityLabel="Cerrar escáner"
+            >
+              <Text style={styles.secondaryCloseText}>Cerrar</Text>
+            </TouchableOpacity>
+          </SafeAreaView>
         ) : isAppActive ? (
           <CameraView
             style={StyleSheet.absoluteFillObject}
@@ -390,6 +419,8 @@ const styles = StyleSheet.create({
   permissionText: { fontSize: 15, color: ui.textSecondary, textAlign: 'center', lineHeight: 22, marginBottom: 24, maxWidth: 320 },
   permissionButton: { minHeight: 52, justifyContent: 'center', backgroundColor: ui.primary, paddingHorizontal: 24, borderRadius: 12 },
   permissionButtonText: { color: ui.onPrimary, fontWeight: '700', fontSize: 15, textAlign: 'center' },
+  secondaryCloseButton: { marginTop: 14, minHeight: 48, justifyContent: 'center', paddingHorizontal: 20 },
+  secondaryCloseText: { color: ui.textSecondary, fontWeight: '600', fontSize: 14 },
   overlay: { ...StyleSheet.absoluteFillObject, justifyContent: 'space-between' },
   topBar: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingBottom: 16, backgroundColor: 'rgba(0, 0, 0, 0.65)' },
   iconButton: { width: 48, height: 48, borderRadius: 24, backgroundColor: 'rgba(255, 255, 255, 0.15)', alignItems: 'center', justifyContent: 'center' },

@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
   Modal,
   View,
@@ -9,32 +9,107 @@ import {
   Platform,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { Lock, Delete, ShieldCheck, ShieldAlert } from 'lucide-react-native';
+import {
+  Delete,
+  ShieldCheck,
+  ShieldAlert,
+  Clock,
+  Check,
+  X,
+} from 'lucide-react-native';
 import * as Haptics from 'expo-haptics';
 import { useAuth } from '@/context/AuthContext';
 import { ui } from '@/lib/theme';
 import { BrandLogo } from '@/components/ui';
+import {
+  PIN_MAX_ATTEMPTS,
+  PIN_MAX_LENGTH,
+  PIN_MIN_LENGTH,
+  normalizePinLength,
+} from '@/lib/pin-mobile';
 
 export const PinLockModal: React.FC = React.memo(() => {
   const insets = useSafeAreaInsets();
-  const { isPinLocked, unlockWithPin, userProfile } = useAuth();
+  const {
+    isPinLocked,
+    isPinSetupOpen,
+    closePinSetup,
+    pinLength,
+    pinFailedAttempts,
+    pinLockoutUntil,
+    unlockWithPin,
+    updatePinCode,
+    lockTerminal,
+    userProfile,
+  } = useAuth();
+
+  const effectiveLength = normalizePinLength(pinLength);
+  const isSetupMode = !isPinLocked && isPinSetupOpen;
+  const visible = isPinLocked || isSetupMode;
 
   const [pin, setPin] = useState<string>('');
-  const [error, setError] = useState<boolean>(false);
+  const [setupStep, setSetupStep] = useState<'create' | 'confirm'>('create');
+  const [draftPin, setDraftPin] = useState<string>('');
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [savingSetup, setSavingSetup] = useState<boolean>(false);
+  const [cooldownSeconds, setCooldownSeconds] = useState<number>(0);
 
-  // Animación de sacudida (shake) para PIN incorrecto
   const shakeAnim = useRef(new Animated.Value(0)).current;
+  const resetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Resetear estado al bloquear/desbloquear
+  const clearPendingReset = useCallback(() => {
+    if (resetTimerRef.current) {
+      clearTimeout(resetTimerRef.current);
+      resetTimerRef.current = null;
+    }
+  }, []);
+
+  // Resetear estado al abrir/cerrar bloqueo o setup
   useEffect(() => {
-    if (isPinLocked) {
+    clearPendingReset();
+    if (visible) {
       setPin('');
-      setError(false);
+      setDraftPin('');
+      setSetupStep('create');
+      setErrorMsg(null);
+      setSavingSetup(false);
       shakeAnim.setValue(0);
     }
-  }, [isPinLocked, shakeAnim]);
+  }, [visible, isPinLocked, isSetupMode, shakeAnim, clearPendingReset]);
 
-  const triggerShake = () => {
+  useEffect(() => clearPendingReset, [clearPendingReset]);
+
+  // Cuenta regresiva en vivo para el cooldown tras intentos fallidos
+  useEffect(() => {
+    if (!isPinLocked || !pinLockoutUntil) {
+      setCooldownSeconds(0);
+      return;
+    }
+
+    const updateRemaining = () => {
+      const remainingMs = pinLockoutUntil - Date.now();
+      if (remainingMs <= 0) {
+        setCooldownSeconds(0);
+        setErrorMsg(null);
+        return false;
+      }
+      setCooldownSeconds(Math.ceil(remainingMs / 1000));
+      return true;
+    };
+
+    if (!updateRemaining()) return;
+    const interval = setInterval(() => {
+      if (!updateRemaining()) {
+        clearInterval(interval);
+      }
+    }, 250);
+
+    return () => clearInterval(interval);
+  }, [isPinLocked, pinLockoutUntil]);
+
+  const isCoolingDown = isPinLocked && cooldownSeconds > 0;
+
+  const triggerShake = useCallback(() => {
     Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error).catch(() => {});
     Animated.sequence([
       Animated.timing(shakeAnim, { toValue: 12, duration: 50, useNativeDriver: true }),
@@ -43,113 +118,261 @@ export const PinLockModal: React.FC = React.memo(() => {
       Animated.timing(shakeAnim, { toValue: -8, duration: 50, useNativeDriver: true }),
       Animated.timing(shakeAnim, { toValue: 0, duration: 50, useNativeDriver: true }),
     ]).start();
-  };
+  }, [shakeAnim]);
 
-  const handleDigit = (digit: string) => {
-    if (pin.length >= 4) return;
-
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
-
-    const nextPin = pin + digit;
-    setPin(nextPin);
-    setError(false);
-
-    if (nextPin.length === 4) {
-      // Verificar código PIN
-      const success = unlockWithPin(nextPin);
-
+  const submitUnlock = useCallback(
+    (candidatePin: string) => {
+      if (isCoolingDown || candidatePin.length < PIN_MIN_LENGTH) return;
+      const success = unlockWithPin(candidatePin);
       if (success) {
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
         setPin('');
-      } else {
-        setError(true);
-        triggerShake();
-        setTimeout(() => {
-          setPin('');
-        }, 350);
+        setErrorMsg(null);
+        return;
       }
+
+      const nextFailures = pinFailedAttempts + 1;
+      const remainingAttempts = Math.max(0, PIN_MAX_ATTEMPTS - nextFailures);
+      setErrorMsg(
+        remainingAttempts > 0
+          ? `PIN incorrecto. ${remainingAttempts} ${
+              remainingAttempts === 1 ? 'intento restante' : 'intentos restantes'
+            }.`
+          : 'Demasiados intentos fallidos. Espera unos segundos.'
+      );
+      triggerShake();
+      clearPendingReset();
+      resetTimerRef.current = setTimeout(() => {
+        setPin('');
+      }, 320);
+    },
+    [isCoolingDown, unlockWithPin, pinFailedAttempts, triggerShake, clearPendingReset]
+  );
+
+  const submitSetupStep = useCallback(async () => {
+    if (savingSetup || pin.length < PIN_MIN_LENGTH) return;
+    if (setupStep === 'create') {
+      setDraftPin(pin);
+      setPin('');
+      setErrorMsg(null);
+      setSetupStep('confirm');
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
+      return;
+    }
+
+    if (pin !== draftPin) {
+      setErrorMsg('Los PIN no coinciden. Vuelve a intentarlo.');
+      triggerShake();
+      clearPendingReset();
+      resetTimerRef.current = setTimeout(() => {
+        setPin('');
+      }, 320);
+      return;
+    }
+
+    setSavingSetup(true);
+    try {
+      await updatePinCode(pin);
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+      setPin('');
+      setDraftPin('');
+      lockTerminal();
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'No se pudo guardar el PIN.');
+      triggerShake();
+    } finally {
+      setSavingSetup(false);
+    }
+  }, [
+    savingSetup,
+    pin,
+    setupStep,
+    draftPin,
+    triggerShake,
+    clearPendingReset,
+    updatePinCode,
+    lockTerminal,
+  ]);
+
+  const maxAllowedDigits = isSetupMode ? PIN_MAX_LENGTH : effectiveLength;
+
+  const handleDigit = (digit: string) => {
+    if (isCoolingDown || savingSetup) return;
+    if (pin.length >= maxAllowedDigits) return;
+
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
+    const nextPin = pin + digit;
+    setPin(nextPin);
+    setErrorMsg(null);
+
+    if (!isSetupMode && nextPin.length === effectiveLength) {
+      submitUnlock(nextPin);
     }
   };
 
   const handleDelete = () => {
-    if (pin.length === 0) return;
+    if (isCoolingDown || savingSetup || pin.length === 0) return;
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
     setPin((prev) => prev.slice(0, -1));
-    setError(false);
+    setErrorMsg(null);
   };
 
-  if (!isPinLocked) return null;
+  if (!visible) return null;
+
+  const showExplicitConfirm = isSetupMode || effectiveLength > PIN_MIN_LENGTH;
+  const canSubmitExplicit =
+    !isCoolingDown && !savingSetup && pin.length >= PIN_MIN_LENGTH;
+  const dotCount = isSetupMode ? Math.max(PIN_MIN_LENGTH, pin.length) : effectiveLength;
+  const dotCompact = dotCount >= 7;
+  const dotMedium = dotCount > 4 && dotCount < 7;
 
   return (
     <Modal
-      visible={isPinLocked}
+      visible={visible}
       animationType="fade"
       transparent={false}
       statusBarTranslucent
+      onRequestClose={isSetupMode ? closePinSetup : () => {}}
     >
       <View
         style={[
           styles.container,
           {
-            paddingTop: Math.max(insets.top, Platform.OS === 'ios' ? 44 : 24) + 16,
+            paddingTop: Math.max(insets.top, Platform.OS === 'ios' ? 44 : 24) + 12,
             paddingBottom: Math.max(insets.bottom, 24),
           },
         ]}
       >
         {/* Cabecera de Seguridad */}
         <View style={styles.header}>
-          <View style={styles.lockIconContainer}><BrandLogo size={58} wordmark={false} /></View>
-          <Text style={styles.title}>Tu terminal está bloqueado</Text>
-          <Text style={styles.subtitle}>
-            {userProfile?.displayName
-              ? `Operador: ${userProfile.displayName}`
-              : 'Ingresa el PIN de 4 dígitos para continuar'}
+          {isSetupMode ? (
+            <TouchableOpacity
+              onPress={closePinSetup}
+              style={styles.cancelSetupButton}
+              accessibilityRole="button"
+              accessibilityLabel="Cancelar configuración de PIN"
+            >
+              <X size={20} color={ui.textSecondary} />
+            </TouchableOpacity>
+          ) : null}
+
+          <View style={styles.lockIconContainer}>
+            <BrandLogo size={58} wordmark={false} />
+          </View>
+
+          <Text style={styles.title}>
+            {isSetupMode
+              ? setupStep === 'create'
+                ? 'Configura tu PIN'
+                : 'Confirma tu PIN'
+              : 'Tu terminal está bloqueado'}
           </Text>
 
-          {/* Indicadores Visuales de 4 Puntos con Animación Shake */}
+          <Text style={styles.subtitle}>
+            {isSetupMode
+              ? setupStep === 'create'
+                ? 'Elige un PIN de 4 a 8 dígitos para proteger este terminal'
+                : 'Ingresa nuevamente el mismo PIN para confirmar'
+              : userProfile?.displayName
+                ? `Operador: ${userProfile.displayName}`
+                : `Ingresa tu PIN de ${effectiveLength} dígitos para continuar`}
+          </Text>
+
+          {/* Indicadores Visuales Dinámicos (4..8 Puntos) */}
           <Animated.View
             style={[
               styles.dotsContainer,
+              dotCompact && styles.dotsContainerCompact,
+              dotMedium && styles.dotsContainerMedium,
               { transform: [{ translateX: shakeAnim }] },
             ]}
           >
-            {[0, 1, 2, 3].map((index) => {
+            {Array.from({ length: dotCount }, (_, index) => {
               const isFilled = pin.length > index;
               return (
                 <View
                   key={index}
                   style={[
                     styles.dot,
+                    dotCompact && styles.dotCompact,
                     isFilled && styles.dotFilled,
-                    error && styles.dotError,
+                    Boolean(errorMsg || isCoolingDown) && styles.dotError,
                   ]}
                 />
               );
             })}
           </Animated.View>
 
-          {/* Mensaje de Error */}
-          {error ? (
-            <View style={styles.errorRow}>
+          {/* Estado: Cooldown, Error o Hint neutro */}
+          {isCoolingDown ? (
+            <View style={styles.cooldownBadge} accessibilityRole="alert" accessibilityLiveRegion="polite">
+              <Clock size={14} color={ui.danger} />
+              <Text style={styles.errorText}>
+                Terminal bloqueado temporalmente · Espera {cooldownSeconds}s
+              </Text>
+            </View>
+          ) : errorMsg ? (
+            <View style={styles.errorRow} accessibilityRole="alert" accessibilityLiveRegion="polite">
               <ShieldAlert size={14} color={ui.danger} />
-              <Text style={styles.errorText}>PIN incorrecto. Intenta de nuevo.</Text>
+              <Text style={styles.errorText}>{errorMsg}</Text>
             </View>
           ) : (
             <View style={styles.hintRow}>
               <ShieldCheck size={14} color={ui.textMuted} />
-              <Text style={styles.hintText}>PIN por defecto: 1234</Text>
+              <Text style={styles.hintText}>
+                {isSetupMode
+                  ? `${pin.length}/${PIN_MAX_LENGTH} dígitos ingresados (mínimo ${PIN_MIN_LENGTH})`
+                  : `Terminal protegido · PIN de ${effectiveLength} dígitos`}
+              </Text>
             </View>
           )}
         </View>
 
         {/* Teclado Numérico Táctil Nativo */}
         <View style={styles.keypadContainer}>
+          {showExplicitConfirm ? (
+            <TouchableOpacity
+              onPress={() => {
+                if (isSetupMode) {
+                  void submitSetupStep();
+                } else {
+                  submitUnlock(pin);
+                }
+              }}
+              disabled={!canSubmitExplicit}
+              style={[
+                styles.confirmButton,
+                !canSubmitExplicit && styles.confirmButtonDisabled,
+              ]}
+              accessibilityRole="button"
+              accessibilityLabel={
+                isSetupMode
+                  ? setupStep === 'create'
+                    ? 'Continuar con este PIN'
+                    : 'Guardar PIN y bloquear terminal'
+                  : 'Confirmar PIN'
+              }
+              accessibilityState={{ disabled: !canSubmitExplicit }}
+              activeOpacity={0.8}
+            >
+              <Check size={18} color={ui.onPrimary} />
+              <Text style={styles.confirmButtonText}>
+                {isSetupMode
+                  ? setupStep === 'create'
+                    ? 'Continuar'
+                    : 'Guardar y bloquear'
+                  : 'Confirmar PIN'}
+              </Text>
+            </TouchableOpacity>
+          ) : null}
+
           <View style={styles.row}>
             {['1', '2', '3'].map((digit) => (
               <TouchableOpacity
                 key={digit}
                 onPress={() => handleDigit(digit)}
-                style={styles.keyButton}
+                disabled={isCoolingDown}
+                style={[styles.keyButton, isCoolingDown && styles.keyDisabled]}
                 accessibilityRole="button"
                 accessibilityLabel={`Dígito ${digit}`}
                 activeOpacity={0.6}
@@ -164,7 +387,8 @@ export const PinLockModal: React.FC = React.memo(() => {
               <TouchableOpacity
                 key={digit}
                 onPress={() => handleDigit(digit)}
-                style={styles.keyButton}
+                disabled={isCoolingDown}
+                style={[styles.keyButton, isCoolingDown && styles.keyDisabled]}
                 accessibilityRole="button"
                 accessibilityLabel={`Dígito ${digit}`}
                 activeOpacity={0.6}
@@ -179,7 +403,8 @@ export const PinLockModal: React.FC = React.memo(() => {
               <TouchableOpacity
                 key={digit}
                 onPress={() => handleDigit(digit)}
-                style={styles.keyButton}
+                disabled={isCoolingDown}
+                style={[styles.keyButton, isCoolingDown && styles.keyDisabled]}
                 accessibilityRole="button"
                 accessibilityLabel={`Dígito ${digit}`}
                 activeOpacity={0.6}
@@ -190,25 +415,31 @@ export const PinLockModal: React.FC = React.memo(() => {
           </View>
 
           <View style={styles.row}>
-            {/* Espacio en blanco o icono decorativo */}
             <View style={styles.keyEmpty}>
               <ShieldCheck size={22} color={ui.textMuted} />
             </View>
 
-            {/* Tecla Cero */}
             <TouchableOpacity
               onPress={() => handleDigit('0')}
-              style={styles.keyButton}
+              disabled={isCoolingDown}
+              style={[styles.keyButton, isCoolingDown && styles.keyDisabled]}
+              accessibilityRole="button"
+              accessibilityLabel="Dígito 0"
               activeOpacity={0.6}
             >
               <Text style={styles.keyText}>0</Text>
             </TouchableOpacity>
 
-            {/* Tecla Borrar */}
             <TouchableOpacity
               onPress={handleDelete}
-              style={[styles.keyButton, styles.keyDelete]}
+              disabled={isCoolingDown || pin.length === 0}
+              style={[
+                styles.keyButton,
+                styles.keyDelete,
+                isCoolingDown && styles.keyDisabled,
+              ]}
               activeOpacity={0.6}
+              accessibilityRole="button"
               accessibilityLabel="Borrar dígito"
             >
               <Delete size={24} color={ui.textSecondary} />
@@ -231,15 +462,26 @@ const styles = StyleSheet.create({
   header: {
     alignItems: 'center',
     width: '100%',
-    marginTop: 20,
+    marginTop: 16,
+  },
+  cancelSetupButton: {
+    position: 'absolute',
+    right: 0,
+    top: 0,
+    width: 44,
+    height: 44,
+    borderRadius: 12,
+    backgroundColor: ui.surface,
+    borderWidth: 1,
+    borderColor: ui.border,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   lockIconContainer: {
     width: 68,
     height: 68,
     borderRadius: 22,
     backgroundColor: ui.surface,
-    borderWidth: 0,
-    borderColor: ui.border,
     alignItems: 'center',
     justifyContent: 'center',
     marginBottom: 18,
@@ -259,9 +501,16 @@ const styles = StyleSheet.create({
   dotsContainer: {
     flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'center',
     gap: 20,
-    marginTop: 36,
-    marginBottom: 20,
+    marginTop: 32,
+    marginBottom: 18,
+  },
+  dotsContainerMedium: {
+    gap: 14,
+  },
+  dotsContainerCompact: {
+    gap: 10,
   },
   dot: {
     width: 16,
@@ -270,6 +519,11 @@ const styles = StyleSheet.create({
     borderWidth: 2,
     borderColor: ui.border,
     backgroundColor: 'transparent',
+  },
+  dotCompact: {
+    width: 13,
+    height: 13,
+    borderRadius: 7,
   },
   dotFilled: {
     backgroundColor: ui.primary,
@@ -284,30 +538,61 @@ const styles = StyleSheet.create({
   errorRow: {
     flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'center',
     gap: 6,
-    height: 24,
+    minHeight: 24,
+    paddingHorizontal: 12,
+  },
+  cooldownBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    backgroundColor: ui.dangerSoft,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 10,
   },
   errorText: {
     color: ui.danger,
     fontSize: 12,
     fontWeight: '600',
+    textAlign: 'center',
   },
   hintRow: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 6,
-    height: 24,
+    minHeight: 24,
   },
   hintText: {
     color: ui.textMuted,
-    fontSize: 11,
+    fontSize: 12,
     fontWeight: '500',
   },
   keypadContainer: {
     width: '100%',
     maxWidth: 320,
     gap: 14,
-    marginBottom: 16,
+    marginBottom: 12,
+  },
+  confirmButton: {
+    minHeight: 48,
+    borderRadius: 12,
+    backgroundColor: ui.primary,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    marginBottom: 4,
+  },
+  confirmButtonDisabled: {
+    opacity: 0.45,
+  },
+  confirmButtonText: {
+    color: ui.onPrimary,
+    fontSize: 15,
+    fontWeight: '700',
   },
   row: {
     flexDirection: 'row',
@@ -316,14 +601,16 @@ const styles = StyleSheet.create({
   },
   keyButton: {
     flex: 1,
-    height: 68,
+    height: 66,
     borderRadius: 14,
     backgroundColor: ui.surface,
     borderWidth: 1,
     borderColor: ui.border,
     alignItems: 'center',
     justifyContent: 'center',
-
+  },
+  keyDisabled: {
+    opacity: 0.45,
   },
   keyText: {
     fontSize: 26,
@@ -332,7 +619,7 @@ const styles = StyleSheet.create({
   },
   keyEmpty: {
     flex: 1,
-    height: 68,
+    height: 66,
     alignItems: 'center',
     justifyContent: 'center',
   },

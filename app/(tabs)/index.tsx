@@ -44,11 +44,15 @@ import {
   Barcode,
   Tag,
   Check,
+  CheckCircle2,
   CalendarClock,
   User,
+  Gift,
+  Sparkles,
 } from 'lucide-react-native';
 import { CameraView, useCameraPermissions, BarcodeScanningResult } from 'expo-camera';
 import * as Haptics from 'expo-haptics';
+import NetInfo from '@react-native-community/netinfo';
 
 import { useCart } from '@/context/CartContext';
 import { useProducts } from '@/context/ProductsContext';
@@ -66,8 +70,24 @@ import { CompanionScannerModal } from '@/components/CompanionScannerModal';
 import { QuotesManagerModal } from '@/components/QuotesManagerModal';
 import { InlineFilterBar, FilterGroup } from '@/components/InlineFilterBar';
 import { createReservationOrOrder } from '@/services/crm-operations-service';
+import { createSaleTransaction, type CreateSaleTransactionParams } from '@/services/sale-service';
+import { enqueueOfflineSale } from '@/services/offline-sync-service';
 import { lookupDocument } from '@/lib/dni-ruc-service';
 import { isValidDNI } from '@/lib/invoicing/types';
+import { computeSaleTaxBreakdown } from '@/lib/invoicing/receipt-amounts';
+import {
+  resolveCartItemMinPrice,
+  getEligibleGiftProducts,
+  evaluateCartPromotions,
+  cartHasPlasticBagProducts,
+  parseNormalizedDecimal,
+  resolveProductBranchStock,
+  ICBPER_BAG_FEE,
+  ICBPER_CART_ITEM_ID,
+} from '@/lib/product-search';
+import { resolveCheckoutPayment } from '@/lib/checkout-payment';
+import { cleanFirestoreData } from '@/lib/firebase-utils';
+import { presentationFactor } from '@/lib/presentation-parity';
 import { ReservationReceiptModal } from '@/components/ReservationReceiptModal';
 import {
   DEFAULT_CATALOG_BRANDS,
@@ -179,7 +199,15 @@ const CartItemRow = React.memo<CartItemRowProps>(({
     <View style={styles.drawerCartItem}>
       <View style={styles.drawerCartItemTop}>
         <View style={{ flex: 1 }}>
-          <Text style={styles.drawerCartItemName}>{item.name}</Text>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+            <Text style={styles.drawerCartItemName}>{item.name}</Text>
+            {item.isGift ? (
+              <View style={styles.giftBadgePill}>
+                <Gift size={10} color={ui.primary} />
+                <Text style={styles.giftBadgePillText}>REGALO</Text>
+              </View>
+            ) : null}
+          </View>
           {item.presentation ? (
             <Text style={styles.drawerCartItemSub}>
               Pres: {item.presentation.name} (x{item.presentation.conversionFactor})
@@ -188,7 +216,9 @@ const CartItemRow = React.memo<CartItemRowProps>(({
             <Text style={styles.drawerCartItemSub}>Var: {item.variant.name}</Text>
           ) : null}
         </View>
-        <Text style={styles.drawerCartItemSubtotal}>{formatPEN(itemSubtotal)}</Text>
+        <Text style={styles.drawerCartItemSubtotal}>
+          {item.isGift ? 'GRATIS' : formatPEN(itemSubtotal)}
+        </Text>
       </View>
 
       {/* Fila de Controles de Cantidad y Precio */}
@@ -215,7 +245,13 @@ const CartItemRow = React.memo<CartItemRowProps>(({
         </View>
 
         {/* Editor de Precio Unitario */}
-        {isEditingPrice ? (
+        {item.isGift ? (
+          <View style={styles.unitPriceBadge}>
+            <Text style={[styles.unitPriceBadgeText, { color: ui.primary }]}>
+              S/ 0.00 (Regalo)
+            </Text>
+          </View>
+        ) : isEditingPrice ? (
           <View style={styles.editPriceInputRow}>
             <TextInput
               style={styles.editPriceInput}
@@ -277,20 +313,40 @@ export default function PosCounterScreen() {
     scanScopeRef.current = scanScope;
     return () => { scanScopeRef.current = ''; };
   }, [scanScope]);
-  const { posSettings, activeCashSession, businessSettings } = useSettings();
+  const {
+    posSettings,
+    discountSettings,
+    activeCashSession,
+    businessSettings,
+    activeBranch,
+    paymentMethods,
+    invoicingEnabled,
+    taxProfile,
+    isOnline: settingsIsOnline,
+  } = useSettings();
   const { canModifyPrice } = usePermissions();
   const { products, categories, loading: productsLoading, refreshing, catalogComplete, error: productsError, refreshProducts, findByBarcode, findByBarcodeRemote, getProductStock } = useProducts();
   const {
     items,
     customer,
+    subtotal: cartSubtotal,
+    discountAmount,
+    shippingAmount,
+    invoiceIntent,
+    saleRequestId,
+    sourceQuoteId,
     total,
     totalAmount,
     itemCount,
     totalItemsCount,
     pausedSales,
     addItem,
+    addGiftItem,
     updateQuantity,
     updateItemPrice,
+    setDiscount,
+    setCustomer,
+    setInvoiceIntent,
     removeItem,
     clearCart,
     pauseCurrentSale,
@@ -356,11 +412,75 @@ export default function PosCounterScreen() {
   const [weightSelectorOpen, setWeightSelectorOpen] = useState(false);
   const [companionScannerOpen, setCompanionScannerOpen] = useState(false);
   const [quotesModalOpen, setQuotesModalOpen] = useState(false);
+  const [promoModalOpen, setPromoModalOpen] = useState(false);
+  const [giftSearchQuery, setGiftSearchQuery] = useState('');
 
-  // 3. Venta Rápida (Concepto Libre)
+  // Promociones, regalos e ICBPER
+  const eligibleGiftProducts = useMemo(
+    () => getEligibleGiftProducts(products, discountSettings, branchId || 'main'),
+    [products, discountSettings, branchId]
+  );
+  const filteredGiftProducts = useMemo(() => {
+    const q = giftSearchQuery.trim().toLowerCase();
+    if (!q) return eligibleGiftProducts.slice(0, 40);
+    return eligibleGiftProducts
+      .filter(
+        (p) =>
+          p.name.toLowerCase().includes(q) ||
+          String(p.sku || '').toLowerCase().includes(q) ||
+          String(p.category || '').toLowerCase().includes(q)
+      )
+      .slice(0, 40);
+  }, [eligibleGiftProducts, giftSearchQuery]);
+  const promoSuggestions = useMemo(
+    () => evaluateCartPromotions(items, discountSettings?.promotions, products),
+    [items, discountSettings?.promotions, products]
+  );
+  const hasBagOrPlasticItem = useMemo(() => cartHasPlasticBagProducts(items), [items]);
+  const icbperCartItem = useMemo(
+    () => items.find((i) => i.id.startsWith(ICBPER_CART_ITEM_ID)),
+    [items]
+  );
+
+  const handleToggleIcbper = useCallback(() => {
+    if (icbperCartItem) {
+      removeItem(icbperCartItem.id);
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+      return;
+    }
+    const bagProduct: Product = {
+      id: ICBPER_CART_ITEM_ID,
+      name: 'Bolsa Plástica (ICBPER)',
+      category: 'Impuesto ICBPER',
+      sku: 'ICBPER',
+      suggestedPrice: ICBPER_BAG_FEE,
+      price: ICBPER_BAG_FEE,
+      costPrice: 0,
+      minSalePrice: 0,
+      stock: { [branchId || 'main']: 99999 },
+      accountId: accountId || 'default',
+      taxExemptionCode: '30',
+    };
+    addItem(bagProduct, { quantity: 1, customPrice: ICBPER_BAG_FEE });
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+  }, [icbperCartItem, removeItem, addItem, branchId, accountId]);
+
+  // 3. Venta Rápida (Concepto Libre) y Venta Rápida Express (1 toque)
   const [quickSaleModalOpen, setQuickSaleModalOpen] = useState(false);
   const [quickConcept, setQuickConcept] = useState('Venta Rápida');
   const [quickAmountStr, setQuickAmountStr] = useState('');
+  const [isProcessingQuickSale, setIsProcessingQuickSale] = useState(false);
+  const [quickSaleBanner, setQuickSaleBanner] = useState<{ text: string; isOffline?: boolean } | null>(null);
+  const quickSaleInFlightRef = useRef(false);
+  const quickSaleBannerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (quickSaleBannerTimerRef.current) {
+        clearTimeout(quickSaleBannerTimerRef.current);
+      }
+    };
+  }, []);
 
   // 4. Ventas en Pausa
   const [pausedModalOpen, setPausedModalOpen] = useState(false);
@@ -369,6 +489,8 @@ export default function PosCounterScreen() {
   const [cartDrawerOpen, setCartDrawerOpen] = useState(false);
   const [editingPriceItemId, setEditingPriceItemId] = useState<string | null>(null);
   const [newPriceStr, setNewPriceStr] = useState('');
+  const [drawerDiscountStr, setDrawerDiscountStr] = useState('');
+  const [showDrawerDiscount, setShowDrawerDiscount] = useState(false);
 
   // Activar visor de cámara embebida
   const toggleInlineCamera = async () => {
@@ -426,7 +548,6 @@ export default function PosCounterScreen() {
         addItem(product, {
           presentation: matchedPresentation,
           quantity: 1,
-          customPrice: matchedPresentation.price,
         });
         return;
       }
@@ -437,7 +558,6 @@ export default function PosCounterScreen() {
         addItem(product, {
           variant: matchedVariant,
           quantity: 1,
-          customPrice: matchedVariant.price ?? product.price,
         });
         return;
       }
@@ -554,7 +674,7 @@ export default function PosCounterScreen() {
       return;
     }
 
-    const depositNum = parseFloat(resDepositStr) || 0;
+    const depositNum = parseNormalizedDecimal(resDepositStr);
     if (depositNum < 0) {
       Alert.alert('Monto Inválido', 'El adelanto no puede ser negativo.');
       return;
@@ -686,7 +806,7 @@ export default function PosCounterScreen() {
 
   // Confirmar Venta Rápida (concepto libre)
   const handleConfirmQuickSale = () => {
-    const amountNum = parseFloat(quickAmountStr);
+    const amountNum = parseNormalizedDecimal(quickAmountStr);
     if (!quickConcept.trim() || isNaN(amountNum) || amountNum <= 0) {
       Alert.alert('Datos Inválidos', 'Ingresa un concepto y un importe en soles mayor a S/ 0.00.');
       return;
@@ -738,14 +858,17 @@ export default function PosCounterScreen() {
 
   // Guardar Nuevo Precio Editado
   const handleSaveItemPrice = (item: CartItem) => {
-    const priceVal = parseFloat(newPriceStr);
+    const priceVal = parseNormalizedDecimal(newPriceStr);
     if (isNaN(priceVal) || priceVal <= 0) {
       Alert.alert('Precio Inválido', 'Ingresa un precio válido en soles.');
       return;
     }
 
-    const minFloor = item.minSalePrice ?? item.product?.minSalePrice ?? 0;
-    if (priceVal < minFloor) {
+    const enableMinSalePrice =
+      posSettings?.enableMinSalePrice !== false &&
+      businessSettings?.enableMinSalePrice !== false;
+    const minFloor = resolveCartItemMinPrice(item, enableMinSalePrice);
+    if (minFloor > 0 && priceVal < minFloor) {
       Alert.alert(
         'Precio Mínimo no Permitido',
         `El precio no puede ser menor al precio mínimo autorizado (${formatPEN(minFloor)}).`
@@ -753,11 +876,221 @@ export default function PosCounterScreen() {
       return;
     }
 
-    const ok = updateItemPrice(item.id, priceVal);
+    const ok = updateItemPrice(item.id, priceVal, enableMinSalePrice);
     if (ok) {
       setEditingPriceItemId(null);
       setNewPriceStr('');
       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    }
+  };
+
+  // Venta Rápida Express (1 toque: Efectivo exacto -> Nota de Venta sin abrir comprobante)
+  const handleInstantQuickSale = async () => {
+    if (quickSaleInFlightRef.current || items.length === 0 || safeTotal <= 0 || !accountId) return;
+    if (posSettings?.enableQuickSale === false) return;
+
+    if (invoiceIntent && invoiceIntent !== 'nota_venta') {
+      Alert.alert(
+        'Comprobante Seleccionado',
+        'La Venta Rápida solo emite Nota de Venta en efectivo. Para emitir Boleta, Factura o Cotización pulsa "Cobrar".',
+        [
+          { text: 'Cancelar', style: 'cancel' },
+          {
+            text: 'Ir a Cobrar',
+            onPress: () => {
+              setCartDrawerOpen(false);
+              setCheckoutModalOpen(true);
+            },
+          },
+        ]
+      );
+      return;
+    }
+
+    if ((posSettings as any)?.requireCashRegister !== false && !activeCashSession) {
+      Alert.alert('Caja Cerrada', 'Abre un turno de caja para usar Venta Rápida o usa Cobrar.');
+      return;
+    }
+
+    if (posSettings?.enableSellerAttribution === true && posSettings?.requireSellerSelection === true) {
+      Alert.alert(
+        'Vendedor Requerido',
+        'Esta cuenta requiere elegir vendedor antes de cobrar.',
+        [
+          { text: 'Cancelar', style: 'cancel' },
+          {
+            text: 'Ir a Cobrar',
+            onPress: () => {
+              setCartDrawerOpen(false);
+              setCheckoutModalOpen(true);
+            },
+          },
+        ]
+      );
+      return;
+    }
+
+    quickSaleInFlightRef.current = true;
+    setIsProcessingQuickSale(true);
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+
+    try {
+      const configuredMethodsRaw =
+        Array.isArray(posSettings?.methods) && posSettings.methods.length > 0
+          ? posSettings.methods
+          : Array.isArray(paymentMethods) && paymentMethods.length > 0
+          ? paymentMethods
+          : [{ id: 'efectivo', name: 'Efectivo', kind: 'cash', enabled: true, order: 0 }];
+
+      const configuredMethods = configuredMethodsRaw.map((m: any) => ({
+        ...m,
+        reportCategory:
+          m.reportCategory ||
+          (m.kind === 'terminal' || m.kind === 'mixed'
+            ? 'card'
+            : m.kind === 'credit'
+            ? 'credit'
+            : m.kind === 'digital'
+            ? 'digital'
+            : 'cash'),
+      }));
+
+      const cashMethod = configuredMethods.find(
+        (m: any) => m.enabled !== false && (m.kind === 'cash' || String(m.id).toLowerCase() === 'efectivo')
+      );
+      const selectedMethodId = cashMethod?.id || 'efectivo';
+      const payment = resolveCheckoutPayment({
+        methods: configuredMethods,
+        selectedMethodId,
+        category: 'cash',
+        total: safeTotal,
+      });
+
+      const saleItems = cleanFirestoreData(
+        items.map((i) => {
+          const resolvedId =
+            (i as any).productId ||
+            (i as any).product?.id ||
+            (i.id.includes('_') ? i.id.split('_')[0] : i.id);
+          const { product, ...cleanI } = i as any;
+          const factor =
+            cleanI.presentationQty || cleanI.conversionFactor || presentationFactor(cleanI.presentation);
+          return {
+            productId: resolvedId,
+            name: cleanI.name,
+            quantity: cleanI.quantity,
+            price: cleanI.price,
+            costPrice: cleanI.costPrice || 0,
+            total: cleanI.lineTotal !== undefined ? cleanI.lineTotal : cleanI.price * cleanI.quantity,
+            sku: cleanI.sku || '',
+            unitOfMeasure: cleanI.unitOfMeasure || 'NIU',
+            presentation: cleanI.presentation || null,
+            variant: cleanI.variant || null,
+            variantId: cleanI.variantId || cleanI.variant?.id,
+            variantName: cleanI.variantName || cleanI.variant?.name,
+            presentationId: cleanI.presentationId,
+            presentationName: cleanI.presentationName,
+            presentationQty: factor,
+            conversionFactor: factor,
+            stockBranchId: cleanI.stockBranchId || branchId || 'main',
+            isGift: Boolean(cleanI.isGift),
+            originalPrice: cleanI.originalPrice,
+            priceModificationReason: cleanI.priceModificationReason,
+            isWeightBased: cleanI.isWeightBased || false,
+          };
+        })
+      );
+
+      const saleTimestamp = Date.now();
+      const opId = `quick_${saleTimestamp}_${Math.random().toString(36).slice(2, 9)}`;
+      const isServerAttributed = posSettings?.enableSellerAttribution === true;
+      const itemsGrossSubtotal =
+        Math.round(
+          items.reduce((sum, it) => sum + Number(it.price || 0) * Number(it.quantity || 0), 0) *
+            100
+        ) / 100;
+      const netSubtotal = Math.max(0, safeTotal - shippingAmount);
+      const breakdown = computeSaleTaxBreakdown(netSubtotal, 'nota_venta', taxProfile);
+      const netInfo = await NetInfo.fetch();
+      const isOnline =
+        settingsIsOnline && Boolean(netInfo.isConnected && netInfo.isInternetReachable !== false);
+
+      const salePayload: CreateSaleTransactionParams = {
+        accountId,
+        branchId: branchId || 'main',
+        userId: user?.uid || 'user_mobile',
+        userName: userProfile?.displayName || user?.displayName || user?.email || 'Cajero POS',
+        userRole: userProfile?.role || undefined,
+        items: saleItems,
+        paymentMethod: 'cash',
+        paymentMethodId: payment.paymentMethodId,
+        paymentMethodName: payment.paymentMethodName,
+        commissionPercent: cashMethod?.commissionPercent,
+        commissionRule: cashMethod?.commissionRule,
+        chargedAmount: payment.chargedAmount,
+        commissionAmount: payment.commissionAmount,
+        surchargeAmount: payment.surchargeAmount,
+        netAmount: payment.netAmount,
+        documentType: 'nota_venta',
+        subtotal: isServerAttributed ? itemsGrossSubtotal : breakdown.subtotal,
+        tax: 0,
+        taxExemptionCode: breakdown.taxExemptionCode,
+        isAmazonExempt: breakdown.isAmazonExempt,
+        total: safeTotal,
+        shippingAmount,
+        discountAmount,
+        payments: cleanFirestoreData(payment.payments),
+        cashReceived: payment.chargedAmount,
+        changeGiven: 0,
+        customer: customer
+          ? {
+              id: customer.id,
+              name: customer.name || 'Cliente Varios',
+              dni: customer.dni || undefined,
+              ruc: customer.ruc || undefined,
+              phone: customer.phone || undefined,
+              address: customer.address || undefined,
+              documentType: customer.ruc ? 'RUC' : customer.dni ? 'DNI' : undefined,
+              documentNumber: customer.ruc || customer.dni || undefined,
+            }
+          : { name: 'Cliente Varios' },
+        customerId: customer?.id,
+        customerName: customer?.name || 'Cliente Varios',
+        sessionId: activeCashSession?.sessionId || activeCashSession?.id,
+        saleDate: saleTimestamp,
+        offlineId: opId,
+        isQuote: false,
+      };
+
+      let labelText = '';
+      if (isOnline) {
+        const result = await createSaleTransaction(salePayload);
+        const corr = result?.correlative || `#${result?.saleNumber || ''}`;
+        labelText = `Venta rápida ${corr} · ${formatPEN(safeTotal)}`;
+      } else {
+        await enqueueOfflineSale(salePayload);
+        labelText = `Venta rápida offline · ${formatPEN(safeTotal)}`;
+      }
+
+      clearCart();
+      setCustomer(null);
+      setInvoiceIntent(null);
+      setCartDrawerOpen(false);
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+
+      if (quickSaleBannerTimerRef.current) {
+        clearTimeout(quickSaleBannerTimerRef.current);
+      }
+      setQuickSaleBanner({ text: labelText, isOffline: !isOnline });
+      quickSaleBannerTimerRef.current = setTimeout(() => {
+        setQuickSaleBanner(null);
+      }, 3500);
+    } catch (err: any) {
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+      Alert.alert('Error en Venta Rápida', err?.message || 'No se pudo procesar la venta rápida.');
+    } finally {
+      quickSaleInFlightRef.current = false;
+      setIsProcessingQuickSale(false);
     }
   };
 
@@ -933,6 +1266,20 @@ export default function PosCounterScreen() {
         )}
       </View>
 
+      {quickSaleBanner ? (
+        <TouchableOpacity
+          activeOpacity={0.9}
+          onPress={() => setQuickSaleBanner(null)}
+          style={[styles.quickSaleToast, { bottom: Math.max(insets.bottom, 12) + 74 }]}
+        >
+          <CheckCircle2 size={18} color={ui.primary} />
+          <Text style={styles.quickSaleToastText} numberOfLines={1}>
+            {quickSaleBanner.text}
+          </Text>
+          <X size={16} color={ui.surface} />
+        </TouchableOpacity>
+      ) : null}
+
       {/* 5. BARRA FLOTANTE INFERIOR Y RESUMEN DEL CARRITO */}
       <View style={[styles.bottomBar, { paddingBottom: Math.max(insets.bottom, 12) }]}>
         <TouchableOpacity
@@ -958,6 +1305,27 @@ export default function PosCounterScreen() {
           </View>
           <ChevronUp size={16} color={ui.textSecondary} />
         </TouchableOpacity>
+
+        {/* BOTÓN 1-TAP VENTA RÁPIDA (Efectivo exacto sin comprobante en pantalla) */}
+        {safeCount > 0 && safeTotal > 0 && posSettings?.enableQuickSale !== false && !sourceQuoteId && !saleRequestId ? (
+          <TouchableOpacity
+            style={styles.quickSaleBtn}
+            onPress={handleInstantQuickSale}
+            disabled={isProcessingQuickSale}
+            accessibilityRole="button"
+            accessibilityLabel={`Venta rápida en efectivo por ${formatPEN(safeTotal)}`}
+            activeOpacity={0.8}
+          >
+            {isProcessingQuickSale ? (
+              <ActivityIndicator size="small" color={ui.primary} />
+            ) : (
+              <>
+                <Zap size={17} color={ui.primary} />
+                <Text style={styles.quickSaleBtnText}>Rápida</Text>
+              </>
+            )}
+          </TouchableOpacity>
+        ) : null}
 
         {/* BOTÓN GRANDE COBRAR */}
         <TouchableOpacity
@@ -1044,6 +1412,144 @@ export default function PosCounterScreen() {
 
               {/* Footer del Carrito */}
               <View style={styles.drawerFooter}>
+                {items.length > 0 ? (
+                  <View style={styles.drawerMetaBlock}>
+                    <View style={styles.docIntentRow}>
+                      {(invoicingEnabled
+                        ? ([
+                            { value: 'nota_venta', label: 'NTV' },
+                            { value: 'boleta', label: 'BOL' },
+                            { value: 'factura', label: 'FAC' },
+                            { value: 'quote', label: 'COT' },
+                          ] as const)
+                        : ([
+                            { value: 'nota_venta', label: 'NTV' },
+                            { value: 'quote', label: 'COT' },
+                          ] as const)
+                      ).map((opt) => {
+                        const active = invoiceIntent === opt.value;
+                        return (
+                          <TouchableOpacity
+                            key={opt.value}
+                            style={[styles.docIntentChip, active && styles.docIntentChipActive]}
+                            onPress={() =>
+                              setInvoiceIntent(invoiceIntent === opt.value ? null : opt.value)
+                            }
+                            accessibilityRole="button"
+                            accessibilityLabel={`Tipo comprobante ${opt.label}`}
+                          >
+                            <Text style={[styles.docIntentChipText, active && styles.docIntentChipTextActive]}>
+                              {opt.label}
+                            </Text>
+                          </TouchableOpacity>
+                        );
+                      })}
+                    </View>
+
+                    <View style={styles.drawerDiscountHeader}>
+                      <Text style={{ fontSize: 12, fontWeight: '600', color: ui.textSecondary }}>
+                        Subtotal: {formatPEN(cartSubtotal)}
+                      </Text>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                        <TouchableOpacity
+                          style={[
+                            styles.drawerDiscountBadgeBtn,
+                            promoSuggestions.length > 0 && { backgroundColor: ui.primarySoft },
+                          ]}
+                          onPress={() => setPromoModalOpen(true)}
+                          accessibilityRole="button"
+                          accessibilityLabel="Abrir promociones y regalos"
+                        >
+                          <Gift size={12} color={ui.primary} />
+                          <Text style={[styles.drawerDiscountBadgeText, promoSuggestions.length > 0 && { color: ui.primary }]}>
+                            {promoSuggestions.length > 0
+                              ? `Promos/Regalos (${promoSuggestions.length})`
+                              : 'Promos y Regalos'}
+                          </Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity
+                          style={styles.drawerDiscountBadgeBtn}
+                          onPress={() => {
+                            setDrawerDiscountStr(discountAmount > 0 ? discountAmount.toFixed(2) : '');
+                            setShowDrawerDiscount((v) => !v);
+                          }}
+                        >
+                          <Tag size={12} color={ui.primary} />
+                          <Text style={styles.drawerDiscountBadgeText}>
+                            {discountAmount > 0 ? `Desc: -${formatPEN(discountAmount)}` : 'Descuento'}
+                          </Text>
+                        </TouchableOpacity>
+                      </View>
+                    </View>
+
+                    {promoSuggestions.length > 0 ? (
+                      <TouchableOpacity
+                        style={styles.promoHintBanner}
+                        onPress={() => setPromoModalOpen(true)}
+                        activeOpacity={0.8}
+                      >
+                        <Sparkles size={13} color={ui.primary} />
+                        <Text style={styles.promoHintBannerText} numberOfLines={1}>
+                          {promoSuggestions[0].name}: {promoSuggestions[0].description}
+                        </Text>
+                        <Text style={styles.promoHintBannerCta}>Ver</Text>
+                      </TouchableOpacity>
+                    ) : null}
+
+                    {(hasBagOrPlasticItem || Boolean(icbperCartItem)) ? (
+                      <View style={styles.icbperRow}>
+                        <Text style={styles.icbperLabel}>
+                          Impuesto bolsa plástica (ICBPER)
+                        </Text>
+                        <TouchableOpacity
+                          style={[
+                            styles.icbperToggleBtn,
+                            Boolean(icbperCartItem) && styles.icbperToggleBtnActive,
+                          ]}
+                          onPress={handleToggleIcbper}
+                          accessibilityRole="button"
+                          accessibilityState={{ checked: Boolean(icbperCartItem) }}
+                        >
+                          <Text
+                            style={[
+                              styles.icbperToggleText,
+                              Boolean(icbperCartItem) && styles.icbperToggleTextActive,
+                            ]}
+                          >
+                            {icbperCartItem ? `ICBPER activo (${icbperCartItem.quantity}x)` : '+ Agregar S/ 0.50'}
+                          </Text>
+                        </TouchableOpacity>
+                      </View>
+                    ) : null}
+
+                    {showDrawerDiscount ? (
+                      <View style={styles.drawerDiscountRow}>
+                        <TextInput
+                          style={styles.drawerDiscountInput}
+                          value={drawerDiscountStr}
+                          onChangeText={setDrawerDiscountStr}
+                          placeholder="Monto descuento (S/)"
+                          placeholderTextColor={ui.textMuted}
+                          keyboardType="decimal-pad"
+                        />
+                        <TouchableOpacity
+                          style={styles.drawerDiscountApplyBtn}
+                          onPress={() => {
+                            const val = Math.max(
+                              0,
+                              Math.min(cartSubtotal, parseNormalizedDecimal(drawerDiscountStr))
+                            );
+                            setDiscount(val);
+                            setShowDrawerDiscount(false);
+                          }}
+                        >
+                          <Text style={styles.drawerDiscountApplyText}>Aplicar</Text>
+                        </TouchableOpacity>
+                      </View>
+                    ) : null}
+                  </View>
+                ) : null}
+
                 <View style={styles.drawerFooterRow}>
                   <TouchableOpacity
                     style={styles.pauseSaleFooterBtn}
@@ -1067,6 +1573,24 @@ export default function PosCounterScreen() {
                     <CalendarClock size={15} color={ui.accent} />
                     <Text style={styles.reserveFooterText}>Reservar</Text>
                   </TouchableOpacity>
+                  {safeCount > 0 && safeTotal > 0 && posSettings?.enableQuickSale !== false && !sourceQuoteId && !saleRequestId ? (
+                    <TouchableOpacity
+                      style={styles.drawerQuickSaleBtn}
+                      onPress={handleInstantQuickSale}
+                      disabled={isProcessingQuickSale}
+                      accessibilityRole="button"
+                      accessibilityLabel={`Venta rápida en efectivo por ${formatPEN(safeTotal)}`}
+                    >
+                      {isProcessingQuickSale ? (
+                        <ActivityIndicator size="small" color={ui.primary} />
+                      ) : (
+                        <>
+                          <Zap size={15} color={ui.primary} />
+                          <Text style={styles.quickSaleBtnText}>Rápida</Text>
+                        </>
+                      )}
+                    </TouchableOpacity>
+                  ) : null}
                   <TouchableOpacity
                     style={[styles.checkoutBtn, (safeCount === 0 || safeTotal <= 0) && styles.checkoutBtnDisabled]}
                     onPress={() => {
@@ -1466,7 +1990,6 @@ export default function PosCounterScreen() {
               presentation: opts.presentation,
               variant: opts.variant,
               quantity: opts.quantity,
-              customPrice: opts.presentation?.price ?? opts.variant?.price,
             });
           }}
         />
@@ -1489,10 +2012,137 @@ export default function PosCounterScreen() {
         />
       )}
 
+      {promoModalOpen && (
+        <Modal
+          visible={promoModalOpen}
+          animationType="slide"
+          transparent
+          onRequestClose={() => setPromoModalOpen(false)}
+        >
+          <View style={styles.subModalOverlay}>
+            <View style={[styles.subModalCard, { maxHeight: '84%' }]}>
+              <View style={styles.subModalHeader}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                  <Gift size={18} color={ui.primary} />
+                  <Text style={styles.subModalTitle}>Promociones y Regalos</Text>
+                </View>
+                <TouchableOpacity
+                  onPress={() => setPromoModalOpen(false)}
+                  accessibilityRole="button"
+                  accessibilityLabel="Cerrar promociones y regalos"
+                >
+                  <X size={20} color={ui.textSecondary} />
+                </TouchableOpacity>
+              </View>
+
+              <ScrollView showsVerticalScrollIndicator={false} style={{ maxHeight: 460 }}>
+                {/* Promociones aplicables al carrito */}
+                <Text style={styles.promoSectionTitle}>Promociones Aplicables</Text>
+                {promoSuggestions.length === 0 ? (
+                  <Text style={styles.promoEmptyText}>
+                    {(discountSettings?.promotions || []).some((p) => p.active !== false)
+                      ? 'Los productos del carrito aún no alcanzan una promoción activa.'
+                      : 'No hay reglas de promoción activas configuradas.'}
+                  </Text>
+                ) : (
+                  promoSuggestions.map((s) => (
+                    <View key={s.promotionId} style={styles.promoCard}>
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.promoCardTitle}>{s.name}</Text>
+                        <Text style={styles.promoCardDesc}>{s.description}</Text>
+                      </View>
+                      {s.freeProduct && s.freeQuantity ? (
+                        <TouchableOpacity
+                          style={styles.promoActionBtn}
+                          onPress={() => {
+                            addGiftItem(s.freeProduct!, { quantity: s.freeQuantity });
+                            Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+                          }}
+                        >
+                          <Text style={styles.promoActionBtnText}>
+                            +{s.freeQuantity} Gratis
+                          </Text>
+                        </TouchableOpacity>
+                      ) : s.suggestedDiscountAmount > 0 ? (
+                        <TouchableOpacity
+                          style={styles.promoActionBtn}
+                          onPress={() => {
+                            const nextDiscount = Math.min(cartSubtotal, s.suggestedDiscountAmount);
+                            setDiscount(nextDiscount);
+                            Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+                          }}
+                        >
+                          <Text style={styles.promoActionBtnText}>
+                            Aplicar -{formatPEN(s.suggestedDiscountAmount)}
+                          </Text>
+                        </TouchableOpacity>
+                      ) : null}
+                    </View>
+                  ))
+                )}
+
+                {/* Catálogo de Regalos S/ 0.00 */}
+                <Text style={[styles.promoSectionTitle, { marginTop: 14 }]}>
+                  Agregar Producto como Regalo (S/ 0.00)
+                </Text>
+                {discountSettings?.enableGifts === false ? (
+                  <Text style={styles.promoEmptyText}>
+                    Los regalos están deshabilitados en la configuración del negocio.
+                  </Text>
+                ) : (
+                  <>
+                    <TextInput
+                      style={[styles.formInput, { marginBottom: 8 }]}
+                      value={giftSearchQuery}
+                      onChangeText={setGiftSearchQuery}
+                      placeholder="Buscar producto elegible para regalo..."
+                      placeholderTextColor={ui.textMuted}
+                    />
+                    {filteredGiftProducts.length === 0 ? (
+                      <Text style={styles.promoEmptyText}>
+                        No hay productos elegibles con stock en esta sucursal.
+                      </Text>
+                    ) : (
+                      filteredGiftProducts.map((p) => {
+                        const stockQty = resolveProductBranchStock(p, branchId || 'main');
+                        return (
+                          <View key={p.id} style={styles.giftProductRow}>
+                            <View style={{ flex: 1 }}>
+                              <Text style={styles.giftProductName} numberOfLines={1}>
+                                {p.name}
+                              </Text>
+                              <Text style={styles.giftProductMeta}>
+                                Stock: {stockQty} · Valor ref: {formatPEN(p.suggestedPrice ?? p.price ?? 0)}
+                              </Text>
+                            </View>
+                            <TouchableOpacity
+                              style={styles.giftAddBtn}
+                              onPress={() => {
+                                addGiftItem(p, { quantity: 1 });
+                                Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+                              }}
+                            >
+                              <Gift size={13} color={ui.onPrimary} />
+                              <Text style={styles.giftAddBtnText}>Regalar</Text>
+                            </TouchableOpacity>
+                          </View>
+                        );
+                      })
+                    )}
+                  </>
+                )}
+              </ScrollView>
+            </View>
+          </View>
+        </Modal>
+      )}
+
       {checkoutModalOpen && (
         <CheckoutModal
           visible={checkoutModalOpen}
           onClose={() => setCheckoutModalOpen(false)}
+          initialDocType={invoiceIntent || undefined}
+          branch={activeBranch}
         />
       )}
 
@@ -2574,5 +3224,285 @@ const styles = StyleSheet.create({
   resMethodChipTextActive: {
     color: ui.surface,
     fontWeight: '700',
+  },
+  quickSaleBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 5,
+    backgroundColor: ui.primarySoft,
+    borderWidth: 1.5,
+    borderColor: ui.primary,
+    borderRadius: 14,
+    minHeight: 52,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  quickSaleBtnText: {
+    color: ui.primary,
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  drawerQuickSaleBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 5,
+    backgroundColor: ui.primarySoft,
+    borderWidth: 1.5,
+    borderColor: ui.primary,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+  },
+  quickSaleToast: {
+    position: 'absolute',
+    left: 16,
+    right: 16,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: ui.text,
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 11,
+    elevation: 6,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.2,
+    shadowRadius: 6,
+  },
+  quickSaleToastText: {
+    flex: 1,
+    color: ui.surface,
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  drawerMetaBlock: {
+    marginBottom: 10,
+    gap: 8,
+  },
+  docIntentRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  docIntentChip: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 6,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: ui.border,
+    backgroundColor: ui.background,
+  },
+  docIntentChipActive: {
+    backgroundColor: ui.primary,
+    borderColor: ui.primary,
+  },
+  docIntentChipText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: ui.textSecondary,
+  },
+  docIntentChipTextActive: {
+    color: ui.onPrimary,
+  },
+  drawerDiscountHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  drawerDiscountBadgeBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    paddingHorizontal: 9,
+    paddingVertical: 4,
+    borderRadius: 8,
+    backgroundColor: ui.surfaceMuted,
+  },
+  drawerDiscountBadgeText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: ui.text,
+  },
+  drawerDiscountRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  drawerDiscountInput: {
+    flex: 1,
+    backgroundColor: ui.background,
+    borderWidth: 1,
+    borderColor: ui.border,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    fontSize: 13,
+    fontWeight: '700',
+    color: ui.text,
+  },
+  drawerDiscountApplyBtn: {
+    backgroundColor: ui.primary,
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+  },
+  drawerDiscountApplyText: {
+    color: ui.onPrimary,
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  giftBadgePill: {
+    marginLeft: 6,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 6,
+    backgroundColor: ui.successSoft,
+    borderWidth: 1,
+    borderColor: ui.success,
+  },
+  giftBadgePillText: {
+    fontSize: 10,
+    fontWeight: '800',
+    color: ui.success,
+  },
+  promoHintBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderRadius: 10,
+    backgroundColor: ui.accentSoft,
+    borderWidth: 1,
+    borderColor: ui.accent,
+  },
+  promoHintBannerText: {
+    flex: 1,
+    fontSize: 12,
+    fontWeight: '600',
+    color: ui.accent,
+  },
+  promoHintBannerCta: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: ui.accent,
+  },
+  icbperRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  icbperLabel: {
+    flex: 1,
+    fontSize: 12,
+    fontWeight: '600',
+    color: ui.textSecondary,
+  },
+  icbperToggleBtn: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: ui.border,
+    backgroundColor: ui.background,
+  },
+  icbperToggleBtnActive: {
+    borderColor: ui.primary,
+    backgroundColor: ui.primarySoft,
+  },
+  icbperToggleText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: ui.textSecondary,
+  },
+  icbperToggleTextActive: {
+    color: ui.primary,
+  },
+  promoSectionTitle: {
+    fontSize: 13,
+    fontWeight: '800',
+    color: ui.text,
+    marginBottom: 8,
+    textTransform: 'uppercase',
+    letterSpacing: 0.4,
+  },
+  promoEmptyText: {
+    fontSize: 13,
+    color: ui.textSecondary,
+    paddingVertical: 8,
+  },
+  promoCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    padding: 12,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: ui.border,
+    backgroundColor: ui.surfaceMuted,
+    marginBottom: 8,
+  },
+  promoCardTitle: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: ui.text,
+  },
+  promoCardDesc: {
+    fontSize: 12,
+    color: ui.textSecondary,
+    marginTop: 2,
+  },
+  promoActionBtn: {
+    backgroundColor: ui.primary,
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  promoActionBtnText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: ui.onPrimary,
+  },
+  giftProductRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: ui.border,
+  },
+  giftProductName: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: ui.text,
+  },
+  giftProductMeta: {
+    fontSize: 12,
+    color: ui.textSecondary,
+    marginTop: 2,
+  },
+  giftAddBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    backgroundColor: ui.successSoft,
+    borderWidth: 1,
+    borderColor: ui.success,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  giftAddBtnText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: ui.success,
   },
 });

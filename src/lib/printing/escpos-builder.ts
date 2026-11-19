@@ -12,9 +12,14 @@ import {
   CartItem,
 } from '../../types';
 import {
-  calculateTaxTotals,
   numberToSpanishWordsPEN,
 } from '../invoicing/types';
+import {
+  receiptAmountsForSale,
+  type TaxProfileInput,
+} from '../invoicing/receipt-amounts';
+import { buildSaleQrContent } from '../invoicing/qr-content';
+import { buildQrSvgMarkup } from '../invoicing/qr-matrix';
 import { formatPEN, formatDatePE } from '../theme';
 
 // ============================================================================
@@ -23,13 +28,21 @@ import { formatPEN, formatDatePE } from '../theme';
 
 export interface EscPosOptions {
   /** Paper width: 80mm = ~48 cols, 58mm = ~32 cols */
-  paperWidth?: 80 | 58;
+  paperWidth?: 80 | 58 | '80mm' | '58mm';
   /** Automatically trigger partial paper cut at the end */
   autoCut?: boolean;
   /** Send electronic cash drawer kick pulse */
   openDrawer?: boolean;
   /** Layout template style */
   ticketTemplate?: 'standard' | 'compact';
+  /** Optional branch metadata to merge store address / commercial info */
+  branch?: Partial<Branch> | null;
+  /** Account IGV tax profile (General 18% / 10% or Amazon exempt Ley 27037) */
+  taxProfile?: TaxProfileInput | null;
+  /** Override public consultation URL */
+  consultUrl?: string;
+  /** Override ticket footer message */
+  receiptFooter?: string;
 }
 
 export interface CashClosureData {
@@ -42,6 +55,17 @@ export interface CashClosureData {
   notes?: string;
 }
 
+const escapeHtml = (value: string): string =>
+  String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
+const is58PaperWidth = (width?: EscPosOptions['paperWidth']): boolean =>
+  width === 58 || width === '58mm';
+
 // ============================================================================
 // 2. ESC/POS BINARY BUILDER CLASS
 // ============================================================================
@@ -51,7 +75,7 @@ export class EscPosBuilder {
   public readonly cols: number;
 
   constructor(public readonly options: EscPosOptions = {}) {
-    this.cols = options.paperWidth === 58 ? 32 : 48;
+    this.cols = is58PaperWidth(options.paperWidth) ? 32 : 48;
     this.init();
   }
 
@@ -247,131 +271,332 @@ export function uint8ArrayToBase64(bytes: Uint8Array): string {
 export const toBase64 = uint8ArrayToBase64;
 
 // ============================================================================
-// 4. SALE RECEIPT ESC/POS BUILDER
+// 4. SALE RECEIPT ESC/POS BUILDER & SHARED NORMALIZERS
 // ============================================================================
+
+const formatReceiptPaymentMethod = (method?: string, provider?: string): string => {
+  const m = String(method || '').toLowerCase();
+  const p = String(provider || '').toLowerCase();
+  if (p === 'yape' || m === 'yape') return 'Yape';
+  if (p === 'plin' || m === 'plin') return 'Plin';
+  if (m === 'cash' || m === 'efectivo') return 'Efectivo';
+  if (m === 'card' || m === 'tarjeta') return 'Tarjeta';
+  if (m === 'transfer' || m === 'transferencia') return 'Transferencia';
+  if (m === 'fiado' || m === 'credit') return 'Crédito / Fiado';
+  if (m === 'mixed' || m === 'mixto') return 'Pago Mixto';
+  return method ? method.charAt(0).toUpperCase() + method.slice(1) : 'Efectivo';
+};
+
+export function resolveReceiptDocumentMeta(sale: Sale) {
+  const rawDocType = String(sale.documentType || 'nota_venta').toLowerCase();
+  const isQuote =
+    Boolean((sale as any).isQuote) ||
+    rawDocType === 'quote' ||
+    rawDocType === 'cotizacion' ||
+    rawDocType === 'cot';
+  const isFacturaDoc = rawDocType === 'factura' || rawDocType === '01';
+  const isBoletaDoc = rawDocType === 'boleta' || rawDocType === '03';
+  const isCreditNote = rawDocType === 'credit_note' || rawDocType === '07';
+  const isDebitNote = rawDocType === 'debit_note' || rawDocType === '08';
+  const isOfflinePending = Boolean(
+    (sale as any).isOffline || (sale as any).offlineQueued || sale.isOfflinePending
+  );
+  const isFacturaAccepted =
+    isFacturaDoc && sale.sunatStatus === 'accepted' && !isOfflinePending;
+  const isFiscal = isBoletaDoc || isFacturaAccepted || isCreditNote || isDebitNote;
+
+  let displayTitle = 'NOTA DE VENTA';
+  if (isQuote) {
+    displayTitle = 'COTIZACION';
+  } else if (isFacturaAccepted) {
+    displayTitle = 'FACTURA ELECTRONICA';
+  } else if (isBoletaDoc) {
+    displayTitle = 'BOLETA DE VENTA ELECTRONICA';
+  } else if (isCreditNote) {
+    displayTitle = 'NOTA DE CREDITO ELECTRONICA';
+  } else if (isDebitNote) {
+    displayTitle = 'NOTA DE DEBITO ELECTRONICA';
+  }
+
+  const fallbackNv = sale.saleNumber ? `NV-${String(sale.saleNumber).padStart(6, '0')}` : 'S/N';
+  const docNumber =
+    isFacturaDoc && !isFacturaAccepted
+      ? sale.correlative && !String(sale.correlative).toUpperCase().startsWith('F')
+        ? String(sale.correlative)
+        : fallbackNv
+      : sale.documentNumber ||
+        sale.correlative ||
+        `V-${String(sale.saleNumber || 1).padStart(6, '0')}`;
+
+  return {
+    isQuote,
+    isFacturaDoc,
+    isBoletaDoc,
+    isCreditNote,
+    isDebitNote,
+    isOfflinePending,
+    isFacturaAccepted,
+    isFiscal,
+    displayTitle,
+    docNumber,
+  };
+}
+
+function resolveReceiptCustomerMeta(sale: Sale) {
+  const receiptCustomer = sale.receiptCustomer;
+  const name = receiptCustomer?.name || sale.customerName || '';
+  const identityNumber = String(
+    receiptCustomer?.identityNumber ||
+      sale.customerRuc ||
+      sale.customerDni ||
+      (sale as any).customerDocNumber ||
+      (sale as any).customerDocument ||
+      ''
+  ).trim();
+  const digits = identityNumber.replace(/\D/g, '');
+  const idType = receiptCustomer?.identityType;
+  const docLabel =
+    idType === '6' || digits.length === 11
+      ? 'RUC'
+      : idType === '1' || digits.length === 8
+        ? 'DNI'
+        : 'Doc';
+  const address = receiptCustomer?.address || sale.customerAddress || '';
+  return { name, identityNumber, docLabel, address };
+}
+
+function resolveReceiptPayments(sale: Sale) {
+  const rawSplits =
+    Array.isArray(sale.payments) && sale.payments.length > 0
+      ? sale.payments
+      : Array.isArray((sale as any).paymentSplits) && (sale as any).paymentSplits.length > 0
+        ? (sale as any).paymentSplits
+        : Array.isArray((sale as any).mixedPayments)
+          ? (sale as any).mixedPayments
+          : [];
+
+  const splits = rawSplits
+    .filter((s: any) => (Number(s?.amount) || 0) > 0)
+    .map((s: any) => ({
+      label: String(
+        s.methodName ||
+          s.methodLabel ||
+          formatReceiptPaymentMethod(s.category || s.method, s.digitalProvider || s.provider)
+      ),
+      amount: Number(s.amount) || 0,
+    }));
+
+  const paymentLabel = String(
+    sale.paymentMethodName ||
+      (splits.length > 1
+        ? 'MIXTO'
+        : splits[0]?.label ||
+          formatReceiptPaymentMethod(sale.paymentMethod, sale.digitalProvider))
+  ).toUpperCase();
+
+  return { splits, paymentLabel };
+}
 
 /**
  * Builds binary ESC/POS ticket for sales and electronic invoices.
- * Includes Peruvian tax compliance protection: if a Factura or Boleta lacks
- * accepted CDR, it is safely degraded to "NOTA DE VENTA".
+ * Includes Peruvian tax compliance protection: if a Factura lacks
+ * accepted CDR (or is offline), it is safely degraded to "NOTA DE VENTA".
  */
 export function buildSaleReceiptEscPos(
   sale: Sale,
   business: Partial<BusinessSettings & Branch> = {},
   options: EscPosOptions = {}
 ): Uint8Array {
-  const builder = new EscPosBuilder(options);
+  const is58 = is58PaperWidth(options.paperWidth);
+  const builder = new EscPosBuilder({
+    ...options,
+    paperWidth: is58 ? 58 : 80,
+  });
   const isCompact = options.ticketTemplate === 'compact';
+  const merged = { ...(business || {}), ...(options.branch || {}) } as Partial<BusinessSettings & Branch> & {
+    razonSocial?: string;
+    commercialName?: string;
+    email?: string;
+    sunatResolution?: string;
+    authorizationText?: string;
+    printedFormatResolution?: string;
+  };
 
   // 1. Kick cash drawer if requested
   if (options.openDrawer) {
     builder.openCashDrawer();
   }
 
-  // 2. Resolve fiscal title with anti-evasion / tax protection
-  let rawDocType = String(sale.documentType || 'nota_venta').toLowerCase();
-  let isFiscal = rawDocType === 'factura' || rawDocType === 'boleta' || rawDocType === '01' || rawDocType === '03';
-
-  // Strict tax protection: if marked as Factura/Boleta without accepted CDR or offline pending, degrade to NOTA DE VENTA
-  let displayTitle = 'NOTA DE VENTA';
-  if (isFiscal) {
-    if (sale.sunatStatus === 'accepted' && !sale.isOfflinePending) {
-      displayTitle = rawDocType.includes('factura') || rawDocType === '01' ? 'FACTURA ELECTRONICA' : 'BOLETA DE VENTA ELECTRONICA';
-    } else {
-      displayTitle = 'NOTA DE VENTA';
-      isFiscal = false;
-    }
-  } else if (rawDocType === 'cotizacion' || rawDocType === 'cot') {
-    displayTitle = 'COTIZACION';
-  }
+  // 2. Resolve fiscal title with Web anti-evasion rule:
+  // Only Factura ('01'/'factura') degrades to NOTA DE VENTA while pending/unaccepted;
+  // Boleta ('03'/'boleta') remains optimistically BOLETA DE VENTA ELECTRONICA.
+  const {
+    isOfflinePending,
+    isFiscal,
+    displayTitle,
+    docNumber,
+  } = resolveReceiptDocumentMeta(sale);
 
   // 3. Business Header
   builder.align('center');
-  if (sale.isOfflinePending) {
+  if (isOfflinePending) {
     builder.bold(true).line('*** OPERACION OFFLINE ***');
     builder.line('PENDIENTE DE SINCRONIZACION').bold(false);
     builder.divider('*');
   }
 
-  const businessName = business.businessName || business.name || 'VENTIFY POS';
+  const businessName = merged.commercialName || merged.businessName || merged.name || 'VENTIFY POS';
   builder.bold(true).size('double-height').line(businessName).size('normal').bold(false);
 
-  if (business.description && !isCompact) {
-    builder.line(`"${business.description}"`);
+  if (merged.razonSocial && merged.razonSocial !== businessName) {
+    builder.line(merged.razonSocial);
+  }
+  if (merged.description && !isCompact) {
+    builder.line(`"${merged.description}"`);
+  }
+  if (merged.ruc) {
+    builder.bold(true).line(`RUC: ${merged.ruc}`).bold(false);
   }
 
-  if (business.ruc) {
-    builder.bold(true).line(`RUC: ${business.ruc}`).bold(false);
+  const fiscalAddress = merged.fiscalAddress || merged.address;
+  const storeAddress = merged.commercialAddress;
+  if (fiscalAddress) {
+    builder.line(fiscalAddress);
   }
-
-  const storeAddress = business.commercialAddress || business.address;
-  if (storeAddress) {
-    builder.line(storeAddress);
+  if (storeAddress && storeAddress !== fiscalAddress) {
+    builder.line(`Tienda: ${storeAddress}`);
   }
-  if (business.commercialPhone || business.phone) {
-    builder.line(`Telf: ${business.commercialPhone || business.phone}`);
+  if (merged.commercialPhone || merged.phone) {
+    builder.line(`Telf: ${merged.commercialPhone || merged.phone}`);
+  }
+  if (!isCompact && merged.email) {
+    builder.line(merged.email);
   }
 
   // 4. Document Series & Number
   builder.divider('.');
   builder.bold(true).size('double-height').line(displayTitle).size('normal');
-  const docNumber = sale.documentNumber || `V-${String(sale.saleNumber || 1).padStart(6, '0')}`;
   builder.bold(true).line(docNumber).bold(false);
   builder.divider('.');
 
   // 5. Sale Meta & Customer
   builder.align('left');
   builder.twoColumns('Fecha:', formatDatePE(sale.date));
-  const operator = sale.cashierUsername || sale.sellerName;
+  const operator =
+    sale.cashierUsername ||
+    sale.sellerName ||
+    (sale as any).completedByName ||
+    (sale as any).userName;
   if (operator) {
     builder.twoColumns('Cajero/Vend:', operator);
   }
 
-  if (sale.customerName) {
-    builder.line(`Cliente: ${sale.customerName.toUpperCase()}`);
-    if (sale.customerRuc) {
-      builder.line(`RUC: ${sale.customerRuc}`);
-    } else if (sale.customerDni) {
-      builder.line(`DNI: ${sale.customerDni}`);
+  const customerMeta = resolveReceiptCustomerMeta(sale);
+  if (customerMeta.name) {
+    builder.line(`Cliente: ${customerMeta.name.toUpperCase()}`);
+    if (customerMeta.identityNumber) {
+      builder.line(`${customerMeta.docLabel}: ${customerMeta.identityNumber}`);
     }
-    if (sale.customerAddress) {
-      builder.line(`Direccion: ${sale.customerAddress.toUpperCase()}`);
+    if (customerMeta.address) {
+      builder.line(`Direccion: ${customerMeta.address.toUpperCase()}`);
     }
   }
 
-  builder.twoColumns('Forma de pago:', (sale.paymentMethod || 'EFECTIVO').toUpperCase());
+  const { splits, paymentLabel } = resolveReceiptPayments(sale);
+  builder.twoColumns('Forma de pago:', paymentLabel);
 
-  // 6. Products Table
+  if (splits.length > 1 && !isCompact) {
+    for (const split of splits) {
+      builder.twoColumns(`  - ${split.label.toUpperCase()}:`, formatPEN(split.amount));
+    }
+  }
+
+  // 6. Products Table (2-line SKU format)
   builder.divider('.');
-  builder.bold(true).line('CANT / PRECIO UNIT                TOTAL').bold(false);
+  builder.bold(true).twoColumns('SKU   CANT   PRECIO', 'TOTAL').bold(false);
   builder.divider('.');
 
   for (const item of sale.items || []) {
     const qty = Number(item.quantity) || 1;
     const price = Number(item.price) || 0;
     const total = Number(item.lineTotal ?? qty * price);
-    builder.itemRow(item.name, qty, price, total, item.unitOfMeasure);
+    const presentationName = item.presentation?.name || (item as any).presentationName;
+    const variantName = item.variant?.name || (item as any).variantName;
+    const presentationSuffix = presentationName ? ` (${presentationName})` : '';
+    const variantSuffix = variantName ? ` [${variantName}]` : '';
+    builder.line(`${item.name}${presentationSuffix}${variantSuffix}`);
+    const skuPrefix = item.sku ? `${item.sku} ` : '';
+    const unitStr = (item.unitOfMeasure || 'UND').trim().toUpperCase();
+    builder.twoColumns(`${skuPrefix}${qty} ${unitStr} x ${price.toFixed(2)}`, formatPEN(total));
+    if (Number((item as any).discount) > 0) {
+      builder.twoColumns('  Desc. item:', `-${formatPEN(Number((item as any).discount))}`);
+    }
   }
 
   // 7. Totals & Tax Breakdown
   builder.divider('.');
-  const taxInfo = calculateTaxTotals(sale.total);
+  const amounts = receiptAmountsForSale(sale, sale.fiscalAmounts, options.taxProfile);
+  const igvPct =
+    amounts.taxed > 0 && amounts.igv > 0 ? Math.round((amounts.igv / amounts.taxed) * 100) : 18;
+  const shippingAmount = Math.round((Number(sale.shippingAmount) || 0) * 100) / 100;
+
+  if ((sale.discountAmount || 0) > 0) {
+    builder.twoColumns('Descuento:', `-${formatPEN(sale.discountAmount!)}`);
+  }
+  if (shippingAmount > 0) {
+    builder.twoColumns('Envio:', formatPEN(shippingAmount));
+  }
 
   if (isFiscal) {
-    builder.twoColumns('Op. Gravada (18%):', formatPEN(taxInfo.opGravada));
-    builder.twoColumns('IGV (18%):', formatPEN(taxInfo.igv));
+    if (amounts.taxed > 0) {
+      builder.twoColumns('Op. Gravada:', formatPEN(amounts.taxed));
+      if (amounts.igv > 0) {
+        builder.twoColumns(`IGV (${igvPct}%):`, formatPEN(amounts.igv));
+      }
+    }
+    if (amounts.exempt > 0) {
+      builder.twoColumns('Op. Exonerada:', formatPEN(amounts.exempt));
+    }
+    if (amounts.unaffected > 0) {
+      builder.twoColumns('Op. Inafecta:', formatPEN(amounts.unaffected));
+    }
+    if (amounts.otherTaxes > 0) {
+      builder.twoColumns('Otros cargos:', formatPEN(amounts.otherTaxes));
+    }
+    if (
+      amounts.taxed === 0 &&
+      amounts.exempt === 0 &&
+      amounts.unaffected === 0 &&
+      amounts.igv === 0
+    ) {
+      builder.twoColumns('Subtotal:', formatPEN(amounts.subtotal));
+    }
   } else {
-    builder.twoColumns('Subtotal:', formatPEN(sale.subtotal || taxInfo.opGravada));
+    builder.twoColumns('Subtotal:', formatPEN(sale.subtotal || amounts.subtotal || amounts.total));
   }
 
   builder.divider('.');
   builder.bold(true).size('double-height');
-  builder.twoColumns('TOTAL:', formatPEN(sale.total));
+  builder.twoColumns('TOTAL:', formatPEN(amounts.total || sale.total));
   builder.size('normal').bold(false);
 
   if ((sale.surchargeAmount || 0) > 0) {
     builder.twoColumns('Recargo:', formatPEN(sale.surchargeAmount!));
     builder.bold(true).twoColumns('TOTAL COBRADO:', formatPEN(sale.chargedAmount ?? sale.total + sale.surchargeAmount!)).bold(false);
+  }
+
+  const depositInfo = (sale as any).depositInfo;
+  if (depositInfo && (Number(depositInfo.appliedAmount) > 0 || Number(depositInfo.depositAmount) > 0)) {
+    const applied = Number(depositInfo.appliedAmount ?? depositInfo.depositAmount ?? 0);
+    const remaining = Number(
+      depositInfo.remainingAmount ?? depositInfo.remainingBalance ?? Math.max(0, (amounts.total || sale.total) - applied)
+    );
+    builder.divider('.');
+    if (Number(depositInfo.originalTotal) > 0) {
+      builder.twoColumns('Total original:', formatPEN(Number(depositInfo.originalTotal)));
+    }
+    builder.twoColumns('Adelanto Aplicado:', formatPEN(applied));
+    builder.twoColumns('Saldo Pendiente:', formatPEN(remaining));
   }
 
   // 8. Cash Received & Change
@@ -381,35 +606,57 @@ export function buildSaleReceiptEscPos(
     builder.twoColumns('Vuelto:', formatPEN(sale.changeGiven ?? Math.max(0, sale.cashReceived - (sale.chargedAmount ?? sale.total))));
   }
 
-  // 9. Amount in Words
-  const words = sale.amountInWords || numberToSpanishWordsPEN(sale.total);
+  // 9. Amount in Words & Tax Legends
+  const rawWords = (sale as any).amountInWords || numberToSpanishWordsPEN(amounts.total || sale.total);
+  const wordsLine = String(rawWords).toUpperCase().startsWith('SON:')
+    ? String(rawWords)
+    : `SON: ${rawWords}`;
   builder.divider('.');
-  builder.align('center').bold(true).line(words).bold(false);
+  builder.align('center').bold(true).line(wordsLine).bold(false);
 
-  // 10. QR Code
-  builder.divider('.');
-  let qrData = sale.qrContent;
-  if (!qrData && isFiscal && business.ruc) {
-    // Standard SUNAT QR string format
-    const docTypeNum = displayTitle.includes('FACTURA') ? '01' : '03';
-    const clientDocType = sale.customerRuc ? '6' : sale.customerDni ? '1' : '-';
-    const clientDocNum = sale.customerRuc || sale.customerDni || '-';
-    const dateFormatted = new Date(sale.date).toISOString().split('T')[0];
-    qrData = `${business.ruc}|${docTypeNum}|${docNumber}|${taxInfo.igv.toFixed(2)}|${sale.total.toFixed(2)}|${dateFormatted}|${clientDocType}|${clientDocNum}|`;
+  if (isFiscal && amounts.isAmazonExempt) {
+    builder.line('BIENES TRANSFERIDOS EN LA AMAZONIA REGION SELVA PARA SER CONSUMIDOS EN LA MISMA');
   }
 
+  // 10. QR Code & Hash
+  const consultUrl = options.consultUrl || merged.consultUrl || sale.consultUrl || 'https://ventify.com.pe/comprobantes';
+  const qrData = buildSaleQrContent(
+    isOfflinePending ? { ...sale, isOfflinePending: true } : sale,
+    {
+      emitterRuc: merged.ruc,
+      consultUrl,
+      taxProfile: options.taxProfile,
+    }
+  );
+
   if (qrData) {
+    builder.divider('.');
     builder.feed(1);
-    builder.qr(qrData, options.paperWidth === 58 ? 4 : 5);
+    builder.qr(qrData, is58 ? 4 : 5);
     builder.feed(1);
+  }
+
+  const sunatHash = (sale as any).sunatHash || (sale as any).hash || (sale as any).digestValue;
+  if (sunatHash && !isCompact) {
+    builder.line(`Hash: ${sunatHash}`);
   }
 
   // 11. Footer & Consultation URL
-  const consultUrl = business.consultUrl || sale.consultUrl || 'https://ventify.com.pe/comprobantes';
+  builder.divider('.');
   builder.line('Consulta tu comprobante en:');
   builder.bold(true).line(consultUrl).bold(false);
 
-  const footer = business.receiptFooter || sale.footerNote || '¡GRACIAS POR SU PREFERENCIA!';
+  if (isFiscal && !isCompact) {
+    const authText =
+      sale.printedFormatResolution ||
+      merged.printedFormatResolution ||
+      merged.sunatResolution ||
+      merged.authorizationText ||
+      'Representacion impresa del comprobante electronico';
+    builder.line(authText);
+  }
+
+  const footer = options.receiptFooter || merged.receiptFooter || sale.footerNote || 'GRACIAS POR SU PREFERENCIA!';
   builder.feed(1);
   builder.bold(true).line(footer).bold(false);
   builder.divider('.');
@@ -529,102 +776,193 @@ export function buildCashClosureEscPos(
  */
 export function buildReceiptHtml(
   sale: Sale,
-  business: Partial<BusinessSettings & Branch> = {}
+  business: Partial<BusinessSettings & Branch> = {},
+  options: EscPosOptions = {}
 ): string {
-  const isFiscal = sale.documentType === 'factura' || sale.documentType === 'boleta' || sale.documentType === '01' || sale.documentType === '03';
-  const taxInfo = calculateTaxTotals(sale.total);
-  const words = sale.amountInWords || numberToSpanishWordsPEN(sale.total);
-  const docNumber = sale.documentNumber || `V-${String(sale.saleNumber || 1).padStart(6, '0')}`;
-  const businessName = business.businessName || business.name || 'VENTIFY POS';
-  const consultUrl = business.consultUrl || sale.consultUrl || 'https://ventify.com.pe/comprobantes';
-  const footer = business.receiptFooter || sale.footerNote || '¡Gracias por su compra!';
+  const is58 = is58PaperWidth(options.paperWidth);
+  const paperMm = is58 ? 58 : 80;
+  const maxWidth = is58 ? '220px' : '300px';
+  const isCompact = options.ticketTemplate === 'compact';
+  const merged = { ...(business || {}), ...(options.branch || {}) } as Partial<BusinessSettings & Branch> & {
+    razonSocial?: string;
+    commercialName?: string;
+    email?: string;
+    receiptLogoUrl?: string;
+    sunatResolution?: string;
+    authorizationText?: string;
+    printedFormatResolution?: string;
+  };
+
+  const {
+    isOfflinePending,
+    isFiscal,
+    displayTitle,
+    docNumber,
+  } = resolveReceiptDocumentMeta(sale);
+
+  const amounts = receiptAmountsForSale(sale, sale.fiscalAmounts, options.taxProfile);
+  const igvPct =
+    amounts.taxed > 0 && amounts.igv > 0 ? Math.round((amounts.igv / amounts.taxed) * 100) : 18;
+  const rawWords = (sale as any).amountInWords || numberToSpanishWordsPEN(amounts.total || sale.total);
+  const words = String(rawWords).toUpperCase().startsWith('SON:')
+    ? String(rawWords)
+    : `SON: ${rawWords}`;
+
+  const businessName = merged.commercialName || merged.businessName || merged.name || 'VENTIFY POS';
+  const consultUrl = options.consultUrl || merged.consultUrl || sale.consultUrl || 'https://ventify.com.pe/comprobantes';
+  const footer = options.receiptFooter || merged.receiptFooter || sale.footerNote || '¡Gracias por su compra!';
+  const logoUrl =
+    (merged as any).receiptLogoDataUrl ||
+    (merged as any).receiptLogo ||
+    merged.receiptLogoUrl ||
+    (merged as any).logoUrl;
+  const fiscalAddress = merged.fiscalAddress || merged.address;
+  const storeAddress = merged.commercialAddress;
+  const operator =
+    sale.cashierUsername ||
+    sale.sellerName ||
+    (sale as any).completedByName ||
+    (sale as any).userName;
+
+  const qrData = buildSaleQrContent(
+    isOfflinePending ? { ...sale, isOfflinePending: true } : sale,
+    {
+      emitterRuc: merged.ruc,
+      consultUrl,
+      taxProfile: options.taxProfile,
+    }
+  );
+  const qrSvg = qrData ? buildQrSvgMarkup(qrData, is58 ? 96 : 112, 2) : '';
+  const sunatHash = (sale as any).sunatHash || (sale as any).hash || (sale as any).digestValue;
+  const { splits, paymentLabel } = resolveReceiptPayments(sale);
+  const customerMeta = resolveReceiptCustomerMeta(sale);
+  const depositInfo = (sale as any).depositInfo;
+  const shippingAmount = Math.round((Number(sale.shippingAmount) || 0) * 100) / 100;
 
   const itemsRows = (sale.items || [])
     .map((item: CartItem) => {
       const qty = Number(item.quantity) || 1;
       const price = Number(item.price) || 0;
       const total = Number(item.lineTotal ?? qty * price);
+      const presentationName = item.presentation?.name || (item as any).presentationName;
+      const variantName = item.variant?.name || (item as any).variantName;
+      const presentationSuffix = presentationName ? ` (${escapeHtml(String(presentationName))})` : '';
+      const variantSuffix = variantName ? ` [${escapeHtml(String(variantName))}]` : '';
+      const sku = escapeHtml(String(item.sku || '-'));
+      const unitStr = escapeHtml(String((item.unitOfMeasure || 'UND').trim().toUpperCase()));
+      const itemDisc = Number((item as any).discount) || 0;
       return `
         <tr>
-          <td style="text-align: left; padding: 4px 0;">
-            <div style="font-weight: bold;">${item.name}</div>
-            <div style="font-size: 11px; color: #555;">${qty} ${item.unitOfMeasure || 'UND'} x S/ ${price.toFixed(2)}</div>
-          </td>
-          <td style="text-align: right; vertical-align: top; padding: 4px 0; font-weight: bold;">
-            S/ ${total.toFixed(2)}
+          <td colspan="4" style="text-align: left; padding: 4px 0 1px; font-weight: 700;">
+            ${escapeHtml(item.name)}${presentationSuffix}${variantSuffix}
           </td>
         </tr>
+        <tr style="font-size: ${is58 ? '10px' : '11px'}; color: #333; border-bottom: 1px dotted #ddd;">
+          <td style="padding: 0 4px 4px 0;">${sku}</td>
+          <td style="padding: 0 4px 4px 0;">${qty} ${unitStr}</td>
+          <td style="text-align: right; padding: 0 4px 4px 0;">${price.toFixed(2)}</td>
+          <td style="text-align: right; padding: 0 0 4px 0; font-weight: 700; color: #000;">S/ ${total.toFixed(2)}</td>
+        </tr>
+        ${
+          itemDisc > 0
+            ? `<tr><td colspan="4" style="text-align: right; font-size: 10px; color: #555; padding-bottom: 3px;">Desc. item: -S/ ${itemDisc.toFixed(2)}</td></tr>`
+            : ''
+        }
       `;
     })
     .join('');
+
+  const splitsHtml =
+    splits.length > 1
+      ? splits
+          .map(
+            (s: { label: string; amount: number }) =>
+              `<div class="row" style="font-size: 11px; color: #333;"><span>• ${escapeHtml(
+                s.label
+              )}</span><span>${formatPEN(s.amount)}</span></div>`
+          )
+          .join('')
+      : '';
+
+  const resolutionText =
+    sale.printedFormatResolution ||
+    merged.printedFormatResolution ||
+    merged.sunatResolution ||
+    merged.authorizationText ||
+    'Representación impresa del comprobante electrónico';
 
   return `
 <!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Comprobante ${docNumber}</title>
+  <title>Comprobante ${escapeHtml(docNumber)}</title>
   <style>
     @page {
-      size: 80mm auto;
+      size: ${paperMm}mm auto;
       margin: 0;
     }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
-      font-size: 13px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Courier New", monospace;
+      font-size: ${is58 ? '11px' : '12.5px'};
       line-height: 1.35;
       color: #000;
       background: #fff;
-      margin: 0;
-      padding: 16px 12px;
-      max-width: 300px;
       margin: 0 auto;
+      padding: ${is58 ? '10px 8px' : '14px 12px'};
+      max-width: ${maxWidth};
     }
     .center { text-align: center; }
-    .bold { font-weight: bold; }
-    .divider { border-top: 1px dashed #000; margin: 8px 0; }
-    .divider-double { border-top: 2px solid #000; margin: 8px 0; }
-    .row { display: flex; justify-content: space-between; margin: 3px 0; }
-    .table-items { width: 100%; border-collapse: collapse; margin: 8px 0; }
-    .title { font-size: 16px; font-weight: 800; letter-spacing: 0.5px; }
-    .total-title { font-size: 17px; font-weight: 800; }
+    .bold { font-weight: 700; }
+    .divider { border-top: 1px dashed #000; margin: 7px 0; }
+    .row { display: flex; justify-content: space-between; margin: 2.5px 0; gap: 8px; }
+    .table-items { width: 100%; border-collapse: collapse; margin: 6px 0; }
+    .title { font-size: ${is58 ? '14px' : '15.5px'}; font-weight: 800; letter-spacing: 0.4px; }
+    .total-title { font-size: ${is58 ? '14.5px' : '16.5px'}; font-weight: 800; }
   </style>
 </head>
 <body>
   <div class="center">
-    ${sale.isOfflinePending ? '<div class="bold" style="background: #000; color: #fff; padding: 2px;">*** OFFLINE PENDIENTE ***</div>' : ''}
-    <div class="title">${businessName}</div>
-    ${business.description ? `<div style="font-size: 12px; margin-top: 2px;">"${business.description}"</div>` : ''}
-    ${business.ruc ? `<div class="bold" style="margin-top: 2px;">RUC: ${business.ruc}</div>` : ''}
-    ${business.commercialAddress || business.address ? `<div>${business.commercialAddress || business.address}</div>` : ''}
-    ${business.commercialPhone || business.phone ? `<div>Telf: ${business.commercialPhone || business.phone}</div>` : ''}
+    ${isOfflinePending ? '<div class="bold" style="background: #000; color: #fff; padding: 2px 4px; margin-bottom: 4px;">*** OFFLINE PENDIENTE ***</div>' : ''}
+    ${logoUrl ? `<img src="${escapeHtml(logoUrl)}" alt="Logo" style="max-width: ${is58 ? '105px' : '136px'}; max-height: 54px; object-fit: contain; margin: 0 auto 6px; display: block;" />` : ''}
+    <div class="title">${escapeHtml(businessName)}</div>
+    ${merged.razonSocial && merged.razonSocial !== businessName ? `<div style="font-size: 11px;">${escapeHtml(merged.razonSocial)}</div>` : ''}
+    ${merged.description && !isCompact ? `<div style="font-size: 11px; margin-top: 2px; font-style: italic;">"${escapeHtml(merged.description)}"</div>` : ''}
+    ${merged.ruc ? `<div class="bold" style="margin-top: 2px;">RUC: ${escapeHtml(merged.ruc)}</div>` : ''}
+    ${fiscalAddress ? `<div style="font-size: 11px;">${escapeHtml(fiscalAddress)}</div>` : ''}
+    ${storeAddress && storeAddress !== fiscalAddress ? `<div style="font-size: 11px;">Tienda: ${escapeHtml(storeAddress)}</div>` : ''}
+    ${merged.commercialPhone || merged.phone ? `<div style="font-size: 11px;">Telf: ${escapeHtml(String(merged.commercialPhone || merged.phone))}</div>` : ''}
+    ${!isCompact && merged.email ? `<div style="font-size: 11px;">${escapeHtml(merged.email)}</div>` : ''}
   </div>
 
   <div class="divider"></div>
-  <div class="center bold title" style="font-size: 14px;">
-    ${isFiscal ? (String(sale.documentType).includes('factura') || sale.documentType === '01' ? 'FACTURA ELECTRONICA' : 'BOLETA DE VENTA ELECTRONICA') : 'NOTA DE VENTA'}
-  </div>
-  <div class="center bold" style="font-size: 14px;">${docNumber}</div>
+  <div class="center bold title" style="font-size: ${is58 ? '12.5px' : '13.5px'};">${displayTitle}</div>
+  <div class="center bold" style="font-size: ${is58 ? '12.5px' : '13.5px'};">${escapeHtml(docNumber)}</div>
   <div class="divider"></div>
 
-  <div class="row"><span>Fecha:</span><span>${formatDatePE(sale.date)}</span></div>
-  ${sale.cashierUsername || sale.sellerName ? `<div class="row"><span>Cajero/Vend:</span><span>${sale.cashierUsername || sale.sellerName}</span></div>` : ''}
-  ${sale.customerName ? `
+  <div class="row"><span>Fecha:</span><span>${escapeHtml(formatDatePE(sale.date))}</span></div>
+  ${operator ? `<div class="row"><span>Cajero/Vend:</span><span>${escapeHtml(String(operator))}</span></div>` : ''}
+  ${customerMeta.name ? `
     <div style="margin-top: 4px;">
-      <div class="bold">Cliente: ${sale.customerName.toUpperCase()}</div>
-      ${sale.customerRuc ? `<div>RUC: ${sale.customerRuc}</div>` : ''}
-      ${sale.customerDni ? `<div>DNI: ${sale.customerDni}</div>` : ''}
-      ${sale.customerAddress ? `<div>Dirección: ${sale.customerAddress}</div>` : ''}
+      <div class="bold">Cliente: ${escapeHtml(customerMeta.name.toUpperCase())}</div>
+      ${customerMeta.identityNumber ? `<div>${customerMeta.docLabel}: ${escapeHtml(customerMeta.identityNumber)}</div>` : ''}
+      ${customerMeta.address ? `<div>Dirección: ${escapeHtml(customerMeta.address)}</div>` : ''}
     </div>
   ` : ''}
-  <div class="row" style="margin-top: 4px;"><span>Forma de Pago:</span><span class="bold">${(sale.paymentMethod || 'EFECTIVO').toUpperCase()}</span></div>
+  <div class="row" style="margin-top: 4px;">
+    <span>Forma de Pago:</span>
+    <span class="bold">${escapeHtml(paymentLabel)}</span>
+  </div>
+  ${splitsHtml}
 
   <div class="divider"></div>
   <table class="table-items">
     <thead>
-      <tr style="border-bottom: 1px dashed #000;">
-        <th style="text-align: left; padding-bottom: 4px;">DETALLE</th>
-        <th style="text-align: right; padding-bottom: 4px;">TOTAL</th>
+      <tr style="border-bottom: 1px dashed #000; font-size: ${is58 ? '10px' : '11px'};">
+        <th style="text-align: left; padding-bottom: 3px;">SKU</th>
+        <th style="text-align: left; padding-bottom: 3px;">CANT</th>
+        <th style="text-align: right; padding-bottom: 3px;">PRECIO</th>
+        <th style="text-align: right; padding-bottom: 3px;">TOTAL</th>
       </tr>
     </thead>
     <tbody>
@@ -633,21 +971,38 @@ export function buildReceiptHtml(
   </table>
 
   <div class="divider"></div>
+  ${(sale.discountAmount || 0) > 0 ? `<div class="row"><span>Descuento:</span><span>-${formatPEN(sale.discountAmount!)}</span></div>` : ''}
+  ${shippingAmount > 0 ? `<div class="row"><span>Envío:</span><span>${formatPEN(shippingAmount)}</span></div>` : ''}
   ${isFiscal ? `
-    <div class="row"><span>Op. Gravada (18%):</span><span>${formatPEN(taxInfo.opGravada)}</span></div>
-    <div class="row"><span>IGV (18%):</span><span>${formatPEN(taxInfo.igv)}</span></div>
+    ${amounts.taxed > 0 ? `
+      <div class="row"><span>Op. Gravada:</span><span>${formatPEN(amounts.taxed)}</span></div>
+      ${amounts.igv > 0 ? `<div class="row"><span>IGV (${igvPct}%):</span><span>${formatPEN(amounts.igv)}</span></div>` : ''}
+    ` : ''}
+    ${amounts.exempt > 0 ? `<div class="row"><span>Op. Exonerada:</span><span>${formatPEN(amounts.exempt)}</span></div>` : ''}
+    ${amounts.unaffected > 0 ? `<div class="row"><span>Op. Inafecta:</span><span>${formatPEN(amounts.unaffected)}</span></div>` : ''}
+    ${amounts.otherTaxes > 0 ? `<div class="row"><span>Otros cargos:</span><span>${formatPEN(amounts.otherTaxes)}</span></div>` : ''}
+    ${amounts.taxed === 0 && amounts.exempt === 0 && amounts.unaffected === 0 && amounts.igv === 0 ? `
+      <div class="row"><span>Subtotal:</span><span>${formatPEN(amounts.subtotal)}</span></div>
+    ` : ''}
   ` : `
-    <div class="row"><span>Subtotal:</span><span>${formatPEN(sale.subtotal || taxInfo.opGravada)}</span></div>
+    <div class="row"><span>Subtotal:</span><span>${formatPEN(sale.subtotal || amounts.subtotal || amounts.total)}</span></div>
   `}
   <div class="divider"></div>
-  <div class="row total-title" style="margin: 6px 0;">
+  <div class="row total-title" style="margin: 5px 0;">
     <span>TOTAL:</span>
-    <span>${formatPEN(sale.total)}</span>
+    <span>${formatPEN(amounts.total || sale.total)}</span>
   </div>
 
   ${(sale.surchargeAmount || 0) > 0 ? `
     <div class="row"><span>Recargo:</span><span>${formatPEN(sale.surchargeAmount!)}</span></div>
     <div class="row bold"><span>TOTAL COBRADO:</span><span>${formatPEN(sale.chargedAmount ?? sale.total + sale.surchargeAmount!)}</span></div>
+  ` : ''}
+
+  ${depositInfo && (Number(depositInfo.appliedAmount) > 0 || Number(depositInfo.depositAmount) > 0) ? `
+    <div class="divider"></div>
+    ${Number(depositInfo.originalTotal) > 0 ? `<div class="row"><span>Total original:</span><span>${formatPEN(Number(depositInfo.originalTotal))}</span></div>` : ''}
+    <div class="row"><span>Adelanto Aplicado:</span><span>${formatPEN(Number(depositInfo.appliedAmount ?? depositInfo.depositAmount ?? 0))}</span></div>
+    <div class="row bold"><span>Saldo Pendiente:</span><span>${formatPEN(Number(depositInfo.remainingAmount ?? depositInfo.remainingBalance ?? Math.max(0, (amounts.total || sale.total) - Number(depositInfo.appliedAmount ?? depositInfo.depositAmount ?? 0))))}</span></div>
   ` : ''}
 
   ${sale.cashReceived && sale.cashReceived > 0 ? `
@@ -657,13 +1012,18 @@ export function buildReceiptHtml(
   ` : ''}
 
   <div class="divider"></div>
-  <div class="center bold" style="font-size: 11px; margin: 6px 0;">${words}</div>
+  <div class="center bold" style="font-size: 11px; margin: 5px 0;">${escapeHtml(words)}</div>
+  ${isFiscal && amounts.isAmazonExempt ? '<div class="center" style="font-size: 9.5px; margin-top: 4px;">BIENES TRANSFERIDOS EN LA AMAZONÍA REGIÓN SELVA PARA SER CONSUMIDOS EN LA MISMA</div>' : ''}
+
+  ${qrSvg ? `<div class="divider"></div><div class="center" style="margin: 8px 0;">${qrSvg}</div>` : ''}
+  ${sunatHash && !isCompact ? `<div class="center" style="font-size: 9.5px; color: #444; word-break: break-all;">Hash: ${escapeHtml(String(sunatHash))}</div>` : ''}
 
   <div class="divider"></div>
-  <div class="center" style="font-size: 11px; margin-top: 8px;">
+  <div class="center" style="font-size: 10.5px; margin-top: 6px;">
     <div>Consulta tu comprobante en:</div>
-    <div class="bold">${consultUrl}</div>
-    <div class="bold" style="font-size: 13px; margin-top: 8px;">${footer}</div>
+    <div class="bold" style="word-break: break-all;">${escapeHtml(consultUrl)}</div>
+    ${isFiscal && !isCompact ? `<div style="font-size: 9.5px; color: #555; margin-top: 4px;">${escapeHtml(String(resolutionText))}</div>` : ''}
+    <div class="bold" style="font-size: 12px; margin-top: 7px;">${escapeHtml(footer)}</div>
   </div>
 </body>
 </html>

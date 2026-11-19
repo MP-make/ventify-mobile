@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import { ActivityIndicator, Modal, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { ActivityIndicator, KeyboardAvoidingView, Modal, Platform, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { X } from 'lucide-react-native';
 import { ui, theme, formatPEN } from '@/lib/theme';
 
@@ -52,9 +53,10 @@ export function ReservationCancellationModal({
   const customer = item?.customer?.name || item?.customerName || 'el cliente';
 
   return (
-    <Modal visible={visible} transparent animationType="fade" onRequestClose={busy ? undefined : onClose}>
-      <View style={styles.overlay}>
-        <View style={styles.card}>
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={() => { if (!busy) onClose(); }}>
+      <SafeAreaView edges={['top', 'bottom']} style={styles.safeArea}>
+        <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.overlay}>
+          <View style={styles.card}>
           <View style={styles.header}>
             <View style={styles.headerText}>
               <Text style={styles.title}>{title}</Text>
@@ -126,13 +128,15 @@ export function ReservationCancellationModal({
               {busy ? <ActivityIndicator color={ui.onPrimary} /> : <Text style={styles.confirmText}>Confirmar cancelación</Text>}
             </TouchableOpacity>
           </View>
-        </View>
-      </View>
+          </View>
+        </KeyboardAvoidingView>
+      </SafeAreaView>
     </Modal>
   );
 }
 
 const styles = StyleSheet.create({
+  safeArea: { flex: 1 },
   overlay: { flex: 1, backgroundColor: 'rgba(15,23,42,0.62)', justifyContent: 'center', padding: 20 },
   card: { maxHeight: '90%', width: '100%', maxWidth: 520, alignSelf: 'center', borderRadius: theme.borderRadius.xl, backgroundColor: ui.surface, overflow: 'hidden', borderWidth: 1, borderColor: ui.border },
   header: { padding: 18, flexDirection: 'row', alignItems: 'flex-start', borderBottomWidth: 1, borderColor: ui.border },

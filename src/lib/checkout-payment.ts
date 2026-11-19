@@ -11,9 +11,10 @@ export type CheckoutPaymentCategory =
   | 'fiado';
 
 export interface CheckoutPaymentSplitInput {
+  methodId?: string;
   category: 'cash' | 'card' | 'digital';
   amount: number;
-  digitalProvider?: 'yape' | 'plin';
+  digitalProvider?: 'yape' | 'plin' | 'transferencia';
 }
 
 export interface ResolveCheckoutPaymentInput {
@@ -89,14 +90,23 @@ const methodForSplit = (
   split: CheckoutPaymentSplitInput,
 ): PosPaymentMethodConfig | undefined => {
   const enabled = methods.filter(method => method.enabled);
+  if (split.methodId) {
+    return enabled.find(
+      method => method.id === split.methodId && method.kind !== 'mixed' && method.kind !== 'credit'
+    );
+  }
   if (split.category === 'cash') {
     return enabled.find(method => method.kind === 'cash' || method.reportCategory === 'cash');
   }
   if (split.category === 'card') {
     return enabled.find(method => method.kind !== 'mixed' && method.kind !== 'credit' && (method.kind === 'terminal' || method.reportCategory === 'card'));
   }
+  const digitalProvider = split.digitalProvider;
+  if (digitalProvider === 'transferencia') {
+    return enabled.find(isTransferMethod);
+  }
   return enabled.find(method => method.kind === 'digital' && (
-    split.digitalProvider ? isProviderMethod(method, split.digitalProvider) : true
+    digitalProvider ? isProviderMethod(method, digitalProvider) : true
   ));
 };
 

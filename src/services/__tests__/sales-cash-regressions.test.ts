@@ -57,7 +57,7 @@ vi.mock('firebase/firestore', () => {
     where: (...args: unknown[]) => ({ args }),
     getDocs: async (request: any) => {
       const collectionName = request.args?.[0]?.path;
-      const docs = collectionName === 'accounts_receivable'
+      const docs = (collectionName === 'reservations' || collectionName === 'accounts_receivable')
         ? [...(mocks.collections.get(collectionName) || [])].map(([id]) => ({ ...snapshot(`${collectionName}/${id}`), ref: ref(`${collectionName}/${id}`) })) : [];
       return { empty: docs.length === 0, docs };
     },
@@ -252,10 +252,10 @@ describe('sales and cash transaction regressions', () => {
     seed('sales', 'fiado-sale', { accountId: 'a1', branchId: 'b1', status: 'completed', items: [], total: 100,
       paymentMethod: 'credit', paymentCategory: 'credit', creditMode: 'receivable', customerId: 'c1' });
     seed('customers', 'c1', { currentDebt: 70 });
-    seed('accounts_receivable', 'ar1', { accountId: 'a1', saleId: 'fiado-sale', customerId: 'c1', currentDebt: 30, status: 'pending' });
+    seed('reservations', 'res1', { accountId: 'a1', saleId: 'fiado-sale', customerId: 'c1', type: 'fiado', isCreditSale: true, currentDebt: 30, status: 'pending' });
     await cancelSaleWithReversal('fiado-sale', 'Reversa', { uid: 'u1', role: 'admin' });
     expect(mocks.writes.find(w => w.path === 'customers/c1')?.value).toMatchObject({ currentDebt: 40 });
-    expect(mocks.writes.find(w => w.path === 'accounts_receivable/ar1')?.value).toMatchObject({ currentDebt: 0, status: 'cancelled' });
+    expect(mocks.writes.find(w => w.path === 'reservations/res1')?.value).toMatchObject({ currentDebt: 0, status: 'cancelled' });
   });
 
   it('aggregates multiple variant lines for one product into one stock update', async () => {

@@ -14,8 +14,9 @@ import {
   initializeAuth,
   getAuth,
   Auth,
+  type Persistence,
 } from 'firebase/auth';
-import AsyncStorage from '@react-native-async-storage/async-storage';
+import { getStorage, FirebaseStorage } from 'firebase/storage';
 
 // 1. Resolve environment variables (supporting EXPO_PUBLIC_* and NEXT_PUBLIC_*)
 const firebaseConfig = {
@@ -50,6 +51,56 @@ export const APP_URL: string =
   process.env.NEXT_PUBLIC_APP_URL ||
   'https://ventify.com.pe';
 
+type PersistenceFactory = (storage: unknown) => Persistence;
+
+function resolveReactNativePersistence(): PersistenceFactory | null {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const authModule = require('firebase/auth');
+    const candidate =
+      authModule?.getReactNativePersistence ??
+      authModule?.default?.getReactNativePersistence;
+    if (typeof candidate === 'function') {
+      return candidate as PersistenceFactory;
+    }
+  } catch {
+    // Fallback to @firebase/auth directly below
+  }
+
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const rnAuthModule = require('@firebase/auth');
+    const candidate =
+      rnAuthModule?.getReactNativePersistence ??
+      rnAuthModule?.default?.getReactNativePersistence;
+    if (typeof candidate === 'function') {
+      return candidate as PersistenceFactory;
+    }
+  } catch {
+    // Expected in pure Node/Vitest or browser environments
+  }
+
+  return null;
+}
+
+function resolveAsyncStorage(): unknown | null {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const storageModule = require('@react-native-async-storage/async-storage');
+    const candidate = storageModule?.default ?? storageModule;
+    if (
+      candidate &&
+      typeof candidate.getItem === 'function' &&
+      typeof candidate.setItem === 'function'
+    ) {
+      return candidate;
+    }
+  } catch {
+    // Expected in pure Node/Vitest when RN native modules are unavailable
+  }
+  return null;
+}
+
 // 2. Initialize or get Firebase App
 const app: FirebaseApp = !getApps().length
   ? initializeApp(firebaseConfig)
@@ -58,16 +109,12 @@ const app: FirebaseApp = !getApps().length
 // 3. Initialize Firebase Auth with React Native AsyncStorage Persistence
 let authInstance: Auth;
 try {
-  // getReactNativePersistence is exported by @firebase/auth in React Native
-  // We resolve dynamically to maintain type safety and runtime compatibility
-  const authModule = require('firebase/auth');
-  const getPersistence =
-    authModule.getReactNativePersistence ||
-    (authModule.default && authModule.default.getReactNativePersistence);
+  const getPersistence = resolveReactNativePersistence();
+  const asyncStorage = getPersistence ? resolveAsyncStorage() : null;
 
-  if (typeof getPersistence === 'function') {
+  if (getPersistence && asyncStorage) {
     authInstance = initializeAuth(app, {
-      persistence: getPersistence(AsyncStorage),
+      persistence: getPersistence(asyncStorage),
     });
   } else {
     authInstance = getAuth(app);
@@ -92,4 +139,8 @@ try {
 }
 
 export const db: Firestore = dbInstance;
+
+// 5. Initialize Firebase Storage for catalog & asset uploads
+export const storage: FirebaseStorage = getStorage(app);
+
 export { app };

@@ -1,21 +1,46 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { View, Text, TouchableOpacity, Modal, ScrollView, StyleSheet } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { Store, ChevronDown, Lock, WifiOff, CloudOff, Check, X, MapPin } from 'lucide-react-native';
+import { Store, ChevronDown, Lock, WifiOff, CloudOff, Check, X, MapPin, LayoutGrid } from 'lucide-react-native';
 import { useAuth } from '@/context/AuthContext';
 import { useSettings } from '@/context/SettingsContext';
+import { subscribeAccountNotifications } from '@/services/notification-service';
+import { ModuleLauncherModal } from '@/components/ModuleLauncherModal';
 import { ui } from '@/lib/theme';
-import { BrandLogo } from '@/components/ui';
 
 export interface HeaderProps { title?: string; showBranchSelector?: boolean }
 
 export const Header: React.FC<HeaderProps> = React.memo(({ title, showBranchSelector = true }) => {
   const insets = useSafeAreaInsets();
-  const { lockTerminal, branchId, setActiveBranchId, allBranchesAccess, role } = useAuth();
+  const { accountId, lockTerminal, branchId, setActiveBranchId, allBranchesAccess, role } = useAuth();
   const { businessName, activeBranchName, branches, isCashOpen, isOnline, offlineQueueCount } = useSettings();
   const [branchModalVisible, setBranchModalVisible] = useState(false);
+  const [launcherVisible, setLauncherVisible] = useState(false);
+  const [unreadCount, setUnreadCount] = useState(0);
+
   const canSwitchBranch = Boolean(allBranchesAccess || role === 'owner' || role === 'admin') && branches.length > 1;
   const handleSelectBranch = (bId: string) => { setActiveBranchId(bId); setBranchModalVisible(false); };
+
+  useEffect(() => {
+    if (!accountId || role === 'seller') {
+      setUnreadCount(0);
+      return;
+    }
+    const notifBranchScope =
+      allBranchesAccess || role === 'owner' || role === 'admin' ? undefined : branchId;
+
+    const unsubscribe = subscribeAccountNotifications(
+      accountId,
+      notifBranchScope,
+      (items) => {
+        setUnreadCount(items.reduce((acc, item) => (item.read ? acc : acc + 1), 0));
+      },
+      () => {
+        // Keep silent in global header bar on transient read errors
+      }
+    );
+    return () => unsubscribe();
+  }, [accountId, branchId, allBranchesAccess, role]);
 
   return (
     <>
@@ -45,7 +70,7 @@ export const Header: React.FC<HeaderProps> = React.memo(({ title, showBranchSele
           <View style={styles.rightActions}>
             <View style={[styles.cashStatus, { backgroundColor: isCashOpen ? ui.successSoft : ui.surfaceMuted }]}>
               <View style={[styles.dot, { backgroundColor: isCashOpen ? ui.success : ui.textMuted }]} />
-              <Text style={[styles.cashText, { color: isCashOpen ? ui.success : ui.textSecondary }]}>
+              <Text style={[styles.cashText, { color: isCashOpen ? ui.success : ui.textSecondary }]} numberOfLines={1}>
                 {isCashOpen ? 'Caja abierta' : 'Caja cerrada'}
               </Text>
             </View>
@@ -56,7 +81,17 @@ export const Header: React.FC<HeaderProps> = React.memo(({ title, showBranchSele
               accessibilityLabel="Bloquear terminal con PIN"
               accessibilityHint="Solicita el PIN para volver a usar el terminal"
             >
-              <Lock size={16} color={ui.textSecondary} />
+              <Lock size={15} color={ui.textSecondary} />
+            </TouchableOpacity>
+            <TouchableOpacity
+              onPress={() => setLauncherVisible(true)}
+              style={styles.moreButton}
+              accessibilityRole="button"
+              accessibilityLabel={unreadCount > 0 ? `Más módulos, ${unreadCount} notificaciones sin leer` : 'Más módulos'}
+            >
+              <LayoutGrid size={15} color={ui.primary} />
+              <Text style={styles.moreButtonText}>Más</Text>
+              {unreadCount > 0 && <View style={styles.unreadDot} />}
             </TouchableOpacity>
           </View>
         </View>
@@ -67,6 +102,7 @@ export const Header: React.FC<HeaderProps> = React.memo(({ title, showBranchSele
           <View style={styles.notice}><CloudOff size={13} color={ui.warning} /><Text style={styles.noticeText}>{offlineQueueCount} pendientes de sincronizar</Text></View>
         ) : null}
       </View>
+
       {branchModalVisible && (
         <Modal visible={branchModalVisible} transparent animationType="fade" onRequestClose={() => setBranchModalVisible(false)}>
           <TouchableOpacity style={styles.overlay} activeOpacity={1} onPress={() => setBranchModalVisible(false)}>
@@ -91,20 +127,31 @@ export const Header: React.FC<HeaderProps> = React.memo(({ title, showBranchSele
           </TouchableOpacity>
         </Modal>
       )}
+
+      {launcherVisible && (
+        <ModuleLauncherModal
+          visible={launcherVisible}
+          onClose={() => setLauncherVisible(false)}
+          unreadCount={unreadCount}
+        />
+      )}
     </>
   );
 });
 const styles = StyleSheet.create({
   container: { backgroundColor: ui.surface, paddingHorizontal: 14, paddingBottom: 6, borderBottomWidth: 1, borderBottomColor: ui.border },
-  singleBarRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8, minHeight: 38 },
+  singleBarRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 6, minHeight: 38 },
   branchButton: { flex: 1, minWidth: 0, flexDirection: 'row', alignItems: 'center', gap: 6 },
   titleWrapper: { flex: 1, minWidth: 0 },
   storeIconMini: { width: 26, height: 26, borderRadius: 7, backgroundColor: ui.primarySoft, alignItems: 'center', justifyContent: 'center' },
   branchName: { flexShrink: 1, color: ui.text, fontSize: 13, fontWeight: '700' },
-  rightActions: { flexDirection: 'row', alignItems: 'center', gap: 8, flexShrink: 0 },
-  lockButton: { width: 34, height: 34, alignItems: 'center', justifyContent: 'center', borderRadius: 9, backgroundColor: ui.surfaceMuted },
+  rightActions: { flexDirection: 'row', alignItems: 'center', gap: 6, flexShrink: 0 },
+  lockButton: { width: 32, height: 32, alignItems: 'center', justifyContent: 'center', borderRadius: 9, backgroundColor: ui.surfaceMuted },
+  moreButton: { height: 32, paddingHorizontal: 9, flexDirection: 'row', alignItems: 'center', gap: 4, borderRadius: 9, backgroundColor: ui.primarySoft, position: 'relative' },
+  moreButtonText: { fontSize: 11, fontWeight: '700', color: ui.primary },
+  unreadDot: { position: 'absolute', top: -2, right: -2, width: 9, height: 9, borderRadius: 5, backgroundColor: '#EF4444', borderWidth: 1.5, borderColor: ui.surface },
   sheetCloseButton: { width: 38, height: 38, alignItems: 'center', justifyContent: 'center', borderRadius: 10, backgroundColor: ui.surfaceMuted },
-  cashStatus: { flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 8, paddingVertical: 5, borderRadius: 8 },
+  cashStatus: { flexDirection: 'row', alignItems: 'center', gap: 4, paddingHorizontal: 7, paddingVertical: 5, borderRadius: 8 },
   dot: { width: 6, height: 6, borderRadius: 3 },
   cashText: { fontSize: 11, fontWeight: '600' },
   notice: { flexDirection: 'row', alignItems: 'center', gap: 6, backgroundColor: ui.warningSoft, padding: 6, borderRadius: 7, marginTop: 4 },

@@ -29,6 +29,7 @@ import {
   getDocs,
   updateDoc,
   deleteDoc,
+  deleteField,
   query,
   where,
   orderBy,
@@ -42,6 +43,11 @@ import {
 } from 'firebase/firestore';
 import { cleanFirestoreData } from '@/lib/firebase-utils';
 import { apiRequest } from '@/lib/api-client';
+import {
+  ROLE_PERMISSIONS,
+  type CustomPermissions,
+  type Permission,
+} from '@/lib/role-permissions';
 
 // ============================================================================
 // CONSTANTES DE COLECCIONES OFICIALES
@@ -49,6 +55,7 @@ import { apiRequest } from '@/lib/api-client';
 
 export const QUOTES_COLLECTION = 'quotes';
 export const USERS_COLLECTION = 'users';
+export const BRANCHES_COLLECTION = 'branches';
 export const PAYROLL_SETTLEMENTS_COLLECTION = 'payroll_settlements';
 export const CASH_SESSIONS_COLLECTION = 'cash_register_sessions';
 export const CASH_MOVEMENTS_COLLECTION = 'cash_register_movements';
@@ -254,14 +261,159 @@ export interface TeamMember {
   roleLabel: string;
   branchId?: string;
   branchName?: string;
+  allBranchesAccess?: boolean;
+  customPermissions?: CustomPermissions | null;
   accountId: string;
   isActive: boolean;
+  status?: string;
   baseSalary?: number;
   dni?: string;
   photoURL?: string;
   createdAt?: number;
   lastLogin?: number;
 }
+
+export interface BranchItem {
+  id: string;
+  accountId: string;
+  name: string;
+  address?: string;
+  phone?: string;
+  email?: string;
+  manager?: string;
+  isActive: boolean;
+  businessName?: string;
+  ruc?: string;
+  commercialAddress?: string;
+  fiscalAddress?: string;
+  commercialPhone?: string;
+  receiptFooter?: string;
+  createdAt?: number;
+  updatedAt?: number;
+}
+
+export interface CreateTeamUserParams {
+  accountId: string;
+  name: string;
+  email: string;
+  role: TeamRole;
+  branchId?: string;
+  allBranchesAccess?: boolean;
+  phone?: string;
+  dni?: string;
+  baseSalary?: number;
+  customPermissions?: CustomPermissions | null;
+}
+
+export interface UpdateTeamUserParams {
+  accountId: string;
+  name?: string;
+  role?: TeamRole;
+  branchId?: string | null;
+  allBranchesAccess?: boolean;
+  phone?: string;
+  dni?: string;
+  baseSalary?: number | null;
+  isActive?: boolean;
+  customPermissions?: CustomPermissions | null;
+}
+
+export interface SaveBranchParams {
+  id?: string;
+  accountId: string;
+  name: string;
+  address?: string;
+  phone?: string;
+  email?: string;
+  manager?: string;
+  isActive?: boolean;
+  businessName?: string;
+  ruc?: string;
+  commercialAddress?: string;
+  fiscalAddress?: string;
+  commercialPhone?: string;
+  receiptFooter?: string;
+}
+
+export interface PermissionGroupDefinition {
+  label: string;
+  permissions: Array<{ key: Permission; label: string }>;
+}
+
+export const PERMISSION_GROUPS: Record<string, PermissionGroupDefinition> = {
+  ventas: {
+    label: 'Ventas',
+    permissions: [
+      { key: 'register_sale', label: 'Registrar ventas' },
+      { key: 'associate_customer', label: 'Asociar cliente a venta' },
+      { key: 'modify_price', label: 'Modificar precios' },
+      { key: 'process_return', label: 'Procesar devoluciones' },
+      { key: 'create_credit_notes', label: 'Crear notas de crédito' },
+    ],
+  },
+  inventario: {
+    label: 'Inventario',
+    permissions: [
+      { key: 'manage_products', label: 'Gestionar productos' },
+      { key: 'manage_inventory_adjustments', label: 'Ajustes de inventario' },
+      { key: 'request_transfer', label: 'Solicitar transferencias' },
+      { key: 'approve_transfer', label: 'Aprobar transferencias' },
+      { key: 'manage_transfers', label: 'Gestionar transferencias' },
+    ],
+  },
+  clientes: {
+    label: 'Clientes',
+    permissions: [{ key: 'manage_customers', label: 'Gestionar clientes' }],
+  },
+  pedidos: {
+    label: 'Pedidos y Reservas',
+    permissions: [
+      { key: 'view_orders', label: 'Ver pedidos' },
+      { key: 'create_orders', label: 'Crear pedidos' },
+      { key: 'accept_orders', label: 'Aceptar pedidos' },
+    ],
+  },
+  reportes: {
+    label: 'Reportes y Finanzas',
+    permissions: [
+      { key: 'access_dashboard', label: 'Acceder al dashboard' },
+      { key: 'view_reports', label: 'Ver reportes' },
+      { key: 'view_margins', label: 'Ver márgenes y P&L' },
+      { key: 'view_inventory_value', label: 'Ver valor de inventario' },
+      { key: 'view_own_sales', label: 'Consultar solo mis ventas atribuidas' },
+    ],
+  },
+  caja: {
+    label: 'Caja',
+    permissions: [{ key: 'manage_cash_register', label: 'Gestionar caja' }],
+  },
+  administracion: {
+    label: 'Administración',
+    permissions: [
+      { key: 'manage_users', label: 'Gestionar usuarios' },
+      { key: 'manage_branches', label: 'Gestionar sucursales' },
+      { key: 'manage_settings', label: 'Gestionar configuración' },
+      { key: 'manage_discounts', label: 'Gestionar descuentos' },
+    ],
+  },
+  pestanas: {
+    label: 'Pestañas (acceso al menú)',
+    permissions: [
+      { key: 'access_sales', label: 'Ventas' },
+      { key: 'access_sale_requests', label: 'Solicitudes de Venta' },
+      { key: 'access_products', label: 'Productos' },
+      { key: 'access_inventory', label: 'Inventario' },
+      { key: 'access_suppliers', label: 'Proveedores' },
+      { key: 'access_customers', label: 'Clientes' },
+      { key: 'access_transfers', label: 'Transferencias' },
+      { key: 'access_cash_management', label: 'Caja' },
+      { key: 'access_branches', label: 'Sucursales' },
+      { key: 'access_reports', label: 'Informes' },
+      { key: 'access_users', label: 'Usuarios' },
+      { key: 'access_settings', label: 'Configuración' },
+    ],
+  },
+};
 
 export type PayrollConceptType = 'advance' | 'salary' | 'bonus' | 'commission';
 
@@ -805,9 +957,269 @@ export const markSaleRequestAsConverted = async (requestId: string, saleId: stri
   });
 };
 
+export interface ConvertSaleRequestParams {
+  branchId?: string;
+  sessionId?: string;
+  paymentMethod?: string;
+  sellerId?: string;
+  sellerName?: string;
+  documentType?: string;
+  notes?: string;
+}
+
+/** Convierte una solicitud de venta aprobada o pendiente en una venta real vía servidor. */
+export const convertSaleRequest = async (
+  requestId: string,
+  params?: ConvertSaleRequestParams
+): Promise<{ success: boolean; saleId?: string; saleNumber?: number; message?: string }> => {
+  if (!requestId) throw new Error('ID de solicitud requerido.');
+  return apiRequest<{ success: boolean; saleId?: string; saleNumber?: number; message?: string }>(
+    `/api/admin/sale-requests/${encodeURIComponent(requestId)}/convert`,
+    {
+      method: 'POST',
+      body: params ? cleanFirestoreData(params) : {},
+    }
+  );
+};
+
 // ============================================================================
-// 3. PERSONAL, COLABORADORES Y PLANILLAS (USERS & PAYROLL)
+// 3. PERSONAL, COLABORADORES, SUCURSALES Y PLANILLAS
 // ============================================================================
+
+const TEAM_ROLE_PRIORITY: Record<string, number> = {
+  owner: 1,
+  admin: 2,
+  manager: 3,
+  cashier: 4,
+  seller: 5,
+};
+
+const mapTeamMemberDoc = (id: string, data: Record<string, any>, fallbackAccountId: string): TeamMember => {
+  const rawRole = (data.role || 'seller') as TeamRole;
+  return {
+    id,
+    uid: data.uid || id,
+    name: data.name || data.displayName || data.email || 'Colaborador',
+    displayName: data.displayName || data.name || '',
+    email: data.email || '',
+    phone: data.phone || '',
+    role: rawRole,
+    roleLabel: getRoleDisplay(rawRole),
+    branchId: data.branchId || undefined,
+    branchName: data.branchName || undefined,
+    allBranchesAccess: data.allBranchesAccess === true,
+    customPermissions: data.customPermissions || null,
+    accountId: data.accountId || fallbackAccountId,
+    isActive: data.isActive !== false,
+    status: data.status || (data.isActive === false ? 'inactive' : 'active'),
+    baseSalary: typeof data.baseSalary === 'number' ? data.baseSalary : undefined,
+    dni: data.dni || '',
+    photoURL: data.photoURL || undefined,
+    createdAt: toMillis(data.createdAt),
+    lastLogin: data.lastLogin ? toMillis(data.lastLogin) : undefined,
+  };
+};
+
+const sortTeamMembers = (members: TeamMember[]): TeamMember[] =>
+  members.sort((a, b) => {
+    if (a.isActive !== b.isActive) return a.isActive ? -1 : 1;
+    return (TEAM_ROLE_PRIORITY[a.role] || 99) - (TEAM_ROLE_PRIORITY[b.role] || 99);
+  });
+
+/** Calcula el siguiente objeto `customPermissions` al activar/revocar un permiso respecto al rol base. */
+export const toggleCustomPermission = (
+  role: TeamRole,
+  current: CustomPermissions | null | undefined,
+  permission: Permission,
+  checked: boolean
+): CustomPermissions => {
+  const basePermissions = ROLE_PERMISSIONS[role] || [];
+  let newGranted = [...(current?.granted || [])];
+  let newRevoked = [...(current?.revoked || [])];
+
+  if (checked) {
+    if (!basePermissions.includes(permission) && !newGranted.includes(permission)) {
+      newGranted.push(permission);
+    }
+    newRevoked = newRevoked.filter((p) => p !== permission);
+    if (permission === 'manage_cash_register' && !basePermissions.includes('access_cash_management')) {
+      if (!newGranted.includes('access_cash_management')) {
+        newGranted.push('access_cash_management');
+      }
+      newRevoked = newRevoked.filter((p) => p !== 'access_cash_management');
+    }
+  } else {
+    if (basePermissions.includes(permission) && !newRevoked.includes(permission)) {
+      newRevoked.push(permission);
+    }
+    newGranted = newGranted.filter((p) => p !== permission);
+  }
+
+  return { granted: newGranted, revoked: newRevoked };
+};
+
+/** Crea un nuevo miembro del equipo a través de `/api/users` (valida límites de plan y asigna claims). */
+export const createTeamUser = async (
+  params: CreateTeamUserParams
+): Promise<{ id?: string; resetLink?: string; message?: string }> => {
+  const { accountId, name, email, role, branchId, allBranchesAccess, phone, dni, baseSalary, customPermissions } = params;
+  if (!accountId || !name.trim() || !email.trim()) {
+    throw new Error('Nombre, correo y cuenta son obligatorios.');
+  }
+  if (role === 'seller') {
+    throw new Error('Los vendedores sin acceso se crean desde Configuración POS → Vendedores.');
+  }
+  if (['cashier', 'manager'].includes(role) && !branchId && allBranchesAccess !== true) {
+    throw new Error('Selecciona una sucursal o habilita acceso multisede.');
+  }
+
+  return apiRequest('/api/users', {
+    method: 'POST',
+    body: {
+      accountId,
+      name: name.trim(),
+      email: email.trim().toLowerCase(),
+      role,
+      ...(branchId && branchId !== 'all' && !allBranchesAccess ? { branchId } : {}),
+      allBranchesAccess: Boolean(allBranchesAccess),
+      ...(phone?.trim() ? { phone: phone.trim() } : {}),
+      ...(dni?.trim() ? { dni: dni.trim() } : {}),
+      ...(typeof baseSalary === 'number' && baseSalary > 0 ? { baseSalary } : {}),
+      ...(customPermissions ? { customPermissions } : {}),
+    },
+  });
+};
+
+/** Actualiza rol, sucursal, estado activo o permisos personalizados de un miembro existente. */
+export const updateTeamUser = async (userId: string, params: UpdateTeamUserParams): Promise<void> => {
+  if (!userId || !params.accountId) throw new Error('Usuario y cuenta requeridos.');
+  if (
+    params.role &&
+    ['cashier', 'manager'].includes(params.role) &&
+    (!params.branchId || params.branchId === 'all') &&
+    params.allBranchesAccess !== true
+  ) {
+    throw new Error('Selecciona una sucursal o habilita acceso multisede.');
+  }
+
+  const payload: Record<string, any> = {
+    updatedAt: serverTimestamp(),
+  };
+  if (params.name !== undefined) payload.name = params.name.trim();
+  if (params.role !== undefined) payload.role = params.role;
+  if (params.phone !== undefined) payload.phone = params.phone.trim();
+  if (params.dni !== undefined) payload.dni = params.dni.trim();
+  if (params.isActive !== undefined) {
+    payload.isActive = params.isActive;
+    payload.status = params.isActive ? 'active' : 'inactive';
+  }
+  if (params.allBranchesAccess !== undefined) {
+    payload.allBranchesAccess = Boolean(params.allBranchesAccess);
+  }
+  if (params.baseSalary === null) {
+    payload.baseSalary = deleteField();
+  } else if (typeof params.baseSalary === 'number') {
+    payload.baseSalary = params.baseSalary;
+  }
+
+  if (params.allBranchesAccess === true || params.branchId === null || params.branchId === 'all') {
+    payload.branchId = deleteField();
+  } else if (params.branchId) {
+    payload.branchId = params.branchId;
+  }
+
+  if (params.customPermissions === null) {
+    payload.customPermissions = deleteField();
+  } else if (params.customPermissions !== undefined) {
+    payload.customPermissions = params.customPermissions;
+  }
+
+  await setDoc(doc(db, USERS_COLLECTION, userId), payload, { merge: true });
+};
+
+/** Lista sucursales de la cuenta ordenadas por estado activo y nombre. */
+export const getBranchesList = async (accountId: string): Promise<BranchItem[]> => {
+  if (!accountId) return [];
+  const snap = await getDocs(query(collection(db, BRANCHES_COLLECTION), where('accountId', '==', accountId)));
+  const items: BranchItem[] = snap.docs.map((d) => {
+    const data = d.data() || {};
+    return {
+      id: d.id,
+      accountId: data.accountId || accountId,
+      name: data.name || 'Sucursal',
+      address: data.address || '',
+      phone: data.phone || '',
+      email: data.email || '',
+      manager: data.manager || '',
+      isActive: data.isActive !== false,
+      businessName: data.businessName || '',
+      ruc: data.ruc || '',
+      commercialAddress: data.commercialAddress || '',
+      fiscalAddress: data.fiscalAddress || '',
+      commercialPhone: data.commercialPhone || '',
+      receiptFooter: data.receiptFooter || '',
+      createdAt: toMillis(data.createdAt),
+      updatedAt: toMillis(data.updatedAt),
+    };
+  });
+  items.sort((a, b) => {
+    if (a.isActive !== b.isActive) return a.isActive ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
+  return items;
+};
+
+/** Crea o edita una sucursal validando límite del plan al crear. */
+export const saveBranchRecord = async (params: SaveBranchParams): Promise<string> => {
+  const name = params.name?.trim();
+  if (!params.accountId || !name) {
+    throw new Error('Nombre de sucursal y cuenta son requeridos.');
+  }
+  const now = Date.now();
+  const body = cleanFirestoreData({
+    accountId: params.accountId,
+    name,
+    address: params.address?.trim() || '',
+    phone: params.phone?.trim() || '',
+    email: params.email?.trim() || '',
+    manager: params.manager?.trim() || '',
+    isActive: params.isActive !== false,
+    ...(params.businessName?.trim() ? { businessName: params.businessName.trim() } : {}),
+    ...(params.ruc?.trim() ? { ruc: params.ruc.trim() } : {}),
+    ...(params.commercialAddress?.trim() ? { commercialAddress: params.commercialAddress.trim() } : {}),
+    ...(params.fiscalAddress?.trim() ? { fiscalAddress: params.fiscalAddress.trim() } : {}),
+    ...(params.commercialPhone?.trim() ? { commercialPhone: params.commercialPhone.trim() } : {}),
+    ...(params.receiptFooter?.trim() ? { receiptFooter: params.receiptFooter.trim() } : {}),
+    updatedAt: now,
+  });
+
+  if (params.id) {
+    await setDoc(doc(db, BRANCHES_COLLECTION, params.id), body, { merge: true });
+    return params.id;
+  }
+
+  const limitCheck = await apiRequest<{ allowed: boolean; reason?: string }>('/api/plan-limits/validate', {
+    method: 'POST',
+    body: { accountId: params.accountId, operation: 'createBranch' },
+  });
+  if (!limitCheck?.allowed) {
+    throw new Error(limitCheck?.reason || 'Has alcanzado el límite de sucursales de tu plan actual.');
+  }
+
+  const createdRef = await addDoc(collection(db, BRANCHES_COLLECTION), {
+    ...body,
+    createdAt: now,
+  });
+  return createdRef.id;
+};
+
+export const toggleBranchActive = async (branchId: string, isActive: boolean): Promise<void> => {
+  if (!branchId) throw new Error('ID de sucursal requerido.');
+  await updateDoc(doc(db, BRANCHES_COLLECTION, branchId), {
+    isActive,
+    updatedAt: Date.now(),
+  });
+};
 
 /**
  * Obtiene la lista completa de colaboradores/usuarios del negocio desde la colección oficial `users`.
@@ -819,48 +1231,8 @@ export const getTeamMembers = async (accountId: string): Promise<TeamMember[]> =
   try {
     const qUsers = query(collection(db, USERS_COLLECTION), where('accountId', '==', accountId));
     const snapshot = await getDocs(qUsers);
-
-    const members: TeamMember[] = snapshot.docs.map((docSnap) => {
-      const data = docSnap.data();
-      const rawRole = (data.role || 'seller') as TeamRole;
-
-      return {
-        id: docSnap.id,
-        uid: data.uid || docSnap.id,
-        name: data.name || data.displayName || data.email || 'Colaborador',
-        displayName: data.displayName || data.name || '',
-        email: data.email || '',
-        phone: data.phone || '',
-        role: rawRole,
-        roleLabel: getRoleDisplay(rawRole),
-        branchId: data.branchId || undefined,
-        branchName: data.branchName || undefined,
-        accountId: data.accountId || accountId,
-        isActive: data.isActive !== false,
-        baseSalary: typeof data.baseSalary === 'number' ? data.baseSalary : undefined,
-        dni: data.dni || '',
-        photoURL: data.photoURL || undefined,
-        createdAt: toMillis(data.createdAt),
-        lastLogin: data.lastLogin ? toMillis(data.lastLogin) : undefined,
-      };
-    });
-
-    const rolePriority: Record<string, number> = {
-      owner: 1,
-      admin: 2,
-      manager: 3,
-      cashier: 4,
-      seller: 5,
-    };
-
-    members.sort((a, b) => {
-      if (a.isActive !== b.isActive) return a.isActive ? -1 : 1;
-      const rankA = rolePriority[a.role] || 99;
-      const rankB = rolePriority[b.role] || 99;
-      return rankA - rankB;
-    });
-
-    return members;
+    const members = snapshot.docs.map((docSnap) => mapTeamMemberDoc(docSnap.id, docSnap.data(), accountId));
+    return sortTeamMembers(members);
   } catch (error) {
     console.error('[EnterpriseOps] Error al obtener colaboradores:', error);
     return [];
@@ -884,42 +1256,8 @@ export const subscribeToTeamMembers = (
     return onSnapshot(
       qUsers,
       (snapshot) => {
-        const members: TeamMember[] = snapshot.docs.map((docSnap) => {
-          const data = docSnap.data();
-          const rawRole = (data.role || 'seller') as TeamRole;
-          return {
-            id: docSnap.id,
-            uid: data.uid || docSnap.id,
-            name: data.name || data.displayName || data.email || 'Colaborador',
-            displayName: data.displayName || data.name || '',
-            email: data.email || '',
-            phone: data.phone || '',
-            role: rawRole,
-            roleLabel: getRoleDisplay(rawRole),
-            branchId: data.branchId || undefined,
-            branchName: data.branchName || undefined,
-            accountId: data.accountId || accountId,
-            isActive: data.isActive !== false,
-            baseSalary: typeof data.baseSalary === 'number' ? data.baseSalary : undefined,
-            dni: data.dni || '',
-            photoURL: data.photoURL || undefined,
-            createdAt: toMillis(data.createdAt),
-          };
-        });
-
-        const rolePriority: Record<string, number> = {
-          owner: 1,
-          admin: 2,
-          manager: 3,
-          cashier: 4,
-          seller: 5,
-        };
-        members.sort((a, b) => {
-          if (a.isActive !== b.isActive) return a.isActive ? -1 : 1;
-          return (rolePriority[a.role] || 99) - (rolePriority[b.role] || 99);
-        });
-
-        callback(members);
+        const members = snapshot.docs.map((docSnap) => mapTeamMemberDoc(docSnap.id, docSnap.data(), accountId));
+        callback(sortTeamMembers(members));
       },
       (err) => {
         console.warn('[EnterpriseOps] Error en subscribeToTeamMembers:', err);
@@ -979,7 +1317,7 @@ export const getPayrollMovements = async (
           conceptType: rawConcept,
           conceptLabel: getConceptDisplay(rawConcept),
           paymentMethod: data.paymentMethod || data.method || 'Efectivo',
-          notes: data.description || data.notes || '',
+          notes: data.reason || data.description || data.notes || '',
           deductFromCashDrawer: true,
           sessionId: data.sessionId || null,
           cashMovementId: docSnap.id,
@@ -1003,7 +1341,9 @@ export const getPayrollMovements = async (
     setSnap.docs.forEach((docSnap) => {
         const data = docSnap.data();
         const rawConcept: PayrollConceptType = (data.conceptType as PayrollConceptType) || 'salary';
-        const amt = Math.abs(Number(data.netPayable) || Number(data.netSalary) || Number(data.total) || 0);
+        const amt = Math.abs(
+          Number(data.netPayable ?? data.netPay ?? data.totalSettled ?? data.netSalary ?? data.total) || 0
+        );
 
         movements.push({
           id: docSnap.id,
@@ -1023,7 +1363,7 @@ export const getPayrollMovements = async (
           cashMovementId: null,
           createdBy: data.createdBy || '',
           createdByName: data.createdByName || 'Usuario',
-          date: toMillis(data.date || data.createdAt),
+          date: toMillis(data.paidAt || data.date || data.createdAt || data.periodEnd),
           createdAt: data.createdAt,
         });
     });
@@ -1070,6 +1410,66 @@ export const subscribeToPayrollMovements = (
   return () => { active = false; clearInterval(timer); };
 };
 
+/** Construye una liquidación compatible con `/payroll` web para evitar crashes al renderizar fechas o desgloses. */
+export const buildCanonicalPayrollSettlementPayload = (input: {
+  id: string;
+  accountId: string;
+  branchId: string;
+  branchName?: string;
+  employeeId: string;
+  employeeName: string;
+  employeeRole?: string;
+  amount: number;
+  conceptType: PayrollConceptType;
+  paymentMethod?: string;
+  notes?: string;
+  createdBy: string;
+  createdByName: string;
+  now?: number;
+  periodStart?: number;
+  periodEnd?: number;
+}): Record<string, any> => {
+  const now = input.now ?? Date.now();
+  const refDate = new Date(now);
+  const periodStart =
+    input.periodStart ?? new Date(refDate.getFullYear(), refDate.getMonth(), 1, 0, 0, 0, 0).getTime();
+  const periodEnd =
+    input.periodEnd ?? new Date(refDate.getFullYear(), refDate.getMonth() + 1, 0, 23, 59, 59, 999).getTime();
+  const normalizedAmount = Math.round(input.amount * 100) / 100;
+
+  return {
+    id: input.id,
+    accountId: input.accountId,
+    branchId: input.branchId,
+    branchName: input.branchName || '',
+    employeeId: input.employeeId,
+    employeeName: input.employeeName,
+    employeeRole: input.employeeRole || '',
+    periodStart,
+    periodEnd,
+    baseSalary: normalizedAmount,
+    advances: [],
+    consumptions: [],
+    totalAdvances: 0,
+    totalConsumptions: 0,
+    netPay: normalizedAmount,
+    netPayable: normalizedAmount,
+    totalSettled: normalizedAmount,
+    netSalary: normalizedAmount,
+    conceptType: input.conceptType,
+    paymentMethod: input.paymentMethod || 'Transferencia',
+    notes: input.notes || '',
+    status: 'paid',
+    approvedBy: input.createdBy,
+    approvedAt: now,
+    createdBy: input.createdBy,
+    createdByName: input.createdByName,
+    date: now,
+    paidAt: now,
+    createdAt: now,
+  };
+};
+
 /**
  * Registra un pago de planilla o adelanto de sueldo.
  * 
@@ -1079,8 +1479,8 @@ export const subscribeToPayrollMovements = (
  *      `category: 'payroll_advance'`, `isEmployeeAdvance: true`, `employeeId`.
  *   2. Descuenta de `expectedAmount` e incrementa `totalExpenses` en la sesión de caja activa.
  * - Si NO se deduce de caja o no hay `sessionId`:
- *   Crea documento en la colección oficial `payroll_settlements` autorizada en firestore.rules.
- * - NO escribe en la inexistente colección `payroll_movements`.
+ *   Crea documento en la colección oficial `payroll_settlements` autorizada en firestore.rules
+ *   con esquema canónico web (`periodStart`, `periodEnd`, `baseSalary`, `advances`, `consumptions`, etc.).
  */
 export const registerPayrollPayment = async (
   params: RegisterPayrollPaymentParams
@@ -1138,6 +1538,8 @@ export const registerPayrollPayment = async (
       const newExpected = Math.round((currentExpected - normalizedAmount) * 100) / 100;
       const newExpenses = Math.round((currentExpenses + normalizedAmount) * 100) / 100;
 
+      const reasonText = `${conceptName}: ${employeeName}${notes ? ` - ${notes}` : ''}`;
+
       // 1. Insertar movimiento en cash_register_movements
       const cashMovementPayload = {
         id: cashMovementId,
@@ -1147,13 +1549,15 @@ export const registerPayrollPayment = async (
         branchName: branchName || '',
         type: 'expense' as const,
         category: 'payroll_advance',
+        expenseCategoryId: 'employee_advance',
         isEmployeeAdvance: true,
         employeeId,
         employeeName,
         employeeRole: employeeRole || '',
         conceptType,
         amount: -normalizedAmount, // Egreso negativo en flujo de caja
-        description: `${conceptName}: ${employeeName}${notes ? ` - ${notes}` : ''}`,
+        description: reasonText,
+        reason: reasonText,
         paymentMethod: paymentMethod || 'Efectivo',
         createdBy: currentUserId,
         createdByName: currentUserName,
@@ -1184,24 +1588,22 @@ export const registerPayrollPayment = async (
   const settlementId = settlementRef.id;
 
   const settlementPayload: Record<string, any> = {
-    id: settlementId,
-    accountId,
-    branchId,
-    branchName: branchName || '',
-    employeeId,
-    employeeName,
-    employeeRole: employeeRole || '',
-    netPayable: normalizedAmount,
-    netSalary: normalizedAmount,
-    conceptType,
-    paymentMethod: paymentMethod || 'Transferencia',
-    notes: notes || '',
-    status: 'approved',
-    createdBy: currentUserId,
-    createdByName: currentUserName,
-    date: now,
-    paidAt: now,
-    createdAt: Date.now(),
+    ...buildCanonicalPayrollSettlementPayload({
+      id: settlementId,
+      accountId,
+      branchId,
+      branchName,
+      employeeId,
+      employeeName,
+      employeeRole,
+      amount: normalizedAmount,
+      conceptType,
+      paymentMethod,
+      notes,
+      createdBy: currentUserId,
+      createdByName: currentUserName,
+      now,
+    }),
     serverCreatedAt: serverTimestamp(),
   };
 
@@ -1229,9 +1631,16 @@ export default {
   resolveSaleRequest,
   createSaleRequest,
   markSaleRequestAsConverted,
-  // Personal y planillas
+  convertSaleRequest,
+  // Personal, sucursales y planillas
   getTeamMembers,
   subscribeToTeamMembers,
+  createTeamUser,
+  updateTeamUser,
+  toggleCustomPermission,
+  getBranchesList,
+  saveBranchRecord,
+  toggleBranchActive,
   getPayrollMovements,
   subscribeToPayrollMovements,
   registerPayrollPayment,

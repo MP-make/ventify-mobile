@@ -13,6 +13,7 @@ import {
   KeyboardAvoidingView,
   Platform,
   ActivityIndicator,
+  Switch,
   useWindowDimensions,
 } from 'react-native';
 import { Image } from 'expo-image';
@@ -32,6 +33,9 @@ import {
   ChevronUp,
   Tag,
   Ruler,
+  Edit2,
+  ImagePlus,
+  Star,
 } from 'lucide-react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as ImagePicker from 'expo-image-picker';
@@ -39,17 +43,30 @@ import * as Haptics from 'expo-haptics';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { ui } from '@/lib/theme';
 import { SectionHeading } from '@/components/ui';
+import { useAuth } from '@/context/AuthContext';
 import { useSettings } from '@/context/SettingsContext';
 import { usePermissions } from '@/hooks/usePermissions';
-import { DEFAULT_CATALOG_BRANDS, DEFAULT_CATALOG_SIZES } from '@/lib/catalog-filters';
+import { DEFAULT_CATALOG_BRANDS } from '@/lib/catalog-filters';
+import type { BranchPriceConfig, PriceTier, ProductAttribute, ProductVariant } from '@/types';
+import {
+  isLocalFileUri,
+  mergeSingleBranchStock,
+  normalizePresentationBidirectional,
+  normalizePriceTiers,
+  sanitizeRemoteImageUrls,
+  serializeBranchPrices,
+  uploadProductImageToStorage,
+} from '@/services/inventory-kardex-service';
 
 export interface ProductPresentation {
   id: string;
   name: string;
   conversionFactor: number;
+  quantity?: number;
   factor?: number;
   price: number;
   barcode?: string;
+  active?: boolean;
 }
 
 export interface ProductFormData {
@@ -63,13 +80,21 @@ export interface ProductFormData {
   sizeLabel?: string;
   sizes?: string[];
   unitOfMeasure: 'NIU' | 'KGM' | 'LTR' | 'BX' | string;
+  allowDecimals?: boolean;
+  taxExemptionCode?: '10' | '20' | '30' | string;
   price: number;
   minSalePrice: number;
   cost: number;
   stock: number;
   minStock: number;
   presentations: ProductPresentation[];
+  variants?: ProductVariant[];
+  priceTiers?: PriceTier[];
+  branchPrices?: Record<string, BranchPriceConfig>;
+  attributes?: ProductAttribute[];
   imageUrl?: string;
+  thumbUrl?: string;
+  galleryImages?: string[];
   stockByBranch?: Record<string, number>;
 }
 
@@ -79,6 +104,7 @@ interface ProductFormModalProps {
   product?: any | null;
   onSave?: (productData: ProductFormData) => Promise<void> | void;
   branchId?: string;
+  accountId?: string;
 }
 
 /**
@@ -116,12 +142,32 @@ const COMMON_CATEGORIES = [
   'Otros',
 ];
 
-const UNITS: { code: 'NIU' | 'KGM' | 'LTR' | 'BX'; label: string; desc: string }[] = [
+const UNITS: { code: string; label: string; desc: string }[] = [
   { code: 'NIU', label: 'Unidad (NIU)', desc: 'Pieza individual' },
   { code: 'KGM', label: 'Kilo (KGM)', desc: 'Venta por peso' },
   { code: 'LTR', label: 'Litro (LTR)', desc: 'Líquidos a granel' },
   { code: 'BX', label: 'Caja (BX)', desc: 'Embalaje por caja' },
+  { code: 'g', label: 'Gramo (g)', desc: 'Fracción peso menor' },
+  { code: 'm', label: 'Metro (m)', desc: 'Venta por longitud' },
 ];
+
+const TAX_CODES: { code: '10' | '20' | '30'; label: string; desc: string }[] = [
+  { code: '10', label: 'Gravado IGV (18%)', desc: 'SUNAT 10' },
+  { code: '20', label: 'Exonerado (0%)', desc: 'SUNAT 20' },
+  { code: '30', label: 'Inafecto (0%)', desc: 'SUNAT 30' },
+];
+
+const VARIANT_COLORS = [
+  '#111827',
+  '#315BE8',
+  '#BF3545',
+  '#087F5B',
+  '#A65E09',
+  '#7545D9',
+  '#FFFFFF',
+];
+
+const MAX_GALLERY_IMAGES = 6;
 
 const BARCODE_SCANNER_CONFIG: any = {
   barcodeTypes: ['ean13', 'ean8', 'qr', 'code128', 'code39', 'upc_a', 'upc_e'],
@@ -133,14 +179,18 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
   product,
   onSave,
   branchId = 'main',
+  accountId: accountIdProp,
 }) => {
   const { width: windowWidth } = useWindowDimensions();
   const insets = useSafeAreaInsets();
+  const { accountId: authAccountId } = useAuth();
+  const effectiveAccountId = accountIdProp || authAccountId || '';
   const { branches, posSettings } = useSettings();
   const { canManageProducts, canViewMargins } = usePermissions();
   const enableCatalogFilters = !!posSettings?.enableCatalogFilters;
   const compactLayout = windowWidth < 380;
   const lastScanTimestampRef = useRef<number>(0);
+
   const [name, setName] = useState('');
   const [category, setCategory] = useState('Abarrotes');
   const [barcode, setBarcode] = useState('');
@@ -150,18 +200,46 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
   const [extraBarcodes, setExtraBarcodes] = useState<string[]>([]);
   const [showExtraBarcodes, setShowExtraBarcodes] = useState(false);
   const [scanningTarget, setScanningTarget] = useState<'main' | number>('main');
-  const [unitOfMeasure, setUnitOfMeasure] = useState<'NIU' | 'KGM' | 'LTR' | 'BX'>('NIU');
+  const [unitOfMeasure, setUnitOfMeasure] = useState<string>('NIU');
+  const [allowDecimals, setAllowDecimals] = useState<boolean>(false);
+  const [taxExemptionCode, setTaxExemptionCode] = useState<'10' | '20' | '30'>('10');
   const [priceStr, setPriceStr] = useState('');
   const [minPriceStr, setMinPriceStr] = useState('');
   const [costStr, setCostStr] = useState('');
   const [stockStr, setStockStr] = useState('0');
   const [minStockStr, setMinStockStr] = useState('3');
   const [presentations, setPresentations] = useState<ProductPresentation[]>([]);
-  const [imageUrl, setImageUrl] = useState<string | undefined>(undefined);
+  const [galleryImages, setGalleryImages] = useState<string[]>([]);
+  const [uploadStatus, setUploadStatus] = useState<string | null>(null);
   const [stockByBranch, setStockByBranch] = useState<Record<string, number>>({});
 
-  // Sub-modal de presentación
+  // Precios por volumen, precios por sucursal, variantes y atributos
+  const [priceTiers, setPriceTiers] = useState<PriceTier[]>([]);
+  const [tierMinQtyStr, setTierMinQtyStr] = useState('');
+  const [tierPriceStr, setTierPriceStr] = useState('');
+  const [branchPricesDraft, setBranchPricesDraft] = useState<
+    Record<string, { suggestedPrice: string; costPrice: string; minSalePrice: string }>
+  >({});
+  const [showBranchPricesSection, setShowBranchPricesSection] = useState(false);
+
+  const [variants, setVariants] = useState<ProductVariant[]>([]);
+  const [variantModalOpen, setVariantModalOpen] = useState(false);
+  const [editingVariantId, setEditingVariantId] = useState<string | null>(null);
+  const [varName, setVarName] = useState('');
+  const [varSize, setVarSize] = useState('');
+  const [varColorHex, setVarColorHex] = useState('#111827');
+  const [varSku, setVarSku] = useState('');
+  const [varBarcode, setVarBarcode] = useState('');
+  const [varPriceAdjStr, setVarPriceAdjStr] = useState('');
+  const [varStockStr, setVarStockStr] = useState('0');
+
+  const [attributesList, setAttributesList] = useState<Array<{ key: string; value: string }>>([]);
+  const [attrKeyInput, setAttrKeyInput] = useState('');
+  const [attrValInput, setAttrValInput] = useState('');
+
+  // Sub-modal de presentación (crear o editar)
   const [presModalOpen, setPresModalOpen] = useState(false);
+  const [editingPresId, setEditingPresId] = useState<string | null>(null);
   const [presName, setPresName] = useState('');
   const [presFactor, setPresFactor] = useState('');
   const [presPrice, setPresPrice] = useState('');
@@ -172,26 +250,76 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [isSaving, setIsSaving] = useState(false);
 
+  const appendGalleryUris = (uris: string[]) => {
+    setGalleryImages((prev) => {
+      const merged = [...prev];
+      for (const uri of uris) {
+        if (uri && !merged.includes(uri) && merged.length < MAX_GALLERY_IMAGES) {
+          merged.push(uri);
+        }
+      }
+      return merged;
+    });
+  };
+
   const handlePickImage = async () => {
     try {
+      const remaining = Math.max(1, MAX_GALLERY_IMAGES - galleryImages.length);
       const result = await ImagePicker.launchImageLibraryAsync({
         mediaTypes: ['images'],
-        allowsEditing: true,
-        aspect: [1, 1],
-        quality: 0.7,
+        allowsMultipleSelection: true,
+        selectionLimit: remaining,
+        quality: 0.75,
       });
 
       if (!result.canceled && result.assets && result.assets.length > 0) {
-        setImageUrl(result.assets[0].uri);
+        appendGalleryUris(result.assets.map((a) => a.uri));
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       }
-    } catch (err: any) {
+    } catch {
       Alert.alert('Error', 'No se pudo seleccionar la imagen de la galería.');
     }
   };
 
+  const handleTakePhoto = async () => {
+    try {
+      const perm = await ImagePicker.requestCameraPermissionsAsync();
+      if (!perm.granted) {
+        Alert.alert('Permiso requerido', 'Activa el permiso de cámara para tomar fotos del producto.');
+        return;
+      }
+      const result = await ImagePicker.launchCameraAsync({
+        mediaTypes: ['images'],
+        allowsEditing: true,
+        aspect: [1, 1],
+        quality: 0.75,
+      });
+      if (!result.canceled && result.assets && result.assets.length > 0) {
+        appendGalleryUris([result.assets[0].uri]);
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      }
+    } catch {
+      Alert.alert('Error', 'No se pudo capturar la foto.');
+    }
+  };
+
+  const handleSetMainImage = (index: number) => {
+    setGalleryImages((prev) => {
+      if (index <= 0 || index >= prev.length) return prev;
+      const target = prev[index];
+      return [target, ...prev.filter((_, i) => i !== index)];
+    });
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+  };
+
+  const handleRemoveImage = (index: number) => {
+    setGalleryImages((prev) => prev.filter((_, i) => i !== index));
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+  };
+
   useEffect(() => {
     if (visible) {
+      setUploadStatus(null);
       if (product) {
         setName(product.name || '');
         setCategory(product.category || 'Abarrotes');
@@ -204,7 +332,15 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
           : [];
         setExtraBarcodes(existingExtras);
         setShowExtraBarcodes(existingExtras.length > 0);
-        setUnitOfMeasure(product.unitOfMeasure || 'NIU');
+        const unit = product.unitOfMeasure || 'NIU';
+        setUnitOfMeasure(unit);
+        setAllowDecimals(
+          product.allowDecimals !== undefined
+            ? Boolean(product.allowDecimals)
+            : ['KGM', 'kg', 'LTR', 'lt', 'g', 'm'].includes(unit)
+        );
+        const rawTax = String(product.taxExemptionCode || '10');
+        setTaxExemptionCode(rawTax === '20' || rawTax === '30' ? rawTax : '10');
         setPriceStr(product.price !== undefined ? String(product.price) : '');
         setMinPriceStr(
           product.minSalePrice !== undefined
@@ -228,17 +364,61 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
             ? product.stock
             : 0;
         setStockStr(String(currentStock));
-        setMinStockStr(String(product.minStock || 3));
-        setPresentations(product.presentations || []);
-        setImageUrl(product.imageUrl || product.thumbUrl || undefined);
+        setMinStockStr(
+          product.minStock !== undefined && product.minStock !== null
+            ? String(product.minStock)
+            : '3'
+        );
+        setPresentations((product.presentations || []).map(normalizePresentationBidirectional));
+
+        const initialGallery = sanitizeRemoteImageUrls(
+          Array.isArray(product.galleryImages) && product.galleryImages.length > 0
+            ? product.galleryImages
+            : [product.imageUrl || product.thumbUrl || '']
+        );
+        setGalleryImages(initialGallery);
 
         if (product.stock && typeof product.stock === 'object') {
-          // Mantener solo sucursales asignadas. La ausencia de una clave no es
-          // equivalente a stock cero ni debe adscribir el producto a esa sede.
           setStockByBranch({ ...product.stock });
         } else {
           setStockByBranch({ [branchId]: typeof product.stock === 'number' ? product.stock : 0 });
         }
+
+        setPriceTiers(normalizePriceTiers(product.priceTiers));
+        setTierMinQtyStr('');
+        setTierPriceStr('');
+
+        const bpDraft: Record<string, { suggestedPrice: string; costPrice: string; minSalePrice: string }> = {};
+        if (product.branchPrices && typeof product.branchPrices === 'object') {
+          for (const [bId, cfg] of Object.entries<any>(product.branchPrices)) {
+            if (!cfg) continue;
+            bpDraft[bId] = {
+              suggestedPrice: cfg.suggestedPrice !== undefined ? String(cfg.suggestedPrice) : '',
+              costPrice: cfg.costPrice !== undefined ? String(cfg.costPrice) : '',
+              minSalePrice: cfg.minSalePrice !== undefined ? String(cfg.minSalePrice) : '',
+            };
+          }
+        }
+        setBranchPricesDraft(bpDraft);
+        setShowBranchPricesSection(Object.keys(bpDraft).length > 0);
+
+        setVariants(Array.isArray(product.variants) ? product.variants : []);
+        const rawAttrs = Array.isArray(product.attributes)
+          ? product.attributes
+              .map((a: any) => ({
+                key: String(a?.name ?? a?.key ?? '').trim(),
+                value: String(a?.value ?? '').trim(),
+              }))
+              .filter((a: { key: string; value: string }) => a.key.length > 0)
+          : product.attributes && typeof product.attributes === 'object'
+          ? Object.entries(product.attributes).map(([k, v]) => ({
+              key: k,
+              value: String(v ?? ''),
+            }))
+          : [];
+        setAttributesList(rawAttrs);
+        setAttrKeyInput('');
+        setAttrValInput('');
       } else {
         // Reset para nuevo producto
         setName('');
@@ -250,20 +430,31 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
         setExtraBarcodes([]);
         setShowExtraBarcodes(false);
         setUnitOfMeasure('NIU');
+        setAllowDecimals(false);
+        setTaxExemptionCode('10');
         setPriceStr('');
         setMinPriceStr('');
         setCostStr('');
         setStockStr('0');
         setMinStockStr('3');
         setPresentations([]);
-        setImageUrl(undefined);
-
-        // Asignar el producto nuevo solo a la sucursal activa. Las demás se
-        // agregan cuando el usuario ingresa stock explícitamente.
+        setGalleryImages([]);
         setStockByBranch(branchId ? { [branchId]: 0 } : {});
+        setPriceTiers([]);
+        setTierMinQtyStr('');
+        setTierPriceStr('');
+        setBranchPricesDraft({});
+        setShowBranchPricesSection(false);
+        setVariants([]);
+        setAttributesList([]);
+        setAttrKeyInput('');
+        setAttrValInput('');
       }
       setScannerActive(false);
       setPresModalOpen(false);
+      setEditingPresId(null);
+      setVariantModalOpen(false);
+      setEditingVariantId(null);
     }
   }, [visible, product, branchId, branches]);
 
@@ -346,6 +537,24 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
   };
 
+  const handleOpenNewPresentation = () => {
+    setEditingPresId(null);
+    setPresName('');
+    setPresFactor('');
+    setPresPrice('');
+    setPresBarcode('');
+    setPresModalOpen(true);
+  };
+
+  const handleOpenEditPresentation = (pres: ProductPresentation) => {
+    setEditingPresId(pres.id);
+    setPresName(pres.name || '');
+    setPresFactor(String(presentationFactor(pres)));
+    setPresPrice(String(pres.price ?? ''));
+    setPresBarcode(pres.barcode || '');
+    setPresModalOpen(true);
+  };
+
   const handleAddPresentation = () => {
     const factorNum = parseFloat(presFactor);
     const priceNum = parseFloat(presPrice);
@@ -354,15 +563,22 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
       return;
     }
 
-    const newPres: ProductPresentation = {
-      id: `pres_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    const updatedPres = normalizePresentationBidirectional({
+      id: editingPresId || `pres_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
       name: presName.trim(),
       conversionFactor: factorNum,
+      quantity: factorNum,
       price: priceNum,
       barcode: presBarcode.trim() || undefined,
-    };
+      active: true,
+    });
 
-    setPresentations((prev) => [...prev, newPres]);
+    setPresentations((prev) =>
+      editingPresId
+        ? prev.map((p) => (p.id === editingPresId ? updatedPres : p))
+        : [...prev, updatedPres]
+    );
+    setEditingPresId(null);
     setPresName('');
     setPresFactor('');
     setPresPrice('');
@@ -373,6 +589,123 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
 
   const handleRemovePresentation = (id: string) => {
     setPresentations((prev) => prev.filter((p) => p.id !== id));
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+  };
+
+  const handleAddPriceTier = () => {
+    const minQty = parseFloat(tierMinQtyStr);
+    const tierPrice = parseFloat(tierPriceStr);
+    if (!Number.isFinite(minQty) || minQty < 2 || !Number.isFinite(tierPrice) || tierPrice <= 0) {
+      Alert.alert('Escala inválida', 'Ingresa cantidad mínima (>= 2) y precio unitario mayor a S/ 0.00.');
+      return;
+    }
+    setPriceTiers((prev) => {
+      const filtered = prev.filter((t) => Number(t.minQuantity ?? t.minQty) !== minQty);
+      return normalizePriceTiers([...filtered, { minQuantity: minQty, minQty, unitPrice: tierPrice, price: tierPrice }]);
+    });
+    setTierMinQtyStr('');
+    setTierPriceStr('');
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+  };
+
+  const handleRemovePriceTier = (index: number) => {
+    setPriceTiers((prev) => prev.filter((_, i) => i !== index));
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+  };
+
+  const syncBranchStockFromVariants = (nextVariants: ProductVariant[]) => {
+    if (nextVariants.length === 0) return;
+    const sum = nextVariants.reduce((acc, v) => acc + (Number(v.stock?.[branchId] ?? 0) || 0), 0);
+    setStockStr(String(sum));
+    setStockByBranch((prev) => ({ ...prev, [branchId]: sum }));
+  };
+
+  const handleOpenNewVariant = () => {
+    setEditingVariantId(null);
+    setVarName('');
+    setVarSize('');
+    setVarColorHex('#111827');
+    setVarSku('');
+    setVarBarcode('');
+    setVarPriceAdjStr('');
+    setVarStockStr('0');
+    setVariantModalOpen(true);
+  };
+
+  const handleOpenEditVariant = (v: ProductVariant) => {
+    setEditingVariantId(v.id);
+    setVarName(v.name || '');
+    setVarSize(v.sizeLabel || '');
+    setVarColorHex(v.colorHex || '#111827');
+    setVarSku(v.sku || '');
+    setVarBarcode(v.barcode || '');
+    setVarPriceAdjStr(v.priceAdjustment !== undefined ? String(v.priceAdjustment) : '');
+    setVarStockStr(String(v.stock?.[branchId] ?? 0));
+    setVariantModalOpen(true);
+  };
+
+  const handleSaveVariant = () => {
+    if (!varName.trim()) {
+      Alert.alert('Variante requerida', 'Ingresa un nombre para la variante (ej. Rojo / Talla M).');
+      return;
+    }
+    const vStockNum = Math.max(0, parseFloat(varStockStr) || 0);
+    const adjNum = parseFloat(varPriceAdjStr) || 0;
+    const existing = editingVariantId ? variants.find((v) => v.id === editingVariantId) : undefined;
+    const nextVariant: ProductVariant = {
+      ...(existing || {}),
+      id: editingVariantId || `var_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      name: varName.trim(),
+      sizeLabel: varSize.trim() || undefined,
+      colorHex: varColorHex || undefined,
+      sku: varSku.trim() || undefined,
+      barcode: varBarcode.trim() || undefined,
+      priceAdjustment: adjNum !== 0 ? adjNum : undefined,
+      stock: {
+        ...(existing?.stock || {}),
+        [branchId]: vStockNum,
+      },
+    };
+    const nextList = editingVariantId
+      ? variants.map((v) => (v.id === editingVariantId ? nextVariant : v))
+      : [...variants, nextVariant];
+    setVariants(nextList);
+    syncBranchStockFromVariants(nextList);
+    setVariantModalOpen(false);
+    setEditingVariantId(null);
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+  };
+
+  const handleRemoveVariant = (variantId: string) => {
+    const nextList = variants.filter((v) => v.id !== variantId);
+    setVariants(nextList);
+    syncBranchStockFromVariants(nextList);
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+  };
+
+  const handleAddAttribute = () => {
+    const k = attrKeyInput.trim();
+    const v = attrValInput.trim();
+    if (!k || !v) {
+      Alert.alert('Atributo incompleto', 'Ingresa tanto el nombre como el valor del atributo.');
+      return;
+    }
+    setAttributesList((prev) => {
+      const idx = prev.findIndex((item) => item.key.toLowerCase() === k.toLowerCase());
+      if (idx >= 0) {
+        const next = [...prev];
+        next[idx] = { key: k, value: v };
+        return next;
+      }
+      return [...prev, { key: k, value: v }];
+    });
+    setAttrKeyInput('');
+    setAttrValInput('');
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+  };
+
+  const handleRemoveAttribute = (idx: number) => {
+    setAttributesList((prev) => prev.filter((_, i) => i !== idx));
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
   };
 
@@ -389,45 +722,124 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
       Alert.alert('Precio Mínimo Inválido', 'El precio mínimo no puede ser mayor al precio de venta.');
       return;
     }
-
-    const cleanExtraBarcodes = extraBarcodes
-      .map((b) => b.trim())
-      .filter((b) => b.length > 0 && b !== barcode.trim());
-
-    const payload: ProductFormData = {
-      id: product?.id,
-      name: name.trim(),
-      category: category.trim() || 'General',
-      barcode: barcode.trim(),
-      barcodes: cleanExtraBarcodes,
-      sku: sku.trim() || barcode.trim() || `SKU-${Date.now().toString().slice(-6)}`,
-      ...catalogAttributeUpdate(product, enableCatalogFilters, brand, sizeLabel),
-      unitOfMeasure,
-      price: priceVal,
-      minSalePrice: minPriceVal > 0 ? minPriceVal : priceVal,
-      cost: costVal,
-      stock: branches && branches.length > 1
-        ? (stockByBranch[branchId] ?? parseFloat(stockStr) ?? 0)
-        : parseFloat(stockStr) || 0,
-      minStock: parseFloat(minStockStr) || 3,
-      presentations: presentations.map(normalizePresentation),
-      imageUrl: imageUrl || product?.imageUrl || '',
-      stockByBranch: { ...stockByBranch },
-    };
-
     if (!canManageProducts) {
       Alert.alert('Acceso Denegado', 'No cuentas con permisos para crear o modificar productos.');
       return;
     }
 
+    const cleanExtraBarcodes = extraBarcodes
+      .map((b) => b.trim())
+      .filter((b) => b.length > 0 && b !== barcode.trim());
+
     try {
       setIsSaving(true);
+      setUploadStatus(null);
+
+      // Subir imágenes locales a Firebase Storage antes de persistir en Firestore
+      const localCount = galleryImages.filter((u) => isLocalFileUri(u)).length;
+      if (localCount > 0 && !effectiveAccountId) {
+        throw new Error('No se detectó accountId para subir imágenes a la nube.');
+      }
+
+      const resolvedGallery: string[] = [];
+      let uploadedIdx = 0;
+      for (const uri of galleryImages) {
+        if (isLocalFileUri(uri)) {
+          uploadedIdx += 1;
+          setUploadStatus(`Subiendo imagen ${uploadedIdx} de ${localCount}...`);
+          const remoteUrl = await uploadProductImageToStorage(
+            uri,
+            effectiveAccountId,
+            product?.id
+          );
+          resolvedGallery.push(remoteUrl);
+        } else if (uri) {
+          resolvedGallery.push(uri);
+        }
+      }
+      setUploadStatus(null);
+
+      const safeGallery = sanitizeRemoteImageUrls(resolvedGallery);
+      const finalImageUrl = safeGallery[0] || '';
+
+      const singleBranchStockNum = parseFloat(stockStr) || 0;
+      const mergedStockByBranch = mergeSingleBranchStock({
+        existingStock: product?.stock,
+        stockByBranch,
+        singleBranchStock: singleBranchStockNum,
+        branchId,
+        isMultiBranch: Boolean(branches && branches.length > 1),
+        variants,
+      });
+
+      const parsedMinStock = parseFloat(minStockStr);
+      const safeMinStock =
+        Number.isFinite(parsedMinStock) && parsedMinStock >= 0 ? parsedMinStock : 3;
+
+      const numericBranchDraft: Record<string, BranchPriceConfig> = {};
+      for (const [bId, draft] of Object.entries(branchPricesDraft)) {
+        const sug = parseFloat(draft.suggestedPrice);
+        const cst = parseFloat(draft.costPrice);
+        const min = parseFloat(draft.minSalePrice);
+        const entry: BranchPriceConfig = {};
+        if (Number.isFinite(sug) && sug > 0) entry.suggestedPrice = sug;
+        if (Number.isFinite(cst) && cst > 0) entry.costPrice = cst;
+        if (Number.isFinite(min) && min > 0) entry.minSalePrice = min;
+        if (Object.keys(entry).length > 0) {
+          numericBranchDraft[bId] = entry;
+        }
+      }
+      const serializedBranchPrices = serializeBranchPrices(numericBranchDraft, {
+        baseSuggested: priceVal,
+        baseCost: costVal,
+        showMinSalePrice: true,
+      });
+
+      const attributesArray: ProductAttribute[] = [];
+      for (const item of attributesList) {
+        const attrName = item.key.trim();
+        const attrValue = item.value.trim();
+        if (attrName && attrValue) {
+          attributesArray.push({ name: attrName, value: attrValue });
+        }
+      }
+
+      const payload: ProductFormData = {
+        id: product?.id,
+        name: name.trim(),
+        category: category.trim() || 'General',
+        barcode: barcode.trim(),
+        barcodes: cleanExtraBarcodes,
+        sku: sku.trim() || barcode.trim() || `SKU-${Date.now().toString().slice(-6)}`,
+        ...catalogAttributeUpdate(product, enableCatalogFilters, brand, sizeLabel),
+        unitOfMeasure,
+        allowDecimals,
+        taxExemptionCode,
+        price: priceVal,
+        minSalePrice: minPriceVal > 0 ? minPriceVal : priceVal,
+        cost: costVal,
+        stock: mergedStockByBranch[branchId] ?? singleBranchStockNum,
+        minStock: safeMinStock,
+        presentations: presentations.map((p) =>
+          normalizePresentationBidirectional(normalizePresentation(p))
+        ),
+        variants,
+        priceTiers: normalizePriceTiers(priceTiers),
+        branchPrices: serializedBranchPrices,
+        attributes: attributesArray,
+        imageUrl: finalImageUrl,
+        thumbUrl: finalImageUrl,
+        galleryImages: safeGallery,
+        stockByBranch: mergedStockByBranch,
+      };
+
       if (onSave) {
         await onSave(payload);
       }
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       onClose();
     } catch (err: any) {
+      setUploadStatus(null);
       Alert.alert('Error al guardar', err?.message || 'No se pudo guardar el producto.');
     } finally {
       setIsSaving(false);
@@ -503,37 +915,89 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
             <Text style={styles.label}>
               Nombre del Producto <Text style={styles.required}>*</Text>
             </Text>
-            <View style={styles.nameWithImageRow}>
-              <TextInput
-                style={[styles.input, styles.inputWithImage]}
-                value={name}
-                onChangeText={setName}
-                accessibilityLabel="Nombre del producto, obligatorio"
-                placeholder="Ej. Gaseosa Inca Kola 500ml"
-                placeholderTextColor={ui.textMuted}
-              />
-              <TouchableOpacity
-                onPress={handlePickImage}
-                style={[styles.attachImageBtn, !!imageUrl && styles.attachImageBtnActive]}
-                accessibilityRole="button"
-                accessibilityLabel={imageUrl ? 'Cambiar imagen adjunta' : 'Adjuntar imagen'}
-                activeOpacity={0.7}
-              >
-                {imageUrl ? (
-                  <Image source={{ uri: imageUrl }} style={styles.attachedThumbnail} contentFit="cover" />
-                ) : (
-                  <Camera size={18} color={ui.primary} />
-                )}
-              </TouchableOpacity>
-            </View>
-            {imageUrl ? (
-              <View style={styles.imageActionRow}>
-                <Text style={styles.imageActionText}>Foto adjunta</Text>
-                <TouchableOpacity onPress={() => setImageUrl(undefined)}>
-                  <Text style={styles.imageRemoveText}>Quitar</Text>
+            <TextInput
+              style={styles.input}
+              value={name}
+              onChangeText={setName}
+              accessibilityLabel="Nombre del producto, obligatorio"
+              placeholder="Ej. Gaseosa Inca Kola 500ml"
+              placeholderTextColor={ui.textMuted}
+            />
+          </View>
+
+          {/* Galería de Imágenes (Subida automática a Firebase Storage) */}
+          <View style={styles.formGroup}>
+            <View style={styles.labelRow}>
+              <Text style={styles.label}>
+                Imágenes ({galleryImages.length}/{MAX_GALLERY_IMAGES})
+              </Text>
+              <View style={styles.galleryActionsRow}>
+                <TouchableOpacity
+                  onPress={handleTakePhoto}
+                  style={styles.pillActionBtn}
+                  disabled={galleryImages.length >= MAX_GALLERY_IMAGES}
+                  activeOpacity={0.7}
+                  accessibilityRole="button"
+                  accessibilityLabel="Tomar foto del producto"
+                >
+                  <Camera size={13} color={ui.primary} />
+                  <Text style={styles.pillActionText}>Cámara</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  onPress={handlePickImage}
+                  style={styles.pillActionBtn}
+                  disabled={galleryImages.length >= MAX_GALLERY_IMAGES}
+                  activeOpacity={0.7}
+                  accessibilityRole="button"
+                  accessibilityLabel="Elegir fotos de galería"
+                >
+                  <ImagePlus size={13} color={ui.primary} />
+                  <Text style={styles.pillActionText}>Galería</Text>
                 </TouchableOpacity>
               </View>
-            ) : null}
+            </View>
+            {galleryImages.length > 0 ? (
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={styles.galleryStrip}
+              >
+                {galleryImages.map((uri, idx) => (
+                  <View key={`${uri}-${idx}`} style={styles.galleryCard}>
+                    <TouchableOpacity
+                      onPress={() => handleSetMainImage(idx)}
+                      activeOpacity={0.85}
+                      accessibilityRole="button"
+                      accessibilityLabel={idx === 0 ? 'Imagen principal' : 'Marcar como principal'}
+                    >
+                      <Image source={{ uri }} style={styles.galleryThumb} contentFit="cover" />
+                      {idx === 0 ? (
+                        <View style={styles.galleryMainBadge}>
+                          <Star size={10} color={ui.onPrimary} />
+                          <Text style={styles.galleryMainBadgeText}>Principal</Text>
+                        </View>
+                      ) : (
+                        <View style={styles.gallerySetMainTag}>
+                          <Text style={styles.gallerySetMainTagText}>Principal</Text>
+                        </View>
+                      )}
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      onPress={() => handleRemoveImage(idx)}
+                      style={styles.galleryRemoveBtn}
+                      accessibilityRole="button"
+                      accessibilityLabel="Eliminar imagen"
+                    >
+                      <X size={12} color={ui.onPrimary} />
+                    </TouchableOpacity>
+                  </View>
+                ))}
+              </ScrollView>
+            ) : (
+              <Text style={styles.galleryEmptyHint}>
+                Sin imágenes. La primera foto será la portada en el POS.
+              </Text>
+            )}
           </View>
 
           {/* 2. Código de Barras + EAN-13 Generator */}
@@ -798,7 +1262,7 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
             </View>
           )}
 
-          {/* 5. Unidad de Medida SUNAT */}
+          {/* 5. Unidad de Medida SUNAT + Decimales + IGV */}
           <View style={styles.formGroup}>
             <Text style={styles.label}>Unidad de Medida (Estándar SUNAT)</Text>
             <View style={styles.unitsGrid}>
@@ -808,7 +1272,12 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
                   <TouchableOpacity
                     key={u.code}
                     style={[styles.unitCard, isSelected && styles.unitCardSelected]}
-                    onPress={() => setUnitOfMeasure(u.code)}
+                    onPress={() => {
+                      setUnitOfMeasure(u.code);
+                      if (['KGM', 'LTR', 'g', 'm'].includes(u.code)) {
+                        setAllowDecimals(true);
+                      }
+                    }}
                     activeOpacity={0.8}
                     accessibilityRole="button"
                     accessibilityState={{ selected: isSelected }}
@@ -826,7 +1295,46 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
             </View>
           </View>
 
-          <SectionHeading title="Precios" subtitle="Venta, costo y margen estimado." />
+          <View style={styles.toggleRowCard}>
+            <View style={{ flex: 1, marginRight: 12 }}>
+              <Text style={styles.toggleRowTitle}>Permitir cantidades decimales / peso</Text>
+              <Text style={styles.toggleRowSubtitle}>
+                Activa para vender fracciones (ej. 0.250 kg o 1.5 lt) en el POS.
+              </Text>
+            </View>
+            <Switch
+              value={allowDecimals}
+              onValueChange={setAllowDecimals}
+              trackColor={{ false: ui.border, true: ui.primarySoft }}
+              thumbColor={allowDecimals ? ui.primary : ui.surface}
+            />
+          </View>
+
+          <View style={styles.formGroup}>
+            <Text style={styles.label}>Afectación IGV (SUNAT)</Text>
+            <View style={styles.taxGrid}>
+              {TAX_CODES.map((tc) => {
+                const isSelected = taxExemptionCode === tc.code;
+                return (
+                  <TouchableOpacity
+                    key={tc.code}
+                    style={[styles.taxChip, isSelected && styles.taxChipSelected]}
+                    onPress={() => setTaxExemptionCode(tc.code)}
+                    activeOpacity={0.8}
+                    accessibilityRole="button"
+                    accessibilityState={{ selected: isSelected }}
+                  >
+                    <Text style={[styles.taxChipLabel, isSelected && styles.taxChipLabelSelected]}>
+                      {tc.label}
+                    </Text>
+                    <Text style={styles.taxChipDesc}>{tc.desc}</Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+          </View>
+
+          <SectionHeading title="Precios" subtitle="Venta, costo, escalas y margen estimado." />
 
           <View style={[styles.rowTwoCols, compactLayout && styles.rowTwoColsCompact]}>
             <View style={[styles.formGroup, styles.colFlex, compactLayout && styles.colFlexCompact]}>
@@ -870,25 +1378,158 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
                 placeholderTextColor={ui.textMuted}
               />
             </View>
-            <View style={[styles.formGroup, styles.colFlex, compactLayout && styles.colFlexCompact]}>
-              <Text style={styles.label}>Margen Estimado</Text>
-              <View
-                style={[
-                  styles.marginBadge,
-                  marginCalculation.status === 'healthy' && styles.marginBadgeGreen,
-                  marginCalculation.status === 'moderate' && styles.marginBadgeAmber,
-                  marginCalculation.status === 'loss' && styles.marginBadgeRed,
-                ]}
-              >
-                <Percent size={14} color={ui.text} />
-                <Text style={styles.marginBadgeText}>
-                  {marginCalculation.pct.toFixed(1)}% (S/ {marginCalculation.profit.toFixed(2)})
-                </Text>
+            {canViewMargins ? (
+              <View style={[styles.formGroup, styles.colFlex, compactLayout && styles.colFlexCompact]}>
+                <Text style={styles.label}>Margen Estimado</Text>
+                <View
+                  style={[
+                    styles.marginBadge,
+                    marginCalculation.status === 'healthy' && styles.marginBadgeGreen,
+                    marginCalculation.status === 'moderate' && styles.marginBadgeAmber,
+                    marginCalculation.status === 'loss' && styles.marginBadgeRed,
+                  ]}
+                >
+                  <Percent size={14} color={ui.text} />
+                  <Text style={styles.marginBadgeText}>
+                    {marginCalculation.pct.toFixed(1)}% (S/ {marginCalculation.profit.toFixed(2)})
+                  </Text>
+                </View>
               </View>
-            </View>
+            ) : null}
           </View>
 
+          {/* Precios por Volumen / Mayoreo */}
+          <View style={styles.sectionCard}>
+            <Text style={styles.sectionCardTitle}>Precios por Volumen (Opcional)</Text>
+            <View style={styles.inlineAddRow}>
+              <TextInput
+                style={[styles.input, { flex: 1 }]}
+                value={tierMinQtyStr}
+                onChangeText={setTierMinQtyStr}
+                placeholder="Mín. cant. (ej. 6)"
+                keyboardType="numeric"
+                placeholderTextColor={ui.textMuted}
+              />
+              <TextInput
+                style={[styles.input, { flex: 1 }]}
+                value={tierPriceStr}
+                onChangeText={setTierPriceStr}
+                placeholder="Precio c/u (S/)"
+                keyboardType="decimal-pad"
+                placeholderTextColor={ui.textMuted}
+              />
+              <TouchableOpacity
+                style={styles.inlineAddBtn}
+                onPress={handleAddPriceTier}
+                accessibilityRole="button"
+                accessibilityLabel="Agregar escala de precio"
+              >
+                <Plus size={18} color={ui.onPrimary} />
+              </TouchableOpacity>
+            </View>
+            {priceTiers.length > 0 && (
+              <View style={{ marginTop: 8, gap: 6 }}>
+                {priceTiers.map((tier, idx) => (
+                  <View key={`${tier.minQuantity}-${idx}`} style={styles.presItemCard}>
+                    <Text style={styles.presItemDetails}>
+                      Desde <Text style={{ fontWeight: '700', color: ui.text }}>{tier.minQuantity}</Text> u.:{' '}
+                      <Text style={{ fontWeight: '700', color: ui.primary }}>
+                        S/ {Number(tier.unitPrice ?? tier.price).toFixed(2)}
+                      </Text>{' '}
+                      c/u
+                    </Text>
+                    <TouchableOpacity onPress={() => handleRemovePriceTier(idx)} style={styles.presDeleteBtn}>
+                      <Trash2 size={15} color={ui.danger} />
+                    </TouchableOpacity>
+                  </View>
+                ))}
+              </View>
+            )}
+          </View>
+
+          {/* Precios diferenciados por sucursal */}
+          {branches && branches.length > 1 ? (
+            <View style={styles.sectionCard}>
+              <TouchableOpacity
+                style={styles.collapsibleHeader}
+                onPress={() => setShowBranchPricesSection((v) => !v)}
+              >
+                <Text style={styles.sectionCardTitle}>Precios por Sucursal (Opcional)</Text>
+                {showBranchPricesSection ? (
+                  <ChevronUp size={18} color={ui.textSecondary} />
+                ) : (
+                  <ChevronDown size={18} color={ui.textSecondary} />
+                )}
+              </TouchableOpacity>
+              {showBranchPricesSection && (
+                <View style={{ marginTop: 10, gap: 10 }}>
+                  {branches.map((b, idx) => {
+                    const bId = b.id || `branch_${idx}`;
+                    const current = branchPricesDraft[bId] || {
+                      suggestedPrice: '',
+                      costPrice: '',
+                      minSalePrice: '',
+                    };
+                    return (
+                      <View key={bId} style={styles.branchPriceCard}>
+                        <Text style={styles.branchStockName}>{b.name || bId}</Text>
+                        <View style={styles.branchPriceInputsRow}>
+                          <TextInput
+                            style={[styles.input, { flex: 1 }]}
+                            placeholder={`Venta (${priceStr || 'base'})`}
+                            keyboardType="decimal-pad"
+                            placeholderTextColor={ui.textMuted}
+                            value={current.suggestedPrice}
+                            onChangeText={(txt) =>
+                              setBranchPricesDraft((prev) => ({
+                                ...prev,
+                                [bId]: { ...current, suggestedPrice: txt },
+                              }))
+                            }
+                          />
+                          <TextInput
+                            style={[styles.input, { flex: 1 }]}
+                            placeholder={`Mín (${minPriceStr || 'base'})`}
+                            keyboardType="decimal-pad"
+                            placeholderTextColor={ui.textMuted}
+                            value={current.minSalePrice}
+                            onChangeText={(txt) =>
+                              setBranchPricesDraft((prev) => ({
+                                ...prev,
+                                [bId]: { ...current, minSalePrice: txt },
+                              }))
+                            }
+                          />
+                          <TextInput
+                            style={[styles.input, { flex: 1 }]}
+                            placeholder={`Costo (${costStr || 'base'})`}
+                            keyboardType="decimal-pad"
+                            placeholderTextColor={ui.textMuted}
+                            value={current.costPrice}
+                            onChangeText={(txt) =>
+                              setBranchPricesDraft((prev) => ({
+                                ...prev,
+                                [bId]: { ...current, costPrice: txt },
+                              }))
+                            }
+                          />
+                        </View>
+                      </View>
+                    );
+                  })}
+                </View>
+              )}
+            </View>
+          ) : null}
+
           <SectionHeading title="Inventario" subtitle="Existencias actuales y alerta de reposición." />
+          {variants.length > 0 && (
+            <View style={styles.infoBanner}>
+              <Text style={styles.infoBannerText}>
+                Este producto tiene variantes. El stock de la sucursal activa se calcula sumando tus variantes ({stockStr} u.).
+              </Text>
+            </View>
+          )}
           {branches && branches.length > 1 ? (
             <View style={styles.formGroup}>
               <Text style={styles.label}>Stock por Sucursal ({unitOfMeasure})</Text>
@@ -907,7 +1548,8 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
                           const num = parseFloat(val) || 0;
                           setStockByBranch((prev) => ({ ...prev, [bId]: num }));
                         }}
-                        keyboardType="numeric"
+                        editable={!(variants.length > 0 && bId === branchId)}
+                        keyboardType={allowDecimals ? 'decimal-pad' : 'numeric'}
                         placeholder="0"
                         placeholderTextColor={ui.textMuted}
                       />
@@ -923,7 +1565,7 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
                   onChangeText={setMinStockStr}
                   accessibilityLabel="Alerta de stock mínimo"
                   placeholder="3"
-                  keyboardType="numeric"
+                  keyboardType={allowDecimals ? 'decimal-pad' : 'numeric'}
                   placeholderTextColor={ui.textMuted}
                 />
               </View>
@@ -933,12 +1575,13 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
               <View style={[styles.formGroup, styles.colFlex, compactLayout && styles.colFlexCompact]}>
                 <Text style={styles.label}>Stock Actual ({unitOfMeasure})</Text>
                 <TextInput
-                  style={styles.input}
+                  style={[styles.input, variants.length > 0 && styles.inputReadonly]}
                   value={stockStr}
                   onChangeText={setStockStr}
+                  editable={variants.length === 0}
                   accessibilityLabel={`Stock actual en ${unitOfMeasure}`}
                   placeholder="0"
-                  keyboardType="numeric"
+                  keyboardType={allowDecimals ? 'decimal-pad' : 'numeric'}
                   placeholderTextColor={ui.textMuted}
                 />
               </View>
@@ -950,7 +1593,7 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
                   onChangeText={setMinStockStr}
                   accessibilityLabel="Alerta de stock mínimo"
                   placeholder="3"
-                  keyboardType="numeric"
+                  keyboardType={allowDecimals ? 'decimal-pad' : 'numeric'}
                   placeholderTextColor={ui.textMuted}
                 />
               </View>
@@ -963,7 +1606,7 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
             action={(
               <TouchableOpacity
                 style={styles.addPresBtn}
-                onPress={() => setPresModalOpen(true)}
+                onPress={handleOpenNewPresentation}
                 activeOpacity={0.7}
                 accessibilityRole="button"
                 accessibilityLabel="Agregar presentación adicional"
@@ -992,19 +1635,134 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
                       {p.barcode ? ` | Código: ${p.barcode}` : ''}
                     </Text>
                   </View>
-                  <TouchableOpacity
-                    onPress={() => handleRemovePresentation(p.id)}
-                    style={styles.presDeleteBtn}
-                    activeOpacity={0.7}
-                    accessibilityRole="button"
-                    accessibilityLabel={`Eliminar presentación ${p.name}`}
-                  >
-                    <Trash2 size={16} color={ui.danger} />
-                  </TouchableOpacity>
+                  <View style={{ flexDirection: 'row', gap: 6 }}>
+                    <TouchableOpacity
+                      onPress={() => handleOpenEditPresentation(p)}
+                      style={styles.presEditBtn}
+                      activeOpacity={0.7}
+                      accessibilityRole="button"
+                      accessibilityLabel={`Editar presentación ${p.name}`}
+                    >
+                      <Edit2 size={15} color={ui.primary} />
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      onPress={() => handleRemovePresentation(p.id)}
+                      style={styles.presDeleteBtn}
+                      activeOpacity={0.7}
+                      accessibilityRole="button"
+                      accessibilityLabel={`Eliminar presentación ${p.name}`}
+                    >
+                      <Trash2 size={16} color={ui.danger} />
+                    </TouchableOpacity>
+                  </View>
                 </View>
               ))}
             </View>
           )}
+
+          {/* Variantes (Tallas / Colores / Sabores) */}
+          <SectionHeading
+            title="Variantes"
+            subtitle="Opciones de talla, color o sabor con stock independiente."
+            action={(
+              <TouchableOpacity
+                style={styles.addPresBtn}
+                onPress={handleOpenNewVariant}
+                activeOpacity={0.7}
+                accessibilityRole="button"
+                accessibilityLabel="Agregar variante"
+              >
+                <Plus size={16} color={ui.onPrimary} />
+                <Text style={styles.addPresBtnText}>Variante</Text>
+              </TouchableOpacity>
+            )}
+          />
+          {variants.length === 0 ? (
+            <View style={styles.emptyPresCard}>
+              <Package size={20} color={ui.textMuted} />
+              <Text style={styles.emptyPresText}>
+                Sin variantes configuradas. Se manejará stock único del producto.
+              </Text>
+            </View>
+          ) : (
+            <View style={styles.presList}>
+              {variants.map((v) => {
+                const vBranchStock = Number(v.stock?.[branchId] ?? 0);
+                return (
+                  <View key={v.id} style={styles.presItemCard}>
+                    {v.colorHex ? (
+                      <View style={[styles.variantDot, { backgroundColor: v.colorHex }]} />
+                    ) : null}
+                    <View style={styles.presItemInfo}>
+                      <Text style={styles.presItemName}>
+                        {v.name}
+                        {v.sizeLabel ? ` (${v.sizeLabel})` : ''}
+                      </Text>
+                      <Text style={styles.presItemDetails}>
+                        Stock ({branchId}): {vBranchStock}
+                        {v.priceAdjustment
+                          ? ` • Ajuste: ${v.priceAdjustment >= 0 ? '+' : ''}S/ ${v.priceAdjustment.toFixed(2)}`
+                          : ''}
+                        {v.sku ? ` • SKU: ${v.sku}` : ''}
+                      </Text>
+                    </View>
+                    <View style={{ flexDirection: 'row', gap: 6 }}>
+                      <TouchableOpacity
+                        onPress={() => handleOpenEditVariant(v)}
+                        style={styles.presEditBtn}
+                      >
+                        <Edit2 size={15} color={ui.primary} />
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        onPress={() => handleRemoveVariant(v.id)}
+                        style={styles.presDeleteBtn}
+                      >
+                        <Trash2 size={15} color={ui.danger} />
+                      </TouchableOpacity>
+                    </View>
+                  </View>
+                );
+              })}
+            </View>
+          )}
+
+          {/* Atributos / Especificaciones Técnicas */}
+          <View style={[styles.sectionCard, { marginTop: 16 }]}>
+            <Text style={styles.sectionCardTitle}>Atributos Técnicos (Opcional)</Text>
+            <View style={styles.inlineAddRow}>
+              <TextInput
+                style={[styles.input, { flex: 1 }]}
+                value={attrKeyInput}
+                onChangeText={setAttrKeyInput}
+                placeholder="Ej. Material"
+                placeholderTextColor={ui.textMuted}
+              />
+              <TextInput
+                style={[styles.input, { flex: 1 }]}
+                value={attrValInput}
+                onChangeText={setAttrValInput}
+                placeholder="Ej. Algodón"
+                placeholderTextColor={ui.textMuted}
+              />
+              <TouchableOpacity style={styles.inlineAddBtn} onPress={handleAddAttribute}>
+                <Plus size={18} color={ui.onPrimary} />
+              </TouchableOpacity>
+            </View>
+            {attributesList.length > 0 && (
+              <View style={{ marginTop: 8, gap: 6 }}>
+                {attributesList.map((attr, idx) => (
+                  <View key={`${attr.key}-${idx}`} style={styles.presItemCard}>
+                    <Text style={styles.presItemDetails}>
+                      <Text style={{ fontWeight: '700', color: ui.text }}>{attr.key}:</Text> {attr.value}
+                    </Text>
+                    <TouchableOpacity onPress={() => handleRemoveAttribute(idx)} style={styles.presDeleteBtn}>
+                      <Trash2 size={15} color={ui.danger} />
+                    </TouchableOpacity>
+                  </View>
+                ))}
+              </View>
+            )}
+          </View>
 
           <View style={{ height: 40 }} />
         </ScrollView>
@@ -1038,7 +1796,12 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
             accessibilityLabel={product ? 'Guardar cambios del producto' : 'Crear producto'}
           >
             {isSaving ? (
-              <ActivityIndicator color={ui.surface} size="small" />
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                <ActivityIndicator color={ui.surface} size="small" />
+                {uploadStatus ? (
+                  <Text style={styles.saveFooterText}>{uploadStatus}</Text>
+                ) : null}
+              </View>
             ) : (
               <>
                 <Save size={18} color={ui.surface} />
@@ -1050,7 +1813,7 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
           </TouchableOpacity>
         </View>
 
-        {/* Modal Secundario para Crear Presentación */}
+        {/* Modal Secundario para Crear / Editar Presentación */}
         <Modal
           visible={presModalOpen}
           animationType="fade"
@@ -1060,12 +1823,14 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
           <View style={styles.subModalOverlay}>
             <View style={styles.subModalCard}>
               <View style={styles.subModalHeader}>
-                <Text style={styles.subModalTitle}>Nueva Presentación</Text>
+                <Text style={styles.subModalTitle}>
+                  {editingPresId ? 'Editar Presentación' : 'Nueva Presentación'}
+                </Text>
                 <TouchableOpacity
                   onPress={() => setPresModalOpen(false)}
                   style={styles.closeBtn}
                   accessibilityRole="button"
-                  accessibilityLabel="Cerrar nueva presentación"
+                  accessibilityLabel="Cerrar presentación"
                 >
                   <X size={20} color={ui.textSecondary} />
                 </TouchableOpacity>
@@ -1136,7 +1901,135 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
                   accessibilityRole="button"
                 >
                   <Check size={16} color={ui.surface} />
-                  <Text style={styles.subModalConfirmText}>Agregar</Text>
+                  <Text style={styles.subModalConfirmText}>
+                    {editingPresId ? 'Guardar' : 'Agregar'}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        </Modal>
+
+        {/* Modal Secundario para Crear / Editar Variante */}
+        <Modal
+          visible={variantModalOpen}
+          animationType="fade"
+          transparent
+          onRequestClose={() => setVariantModalOpen(false)}
+        >
+          <View style={styles.subModalOverlay}>
+            <View style={styles.subModalCard}>
+              <View style={styles.subModalHeader}>
+                <Text style={styles.subModalTitle}>
+                  {editingVariantId ? 'Editar Variante' : 'Nueva Variante'}
+                </Text>
+                <TouchableOpacity
+                  onPress={() => setVariantModalOpen(false)}
+                  style={styles.closeBtn}
+                >
+                  <X size={20} color={ui.textSecondary} />
+                </TouchableOpacity>
+              </View>
+
+              <View style={styles.formGroup}>
+                <Text style={styles.label}>Nombre *</Text>
+                <TextInput
+                  style={styles.input}
+                  value={varName}
+                  onChangeText={setVarName}
+                  placeholder="Ej. Rojo / Vainilla"
+                  placeholderTextColor={ui.textMuted}
+                />
+              </View>
+
+              <View style={[styles.rowTwoCols, compactLayout && styles.rowTwoColsCompact]}>
+                <View style={[styles.formGroup, styles.colFlex]}>
+                  <Text style={styles.label}>Talla / Medida</Text>
+                  <TextInput
+                    style={styles.input}
+                    value={varSize}
+                    onChangeText={setVarSize}
+                    placeholder="Ej. M, L, 500ml"
+                    placeholderTextColor={ui.textMuted}
+                  />
+                </View>
+                <View style={[styles.formGroup, styles.colFlex]}>
+                  <Text style={styles.label}>Stock ({branchId})</Text>
+                  <TextInput
+                    style={styles.input}
+                    value={varStockStr}
+                    onChangeText={setVarStockStr}
+                    keyboardType={allowDecimals ? 'decimal-pad' : 'numeric'}
+                    placeholder="0"
+                    placeholderTextColor={ui.textMuted}
+                  />
+                </View>
+              </View>
+
+              <View style={[styles.rowTwoCols, compactLayout && styles.rowTwoColsCompact]}>
+                <View style={[styles.formGroup, styles.colFlex]}>
+                  <Text style={styles.label}>Ajuste Precio (S/)</Text>
+                  <TextInput
+                    style={styles.input}
+                    value={varPriceAdjStr}
+                    onChangeText={setVarPriceAdjStr}
+                    keyboardType="numeric"
+                    placeholder="0.00"
+                    placeholderTextColor={ui.textMuted}
+                  />
+                </View>
+                <View style={[styles.formGroup, styles.colFlex]}>
+                  <Text style={styles.label}>SKU Variante</Text>
+                  <TextInput
+                    style={styles.input}
+                    value={varSku}
+                    onChangeText={setVarSku}
+                    placeholder="Opcional"
+                    placeholderTextColor={ui.textMuted}
+                  />
+                </View>
+              </View>
+
+              <View style={styles.formGroup}>
+                <Text style={styles.label}>Código de Barras Variante</Text>
+                <TextInput
+                  style={styles.input}
+                  value={varBarcode}
+                  onChangeText={setVarBarcode}
+                  placeholder="Opcional"
+                  placeholderTextColor={ui.textMuted}
+                />
+              </View>
+
+              <View style={styles.formGroup}>
+                <Text style={styles.label}>Color identificador</Text>
+                <View style={styles.colorSwatchesRow}>
+                  {VARIANT_COLORS.map((hex) => (
+                    <TouchableOpacity
+                      key={hex}
+                      onPress={() => setVarColorHex(hex)}
+                      style={[
+                        styles.colorSwatchBtn,
+                        { backgroundColor: hex },
+                        varColorHex === hex && styles.colorSwatchSelected,
+                      ]}
+                    />
+                  ))}
+                </View>
+              </View>
+
+              <View style={styles.subModalActions}>
+                <TouchableOpacity
+                  style={styles.subModalCancel}
+                  onPress={() => setVariantModalOpen(false)}
+                >
+                  <Text style={styles.subModalCancelText}>Cancelar</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.subModalConfirm} onPress={handleSaveVariant}>
+                  <Check size={16} color={ui.surface} />
+                  <Text style={styles.subModalConfirmText}>
+                    {editingVariantId ? 'Guardar' : 'Agregar'}
+                  </Text>
                 </TouchableOpacity>
               </View>
             </View>
@@ -1819,6 +2712,221 @@ const styles = StyleSheet.create({
   miniChipTextActive: {
     color: ui.primary,
     fontWeight: '700',
+  },
+  galleryActionsRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  galleryStrip: {
+    gap: 10,
+    paddingVertical: 6,
+  },
+  galleryCard: {
+    position: 'relative',
+    width: 82,
+    height: 82,
+    borderRadius: 10,
+    overflow: 'hidden',
+    borderWidth: 1,
+    borderColor: ui.border,
+    backgroundColor: ui.surfaceMuted,
+  },
+  galleryThumb: {
+    width: 82,
+    height: 82,
+  },
+  galleryMainBadge: {
+    position: 'absolute',
+    left: 4,
+    bottom: 4,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 3,
+    backgroundColor: ui.primary,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 6,
+  },
+  galleryMainBadgeText: {
+    fontSize: 9,
+    fontWeight: '700',
+    color: ui.onPrimary,
+  },
+  gallerySetMainTag: {
+    position: 'absolute',
+    left: 4,
+    bottom: 4,
+    backgroundColor: 'rgba(23, 36, 61, 0.72)',
+    paddingHorizontal: 5,
+    paddingVertical: 2,
+    borderRadius: 5,
+  },
+  gallerySetMainTagText: {
+    fontSize: 9,
+    fontWeight: '600',
+    color: ui.onPrimary,
+  },
+  galleryRemoveBtn: {
+    position: 'absolute',
+    top: 4,
+    right: 4,
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    backgroundColor: ui.danger,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  galleryEmptyHint: {
+    fontSize: 12,
+    color: ui.textMuted,
+    marginTop: 4,
+  },
+  toggleRowCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: ui.surface,
+    borderWidth: 1,
+    borderColor: ui.border,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    marginBottom: 14,
+  },
+  toggleRowTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: ui.text,
+  },
+  toggleRowSubtitle: {
+    fontSize: 11,
+    color: ui.textSecondary,
+    marginTop: 2,
+  },
+  taxGrid: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  taxChip: {
+    flex: 1,
+    backgroundColor: ui.surface,
+    borderWidth: 1,
+    borderColor: ui.border,
+    borderRadius: 10,
+    paddingVertical: 8,
+    paddingHorizontal: 8,
+  },
+  taxChipSelected: {
+    backgroundColor: ui.primarySoft,
+    borderColor: ui.primary,
+  },
+  taxChipLabel: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: ui.text,
+  },
+  taxChipLabelSelected: {
+    color: ui.primary,
+  },
+  taxChipDesc: {
+    fontSize: 10,
+    color: ui.textMuted,
+    marginTop: 2,
+  },
+  sectionCard: {
+    backgroundColor: ui.surface,
+    borderWidth: 1,
+    borderColor: ui.border,
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 14,
+  },
+  sectionCardTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: ui.text,
+    marginBottom: 8,
+  },
+  inlineAddRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  inlineAddBtn: {
+    width: 44,
+    height: 44,
+    borderRadius: 10,
+    backgroundColor: ui.primary,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  collapsibleHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  branchPriceCard: {
+    backgroundColor: ui.background,
+    borderRadius: 8,
+    padding: 8,
+    borderWidth: 1,
+    borderColor: ui.border,
+    gap: 6,
+  },
+  branchPriceInputsRow: {
+    flexDirection: 'row',
+    gap: 6,
+  },
+  infoBanner: {
+    backgroundColor: ui.primarySoft,
+    borderWidth: 1,
+    borderColor: ui.primary,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    marginBottom: 10,
+  },
+  infoBannerText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: ui.primary,
+  },
+  inputReadonly: {
+    backgroundColor: ui.surfaceMuted,
+    color: ui.textSecondary,
+  },
+  presEditBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: 8,
+    backgroundColor: ui.primarySoft,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  variantDot: {
+    width: 14,
+    height: 14,
+    borderRadius: 7,
+    borderWidth: 1,
+    borderColor: ui.border,
+    marginRight: 8,
+  },
+  colorSwatchesRow: {
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 4,
+  },
+  colorSwatchBtn: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: ui.border,
+  },
+  colorSwatchSelected: {
+    borderWidth: 3,
+    borderColor: ui.primary,
   },
 });
 

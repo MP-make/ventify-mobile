@@ -45,7 +45,7 @@ const CASH_SESSIONS_COLLECTION = 'cash_register_sessions';
 const CASH_MOVEMENTS_COLLECTION = 'cash_register_movements';
 const CUSTOMERS_COLLECTION = 'customers';
 const NOTA_COUNTERS_COLLECTION = 'nota-counters';
-const RECEIVABLES_COLLECTION = 'accounts_receivable';
+const RESERVATIONS_COLLECTION = 'reservations';
 
 const DEFAULT_LOW_STOCK_THRESHOLD = LOW_STOCK_THRESHOLD;
 
@@ -119,6 +119,15 @@ export interface SaleItemInput {
   imageUrl?: string;
   variantId?: string;
   variantName?: string;
+  isGift?: boolean;
+  discount?: number;
+  originalPrice?: number;
+  modifiedPrice?: number;
+  priceModificationReason?: string;
+  margin?: number;
+  marginPercent?: number;
+  weight?: number;
+  taxExemptionCode?: string;
 }
 
 export interface CustomerInput {
@@ -126,6 +135,8 @@ export interface CustomerInput {
   name: string;
   documentType?: 'DNI' | 'RUC' | 'CE' | 'PASAPORTE' | string;
   documentNumber?: string;
+  dni?: string;
+  ruc?: string;
   email?: string;
   phone?: string;
   address?: string;
@@ -148,10 +159,17 @@ export interface CreateSaleTransactionParams {
   paymentMethod: PaymentMethod;
   paymentMethodId?: string;
   paymentMethodName?: string;
+  digitalProvider?: 'yape' | 'plin' | 'transferencia' | string;
+  commissionPercent?: number;
+  commissionRule?: 'business' | 'customer';
   chargedAmount?: number;
   commissionAmount?: number;
   surchargeAmount?: number;
   netAmount?: number;
+  isStaffConsumption?: boolean;
+  employeeId?: string;
+  employeeName?: string;
+  creditDays?: number;
   documentType: SaleDocumentType;
   subtotal?: number;
   tax?: number;
@@ -174,6 +192,9 @@ export interface CreateSaleTransactionParams {
   notes?: string;
   offlineId?: string;
   isQuote?: boolean;
+  taxExemptionCode?: '10' | '20' | string;
+  isAmazonExempt?: boolean;
+  onSunatResult?: (result: SunatEmitResult | null) => void;
   depositInfo?: {
     type: 'reservation' | 'order';
     reservationNumber?: number;
@@ -185,6 +206,7 @@ export interface CreateSaleTransactionParams {
   };
   sourceSaleRequestId?: string;
   sourceQuoteId?: string;
+  sourceReservationId?: string;
 }
 
 export interface CreateSaleTransactionResult {
@@ -197,6 +219,25 @@ export interface CreateSaleTransactionResult {
   sunatStatus: 'pending' | 'submitted' | 'accepted' | 'rejected' | 'error' | 'not_applicable';
   sessionId?: string;
   offlineId?: string;
+  documentNumber?: string;
+  einvoiceId?: string;
+  fiscalAmounts?: {
+    taxed: number;
+    exempt: number;
+    unaffected: number;
+    igv: number;
+    otherTaxes: number;
+    total: number;
+  };
+  receiptCustomer?: {
+    identityType?: string;
+    identityNumber?: string;
+    name?: string;
+    address?: string;
+    email?: string;
+  };
+  cdrDescription?: string | null;
+  sunatHash?: string | null;
 }
 
 export interface CancelSaleResult {
@@ -377,63 +418,128 @@ const legacyPaymentMethodId = (method: string, payments?: PaymentSplit[]): strin
   return aliases[normalized] || method;
 };
 
+const normalizeAttributedDocumentType = (docType: string): string => {
+  const normalized = String(docType || 'nota_venta').trim().toLowerCase();
+  if (normalized === 'factura' || normalized === '01') return '01';
+  if (normalized === 'boleta' || normalized === '03') return '03';
+  if (normalized === 'cotizacion' || normalized === 'cotización' || normalized === 'cot') return 'cot';
+  if (normalized === 'nota' || normalized === 'ntv') return 'nota_venta';
+  return docType || 'nota_venta';
+};
+
 export const buildAttributedSalePayload = (
   params: CreateSaleTransactionParams,
   resolvedSessionId?: string,
-) => ({
-  accountId: params.accountId,
-  branchId: params.branchId,
-  sessionId: resolvedSessionId || params.sessionId || '',
-  total: Math.round(params.total * 100) / 100,
-  subtotal: Math.round((params.subtotal ?? params.total) * 100) / 100,
-  tax: Math.round((params.tax ?? 0) * 100) / 100,
-  shippingAmount: Math.round((params.shippingAmount ?? 0) * 100) / 100,
-  discountAmount: Math.round((params.discountAmount ?? 0) * 100) / 100,
-  paymentMethod: params.paymentMethodName || params.paymentMethod,
-  paymentMethodId: params.paymentMethodId || legacyPaymentMethodId(params.paymentMethod, params.payments),
-  paymentCategory: derivePaymentCategory(params.paymentMethod, params.payments),
-  payments: (params.payments || []).map(part => ({ ...part,
-    methodId: part.methodId || legacyPaymentMethodId(part.category, [part]),
-  })),
-  cashAmount: params.cashAmount,
-  cardAmount: params.cardAmount,
-  digitalAmount: params.digitalAmount,
-  cashReceived: params.cashReceived,
-  changeGiven: params.changeGiven,
-  documentType: params.documentType,
-  items: params.items.map((item) => ({
-    id: item.productId,
-    productId: item.productId,
-    name: item.name,
-    sku: item.sku,
-    price: item.price,
-    quantity: item.quantity,
-    costPrice: item.costPrice,
-    minSalePrice: item.minSalePrice,
-    presentationId: item.presentationId,
-    presentationName: item.presentationName,
-    presentationQty: item.presentationQty,
-    conversionFactor: item.conversionFactor,
-    subtotal: item.subtotal,
-    total: item.total,
-    variantId: item.variantId,
-    variantName: item.variantName,
-  })),
-  customerId: params.customerId || params.customer?.id,
-  customerName: params.customerName || params.customer?.name,
-  customerDni: params.customer?.documentType === 'DNI' ? params.customer.documentNumber : undefined,
-  customerRuc: params.customer?.documentType === 'RUC' ? params.customer.documentNumber : undefined,
-  customerPhone: params.customer?.phone,
-  customerEmail: params.customer?.email,
-  customerAddress: params.customer?.address,
-  notes: params.notes,
-  sellerId: params.sellerId,
-  sellerName: params.sellerName,
-  creditMode: params.paymentMethod === 'fiado' || params.paymentMethod === 'credit'
-    ? 'receivable'
-    : isPrepaidCreditMethod(params.paymentMethod) ? 'prepaid' : undefined,
-  date: params.saleDate,
-});
+) => {
+  const round2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
+  const itemsSum = round2(
+    params.items.reduce(
+      (sum, item) => sum + Number(item.price || 0) * Number(item.quantity || 0),
+      0
+    )
+  );
+  const resolvedSubtotal =
+    params.tax && params.tax > 0
+      ? itemsSum || round2(params.total)
+      : round2(params.subtotal ?? (itemsSum || params.total));
+
+  const methodLower = String(params.paymentMethod || '').toLowerCase();
+  const resolvedDigitalProvider =
+    params.digitalProvider ||
+    params.payments?.find((part) => part.category === 'digital')?.digitalProvider ||
+    (['yape', 'plin'].includes(methodLower) ? methodLower : undefined);
+
+  const rawCustomerDoc = String(
+    params.customer?.documentNumber || ''
+  ).replace(/\D/g, '');
+  const resolvedDni =
+    params.customer?.dni ||
+    (params.customer?.documentType === 'DNI' ||
+    params.customer?.documentType === '1' ||
+    rawCustomerDoc.length === 8
+      ? params.customer?.documentNumber || rawCustomerDoc
+      : undefined);
+  const resolvedRuc =
+    params.customer?.ruc ||
+    (params.customer?.documentType === 'RUC' ||
+    params.customer?.documentType === '6' ||
+    rawCustomerDoc.length === 11
+      ? params.customer?.documentNumber || rawCustomerDoc
+      : undefined);
+
+  return {
+    accountId: params.accountId,
+    branchId: params.branchId,
+    sessionId: resolvedSessionId || params.sessionId || '',
+    total: round2(params.total),
+    subtotal: resolvedSubtotal,
+    tax: 0,
+    shippingAmount: round2(params.shippingAmount ?? 0),
+    discountAmount: round2(params.discountAmount ?? 0),
+    paymentMethod: params.paymentMethodName || params.paymentMethod,
+    paymentMethodId: params.paymentMethodId || legacyPaymentMethodId(params.paymentMethod, params.payments),
+    paymentCategory: derivePaymentCategory(params.paymentMethod, params.payments),
+    digitalProvider: resolvedDigitalProvider,
+    payments: (params.payments || []).map((part) => ({
+      ...part,
+      methodId: part.methodId || legacyPaymentMethodId(part.category, [part]),
+    })),
+    cashAmount: params.cashAmount,
+    cardAmount: params.cardAmount,
+    digitalAmount: params.digitalAmount,
+    cashReceived: params.cashReceived,
+    changeGiven: params.changeGiven,
+    commissionPercent: params.commissionPercent,
+    commissionRule: params.commissionRule,
+    commissionAmount: params.commissionAmount !== undefined ? round2(params.commissionAmount) : undefined,
+    surchargeAmount: params.surchargeAmount !== undefined ? round2(params.surchargeAmount) : undefined,
+    chargedAmount: params.chargedAmount !== undefined ? round2(params.chargedAmount) : undefined,
+    netAmount: params.netAmount !== undefined ? round2(params.netAmount) : undefined,
+    isStaffConsumption: params.isStaffConsumption,
+    employeeId: params.employeeId,
+    employeeName: params.employeeName,
+    taxExemptionCode: params.taxExemptionCode,
+    isAmazonExempt: params.isAmazonExempt,
+    documentType: normalizeAttributedDocumentType(params.documentType),
+    items: params.items.map((item) => ({
+      id: item.productId,
+      productId: item.productId,
+      name: item.name,
+      sku: item.sku,
+      price: item.price,
+      quantity: item.quantity,
+      costPrice: item.costPrice,
+      minSalePrice: item.minSalePrice,
+      presentationId: item.presentationId,
+      presentationName: item.presentationName,
+      presentationQty: item.presentationQty,
+      conversionFactor: item.conversionFactor,
+      stockBranchId: item.stockBranchId,
+      isGift: item.isGift,
+      subtotal: item.subtotal,
+      total: item.total,
+      variantId: item.variantId,
+      variantName: item.variantName,
+    })),
+    customerId: params.customerId || params.customer?.id,
+    customerName: params.customerName || params.customer?.name,
+    customerDni: resolvedDni,
+    customerRuc: resolvedRuc,
+    customerPhone: params.customer?.phone,
+    customerEmail: params.customer?.email,
+    customerAddress: params.customer?.address,
+    notes: params.notes,
+    sellerId: params.sellerId,
+    sellerName: params.sellerName,
+    creditMode:
+      params.paymentMethod === 'fiado' || params.paymentMethod === 'credit'
+        ? 'receivable'
+        : isPrepaidCreditMethod(params.paymentMethod)
+          ? 'prepaid'
+          : undefined,
+    date: params.saleDate,
+  };
+};
 
 /**
  * Envía la venta para su confirmación atómica en el servidor vía POST /api/sales/finalize
@@ -454,7 +560,7 @@ export const finalizeAttributedSaleViaServer = async (
   const salePayload = buildAttributedSalePayload(params, resolvedSessionId);
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 12000);
+  const timeoutId = setTimeout(() => controller.abort(), 110000);
   let response: Response;
   let data: any;
 
@@ -465,6 +571,7 @@ export const finalizeAttributedSaleViaServer = async (
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
+        'x-ventify-client': 'v3',
       },
       body: JSON.stringify({
         sale: cleanFirestoreData(salePayload),
@@ -477,7 +584,12 @@ export const finalizeAttributedSaleViaServer = async (
       }),
     });
 
-    data = await response.json();
+    const rawText = await response.text().catch(() => '');
+    try {
+      data = rawText ? JSON.parse(rawText) : {};
+    } catch {
+      data = { error: rawText.slice(0, 200) };
+    }
   } finally {
     clearTimeout(timeoutId);
   }
@@ -500,9 +612,25 @@ export const finalizeAttributedSaleViaServer = async (
 
   // Despacho asíncrono a SUNAT si corresponde
   if (isElectronic) {
-    emitToSunatAsync(data.saleId, params.accountId, params.branchId).catch((sunatErr) => {
-      console.warn('[SaleService] Async SUNAT dispatch deferred or error:', sunatErr);
-    });
+    const emitOptions = buildSunatEmitOptions(params.documentType, params.customer, params.notes);
+    emitToSunatAsync(data.saleId, params.accountId, params.branchId, emitOptions)
+      .then((sunatRes) => {
+        params.onSunatResult?.(
+          sunatRes ?? {
+            success: false,
+            status: 'error',
+            error: 'No se recibió respuesta del servicio SUNAT.',
+          }
+        );
+      })
+      .catch((sunatErr) => {
+        console.warn('[SaleService] Async SUNAT dispatch deferred or error:', sunatErr);
+        params.onSunatResult?.({
+          success: false,
+          status: 'error',
+          error: sunatErr?.message || 'Error al despachar a SUNAT.',
+        });
+      });
   }
 
   return {
@@ -512,9 +640,15 @@ export const finalizeAttributedSaleViaServer = async (
     documentType: params.documentType,
     total: savedSale.total ?? params.total,
     status: savedSale.status || 'completed',
-    sunatStatus: isElectronic ? 'pending' : 'not_applicable',
+    sunatStatus: savedSale.sunatStatus || (isElectronic ? 'pending' : 'not_applicable'),
     sessionId: savedSale.sessionId || resolvedSessionId,
     offlineId: params.offlineId,
+    documentNumber: savedSale.documentNumber,
+    einvoiceId: savedSale.einvoiceId,
+    fiscalAmounts: savedSale.fiscalAmounts,
+    receiptCustomer: savedSale.receiptCustomer,
+    cdrDescription: savedSale.cdrDescription ?? null,
+    sunatHash: savedSale.sunatHash || savedSale.hash || null,
   };
 };
 
@@ -776,7 +910,7 @@ export const createSaleTransaction = async (
           ? productData.minSalePrice
           : 0;
 
-      if (minSalePrice > 0 && item.price < minSalePrice) {
+      if (!item.isGift && minSalePrice > 0 && item.price < minSalePrice) {
         throw new Error(
           `Precio no permitido para "${item.name}": S/ ${item.price.toFixed(2)} es inferior al precio mínimo autorizado (S/ ${minSalePrice.toFixed(2)}).`
         );
@@ -1073,8 +1207,27 @@ export const createSaleTransaction = async (
       customerName: customerName || null,
       customerDocType: customer?.documentType || null,
       customerDocNumber: customer?.documentNumber || null,
+      customerDni:
+        customer?.dni ||
+        (customer?.documentType === '1' || customer?.documentType === 'DNI'
+          ? customer.documentNumber
+          : null) ||
+        null,
+      customerRuc:
+        customer?.ruc ||
+        (customer?.documentType === '6' || customer?.documentType === 'RUC'
+          ? customer.documentNumber
+          : null) ||
+        null,
       customerPhone: customer?.phone || null,
       customerAddress: customer?.address || null,
+      customerEmail: customer?.email || null,
+      discountAmount: Math.round((params.discountAmount ?? 0) * 100) / 100,
+      shippingAmount: Math.round((params.shippingAmount ?? 0) * 100) / 100,
+      ...(params.sellerId ? { sellerId: params.sellerId } : {}),
+      ...(params.sellerName ? { sellerName: params.sellerName } : {}),
+      ...(params.taxExemptionCode ? { taxExemptionCode: params.taxExemptionCode } : {}),
+      ...(typeof params.isAmazonExempt === 'boolean' ? { isAmazonExempt: params.isAmazonExempt } : {}),
       notes: notes || null,
       sessionId: resolvedSessionId || null,
       offlineId: offlineId || null,
@@ -1185,22 +1338,44 @@ export const createSaleTransaction = async (
         }
       }
 
-      // H. Registrar cuenta por cobrar si es 'fiado' / crédito
+      // H. Registrar fiado canónico en `reservations` si es crédito / fiado (sin escribir accounts_receivable en cliente)
       if (isFiado && customerId) {
-        const receivableRef = doc(collection(db, RECEIVABLES_COLLECTION));
+        const fiadoRef = doc(collection(db, RESERVATIONS_COLLECTION));
         const debtAmount = effectiveCredit > 0 ? effectiveCredit : total;
-        tx.set(receivableRef, {
-          accountId,
-          branchId,
-          customerId,
-          customerName,
-          saleId,
-          correlative,
-          originalAmount: debtAmount,
-          currentDebt: debtAmount,
-          status: 'pending',
-          createdAt: serverTimestamp(),
-        });
+        const saleDateMs = saleDate || Date.now();
+        const creditDays = Math.max(1, Number(params.creditDays || 30));
+        tx.set(
+          fiadoRef,
+          cleanFirestoreData({
+            accountId,
+            branchId,
+            type: 'fiado',
+            isFiado: true,
+            isCreditSale: true,
+            reservationNumber: nextNumber,
+            date: saleDateMs,
+            dueDate: saleDateMs + creditDays * 24 * 60 * 60 * 1000,
+            items: enrichedItems,
+            subtotal: Math.round(subtotal * 100) / 100,
+            tax: Math.round(tax * 100) / 100,
+            total: debtAmount,
+            originalTotal: debtAmount,
+            currentDebt: debtAmount,
+            paidAmount: 0,
+            returnedAmount: 0,
+            returnHistory: [],
+            status: 'pending',
+            customerId,
+            customerName: customerName || 'Cliente Fiado',
+            customerPhone: customer?.phone || null,
+            saleId,
+            correlative,
+            sellerId: params.sellerId || null,
+            sellerName: params.sellerName || null,
+            createdBy: auth.currentUser?.uid || userId,
+            createdAt: serverTimestamp(),
+          })
+        );
       }
     }
 
@@ -1222,9 +1397,25 @@ export const createSaleTransaction = async (
     !isQuote &&
     (transactionResult.documentType === 'boleta' || transactionResult.documentType === 'factura')
   ) {
-    emitToSunatAsync(transactionResult.saleId, accountId, branchId).catch((sunatErr) => {
-      console.warn('[SaleService] Async SUNAT dispatch deferred or error:', sunatErr);
-    });
+    const emitOptions = buildSunatEmitOptions(transactionResult.documentType, customer, notes);
+    emitToSunatAsync(transactionResult.saleId, accountId, branchId, emitOptions)
+      .then((sunatRes) => {
+        params.onSunatResult?.(
+          sunatRes ?? {
+            success: false,
+            status: 'error',
+            error: 'No se recibió respuesta del servicio SUNAT.',
+          }
+        );
+      })
+      .catch((sunatErr) => {
+        console.warn('[SaleService] Async SUNAT dispatch deferred or error:', sunatErr);
+        params.onSunatResult?.({
+          success: false,
+          status: 'error',
+          error: sunatErr?.message || 'Error al despachar a SUNAT.',
+        });
+      });
   }
 
   return transactionResult;
@@ -1234,54 +1425,198 @@ export const createSaleTransaction = async (
 // SUNAT ASYNCHRONOUS EMITTER
 // ============================================================================
 
+export interface SunatEmitCustomerPayload {
+  identityType: '6' | '1';
+  identityNumber: string;
+  name: string;
+  address?: string;
+  email?: string;
+}
+
+export interface SunatEmitOptions {
+  documentType?: '01' | '03' | '07' | '08' | SaleDocumentType;
+  customer?: SunatEmitCustomerPayload;
+  notes?: string[];
+}
+
+export interface SunatEmitResult {
+  success: boolean;
+  status: 'pending' | 'submitted' | 'accepted' | 'rejected' | 'error' | 'not_applicable';
+  documentNumber?: string;
+  cdrDescription?: string | null;
+  einvoiceId?: string;
+  fiscalAmounts?: CreateSaleTransactionResult['fiscalAmounts'];
+  receiptCustomer?: CreateSaleTransactionResult['receiptCustomer'];
+  sunatHash?: string | null;
+  einvoice?: any;
+  error?: string;
+}
+
+export const buildSunatEmitOptions = (
+  documentType: SaleDocumentType | string,
+  customer?: CustomerInput,
+  notes?: string
+): SunatEmitOptions => {
+  const code: '01' | '03' | '07' | '08' =
+    documentType === 'factura' || documentType === '01'
+      ? '01'
+      : documentType === 'credit_note' || documentType === '07'
+        ? '07'
+        : documentType === 'debit_note' || documentType === '08'
+          ? '08'
+          : '03';
+
+  const cleanDoc = String(
+    customer?.ruc || customer?.dni || customer?.documentNumber || ''
+  ).replace(/\D/g, '');
+
+  let emitCustomer: SunatEmitCustomerPayload | undefined;
+  if (code === '01' && cleanDoc.length === 11) {
+    emitCustomer = {
+      identityType: '6',
+      identityNumber: cleanDoc,
+      name: (customer?.name || 'CLIENTE').trim(),
+      ...(customer?.address ? { address: customer.address } : {}),
+      ...(customer?.email ? { email: customer.email } : {}),
+    };
+  } else if (code === '03' && (cleanDoc.length === 8 || cleanDoc.length === 11) && customer?.name) {
+    emitCustomer = {
+      identityType: cleanDoc.length === 11 ? '6' : '1',
+      identityNumber: cleanDoc,
+      name: customer.name.trim(),
+      ...(customer?.address ? { address: customer.address } : {}),
+      ...(customer?.email ? { email: customer.email } : {}),
+    };
+  }
+
+  return {
+    documentType: code,
+    ...(emitCustomer ? { customer: emitCustomer } : {}),
+    ...(notes?.trim() ? { notes: [notes.trim()] } : {}),
+  };
+};
+
 /**
- * Invoca el backend de facturación electrónica SUNAT con el token JWT de Firebase Auth
+ * Invoca el backend de facturación electrónica SUNAT con el token JWT de Firebase Auth.
+ * Envía obligatoriamente `documentType` ('01' | '03' | '07' | '08') y `customer` válido
+ * porque `/api/invoicing/emit` asume Factura ('01') si `documentType` se omite.
  */
 export const emitToSunatAsync = async (
   saleId: string,
   accountId: string,
-  branchId: string
-): Promise<void> => {
+  branchId: string,
+  options?: SunatEmitOptions
+): Promise<SunatEmitResult | null> => {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 12000);
+  const timeoutId = setTimeout(() => controller.abort(), 110000);
   try {
     const currentUser = auth.currentUser;
     const token = await currentUser?.getIdToken();
+    if (!token) return null;
+
+    const rawDocType = options?.documentType;
+    const sunatDocCode: '01' | '03' | '07' | '08' =
+      rawDocType === '01' || rawDocType === 'factura'
+        ? '01'
+        : rawDocType === '07'
+          ? '07'
+          : rawDocType === '08'
+            ? '08'
+            : '03';
+
+    const payload: Record<string, any> = {
+      saleId,
+      accountId,
+      branchId,
+      documentType: sunatDocCode,
+    };
+    if (options?.customer) {
+      payload.customer = options.customer;
+    }
+    if (options?.notes && options.notes.length > 0) {
+      payload.notes = options.notes;
+    }
 
     const response = await fetch(`${APP_URL}/api/invoicing/emit`, {
       method: 'POST',
       signal: controller.signal,
       headers: {
         'Content-Type': 'application/json',
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        Authorization: `Bearer ${token}`,
+        'x-ventify-client': 'v3',
       },
-      body: JSON.stringify({
-        saleId,
-        accountId,
-        branchId,
-      }),
+      body: JSON.stringify(payload),
     });
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error(`[SaleService] Error en emisión SUNAT (${response.status}):`, errorText);
-      await updateDoc(doc(db, SALES_COLLECTION, saleId), {
-        sunatStatus: 'error',
-        sunatError: `HTTP ${response.status}: ${errorText.slice(0, 200)}`,
-        sunatUpdatedAt: serverTimestamp(),
-      });
-      return;
+    const rawText = await response.text().catch(() => '');
+    let data: any;
+    try {
+      data = rawText ? JSON.parse(rawText) : {};
+    } catch {
+      data = { success: false, error: rawText.slice(0, 200) };
     }
 
-    const data = await response.json();
-    await updateDoc(doc(db, SALES_COLLECTION, saleId), {
-      sunatStatus: data.success ? 'accepted' : 'rejected',
-      cdrDescription: data.cdrDescription || data.message || null,
-      hash: data.hash || null,
-      xmlUrl: data.xmlUrl || null,
-      pdfUrl: data.pdfUrl || null,
-      sunatResponseDate: serverTimestamp(),
-    });
+    if (!response.ok) {
+      const errMsg = data?.error || data?.message || `HTTP ${response.status}`;
+      const nextStatus: SunatEmitResult['status'] =
+        response.status >= 500 || response.status === 429 ? 'error' : 'rejected';
+      console.error(`[SaleService] Error en emisión SUNAT (${response.status}):`, errMsg);
+      try {
+        await updateDoc(doc(db, SALES_COLLECTION, saleId), {
+          sunatStatus: nextStatus,
+          sunatError: String(errMsg).slice(0, 200),
+          cdrDescription: String(errMsg).slice(0, 200),
+          sunatUpdatedAt: serverTimestamp(),
+        });
+      } catch (_) {}
+      return {
+        success: false,
+        status: nextStatus,
+        cdrDescription: String(errMsg),
+        error: String(errMsg),
+      };
+    }
+
+    const einvoice = data?.einvoice;
+    const resolvedStatus: SunatEmitResult['status'] =
+      einvoice?.status || (data?.success ? 'accepted' : 'rejected');
+    const resolvedDocNumber: string | undefined =
+      einvoice?.documentNumber || data?.documentNumber || undefined;
+    const cdrDescription: string | null =
+      einvoice?.cdr?.description || data?.cdrDescription || data?.message || data?.error || null;
+    const sunatHash: string | null =
+      einvoice?.digestValue || einvoice?.hash || data?.hash || null;
+
+    try {
+      await updateDoc(doc(db, SALES_COLLECTION, saleId), {
+        sunatStatus: resolvedStatus,
+        ...(resolvedDocNumber ? { documentNumber: resolvedDocNumber } : {}),
+        ...(einvoice?.id ? { einvoiceId: einvoice.id } : {}),
+        ...(einvoice?.receiptAmounts ? { fiscalAmounts: einvoice.receiptAmounts } : {}),
+        ...(einvoice?.receiptCustomer ? { receiptCustomer: einvoice.receiptCustomer } : {}),
+        cdrDescription,
+        hash: sunatHash,
+        sunatHash,
+        xmlUrl: einvoice?.xmlUrl || data?.xmlUrl || null,
+        pdfUrl: einvoice?.pdfUrl || data?.pdfUrl || null,
+        sunatResponseDate: serverTimestamp(),
+      });
+    } catch (persistErr) {
+      // El backend Admin SDK ya actualiza el documento; un cashier puede no tener permisos de updateDoc en sales
+      console.warn('[SaleService] Client post-emit update skipped:', persistErr);
+    }
+
+    return {
+      success: Boolean(data?.success),
+      status: resolvedStatus,
+      documentNumber: resolvedDocNumber,
+      cdrDescription,
+      einvoiceId: einvoice?.id,
+      fiscalAmounts: einvoice?.receiptAmounts,
+      receiptCustomer: einvoice?.receiptCustomer,
+      sunatHash,
+      einvoice,
+    };
   } catch (err: any) {
     console.error('[SaleService] Fallo al invocar endpoint SUNAT:', err);
     try {
@@ -1291,6 +1626,7 @@ export const emitToSunatAsync = async (
         sunatUpdatedAt: serverTimestamp(),
       });
     } catch (_) {}
+    return null;
   } finally {
     clearTimeout(timeoutId);
   }
@@ -1317,9 +1653,112 @@ export const cancelSaleWithReversal = async (
   }
 
   const legacySaleSnapshot = await getDoc(doc(db, SALES_COLLECTION, saleId));
-  const legacyAccountId = legacySaleSnapshot.exists()
-    ? String(legacySaleSnapshot.data()?.accountId || '')
-    : '';
+  const legacySaleData = legacySaleSnapshot.exists() ? legacySaleSnapshot.data() : null;
+  const legacyAccountId = legacySaleData ? String(legacySaleData.accountId || '') : '';
+
+  // En ventas a crédito/fiado o usuarios no-administradores con sesión autenticada,
+  // delegar la reversa atómica al servidor `/api/sales/refund` para respetar firestore.rules
+  // (bloqueo de writes en accounts_receivable y sales.update restringido a owner/admin).
+  if (legacySaleData && legacyAccountId && auth?.currentUser) {
+    const isReceivableSale =
+      legacySaleData.creditMode === 'receivable' ||
+      legacySaleData.paymentMethod === 'fiado' ||
+      legacySaleData.paymentMethod === 'credit' ||
+      legacySaleData.paymentCategory === 'credit' ||
+      Number(legacySaleData.creditAmount || 0) > 0;
+    const roleLower = String(userProfile.role || 'cashier').toLowerCase();
+    const isAdminRole = roleLower === 'owner' || roleLower === 'admin';
+
+    if (
+      (isReceivableSale || !isAdminRole) &&
+      legacySaleData.status === 'completed' &&
+      Array.isArray(legacySaleData.items) &&
+      legacySaleData.items.length > 0
+    ) {
+      let enableSellerAttribution = false;
+      try {
+        const posSnap = await getDoc(doc(db, 'settings', `${legacyAccountId}_pos`));
+        if (posSnap.exists()) {
+          enableSellerAttribution = posSnap.data()?.enableSellerAttribution === true;
+        }
+      } catch {
+        // continuar con verificación de attributionVersion y rol
+      }
+
+      if (
+        enableSellerAttribution ||
+        legacySaleData.attributionVersion === 1 ||
+        !isAdminRole ||
+        legacySaleData.creditMode === 'receivable'
+      ) {
+        let activeSessionId = '';
+        try {
+          const userPtrSnap = await getDoc(
+            doc(
+              db,
+              CASH_SESSIONS_COLLECTION,
+              `active_${legacyAccountId}_${legacySaleData.branchId}_${userProfile.uid}`
+            )
+          );
+          if (userPtrSnap.exists() && userPtrSnap.data()?.status === 'open') {
+            activeSessionId = String(userPtrSnap.data()?.activeSessionId || '');
+          }
+          if (!activeSessionId && legacySaleData.sessionId) {
+            const origSessSnap = await getDoc(
+              doc(db, CASH_SESSIONS_COLLECTION, String(legacySaleData.sessionId))
+            );
+            if (
+              origSessSnap.exists() &&
+              origSessSnap.data()?.status === 'open' &&
+              origSessSnap.data()?.startedBy === userProfile.uid
+            ) {
+              activeSessionId = origSessSnap.id;
+            }
+          }
+        } catch {
+          // manejar ausencia de sesión abajo
+        }
+
+        if (!activeSessionId) {
+          throw new Error(
+            'Abre tu caja en la sucursal de la venta para devolver o anular este comprobante.'
+          );
+        }
+
+        const alreadyRefunded = new Set<number>(
+          Array.isArray(legacySaleData.refundedLineIndices)
+            ? legacySaleData.refundedLineIndices
+            : []
+        );
+        const remainingIndices = legacySaleData.items
+          .map((_: any, idx: number) => idx)
+          .filter((idx: number) => !alreadyRefunded.has(idx));
+
+        if (remainingIndices.length === 0) {
+          throw new Error(
+            'Esta venta ya tiene devoluciones registradas en todas sus líneas.'
+          );
+        }
+
+        const refundRes = await refundSaleLines(saleId, remainingIndices, {
+          accountId: legacyAccountId,
+          branchId: legacySaleData.branchId,
+          sessionId: activeSessionId,
+          method: 'Auto',
+        });
+
+        return {
+          saleId,
+          correlative: legacySaleData.correlative || saleId,
+          status: 'cancelled',
+          reversalMovementsCount: refundRes.reversalMovementsCount,
+          cashRefunded: refundRes.cashRefunded,
+          cancelledAt: new Date(refundRes.refundedAt || Date.now()),
+        };
+      }
+    }
+  }
+
   const legacyMovements = legacyAccountId ? await getDocs(query(
     collection(db, INVENTORY_MOVEMENTS_COLLECTION),
     where('saleId', '==', saleId),
@@ -1333,8 +1772,10 @@ export const cancelSaleWithReversal = async (
     }
   }
 
-  const linkedReceivables = legacyAccountId ? await getDocs(query(
-    collection(db, RECEIVABLES_COLLECTION), where('accountId', '==', legacyAccountId), where('saleId', '==', saleId),
+  const linkedFiadoReservations = legacyAccountId ? await getDocs(query(
+    collection(db, RESERVATIONS_COLLECTION),
+    where('accountId', '==', legacyAccountId),
+    where('saleId', '==', saleId),
   )) : { docs: [] };
 
   const result = await runTransaction(db, async (tx) => {
@@ -1446,11 +1887,21 @@ export const cancelSaleWithReversal = async (
       ? doc(db, CUSTOMERS_COLLECTION, saleData.customerId)
       : null;
     const customerSnap = customerRef ? await tx.get(customerRef) : null;
-    const receivableSnapshots = isFiadoSale
-      ? await Promise.all(linkedReceivables.docs.map(entry => tx.get(entry.ref))) : [];
-    const receivables = receivableSnapshots.filter(entry => entry.exists()).map(entry => ({ ref: entry.ref, data: entry.data()! }));
-    if (receivables.some(entry => entry.data.accountId !== accountId || entry.data.saleId !== saleId || entry.data.customerId !== saleData.customerId)) {
-      throw new Error('La cuenta por cobrar cambió. Actualiza el historial antes de anular.');
+    const fiadoReservationSnapshots = isFiadoSale
+      ? await Promise.all(linkedFiadoReservations.docs.map((entry) => tx.get(entry.ref)))
+      : [];
+    const fiadoReservations = fiadoReservationSnapshots
+      .filter((entry) => entry.exists())
+      .map((entry) => ({ ref: entry.ref, data: entry.data()! }));
+    if (
+      fiadoReservations.some(
+        (entry) =>
+          entry.data.accountId !== accountId ||
+          entry.data.saleId !== saleId ||
+          entry.data.customerId !== saleData.customerId
+      )
+    ) {
+      throw new Error('El fiado vinculado cambió. Actualiza el historial antes de anular.');
     }
 
 
@@ -1608,9 +2059,21 @@ export const cancelSaleWithReversal = async (
     // 3. Revertir deuda por cobrar o devolver créditos prepagados según el método original
     if (customerRef && customerSnap?.exists()) {
       const custData = customerSnap.data();
-      const creditReverted = isFiadoSale && receivables.length
-        ? receivables.reduce((sum, entry) => sum + Math.max(0, Number(entry.data.currentDebt) || 0), 0)
-        : creditAmount;
+      const creditReverted =
+        isFiadoSale && fiadoReservations.length
+          ? fiadoReservations.reduce(
+              (sum, entry) =>
+                sum +
+                Math.max(
+                  0,
+                  Number(
+                    entry.data.currentDebt ??
+                      Math.max(0, Number(entry.data.total || 0) - Number(entry.data.paidAmount || 0))
+                  ) || 0
+                ),
+              0
+            )
+          : creditAmount;
       if (isPrepaidCreditSale) {
         const currentCredits = Number(custData.credits || 0);
         tx.update(customerRef, {
@@ -1626,7 +2089,7 @@ export const cancelSaleWithReversal = async (
       }
     }
 
-    for (const entry of receivables) {
+    for (const entry of fiadoReservations) {
       tx.update(entry.ref, { currentDebt: 0, status: 'cancelled', lastModified: serverTimestamp() });
     }
 

@@ -35,6 +35,7 @@ const ORDER_DEPOSITS_COLLECTION = 'order_deposits';
 const CREDIT_HISTORY_COLLECTION = 'credit_history';
 const RESERVATIONS_COLLECTION = 'reservations';
 const ORDERS_COLLECTION = 'orders';
+const FIADO_RETURNS_COLLECTION = 'fiado_returns';
 const PRODUCTS_COLLECTION = 'products';
 const SALES_COLLECTION = 'sales';
 const INVENTORY_MOVEMENTS_COLLECTION = 'inventory_movements';
@@ -71,6 +72,8 @@ const APP_URL =
 import type { UserProfileInfo } from './sale-service';
 import { aggregateStockRequirements, getDepositSessionUpdates, normalizeOrderItems, toEpochMillis } from './crm-compat';
 import { apiRequest } from '@/lib/api-client';
+import { cleanFirestoreData } from '@/lib/firebase-utils';
+import { deriveBranchIds, deriveLowStockBranches } from '@/lib/product-branch-ids';
 
 export interface CustomerData {
   id?: string;
@@ -121,14 +124,57 @@ export interface FiadoHistoryEntry {
   purpose?: string;
 }
 
+export interface FiadoReturnRecord {
+  date: number;
+  reason: string;
+  operatorId: string;
+  operatorName?: string;
+  items: Array<{
+    productId: string;
+    name: string;
+    quantity: number;
+    stockUnits?: number;
+    variantId?: string;
+    presentationId?: string;
+    presentationQty?: number;
+    unitPrice: number;
+    costPrice?: number;
+  }>;
+  amount: number;
+}
+
 export interface OpenFiado {
   id: string;
   reservationNumber?: number;
+  branchId?: string;
   total: number;
   paidAmount: number;
+  returnedAmount?: number;
   remainingAmount: number;
   date: number;
   dueDate?: number;
+  items?: ReservationOrderItem[];
+  returnHistory?: FiadoReturnRecord[];
+}
+
+export interface FiadoReturnItemInput {
+  productId: string;
+  quantity: number;
+}
+
+export interface ReturnFiadoMerchandiseParams {
+  accountId: string;
+  reservationId: string;
+  items: FiadoReturnItemInput[];
+  reason: string;
+  userProfile: UserProfileInfo;
+}
+
+export interface WriteOffFiadoParams {
+  accountId: string;
+  reservationId: string;
+  reason: string;
+  userProfile: UserProfileInfo;
 }
 
 export interface ReservationOrderItem {
@@ -138,6 +184,7 @@ export interface ReservationOrderItem {
   name?: string;
   sku?: string;
   price: number;
+  costPrice?: number;
   quantity: number;
   variantId?: string;
   variantName?: string;
@@ -200,6 +247,10 @@ export interface ReservationOrder {
     name: string;
     phone?: string;
     documentNumber?: string;
+    dni?: string;
+    ruc?: string;
+    address?: string;
+    email?: string;
   };
   pickupDate?: any;
   notes?: string;
@@ -221,9 +272,14 @@ export interface BusinessKPIContext {
 }
 
 export interface AskVentyAIParams {
-  prompt: string;
+  prompt?: string;
+  question?: string;
+  accountId?: string;
+  branchId?: string;
   contextSummary?: BusinessKPIContext;
   history?: Array<{ role: 'user' | 'assistant' | 'system'; content: string }>;
+  conversationHistory?: Array<{ role: 'user' | 'assistant'; content: string }>;
+  onChunk?: (accumulatedText: string, delta: string) => void;
 }
 
 // ============================================================================
@@ -371,7 +427,6 @@ export const registerFiadoPayment = async (
     }
 
     const reservationSnap = reservationRef ? await tx.get(reservationRef) : null;
-    const isCash = paymentMethod === 'efectivo' || paymentMethod === 'cash';
     const sessionRef = sessionId ? doc(db, CASH_SESSIONS_COLLECTION, sessionId) : null;
     const sessionSnap = sessionRef ? await tx.get(sessionRef) : null;
     const sessionData = sessionSnap ? requireOpenSession(sessionSnap, accountId, branchId) : null;
@@ -440,6 +495,7 @@ export const registerFiadoPayment = async (
       accountId,
       branchId,
       sessionId: sessionId || null,
+      cashSessionId: sessionId || null,
       customerId: customer.id,
       reservationId: params.reservationId || null,
       reservationNumber: reservationData?.reservationNumber || null,
@@ -469,31 +525,12 @@ export const registerFiadoPayment = async (
       });
     }
 
-    // 5. Si el pago es en efectivo, ingresarlo a la caja chica oficial
-    if (isCash && sessionId && sessionRef && sessionSnap) {
-      const cashMovementRef = doc(collection(db, CASH_MOVEMENTS_COLLECTION));
-      tx.set(cashMovementRef, {
-        accountId,
-        branchId,
-        sessionId,
-        type: 'income',
-        category: 'fiado_payment',
-        amount: appliedAmount,
-        description: `Abono de fiado: ${customer.name || cData.name}`,
-        referenceId: paymentId,
-        createdBy: userProfile.uid,
-        createdByName: userProfile.displayName || userProfile.email || 'Usuario',
-        createdAt: serverTimestamp(),
+    // 5. Actualizar acumuladores de depósitos en la sesión de caja para TODOS los medios (efectivo, tarjeta, digital)
+    if (sessionId && sessionRef && sessionSnap && sessionData && appliedAmount > 0) {
+      tx.update(sessionRef, {
+        ...getDepositSessionUpdates(sessionData, 'reservation', paymentMethod, appliedAmount),
+        updatedAt: serverTimestamp(),
       });
-
-      // Actualizar sesión si está abierta
-      if (sessionSnap && sessionData) {
-        const sData = sessionData;
-        tx.update(sessionRef, {
-          ...getDepositSessionUpdates(sData, 'reservation', paymentMethod, appliedAmount),
-          updatedAt: serverTimestamp(),
-        });
-      }
     }
   });
 
@@ -611,21 +648,343 @@ export const getCustomerOpenFiados = async (accountId: string, customerId: strin
   }
   return snapshot.docs.flatMap((entry) => {
     const data = entry.data();
-    if (!(data.isFiado === true || data.isCreditSale === true || data.type === 'fiado') || data.status === 'settled' || data.status === 'cancelled') return [];
+    if (
+      !(data.isFiado === true || data.isCreditSale === true || data.type === 'fiado') ||
+      data.status === 'settled' ||
+      data.status === 'cancelled' ||
+      data.status === 'written_off'
+    ) {
+      return [];
+    }
     const total = Number(data.total) || 0;
     const paidAmount = Number(data.paidAmount) || 0;
-    const remainingAmount = Math.max(0, Math.round((total - paidAmount - (Number(data.returnedAmount) || 0)) * 100) / 100);
+    const returnedAmount = Number(data.returnedAmount) || 0;
+    const remainingAmount = Math.max(0, Math.round((total - paidAmount - returnedAmount) * 100) / 100);
     if (remainingAmount <= 0) return [];
     return [{
       id: entry.id,
       reservationNumber: Number(data.reservationNumber) || undefined,
+      branchId: data.branchId,
       total,
       paidAmount,
+      returnedAmount,
       remainingAmount,
       date: toEpochMillis(data.date || data.createdAt),
       dueDate: toEpochMillis(data.dueDate) || undefined,
+      items: Array.isArray(data.items) ? normalizeOrderItems(data.items) : [],
+      returnHistory: Array.isArray(data.returnHistory) ? data.returnHistory : [],
     }];
   }).sort((a, b) => a.date - b.date);
+};
+
+const roundCents = (n: number): number => Math.round((Number(n) || 0) * 100) / 100;
+const roundUnits = (n: number): number => Math.round((Number(n) || 0) * 10000) / 10000;
+
+const settleLinkedFiadoDeposits = async (accountId: string, reservationId: string): Promise<void> => {
+  try {
+    const snap = await getDocs(
+      query(
+        collection(db, RESERVATION_DEPOSITS_COLLECTION),
+        where('accountId', '==', accountId),
+        where('reservationId', '==', reservationId),
+        where('status', '==', 'active')
+      )
+    );
+    if (snap.empty) return;
+    await runTransaction(db, async (tx) => {
+      const snaps = await Promise.all(snap.docs.map((d) => tx.get(d.ref)));
+      snaps.forEach((docSnap) => {
+        if (docSnap.exists() && docSnap.data()?.status === 'active') {
+          tx.update(docSnap.ref, { status: 'settled' });
+        }
+      });
+    });
+  } catch (err) {
+    console.warn('[CRMService] No se pudieron liquidar depósitos vinculados:', err);
+  }
+};
+
+/**
+ * Devuelve mercadería de un fiado activo: reingresa stock físico por unidad/variante,
+ * reduce `currentDebt` (acumulando excedente en `credits`), marca `settled` si llega a 0
+ * y registra el comprobante en `fiado_returns`.
+ */
+export const returnFiadoMerchandise = async (
+  params: ReturnFiadoMerchandiseParams
+): Promise<{ remaining: number; settled: boolean; creditApplied: number; returnAmount: number }> => {
+  const { accountId, reservationId, items, reason, userProfile } = params;
+  if (!accountId || !reservationId) throw new Error('Cuenta y fiado son requeridos.');
+  if (!reason || reason.trim().length < 3) {
+    throw new Error('Indica el motivo de la devolución (mínimo 3 caracteres).');
+  }
+  if (!userProfile?.uid) throw new Error('Operador no autenticado.');
+  if (!Array.isArray(items) || items.every((i) => !(Number(i.quantity) > 0))) {
+    throw new Error('Indica al menos un producto a devolver.');
+  }
+
+  const reservationRef = doc(db, RESERVATIONS_COLLECTION, reservationId);
+  const returnRef = doc(collection(db, FIADO_RETURNS_COLLECTION));
+  const now = Date.now();
+  const actorName = userProfile.displayName || userProfile.email || 'Usuario';
+
+  let remaining = 0;
+  let settled = false;
+  let creditApplied = 0;
+  let returnValue = 0;
+
+  await runTransaction(db, async (tx) => {
+    const resSnap = await tx.get(reservationRef);
+    if (!resSnap.exists()) throw new Error('Fiado no encontrado.');
+    const resData = resSnap.data() as Record<string, any>;
+    if (resData.accountId !== accountId) throw new Error('El fiado no pertenece a esta cuenta.');
+    if (!(resData.type === 'fiado' || resData.isCreditSale === true || resData.isFiado === true)) {
+      throw new Error('Esta operación solo aplica a fiados.');
+    }
+    if (resData.status !== 'pending') throw new Error('El fiado no está pendiente.');
+    if (!resData.customerId) throw new Error('El fiado no tiene cliente.');
+
+    const resItems: any[] = Array.isArray(resData.items) ? resData.items : [];
+    const alreadyReturned = new Map<string, number>();
+    for (const ret of resData.returnHistory || []) {
+      for (const line of ret.items || []) {
+        const pid = String(line.productId || '');
+        alreadyReturned.set(pid, (alreadyReturned.get(pid) || 0) + (Number(line.quantity) || 0));
+      }
+    }
+
+    const returnLines: FiadoReturnRecord['items'] = [];
+    returnValue = 0;
+    for (const reqLine of items) {
+      const qty = Number(reqLine.quantity) || 0;
+      if (!(qty > 0)) continue;
+      const original = resItems.find((i) => String(i.id || i.productId) === String(reqLine.productId));
+      if (!original) throw new Error('El producto no pertenece a este fiado.');
+      const origPid = String(original.id || original.productId);
+      const used = alreadyReturned.get(origPid) || 0;
+      const maxQty = Number(original.quantity) || 0;
+      if (used + qty > maxQty) {
+        throw new Error(`No se puede devolver más de lo entregado de ${original.name || original.productName || origPid}.`);
+      }
+      const unitPrice = Number(original.price) || 0;
+      const costPrice = Number(original.costPrice);
+      const factor = Number(original.presentationQty) > 0
+        ? Number(original.presentationQty)
+        : Number(original.conversionFactor) > 0
+          ? Number(original.conversionFactor)
+          : 1;
+      const stockUnits = roundUnits(qty * factor);
+      returnLines.push({
+        productId: origPid,
+        name: original.name || original.productName || 'Producto',
+        quantity: qty,
+        stockUnits,
+        ...(original.variantId ? { variantId: original.variantId } : {}),
+        ...(original.presentationId ? { presentationId: original.presentationId } : {}),
+        ...(factor > 1 ? { presentationQty: factor } : {}),
+        unitPrice,
+        costPrice: Number.isFinite(costPrice) ? costPrice : 0,
+      });
+      returnValue = roundCents(returnValue + unitPrice * qty);
+      alreadyReturned.set(origPid, used + qty);
+    }
+
+    if (!returnLines.length || !(returnValue > 0)) {
+      throw new Error('La devolución no tiene un monto válido.');
+    }
+
+    const customerRef = doc(db, CUSTOMERS_COLLECTION, resData.customerId);
+    const productIds = [...new Set(returnLines.map((l) => l.productId))];
+    const [custSnap, ...prodSnaps] = await Promise.all([
+      tx.get(customerRef),
+      ...productIds.map((pid) => tx.get(doc(db, PRODUCTS_COLLECTION, pid))),
+    ]);
+
+    if (!custSnap.exists()) throw new Error('Cliente no encontrado.');
+
+    const branchId = String(resData.branchId || '');
+    for (let idx = 0; idx < productIds.length; idx += 1) {
+      const pid = productIds[idx];
+      const pSnap = prodSnaps[idx];
+      if (!pSnap.exists()) {
+        const label = returnLines.find((l) => l.productId === pid)?.name || pid;
+        throw new Error(`Producto no encontrado: ${label}`);
+      }
+      const product = pSnap.data() as Record<string, any>;
+      const productLines = returnLines.filter((l) => l.productId === pid);
+      const variants = Array.isArray(product.variants) ? product.variants : [];
+      const usesVariants = variants.length > 0 && productLines.some((l) => Boolean(l.variantId));
+
+      if (usesVariants) {
+        const nextVariants = variants.map((v: any) => ({ ...v, stock: { ...(v.stock || {}) } }));
+        for (const line of productLines) {
+          if (!line.variantId) throw new Error(`${product.name || pid}: variante requerida en devolución.`);
+          const vIdx = nextVariants.findIndex((v: any) => v.id === line.variantId);
+          if (vIdx === -1) throw new Error(`${product.name || pid}: variante ${line.variantId} ya no existe.`);
+          const prev = Number(nextVariants[vIdx].stock?.[branchId]) || 0;
+          nextVariants[vIdx].stock[branchId] = roundUnits(prev + (Number(line.stockUnits) || line.quantity));
+        }
+        const aggregated: Record<string, number> = {};
+        for (const v of nextVariants) {
+          for (const [b, q] of Object.entries(v.stock || {})) {
+            aggregated[b] = roundUnits((aggregated[b] || 0) + (Number(q) || 0));
+          }
+        }
+        tx.update(pSnap.ref, {
+          variants: nextVariants,
+          stock: aggregated,
+          branchIds: deriveBranchIds(aggregated),
+          lowStockBranches: deriveLowStockBranches(aggregated, product.reservedStock),
+        });
+      } else {
+        const nextStock = { ...(product.stock || {}) };
+        const addedUnits = productLines.reduce((sum, l) => sum + (Number(l.stockUnits) || l.quantity), 0);
+        nextStock[branchId] = roundUnits((Number(nextStock[branchId]) || 0) + addedUnits);
+        tx.update(pSnap.ref, {
+          stock: nextStock,
+          branchIds: deriveBranchIds(nextStock),
+          lowStockBranches: deriveLowStockBranches(nextStock, product.reservedStock),
+        });
+      }
+    }
+
+    const nextReturned = roundCents((Number(resData.returnedAmount) || 0) + returnValue);
+    const total = Number(resData.total) || 0;
+    const paidAmount = Number(resData.paidAmount) || 0;
+    const nextRemaining = roundCents(Math.max(0, total - paidAmount - nextReturned));
+    const shouldSettle = nextRemaining <= 0;
+    const surplus = roundCents(Math.max(0, paidAmount + nextReturned - total));
+
+    const currentDebt = Number(custSnap.data()?.currentDebt) || 0;
+    const nextDebt = roundCents(Math.max(0, currentDebt - returnValue));
+    const currentCredits = Number(custSnap.data()?.credits) || 0;
+
+    const historyEntry: FiadoReturnRecord = {
+      date: now,
+      reason: reason.trim(),
+      operatorId: userProfile.uid,
+      operatorName: actorName,
+      items: returnLines,
+      amount: returnValue,
+    };
+
+    tx.update(reservationRef, cleanFirestoreData({
+      returnedAmount: nextReturned,
+      returnHistory: [...(resData.returnHistory || []), historyEntry],
+      ...(shouldSettle ? { status: 'settled', settledDate: now } : {}),
+    }));
+
+    tx.update(customerRef, {
+      currentDebt: nextDebt,
+      ...(surplus > 0 ? { credits: roundCents(currentCredits + surplus) } : {}),
+    });
+
+    tx.set(returnRef, cleanFirestoreData({
+      accountId: resData.accountId,
+      branchId: resData.branchId,
+      reservationId,
+      reservationNumber: resData.reservationNumber || 0,
+      customerId: resData.customerId,
+      date: now,
+      reason: reason.trim(),
+      operatorId: userProfile.uid,
+      operatorName: actorName,
+      items: returnLines.map((line) => ({
+        productId: line.productId,
+        name: line.name,
+        quantity: line.quantity,
+        stockUnits: line.stockUnits ?? line.quantity,
+        ...(line.presentationQty ? { presentationQty: line.presentationQty } : {}),
+        ...(line.variantId ? { variantId: line.variantId } : {}),
+        costPrice: line.costPrice || 0,
+        salePrice: line.unitPrice,
+      })),
+      amount: returnValue,
+      createdAt: serverTimestamp(),
+    }));
+
+    remaining = nextRemaining;
+    settled = shouldSettle;
+    creditApplied = surplus;
+  });
+
+  if (settled) {
+    await settleLinkedFiadoDeposits(accountId, reservationId);
+  }
+
+  return { remaining, settled, creditApplied, returnAmount: returnValue };
+};
+
+/**
+ * Castiga un fiado incobrable (`status: 'written_off'`). Solo owner/admin según firestore.rules.
+ * No toca stock ni caja; reduce `currentDebt` por el saldo pendiente del fiado.
+ */
+export const writeOffFiado = async (
+  params: WriteOffFiadoParams
+): Promise<{ writeOffAmount: number; nextDebt: number }> => {
+  const { accountId, reservationId, reason, userProfile } = params;
+  if (!accountId || !reservationId) throw new Error('Cuenta y fiado son requeridos.');
+  if (!reason || reason.trim().length < 3) {
+    throw new Error('Indica el motivo del castigo (mínimo 3 caracteres).');
+  }
+  if (!userProfile?.uid) throw new Error('El operador es obligatorio.');
+
+  const reservationRef = doc(db, RESERVATIONS_COLLECTION, reservationId);
+  let writeOffAmount = 0;
+  let nextDebt = 0;
+
+  await runTransaction(db, async (tx) => {
+    const resSnap = await tx.get(reservationRef);
+    if (!resSnap.exists()) throw new Error('Fiado no encontrado.');
+    const resData = resSnap.data() as Record<string, any>;
+    if (resData.accountId !== accountId) throw new Error('El fiado no pertenece a esta cuenta.');
+    if (!(resData.type === 'fiado' || resData.isCreditSale === true || resData.isFiado === true)) {
+      throw new Error('Esta operación solo aplica a fiados.');
+    }
+    if (resData.status !== 'pending') throw new Error('Este fiado no se puede castigar porque ya fue resuelto.');
+    const remaining = roundCents(
+      Math.max(0, (Number(resData.total) || 0) - (Number(resData.paidAmount) || 0) - (Number(resData.returnedAmount) || 0))
+    );
+    if (!(remaining > 0)) throw new Error('Este fiado no tiene saldo pendiente por castigar.');
+    if (!resData.customerId) throw new Error('El fiado no tiene cliente.');
+
+    const customerRef = doc(db, CUSTOMERS_COLLECTION, resData.customerId);
+    const custSnap = await tx.get(customerRef);
+    if (!custSnap.exists()) throw new Error('Cliente no encontrado.');
+
+    writeOffAmount = remaining;
+    nextDebt = roundCents(Math.max(0, (Number(custSnap.data()?.currentDebt) || 0) - remaining));
+    const now = Date.now();
+
+    tx.update(reservationRef, {
+      status: 'written_off',
+      writtenOffAt: now,
+      writtenOffBy: userProfile.uid,
+      writtenOffByName: userProfile.displayName || userProfile.email || 'Administrador',
+      writeOffReason: reason.trim(),
+      writeOffAmount,
+    });
+    tx.update(customerRef, { currentDebt: nextDebt });
+  });
+
+  await settleLinkedFiadoDeposits(accountId, reservationId);
+  return { writeOffAmount, nextDebt };
+};
+
+/**
+ * Recalcula la deuda real del cliente en el servidor (`POST /api/customers/recalculate-debt`).
+ * Requiere rol owner/admin y permiso `manage_customers`.
+ */
+export const recalculateCustomerDebt = async (
+  accountId: string,
+  customerId: string
+): Promise<{ previousDebt: number; recalculatedDebt: number; diff?: number }> => {
+  return apiRequest<{ previousDebt: number; recalculatedDebt: number; diff?: number }>(
+    '/api/customers/recalculate-debt',
+    {
+      method: 'POST',
+      body: { accountId, customerId },
+    }
+  );
 };
 
 // ============================================================================
@@ -1117,6 +1476,23 @@ export interface CompletePaymentParams {
   sellerId?: string;
   sellerName?: string;
   sessionId?: string;
+  documentType?: 'nota_venta' | 'boleta' | 'factura' | '03' | '01' | string;
+  surchargeAmount?: number;
+  chargedAmount?: number;
+  commissionAmount?: number;
+  commissionPercent?: number;
+  commissionRule?: string;
+  customer?: {
+    id?: string;
+    name?: string;
+    phone?: string;
+    dni?: string;
+    ruc?: string;
+    documentNumber?: string;
+    address?: string;
+    email?: string;
+  };
+  onSunatResult?: (result: any) => void;
   /** Optional deposit refund when cancelling a reservation or order. Omitted keeps the deposit. */
   refundMethod?: string;
   refundPercent?: number;
@@ -1132,41 +1508,112 @@ export const completeOrCancelReservation = async (
   if (action === 'complete') {
     if (!paymentInfo?.sessionId) throw new Error('Abre una caja antes de completar la entrega.');
     const paymentMethod = paymentInfo.paymentMethod || 'efectivo';
-    await apiRequest('/api/sales/finalize', {
+    const rawDoc = String(paymentInfo.documentType || 'nota_venta').toLowerCase();
+    const documentType =
+      rawDoc === 'factura' || rawDoc === '01'
+        ? 'factura'
+        : rawDoc === 'boleta' || rawDoc === '03'
+          ? 'boleta'
+          : 'nota_venta';
+
+    const mergedCustomer = {
+      ...(item.customer || {}),
+      ...(paymentInfo.customer || {}),
+    };
+    const cleanDoc = String(
+      mergedCustomer.ruc || mergedCustomer.dni || mergedCustomer.documentNumber || item.customerDocument || ''
+    ).replace(/\D/g, '');
+
+    if (documentType === 'factura' && cleanDoc.length !== 11) {
+      throw new Error('La Factura requiere un RUC válido de 11 dígitos en el cliente.');
+    }
+
+    const salePayload = cleanFirestoreData({
+      accountId: item.accountId,
+      branchId: item.branchId,
+      sessionId: paymentInfo.sessionId,
+      total: Number(item.total) || 0,
+      subtotal: Number(item.total) || 0,
+      tax: 0,
+      paymentMethod,
+      sellerId: paymentInfo.sellerId,
+      sellerName: paymentInfo.sellerName,
+      paymentMethodId: paymentInfo.paymentMethodId || paymentMethod,
+      paymentCategory: paymentInfo.paymentCategory || (paymentMethod === 'efectivo' ? 'cash' : paymentMethod),
+      documentType,
+      ...(Number.isFinite(Number(paymentInfo.surchargeAmount)) && Number(paymentInfo.surchargeAmount) > 0
+        ? { surchargeAmount: roundCents(Number(paymentInfo.surchargeAmount)) }
+        : {}),
+      ...(Number.isFinite(Number(paymentInfo.chargedAmount)) && Number(paymentInfo.chargedAmount) >= 0
+        ? { chargedAmount: roundCents(Number(paymentInfo.chargedAmount)) }
+        : {}),
+      ...(Number.isFinite(Number(paymentInfo.commissionAmount)) && Number(paymentInfo.commissionAmount) > 0
+        ? { commissionAmount: roundCents(Number(paymentInfo.commissionAmount)) }
+        : {}),
+      ...(Number.isFinite(Number(paymentInfo.commissionPercent)) && Number(paymentInfo.commissionPercent) > 0
+        ? { commissionPercent: Number(paymentInfo.commissionPercent) }
+        : {}),
+      ...(paymentInfo.commissionRule ? { commissionRule: paymentInfo.commissionRule } : {}),
+      customerId: mergedCustomer.id || item.customerId || undefined,
+      customerName: mergedCustomer.name || item.customerName || undefined,
+      customerPhone: mergedCustomer.phone || item.customerPhone || undefined,
+      customerDni: cleanDoc.length === 8 ? cleanDoc : undefined,
+      customerRuc: cleanDoc.length === 11 ? cleanDoc : undefined,
+      customerAddress: mergedCustomer.address || undefined,
+      customerEmail: mergedCustomer.email || undefined,
+      items: normalizeOrderItems(item.items).map((it) => ({
+        id: it.id,
+        name: it.name,
+        price: Number(it.price) || 0,
+        quantity: Number(it.quantity) || 0,
+        sku: it.sku || '',
+        variantId: it.variantId,
+        presentationId: it.presentationId,
+        presentationQty: it.presentationQty || it.conversionFactor || 1,
+        isCustomProduct: Boolean((it as any).isCustomProduct),
+      })),
+    });
+
+    const finalizeRes: any = await apiRequest('/api/sales/finalize', {
       method: 'POST',
       body: {
         operationId: `crm-completion-${item.id}`,
         completion: { type: item.type, id: item.id },
-        sale: {
-          accountId: item.accountId,
-          branchId: item.branchId,
-          sessionId: paymentInfo.sessionId,
-          total: Number(item.total) || 0,
-          subtotal: Number(item.total) || 0,
-          tax: 0,
-          paymentMethod,
-          sellerId: paymentInfo.sellerId,
-          sellerName: paymentInfo.sellerName,
-          paymentMethodId: paymentInfo.paymentMethodId || paymentMethod,
-          paymentCategory: paymentInfo.paymentCategory || (paymentMethod === 'efectivo' ? 'cash' : paymentMethod),
-          documentType: 'nota_venta',
-          customerId: item.customer?.id || item.customerId || undefined,
-          customerName: item.customer?.name || item.customerName || undefined,
-          customerPhone: item.customer?.phone || item.customerPhone || undefined,
-          items: normalizeOrderItems(item.items).map((it) => ({
-            id: it.id,
-            name: it.name,
-            price: Number(it.price) || 0,
-            quantity: Number(it.quantity) || 0,
-            sku: it.sku || '',
-            variantId: it.variantId,
-            presentationId: it.presentationId,
-            presentationQty: it.presentationQty || it.conversionFactor || 1,
-            isCustomProduct: Boolean((it as any).isCustomProduct),
-          })),
-        },
+        sale: salePayload,
       },
     });
+
+    if ((documentType === 'boleta' || documentType === 'factura') && finalizeRes?.saleId) {
+      try {
+        const { buildSunatEmitOptions, emitToSunatAsync } = await import('./sale-service');
+        const emitOptions = buildSunatEmitOptions(
+          documentType,
+          {
+            name: mergedCustomer.name || item.customerName || 'CLIENTE',
+            dni: cleanDoc.length === 8 ? cleanDoc : undefined,
+            ruc: cleanDoc.length === 11 ? cleanDoc : undefined,
+            documentNumber: cleanDoc || undefined,
+            address: mergedCustomer.address,
+            email: mergedCustomer.email,
+          },
+          item.notes
+        );
+        const sunatResult = await emitToSunatAsync(
+          finalizeRes.saleId,
+          item.accountId,
+          item.branchId,
+          emitOptions
+        );
+        paymentInfo.onSunatResult?.(sunatResult);
+      } catch (sunatErr) {
+        console.warn('[CRMService] Emisión SUNAT diferida o fallida al completar:', sunatErr);
+        paymentInfo.onSunatResult?.({
+          success: false,
+          sunatStatus: 'error',
+          error: (sunatErr as Error)?.message || 'Error al despachar comprobante a SUNAT',
+        });
+      }
+    }
     return;
   }
 
@@ -1347,97 +1794,183 @@ export const completeOrCancelReservation = async (
 };
 
 // ============================================================================
-// 3. ASISTENTE VENTY IA
+// 3. ASISTENTE VENTY IA (SSE STREAM REAL)
 // ============================================================================
 
-/**
- * Generador de respuesta inteligente autónoma basado en KPIs reales del negocio
- */
-const generateLocalAIResponse = (
-  prompt: string,
-  ctx?: BusinessKPIContext
-): string => {
-  const lower = prompt.toLowerCase();
-  const todaySales = ctx?.todaySales ?? 0;
-  const salesCount = ctx?.salesCount ?? 0;
-  const lowStockCount = ctx?.lowStockCount ?? 0;
-  const lowStockItems = ctx?.lowStockItems || [];
-  const cashInDrawer = ctx?.cashInDrawer ?? 0;
-  const totalDebt = ctx?.totalDebt ?? 0;
-  const branch = ctx?.branchName || 'tu sucursal';
+export interface VentySseState {
+  buffer: string;
+  reply: string;
+}
 
-  if (lower.includes('ventas') || lower.includes('vendido') || lower.includes('hoy') || lower.includes('cuanto va')) {
-    return `📊 **Resumen de Ventas de Hoy (${branch})**:\n- Total Facturado: **S/ ${todaySales.toFixed(2)}**\n- Transacciones: **${salesCount} ventas**\n- Ticket Promedio: **S/ ${(salesCount > 0 ? todaySales / salesCount : 0).toFixed(2)}**\n\n💡 *Tip: Revisa los productos con más movimiento para asegurar existencias en mostrador.*`;
-  }
+/** Parses one SSE chunk incrementally (handles split lines across chunks, JSON text deltas, and [DONE]). */
+export const consumeVentySseChunk = (
+  chunk: string,
+  state: VentySseState,
+  onChunk?: (accumulatedText: string, delta: string) => void
+): boolean => {
+  state.buffer += chunk;
+  const lines = state.buffer.split('\n');
+  state.buffer = lines.pop() ?? '';
 
-  if (lower.includes('stock') || lower.includes('agotan') || lower.includes('inventario') || lower.includes('falta')) {
-    if (lowStockCount === 0) {
-      return `✅ **Estado de Inventario Excelente**:\nNo tienes productos con stock crítico en ${branch}. Todas las existencias están por encima del límite de seguridad.`;
+  for (const rawLine of lines) {
+    const line = rawLine.replace(/\r$/, '').trim();
+    if (!line || !line.startsWith('data:')) continue;
+    const payload = line.slice(5).trim();
+    if (!payload) continue;
+    if (payload === '[DONE]') return true;
+
+    try {
+      const parsed = JSON.parse(payload);
+      if (typeof parsed?.error === 'string' && parsed.error) {
+        throw new Error(parsed.error);
+      }
+      const delta =
+        typeof parsed?.text === 'string'
+          ? parsed.text
+          : typeof parsed?.delta === 'string'
+            ? parsed.delta
+            : typeof parsed?.reply === 'string'
+              ? parsed.reply
+              : '';
+      if (delta) {
+        state.reply += delta;
+        onChunk?.(state.reply, delta);
+      }
+    } catch (err) {
+      if (err instanceof SyntaxError) continue;
+      throw err;
     }
-    const list = lowStockItems.slice(0, 5).map((it) => `- ⚠️ ${it}`).join('\n');
-    return `🚨 **Alerta de Stock Crítico en ${branch}**:\nTienes **${lowStockCount} productos** en nivel mínimo o por agotarse:\n${list}\n\n📦 *Acción recomendada: Genera una orden de reposición o transferencia entre sucursales.*`;
   }
+  return false;
+};
 
-  if (lower.includes('caja') || lower.includes('arqueo') || lower.includes('efectivo') || lower.includes('dinero')) {
-    return `💵 **Estado de Caja Chica (${branch})**:\n- Saldo estimado en gaveta: **S/ ${cashInDrawer.toFixed(2)}**\n\n🔒 *Recuerda realizar arqueos intermedios y registrar todos los retiros para mantener un Cierre Z sin diferencias.*`;
-  }
-
-  if (lower.includes('fiado') || lower.includes('deuda') || lower.includes('cobrar') || lower.includes('credito')) {
-    return `📑 **Cuentas por Cobrar (Fiados)**:\n- Saldo global pendiente de cobro: **S/ ${totalDebt.toFixed(2)}**\n\n📲 *Consejo: Puedes enviar recordatorios de pago amistosos a tus clientes frecuentes desde la sección CRM.*`;
-  }
-
-  // Respuesta general de consultor comercial
-  return `🤖 **Diagnóstico Comercial Ventify (${branch})**:\n- **Ventas del día**: S/ ${todaySales.toFixed(2)} (${salesCount} transacciones)\n- **Efectivo en caja**: S/ ${cashInDrawer.toFixed(2)}\n- **Alertas de stock**: ${lowStockCount} artículos críticos\n- **Fiados pendientes**: S/ ${totalDebt.toFixed(2)}\n\n¿Deseas que analice algún producto específico o elabore una estrategia de promociones?`;
+/** Parses a complete buffered SSE response body (Hermes fetch fallback when ReadableStream is unavailable). */
+export const parseVentySseText = (
+  rawSse: string,
+  onChunk?: (accumulatedText: string, delta: string) => void
+): string => {
+  const state: VentySseState = { buffer: '', reply: '' };
+  consumeVentySseChunk(`${rawSse}\n`, state, onChunk);
+  return state.reply;
 };
 
 /**
- * Consulta el endpoint de IA de Ventify con token de usuario, o genera un análisis
- * inteligente en vivo si el dispositivo está offline o el endpoint no responde.
+ * Consulta `/api/chat/stream` mediante Server-Sent Events (SSE) autenticado.
+ * Elimina respuestas locales falsas: ante fallo de red o sin conexión retorna un mensaje claro.
  */
 export const askVentyAI = async (
   params: AskVentyAIParams
 ): Promise<string> => {
-  const { prompt, contextSummary, history = [] } = params;
+  const question = String(params.question ?? params.prompt ?? '').trim();
+  if (!question) {
+    return 'Escribe una consulta para Venty IA.';
+  }
+
+  const currentUser = auth.currentUser;
+  if (!currentUser) {
+    return 'Inicia sesión para conversar con Venty IA.';
+  }
+
+  let accountId = params.accountId?.trim() || '';
+  let branchId = params.branchId?.trim() || '';
+
+  let token: string | undefined;
+  try {
+    token = await currentUser.getIdToken();
+    if (!accountId && typeof (currentUser as any).getIdTokenResult === 'function') {
+      const tokenRes = await (currentUser as any).getIdTokenResult();
+      accountId = String(tokenRes?.claims?.accountId || '').trim();
+      if (!branchId && tokenRes?.claims?.branchId) {
+        branchId = String(tokenRes.claims.branchId).trim();
+      }
+    }
+  } catch {
+    return 'No se pudo validar tu sesión para consultar a Venty IA.';
+  }
+
+  if (!token || !accountId) {
+    return 'No se pudo identificar la cuenta activa para consultar a Venty IA.';
+  }
+
+  const rawHistory = params.conversationHistory ?? params.history ?? [];
+  const conversationHistory = rawHistory
+    .filter((m) => (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content.trim().length > 0)
+    .slice(-10)
+    .map((m) => ({
+      role: m.role === 'assistant' ? ('assistant' as const) : ('user' as const),
+      content: m.content.trim(),
+    }));
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 45_000);
 
   try {
-    const currentUser = auth.currentUser;
-    const token = await currentUser?.getIdToken();
-
-    const response = await fetch(`${APP_URL}/api/chat/stream`, {
+    const apiBase = (APP_URL || 'https://ventify.com.pe').replace(/\/$/, '');
+    const response = await fetch(`${apiBase}/api/chat/stream`, {
       method: 'POST',
+      signal: controller.signal,
       headers: {
         'Content-Type': 'application/json',
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        Accept: 'text/event-stream',
+        Authorization: `Bearer ${token}`,
+        'x-ventify-client': 'v3',
       },
       body: JSON.stringify({
-        messages: [
-          ...history,
-          {
-            role: 'system',
-            content: `Eres Venty, el copiloto inteligente de punto de venta Ventify. Contexto actual: ${JSON.stringify(
-              contextSummary || {}
-            )}`,
-          },
-          { role: 'user', content: prompt },
-        ],
+        question,
+        accountId,
+        ...(branchId ? { branchId } : {}),
+        conversationHistory,
       }),
     });
 
-    if (response.ok) {
-      const contentType = response.headers.get('content-type') || '';
-      if (contentType.includes('application/json')) {
-        const json = await response.json();
-        return json.reply || json.content || json.message || 'Respuesta generada por Venty IA.';
-      }
-      const text = await response.text();
-      return text || generateLocalAIResponse(prompt, contextSummary);
-    }
-  } catch (netErr) {
-    console.warn('[CRMService] Fallo conectando a API Venty IA, usando motor local:', netErr);
-  }
+    const contentType = response.headers?.get?.('content-type') || '';
 
-  // Fallback inteligente en vivo
-  return generateLocalAIResponse(prompt, contextSummary);
+    if (!response.ok) {
+      if (contentType.includes('application/json')) {
+        const errJson = await response.json().catch(() => null);
+        return errJson?.error || 'Venty IA no pudo responder en este momento. Inténtalo nuevamente.';
+      }
+      return 'Venty IA no pudo procesar tu consulta en este momento. Inténtalo nuevamente.';
+    }
+
+    if (contentType.includes('application/json')) {
+      const json = await response.json().catch(() => null);
+      return json?.reply || json?.content || json?.message || json?.error || 'Venty IA no devolvió contenido.';
+    }
+
+    const bodyReader = (response as any).body?.getReader?.();
+    if (bodyReader && typeof bodyReader.read === 'function') {
+      const decoder = typeof TextDecoder !== 'undefined' ? new TextDecoder() : null;
+      const state: VentySseState = { buffer: '', reply: '' };
+      while (true) {
+        const { done, value } = await bodyReader.read();
+        if (done) break;
+        const chunkText =
+          typeof value === 'string'
+            ? value
+            : decoder
+              ? decoder.decode(value, { stream: true })
+              : String(value || '');
+        const reachedDone = consumeVentySseChunk(chunkText, state, params.onChunk);
+        if (reachedDone) break;
+      }
+      if (state.buffer.trim()) {
+        consumeVentySseChunk('\n', state, params.onChunk);
+      }
+      return state.reply.trim() || 'Venty IA no devolvió contenido. Intenta reformular tu consulta.';
+    }
+
+    const text = await response.text();
+    const parsed = parseVentySseText(text, params.onChunk).trim();
+    return parsed || 'Venty IA no devolvió contenido. Intenta reformular tu consulta.';
+  } catch (netErr: any) {
+    if (netErr?.name === 'AbortError') {
+      return 'Venty IA tardó demasiado en responder. Verifica tu conexión e inténtalo de nuevo.';
+    }
+    return 'Sin conexión con Venty IA en este momento. Verifica tu acceso a internet e inténtalo nuevamente.';
+  } finally {
+    clearTimeout(timeoutId);
+  }
 };
 
 export default {
@@ -1445,6 +1978,9 @@ export default {
   saveCustomer,
   registerFiadoPayment,
   getCustomerFiadoHistory,
+  returnFiadoMerchandise,
+  writeOffFiado,
+  recalculateCustomerDebt,
   getReservationsAndOrders,
   createReservationOrOrder,
   registerReservationPayment,

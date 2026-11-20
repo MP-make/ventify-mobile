@@ -5,6 +5,10 @@ export function presentationFactor(presentation?: PresentationInput | null): num
   return Number.isFinite(factor) && factor > 0 ? factor : 1;
 }
 export function normalizePresentation<T extends PresentationInput>(presentation: T): T & { conversionFactor: number } {
+  const existing = presentation?.conversionFactor;
+  if (typeof existing === 'number' && Number.isFinite(existing) && existing > 0) {
+    return presentation as T & { conversionFactor: number };
+  }
   return { ...presentation, conversionFactor: presentationFactor(presentation) };
 }
 export function reservationCartLines(items: CartItem[]) {

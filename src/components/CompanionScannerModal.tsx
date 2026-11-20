@@ -28,13 +28,6 @@ import {
   Alert,
   AppState,
 } from 'react-native';
-import AnimatedReanimated, {
-  useSharedValue,
-  useAnimatedStyle,
-  withRepeat,
-  withTiming,
-  Easing as ReanimatedEasing,
-} from 'react-native-reanimated';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   CameraView,
@@ -171,56 +164,91 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
     code: string;
   } | null>(null);
 
-  // Referencias para control de anti-rebote de escaneo
+  // Referencias para control de anti-rebote de escaneo y temporizadores
   const lastScannedCodeRef = useRef<string>('');
   const lastScannedTimeRef = useRef<number>(0);
+  const lastProcessedScanKeyRef = useRef<string | null>(null);
   const isScanBusyRef = useRef<boolean>(false);
+  const isConnectingRef = useRef<boolean>(false);
+  const scanBusyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ============================================================================
-  // ANIMACIONES: LÁSER Y PULSO DE VINCULACIÓN (REANIMATED UI-THREAD)
+  // ANIMACIONES: LÁSER Y PULSO DE VINCULACIÓN (RN ANIMATED NATIVE DRIVER)
   // ============================================================================
 
-  const laserProgress = useSharedValue(0);
-  const pulseScale = useSharedValue(1);
+  const laserProgress = useRef(new Animated.Value(0)).current;
+  const pulseScale = useRef(new Animated.Value(1)).current;
   const bannerOpacityAnim = useRef(new Animated.Value(0)).current;
   const bannerTranslateAnim = useRef(new Animated.Value(-15)).current;
 
-  // Animación del láser escaneador (sube y baja continuamente en hilo UI nativo)
   useEffect(() => {
-    if (!visible) return;
-    laserProgress.value = 0;
-    laserProgress.value = withRepeat(
-      withTiming(1, { duration: 1500, easing: ReanimatedEasing.inOut(ReanimatedEasing.quad) }),
-      -1,
-      true
+    if (!visible || !isAppActive) return;
+    laserProgress.setValue(0);
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(laserProgress, {
+          toValue: 1,
+          duration: 1500,
+          easing: Easing.inOut(Easing.quad),
+          useNativeDriver: true,
+        }),
+        Animated.timing(laserProgress, {
+          toValue: 0,
+          duration: 1500,
+          easing: Easing.inOut(Easing.quad),
+          useNativeDriver: true,
+        }),
+      ])
     );
-  }, [visible, laserProgress]);
-
-  const laserAnimatedStyle = useAnimatedStyle(() => {
-    const maxTravel = session ? 140 : 200;
-    return {
-      transform: [{ translateY: 10 + laserProgress.value * maxTravel }],
+    loop.start();
+    return () => {
+      loop.stop();
     };
-  });
+  }, [visible, isAppActive, laserProgress]);
 
-  // Animación de pulso verde para el indicador "VINCULADO A PC MOSTRADOR"
+  const laserAnimatedStyle = {
+    transform: [
+      {
+        translateY: laserProgress.interpolate({
+          inputRange: [0, 1],
+          outputRange: [10, session ? 150 : 210],
+        }),
+      },
+    ],
+  };
+
   useEffect(() => {
-    if (!visible || !session) return;
-    pulseScale.value = 1;
-    pulseScale.value = withRepeat(
-      withTiming(1.4, { duration: 800, easing: ReanimatedEasing.out(ReanimatedEasing.ease) }),
-      -1,
-      true
+    if (!visible || !session || !isAppActive) return;
+    pulseScale.setValue(1);
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulseScale, {
+          toValue: 1.4,
+          duration: 800,
+          easing: Easing.out(Easing.ease),
+          useNativeDriver: true,
+        }),
+        Animated.timing(pulseScale, {
+          toValue: 1,
+          duration: 800,
+          easing: Easing.inOut(Easing.ease),
+          useNativeDriver: true,
+        }),
+      ])
     );
-  }, [visible, session, pulseScale]);
-
-  const pulseAnimatedStyle = useAnimatedStyle(() => {
-    const opacity = 0.8 - ((pulseScale.value - 1) / 0.4) * 0.8;
-    return {
-      transform: [{ scale: pulseScale.value }],
-      opacity,
+    loop.start();
+    return () => {
+      loop.stop();
     };
-  });
+  }, [visible, session, isAppActive, pulseScale]);
+
+  const pulseAnimatedStyle = {
+    transform: [{ scale: pulseScale }],
+    opacity: pulseScale.interpolate({
+      inputRange: [1, 1.4],
+      outputRange: [0.8, 0],
+    }),
+  };
 
   const bannerHideTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -228,6 +256,9 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
     return () => {
       if (bannerHideTimeoutRef.current) {
         clearTimeout(bannerHideTimeoutRef.current);
+      }
+      if (scanBusyTimeoutRef.current) {
+        clearTimeout(scanBusyTimeoutRef.current);
       }
     };
   }, []);
@@ -271,14 +302,14 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
 
   // Conexión automática si se pasa initialSessionId
   useEffect(() => {
-    if (visible && initialSessionId && !session && !isConnecting) {
+    if (visible && initialSessionId && !session && !isConnectingRef.current) {
       void handleConnect(initialSessionId);
     }
   }, [visible, initialSessionId]);
 
-  // Sondeo reactivo via /api/scanner/reader mientras la sesión esté activa
+  // Sondeo reactivo via /api/scanner/reader mientras la sesión esté activa y modal enfocado
   useEffect(() => {
-    if (!session?.sessionId || !visible) return;
+    if (!session?.sessionId || !visible || !isAppActive) return;
 
     const unsubscribe = subscribeToScannerSession(
       session.sessionId,
@@ -311,25 +342,33 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
           return { ...prev, ...updatedSession };
         });
 
-        // Actualizar estado del historial cuando la PC procesa la lectura
+        // Actualizar estado del historial solo si cambió el scan recibido
         const lastScan = updatedSession.scan;
         if (lastScan) {
-          setScannedHistory((prev) =>
-            prev.map((item) =>
-              item.id === lastScan.id || item.code === lastScan.code
-                ? {
-                    ...item,
-                    status:
-                      lastScan.result === 'rejected'
-                        ? 'rejected'
-                        : lastScan.result === 'pending'
-                        ? 'pending'
-                        : 'added',
-                    message: lastScan.message || item.message,
+          const scanKey = `${lastScan.id || ''}:${lastScan.code || ''}:${lastScan.result || ''}:${lastScan.message || ''}`;
+          if (lastProcessedScanKeyRef.current !== scanKey) {
+            lastProcessedScanKeyRef.current = scanKey;
+            setScannedHistory((prev) => {
+              let changed = false;
+              const next = prev.map((item) => {
+                if (item.id === lastScan.id || item.code === lastScan.code) {
+                  const nextStatus: ScannedCodeHistoryItem['status'] =
+                    lastScan.result === 'rejected'
+                      ? 'rejected'
+                      : lastScan.result === 'pending'
+                      ? 'pending'
+                      : 'added';
+                  const nextMsg = lastScan.message || item.message;
+                  if (item.status !== nextStatus || item.message !== nextMsg) {
+                    changed = true;
+                    return { ...item, status: nextStatus, message: nextMsg };
                   }
-                : item
-            )
-          );
+                }
+                return item;
+              });
+              return changed ? next : prev;
+            });
+          }
         }
       },
       (error) => {
@@ -341,15 +380,15 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
     return () => {
       unsubscribe();
     };
-  }, [session?.sessionId, session?.baseUrl, visible]);
+  }, [session?.sessionId, session?.baseUrl, visible, isAppActive]);
 
   // ============================================================================
   // HANDLERS DE ACCIONES DE VINCULACIÓN
   // ============================================================================
 
   const handleConnect = async (rawCodeOrUrl: string) => {
-    if (!rawCodeOrUrl.trim()) return;
-
+    if (!rawCodeOrUrl.trim() || isConnectingRef.current) return;
+    isConnectingRef.current = true;
     setIsConnecting(true);
     setConnectionError(null);
     void triggerScanHaptic('light');
@@ -366,6 +405,7 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
       setConnectionError(msg);
       void triggerScanHaptic('error');
     } finally {
+      isConnectingRef.current = false;
       setIsConnecting(false);
     }
   };
@@ -477,7 +517,7 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
         message: matchedProduct ? 'Enviando a PC...' : 'Enviando código...',
       };
 
-      setScannedHistory((prev) => [newHistoryItem, ...prev]);
+      setScannedHistory((prev) => [newHistoryItem, ...prev].slice(0, 50));
 
       // 3. Transmisión oficial via /api/scanner/reader
       try {
@@ -523,12 +563,16 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
           Alert.alert('Lectura no procesada', errMsg);
         }
       } finally {
-        setTimeout(() => {
+        if (scanBusyTimeoutRef.current) {
+          clearTimeout(scanBusyTimeoutRef.current);
+        }
+        scanBusyTimeoutRef.current = setTimeout(() => {
           isScanBusyRef.current = false;
+          scanBusyTimeoutRef.current = null;
         }, 500);
       }
     },
-    [session, isConnecting, continuousMode, isArmed, findByBarcode, showDetectedBanner]
+    [session, continuousMode, isArmed, findByBarcode, showDetectedBanner]
   );
 
   // Envío de código escrito manualmente a la PC
@@ -568,7 +612,7 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
       message: 'Enviando ingreso manual...',
     };
 
-    setScannedHistory((prev) => [historyItem, ...prev]);
+    setScannedHistory((prev) => [historyItem, ...prev].slice(0, 50));
     setManualBarcodeText('');
     setManualBarcodeModalVisible(false);
 
@@ -680,13 +724,17 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
           /* VISTA PRINCIPAL DE CÁMARA NATIVA (EXPO-CAMERA) */
           /* ================================================================= */
           <View style={StyleSheet.absoluteFillObject}>
-            {isAppActive ? (
+            {isAppActive && !manualInputModalVisible && !manualBarcodeModalVisible ? (
               <CameraView
                 style={StyleSheet.absoluteFillObject}
                 facing="back"
                 enableTorch={torch}
                 barcodeScannerSettings={BARCODE_SCANNER_CONFIG}
-                onBarcodeScanned={handleBarcodeScanned}
+                onBarcodeScanned={
+                  !isConnecting && (!session || continuousMode || isArmed)
+                    ? handleBarcodeScanned
+                    : undefined
+                }
               />
             ) : (
               <View style={styles.centerContainer}>
@@ -721,7 +769,7 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
                   <View style={styles.headerSessionInfo}>
                     {/* Indicador Verde Pulsante */}
                     <View style={styles.pulseContainer}>
-                      <AnimatedReanimated.View
+                      <Animated.View
                         style={[
                           styles.pulseRing,
                           pulseAnimatedStyle,
@@ -829,7 +877,7 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
                   <View style={styles.reticleCrosshair} />
 
                   {/* Haz de Luz Láser Verde Animado */}
-                  <AnimatedReanimated.View
+                  <Animated.View
                     style={[
                       styles.animatedLaserBeam,
                       laserAnimatedStyle,
@@ -1032,128 +1080,132 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
         {/* =================================================================== */}
         {/* MODAL 1: PEGAR ENLACE O SESIÓN MANUAL (ESTADO 1) */}
         {/* =================================================================== */}
-        <Modal
-          visible={manualInputModalVisible}
-          transparent
-          animationType="fade"
-          onRequestClose={() => setManualInputModalVisible(false)}
-        >
-          <KeyboardAvoidingView
-            style={styles.modalBackdrop}
-            behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        {manualInputModalVisible && (
+          <Modal
+            visible={manualInputModalVisible}
+            transparent
+            animationType="fade"
+            onRequestClose={() => setManualInputModalVisible(false)}
           >
-            <View style={styles.modalCard}>
-              <View style={styles.modalCardHeader}>
-                <Text style={styles.modalCardTitle}>Vinculación Manual</Text>
-                <TouchableOpacity
-                  onPress={() => setManualInputModalVisible(false)}
-                  style={styles.modalCloseButton}
-                >
-                  <X size={18} color={ui.textMuted} />
-                </TouchableOpacity>
+            <KeyboardAvoidingView
+              style={styles.modalBackdrop}
+              behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+            >
+              <View style={styles.modalCard}>
+                <View style={styles.modalCardHeader}>
+                  <Text style={styles.modalCardTitle}>Vinculación Manual</Text>
+                  <TouchableOpacity
+                    onPress={() => setManualInputModalVisible(false)}
+                    style={styles.modalCloseButton}
+                  >
+                    <X size={18} color={ui.textMuted} />
+                  </TouchableOpacity>
+                </View>
+
+                <Text style={styles.modalCardSubtitle}>
+                  Pega la URL de vinculación o escribe el ID de sesión generado por Ventify Web en la
+                  computadora.
+                </Text>
+
+                <TextInput
+                  value={manualSessionInput}
+                  onChangeText={setManualSessionInput}
+                  placeholder="https://ventify.com.pe/scanner/... o ID de sesión"
+                  placeholderTextColor="#6B7280"
+                  style={styles.textInputField}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  autoFocus
+                />
+
+                <View style={styles.modalActionButtons}>
+                  <TouchableOpacity
+                    onPress={() => setManualInputModalVisible(false)}
+                    style={styles.cancelButton}
+                  >
+                    <Text style={styles.cancelButtonText}>Cancelar</Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    onPress={() => handleConnect(manualSessionInput)}
+                    style={styles.confirmActionButton}
+                    disabled={isConnecting || !manualSessionInput.trim()}
+                    activeOpacity={0.8}
+                  >
+                    {isConnecting ? (
+                      <ActivityIndicator size="small" color="#FFFFFF" />
+                    ) : (
+                      <Text style={styles.confirmActionButtonText}>Vincular</Text>
+                    )}
+                  </TouchableOpacity>
+                </View>
               </View>
-
-              <Text style={styles.modalCardSubtitle}>
-                Pega la URL de vinculación o escribe el ID de sesión generado por Ventify Web en la
-                computadora.
-              </Text>
-
-              <TextInput
-                value={manualSessionInput}
-                onChangeText={setManualSessionInput}
-                placeholder="https://ventify.com.pe/scanner/... o ID de sesión"
-                placeholderTextColor="#6B7280"
-                style={styles.textInputField}
-                autoCapitalize="none"
-                autoCorrect={false}
-                autoFocus
-              />
-
-              <View style={styles.modalActionButtons}>
-                <TouchableOpacity
-                  onPress={() => setManualInputModalVisible(false)}
-                  style={styles.cancelButton}
-                >
-                  <Text style={styles.cancelButtonText}>Cancelar</Text>
-                </TouchableOpacity>
-
-                <TouchableOpacity
-                  onPress={() => handleConnect(manualSessionInput)}
-                  style={styles.confirmActionButton}
-                  disabled={isConnecting || !manualSessionInput.trim()}
-                  activeOpacity={0.8}
-                >
-                  {isConnecting ? (
-                    <ActivityIndicator size="small" color="#FFFFFF" />
-                  ) : (
-                    <Text style={styles.confirmActionButtonText}>Vincular</Text>
-                  )}
-                </TouchableOpacity>
-              </View>
-            </View>
-          </KeyboardAvoidingView>
-        </Modal>
+            </KeyboardAvoidingView>
+          </Modal>
+        )}
 
         {/* =================================================================== */}
         {/* MODAL 2: INGRESO MANUAL DE CÓDIGO DE BARRAS (ESTADO 2) */}
         {/* =================================================================== */}
-        <Modal
-          visible={manualBarcodeModalVisible}
-          transparent
-          animationType="fade"
-          onRequestClose={() => setManualBarcodeModalVisible(false)}
-        >
-          <KeyboardAvoidingView
-            style={styles.modalBackdrop}
-            behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        {manualBarcodeModalVisible && (
+          <Modal
+            visible={manualBarcodeModalVisible}
+            transparent
+            animationType="fade"
+            onRequestClose={() => setManualBarcodeModalVisible(false)}
           >
-            <View style={styles.modalCard}>
-              <View style={styles.modalCardHeader}>
-                <Text style={styles.modalCardTitle}>Escribir Código Manual</Text>
-                <TouchableOpacity
-                  onPress={() => setManualBarcodeModalVisible(false)}
-                  style={styles.modalCloseButton}
-                >
-                  <X size={18} color={ui.textMuted} />
-                </TouchableOpacity>
+            <KeyboardAvoidingView
+              style={styles.modalBackdrop}
+              behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+            >
+              <View style={styles.modalCard}>
+                <View style={styles.modalCardHeader}>
+                  <Text style={styles.modalCardTitle}>Escribir Código Manual</Text>
+                  <TouchableOpacity
+                    onPress={() => setManualBarcodeModalVisible(false)}
+                    style={styles.modalCloseButton}
+                  >
+                    <X size={18} color={ui.textMuted} />
+                  </TouchableOpacity>
+                </View>
+
+                <Text style={styles.modalCardSubtitle}>
+                  Si un código de barras está dañado o no es legible por la cámara, escríbelo aquí y se
+                  transmitirá al carrito de la PC.
+                </Text>
+
+                <TextInput
+                  value={manualBarcodeText}
+                  onChangeText={setManualBarcodeText}
+                  placeholder="Ej. 7751234567891 o SKU-001"
+                  placeholderTextColor="#6B7280"
+                  style={styles.textInputField}
+                  autoFocus
+                  returnKeyType="send"
+                  onSubmitEditing={handleManualBarcodeSubmit}
+                />
+
+                <View style={styles.modalActionButtons}>
+                  <TouchableOpacity
+                    onPress={() => setManualBarcodeModalVisible(false)}
+                    style={styles.cancelButton}
+                  >
+                    <Text style={styles.cancelButtonText}>Cancelar</Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    onPress={handleManualBarcodeSubmit}
+                    style={styles.confirmActionButton}
+                    disabled={manualBarcodeText.trim().length < 2}
+                    activeOpacity={0.8}
+                  >
+                    <Text style={styles.confirmActionButtonText}>Transmitir a PC</Text>
+                  </TouchableOpacity>
+                </View>
               </View>
-
-              <Text style={styles.modalCardSubtitle}>
-                Si un código de barras está dañado o no es legible por la cámara, escríbelo aquí y se
-                transmitirá al carrito de la PC.
-              </Text>
-
-              <TextInput
-                value={manualBarcodeText}
-                onChangeText={setManualBarcodeText}
-                placeholder="Ej. 7751234567891 o SKU-001"
-                placeholderTextColor="#6B7280"
-                style={styles.textInputField}
-                autoFocus
-                returnKeyType="send"
-                onSubmitEditing={handleManualBarcodeSubmit}
-              />
-
-              <View style={styles.modalActionButtons}>
-                <TouchableOpacity
-                  onPress={() => setManualBarcodeModalVisible(false)}
-                  style={styles.cancelButton}
-                >
-                  <Text style={styles.cancelButtonText}>Cancelar</Text>
-                </TouchableOpacity>
-
-                <TouchableOpacity
-                  onPress={handleManualBarcodeSubmit}
-                  style={styles.confirmActionButton}
-                  disabled={manualBarcodeText.trim().length < 2}
-                  activeOpacity={0.8}
-                >
-                  <Text style={styles.confirmActionButtonText}>Transmitir a PC</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-          </KeyboardAvoidingView>
-        </Modal>
+            </KeyboardAvoidingView>
+          </Modal>
+        )}
       </View>
     </Modal>
   );

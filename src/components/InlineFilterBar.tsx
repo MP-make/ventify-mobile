@@ -32,6 +32,13 @@ interface InlineFilterBarProps {
   rightElement?: React.ReactNode;
 }
 
+interface NormalizedFilterOption {
+  option: FilterOption;
+  normalized: string;
+  words: string[];
+  initials: string;
+}
+
 // Normalización estricta sin tildes
 function normalizeText(text: string): string {
   return (text || '')
@@ -41,24 +48,52 @@ function normalizeText(text: string): string {
     .trim();
 }
 
-// Coincidencia inteligente por substring, prefijo o iniciales
-function matchesQuery(query: string, itemName: string): boolean {
-  if (!query) return true;
-  const q = normalizeText(query);
-  const target = normalizeText(itemName);
-
-  if (target.includes(q)) return true;
-
-  // Búsqueda por iniciales (ej. "cc" para "Coca Cola")
-  const words = target.split(/\s+/).filter(Boolean);
-  const initials = words.map((w) => w[0]).join('');
-  if (initials.includes(q)) return true;
-
-  // Alguna palabra inicia con el término
-  if (words.some((w) => w.startsWith(q))) return true;
-
+function matchesNormalizedQuery(normalizedQuery: string, item: NormalizedFilterOption): boolean {
+  if (!normalizedQuery) return true;
+  if (item.normalized.includes(normalizedQuery)) return true;
+  if (item.initials.includes(normalizedQuery)) return true;
+  for (let i = 0; i < item.words.length; i += 1) {
+    if (item.words[i].startsWith(normalizedQuery)) return true;
+  }
   return false;
 }
+
+const keyExtractorByName = (item: FilterOption) => item.name;
+
+interface FilterOptionRowProps {
+  option: FilterOption;
+  isActive: boolean;
+  onSelect: (optName: string) => void;
+}
+
+const FilterOptionRow = React.memo<FilterOptionRowProps>(({ option, isActive, onSelect }) => (
+  <TouchableOpacity
+    style={[styles.optionRow, isActive && { backgroundColor: ui.primarySoft }]}
+    onPress={() => onSelect(option.name)}
+    activeOpacity={0.7}
+  >
+    <Text
+      style={[
+        styles.optionText,
+        {
+          color: isActive ? ui.primary : ui.text,
+          fontWeight: isActive ? '700' : '400',
+        },
+      ]}
+      numberOfLines={1}
+    >
+      {option.name}
+    </Text>
+    <View style={styles.optionRightCol}>
+      {option.count !== undefined && (
+        <Text style={[styles.countBadgeText, { color: ui.textSecondary }]}>
+          ({option.count})
+        </Text>
+      )}
+      {isActive ? <Check size={14} color={ui.primary} /> : null}
+    </View>
+  </TouchableOpacity>
+));
 
 export const InlineFilterBar: React.FC<InlineFilterBarProps> = React.memo(({ groups, rightElement }) => {
   const [activeGroupId, setActiveGroupId] = useState<string | null>(null);
@@ -81,25 +116,48 @@ export const InlineFilterBar: React.FC<InlineFilterBarProps> = React.memo(({ gro
     return () => clearTimeout(timer);
   }, [searchQuery]);
 
-  const effectiveQuery = (activeGroup && activeGroup.options.length > 20) ? debouncedSearchQuery : searchQuery;
+  const effectiveQuery =
+    activeGroup && activeGroup.options.length > 20 ? debouncedSearchQuery : searchQuery;
 
-  const filteredOptions = useMemo(() => {
+  const normalizedGroupOptions = useMemo<NormalizedFilterOption[]>(() => {
     if (!activeGroup) return [];
-    return activeGroup.options.filter((opt) => matchesQuery(effectiveQuery, opt.name));
-  }, [activeGroup, effectiveQuery]);
-
-  const toggleGroup = (groupId: string) => {
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    if (activeGroupId === groupId) {
-      setActiveGroupId(null);
-      setSearchQuery('');
-      setDebouncedSearchQuery('');
-    } else {
-      setActiveGroupId(groupId);
-      setSearchQuery('');
-      setDebouncedSearchQuery('');
+    const list: NormalizedFilterOption[] = [];
+    for (let i = 0; i < activeGroup.options.length; i += 1) {
+      const opt = activeGroup.options[i];
+      if (opt.name === 'Todas') continue;
+      const normalized = normalizeText(opt.name);
+      const words = normalized.split(/\s+/).filter(Boolean);
+      let initials = '';
+      for (let w = 0; w < words.length; w += 1) {
+        initials += words[w][0] || '';
+      }
+      list.push({ option: opt, normalized, words, initials });
     }
-  };
+    return list;
+  }, [activeGroup]);
+
+  const filteredOptions = useMemo<FilterOption[]>(() => {
+    if (!activeGroup) return [];
+    const normalizedQuery = normalizeText(effectiveQuery);
+    if (!normalizedQuery) {
+      return normalizedGroupOptions.map((entry) => entry.option);
+    }
+    const result: FilterOption[] = [];
+    for (let i = 0; i < normalizedGroupOptions.length; i += 1) {
+      const entry = normalizedGroupOptions[i];
+      if (matchesNormalizedQuery(normalizedQuery, entry)) {
+        result.push(entry.option);
+      }
+    }
+    return result;
+  }, [activeGroup, normalizedGroupOptions, effectiveQuery]);
+
+  const toggleGroup = useCallback((groupId: string) => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    setActiveGroupId((prev) => (prev === groupId ? null : groupId));
+    setSearchQuery('');
+    setDebouncedSearchQuery('');
+  }, []);
 
   const getGroupIcon = (type?: string, isSelected?: boolean) => {
     const color = isSelected ? ui.primary : ui.textSecondary;
@@ -117,62 +175,36 @@ export const InlineFilterBar: React.FC<InlineFilterBarProps> = React.memo(({ gro
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
   }, [activeGroup]);
 
-  const handleSelectOption = useCallback((optName: string) => {
-    if (!activeGroup) return;
-    activeGroup.onSelect(optName);
-    setActiveGroupId(null);
-    setSearchQuery('');
-    setDebouncedSearchQuery('');
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-  }, [activeGroup]);
+  const handleSelectOption = useCallback(
+    (optName: string) => {
+      if (!activeGroup) return;
+      activeGroup.onSelect(optName);
+      setActiveGroupId(null);
+      setSearchQuery('');
+      setDebouncedSearchQuery('');
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    },
+    [activeGroup]
+  );
 
-  const renderOptionItem = useCallback(({ item: opt }: { item: FilterOption }) => {
-    if (opt.name === 'Todas') return null;
-    const isItemActive = activeGroup?.selectedValue === opt.name;
+  const selectedValue = activeGroup?.selectedValue;
+  const renderOptionItem = useCallback(
+    ({ item: opt }: { item: FilterOption }) => (
+      <FilterOptionRow
+        option={opt}
+        isActive={selectedValue === opt.name}
+        onSelect={handleSelectOption}
+      />
+    ),
+    [selectedValue, handleSelectOption]
+  );
 
-    return (
-      <TouchableOpacity
-        key={opt.name}
-        style={[
-          styles.optionRow,
-          isItemActive && { backgroundColor: ui.primarySoft },
-        ]}
-        onPress={() => handleSelectOption(opt.name)}
-        activeOpacity={0.7}
-      >
-        <Text
-          style={[
-            styles.optionText,
-            {
-              color: isItemActive ? ui.primary : ui.text,
-              fontWeight: isItemActive ? '700' : '400',
-            },
-          ]}
-          numberOfLines={1}
-        >
-          {opt.name}
-        </Text>
-        <View style={styles.optionRightCol}>
-          {opt.count !== undefined && (
-            <Text style={[styles.countBadgeText, { color: ui.textSecondary }]}>
-              ({opt.count})
-            </Text>
-          )}
-          {isItemActive ? <Check size={14} color={ui.primary} /> : null}
-        </View>
-      </TouchableOpacity>
-    );
-  }, [activeGroup?.selectedValue, handleSelectOption]);
-
-  const renderAllOption = () => {
+  const allHeaderElement = useMemo(() => {
     if (!activeGroup) return null;
     const isSelected = activeGroup.selectedValue === 'Todas';
     return (
       <TouchableOpacity
-        style={[
-          styles.optionRow,
-          isSelected && { backgroundColor: ui.primarySoft },
-        ]}
+        style={[styles.optionRow, isSelected && { backgroundColor: ui.primarySoft }]}
         onPress={handleSelectAll}
         activeOpacity={0.7}
       >
@@ -187,12 +219,21 @@ export const InlineFilterBar: React.FC<InlineFilterBarProps> = React.memo(({ gro
         >
           Todas las {activeGroup.label.toLowerCase()}
         </Text>
-        {isSelected ? (
-          <Check size={14} color={ui.primary} />
-        ) : null}
+        {isSelected ? <Check size={14} color={ui.primary} /> : null}
       </TouchableOpacity>
     );
-  };
+  }, [activeGroup, handleSelectAll]);
+
+  const emptyComponent = useMemo(
+    () => (
+      <View style={styles.emptyOptions}>
+        <Text style={[styles.emptyOptionsText, { color: ui.textMuted }]}>
+          Sin coincidencias para "{searchQuery}"
+        </Text>
+      </View>
+    ),
+    [searchQuery]
+  );
 
   return (
     <View style={styles.container}>
@@ -300,16 +341,11 @@ export const InlineFilterBar: React.FC<InlineFilterBarProps> = React.memo(({ gro
                 data={filteredOptions}
                 renderItem={renderOptionItem}
                 estimatedItemSize={36}
-                keyExtractor={(item) => item.name}
-                ListHeaderComponent={renderAllOption}
+                extraData={selectedValue}
+                keyExtractor={keyExtractorByName}
+                ListHeaderComponent={allHeaderElement}
                 keyboardShouldPersistTaps="handled"
-                ListEmptyComponent={
-                  <View style={styles.emptyOptions}>
-                    <Text style={[styles.emptyOptionsText, { color: ui.textMuted }]}>
-                      Sin coincidencias para "{searchQuery}"
-                    </Text>
-                  </View>
-                }
+                ListEmptyComponent={emptyComponent}
               />
             </View>
           ) : (
@@ -318,17 +354,18 @@ export const InlineFilterBar: React.FC<InlineFilterBarProps> = React.memo(({ gro
               keyboardShouldPersistTaps="handled"
               nestedScrollEnabled
             >
-              {renderAllOption()}
+              {allHeaderElement}
 
-              {filteredOptions.map((opt) => renderOptionItem({ item: opt }))}
+              {filteredOptions.map((opt) => (
+                <FilterOptionRow
+                  key={opt.name}
+                  option={opt}
+                  isActive={selectedValue === opt.name}
+                  onSelect={handleSelectOption}
+                />
+              ))}
 
-              {filteredOptions.length === 0 && (
-                <View style={styles.emptyOptions}>
-                  <Text style={[styles.emptyOptionsText, { color: ui.textMuted }]}>
-                    Sin coincidencias para "{searchQuery}"
-                  </Text>
-                </View>
-              )}
+              {filteredOptions.length === 0 && emptyComponent}
             </ScrollView>
           )}
         </View>
@@ -348,28 +385,34 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
   },
   buttonsScroll: {
+    flexGrow: 1,
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
+    gap: 6,
     paddingVertical: 2,
   },
   btnWrapper: {
+    flex: 1,
+    minWidth: 0,
     flexDirection: 'row',
     alignItems: 'center',
   },
   pickerBtn: {
+    flex: 1,
+    minWidth: 0,
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 6,
-    paddingHorizontal: 10,
+    justifyContent: 'space-between',
+    gap: 4,
+    paddingHorizontal: 8,
     paddingVertical: 6,
     borderRadius: 8,
     borderWidth: 1,
     minHeight: 32,
   },
   pickerBtnText: {
+    flex: 1,
     fontSize: 12,
-    maxWidth: 130,
   },
   clearBtn: {
     marginLeft: 3,

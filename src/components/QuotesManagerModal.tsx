@@ -205,7 +205,7 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
 
   const { accountId, branchId, userProfile } = useAuth();
   const { businessSettings, activeBranchName } = useSettings();
-  const { products } = useProducts();
+  const { getProductById } = useProducts();
   const { clearCart, addItem, setCustomer, setNotes, setSourceQuoteId, setSaleRequestId, setDiscount, setShippingAmount } = useCart();
 
   // Estados de lista y filtros
@@ -327,7 +327,7 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
 
         // 3. Cargar ítems al carrito resolviendo catálogo real, presentaciones y variantes
         quote.items.forEach((item) => {
-          const catalogProduct = products.find((p) => p.id === item.id);
+          const catalogProduct = getProductById(item.id);
           const catalogPresentation = item.presentationId
             ? catalogProduct?.presentations?.find((pr) => pr.id === item.presentationId)
             : undefined;
@@ -407,7 +407,7 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
       }
     },
     [
-      products,
+      getProductById,
       clearCart,
       setCustomer,
       addItem,
@@ -764,6 +764,20 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
     );
   }, []);
 
+  const handleSelectQuote = useCallback((quote: Quote) => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
+    setSelectedQuote(quote);
+  }, []);
+
+  const renderQuoteItem = useCallback(
+    ({ item }: { item: Quote }) => (
+      <QuoteCardItem quote={item} onSelect={handleSelectQuote} />
+    ),
+    [handleSelectQuote]
+  );
+
+  const quoteKeyExtractor = useCallback((item: Quote) => item.id, []);
+
   if (!isVisible) return null;
 
   return (
@@ -1112,16 +1126,8 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
             ) : (
               <FlashList
                 data={filteredQuotes}
-                renderItem={({ item }) => (
-                  <QuoteCardItem
-                    quote={item}
-                    onSelect={(quote) => {
-                      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
-                      setSelectedQuote(quote);
-                    }}
-                  />
-                )}
-                keyExtractor={(item) => item.id}
+                renderItem={renderQuoteItem}
+                keyExtractor={quoteKeyExtractor}
                 estimatedItemSize={115}
                 contentContainerStyle={[styles.listScrollContent, { paddingBottom: insets.bottom + 20 }] as any}
                 showsVerticalScrollIndicator={false}
@@ -1132,210 +1138,212 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
       </View>
     </Modal>
 
-    <Modal
-      visible={editModalOpen}
-      animationType="slide"
-      presentationStyle="pageSheet"
-      onRequestClose={() => setEditModalOpen(false)}
-    >
-      <KeyboardAvoidingView
-        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-        style={[styles.container, { paddingTop: Platform.OS === 'ios' ? insets.top : 12 }]}
+    {editModalOpen && (
+      <Modal
+        visible={editModalOpen}
+        animationType="slide"
+        presentationStyle="pageSheet"
+        onRequestClose={() => setEditModalOpen(false)}
       >
-        <View style={styles.header}>
-          <View>
-            <Text style={styles.headerTitle}>Editar Cotización</Text>
-            <Text style={styles.editModalSubtitle}>
-              {selectedQuote?.formattedNumber || ''} · Modifica precios, cantidades y recargos
-            </Text>
-          </View>
-          <TouchableOpacity
-            style={styles.closeButton}
-            onPress={() => setEditModalOpen(false)}
-            hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
-          >
-            <X size={20} color={ui.textSecondary} />
-          </TouchableOpacity>
-        </View>
-
-        <ScrollView
-          style={styles.contentScroll}
-          contentContainerStyle={[styles.detailContentContainer, { paddingBottom: insets.bottom + 28 }]}
-          keyboardShouldPersistTaps="handled"
+        <KeyboardAvoidingView
+          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+          style={[styles.container, { paddingTop: Platform.OS === 'ios' ? insets.top : 12 }]}
         >
-          <View style={styles.itemsCard}>
-            <Text style={styles.itemsCardTitle}>Productos ({editItems.length})</Text>
-            {editItems.map((it, idx) => (
-              <View key={`${it.id}_${it.variantId || ''}_${it.presentationId || ''}_${idx}`} style={styles.editItemCard}>
-                <View style={styles.editItemHeader}>
-                  <View style={{ flex: 1, marginRight: 8 }}>
-                    <Text style={styles.itemNameText}>{it.name}</Text>
-                    {(it.presentationName || it.variantName) ? (
-                      <Text style={styles.itemSubText}>
-                        {[it.presentationName ? `Pres: ${it.presentationName}` : '', it.variantName ? `Var: ${it.variantName}` : '']
-                          .filter(Boolean)
-                          .join(' • ')}
-                      </Text>
-                    ) : null}
-                  </View>
-                  {editItems.length > 1 && (
-                    <TouchableOpacity
-                      onPress={() => setEditItems((prev) => prev.filter((_, i) => i !== idx))}
-                      hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-                    >
-                      <Trash2 size={16} color={ui.danger} />
-                    </TouchableOpacity>
-                  )}
-                </View>
+          <View style={styles.header}>
+            <View>
+              <Text style={styles.headerTitle}>Editar Cotización</Text>
+              <Text style={styles.editModalSubtitle}>
+                {selectedQuote?.formattedNumber || ''} · Modifica precios, cantidades y recargos
+              </Text>
+            </View>
+            <TouchableOpacity
+              style={styles.closeButton}
+              onPress={() => setEditModalOpen(false)}
+              hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+            >
+              <X size={20} color={ui.textSecondary} />
+            </TouchableOpacity>
+          </View>
 
-                <View style={styles.editItemInputsRow}>
-                  <View style={styles.editQtyBox}>
-                    <Text style={styles.editFieldLabel}>Cantidad</Text>
-                    <View style={styles.editStepperRow}>
+          <ScrollView
+            style={styles.contentScroll}
+            contentContainerStyle={[styles.detailContentContainer, { paddingBottom: insets.bottom + 28 }]}
+            keyboardShouldPersistTaps="handled"
+          >
+            <View style={styles.itemsCard}>
+              <Text style={styles.itemsCardTitle}>Productos ({editItems.length})</Text>
+              {editItems.map((it, idx) => (
+                <View key={`${it.id}_${it.variantId || ''}_${it.presentationId || ''}_${idx}`} style={styles.editItemCard}>
+                  <View style={styles.editItemHeader}>
+                    <View style={{ flex: 1, marginRight: 8 }}>
+                      <Text style={styles.itemNameText}>{it.name}</Text>
+                      {(it.presentationName || it.variantName) ? (
+                        <Text style={styles.itemSubText}>
+                          {[it.presentationName ? `Pres: ${it.presentationName}` : '', it.variantName ? `Var: ${it.variantName}` : '']
+                            .filter(Boolean)
+                            .join(' • ')}
+                        </Text>
+                      ) : null}
+                    </View>
+                    {editItems.length > 1 && (
                       <TouchableOpacity
-                        style={styles.editStepBtn}
-                        onPress={() =>
-                          setEditItems((prev) =>
-                            prev.map((row, i) => {
-                              if (i !== idx) return row;
-                              const curr = parseNormalizedDecimal(row.qtyText) ?? row.quantity ?? 1;
-                              const next = Math.max(1, roundQuoteMoney(curr - 1));
-                              return { ...row, quantity: next, qtyText: String(next) };
-                            })
-                          )
-                        }
+                        onPress={() => setEditItems((prev) => prev.filter((_, i) => i !== idx))}
+                        hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
                       >
-                        <Minus size={14} color={ui.text} />
+                        <Trash2 size={16} color={ui.danger} />
                       </TouchableOpacity>
+                    )}
+                  </View>
+
+                  <View style={styles.editItemInputsRow}>
+                    <View style={styles.editQtyBox}>
+                      <Text style={styles.editFieldLabel}>Cantidad</Text>
+                      <View style={styles.editStepperRow}>
+                        <TouchableOpacity
+                          style={styles.editStepBtn}
+                          onPress={() =>
+                            setEditItems((prev) =>
+                              prev.map((row, i) => {
+                                if (i !== idx) return row;
+                                const curr = parseNormalizedDecimal(row.qtyText) ?? row.quantity ?? 1;
+                                const next = Math.max(1, roundQuoteMoney(curr - 1));
+                                return { ...row, quantity: next, qtyText: String(next) };
+                              })
+                            )
+                          }
+                        >
+                          <Minus size={14} color={ui.text} />
+                        </TouchableOpacity>
+                        <TextInput
+                          style={styles.editQtyInput}
+                          value={it.qtyText}
+                          onChangeText={(txt) =>
+                            setEditItems((prev) =>
+                              prev.map((row, i) => (i === idx ? { ...row, qtyText: txt } : row))
+                            )
+                          }
+                          keyboardType="decimal-pad"
+                        />
+                        <TouchableOpacity
+                          style={styles.editStepBtn}
+                          onPress={() =>
+                            setEditItems((prev) =>
+                              prev.map((row, i) => {
+                                if (i !== idx) return row;
+                                const curr = parseNormalizedDecimal(row.qtyText) ?? row.quantity ?? 1;
+                                const next = roundQuoteMoney(curr + 1);
+                                return { ...row, quantity: next, qtyText: String(next) };
+                              })
+                            )
+                          }
+                        >
+                          <Plus size={14} color={ui.text} />
+                        </TouchableOpacity>
+                      </View>
+                    </View>
+
+                    <View style={styles.editPriceBox}>
+                      <Text style={styles.editFieldLabel}>{it.isGift ? 'Regalo (S/ 0)' : 'P. Unit (S/)'}</Text>
                       <TextInput
-                        style={styles.editQtyInput}
-                        value={it.qtyText}
+                        style={[styles.editTextInput, it.isGift && { opacity: 0.6 }]}
+                        value={it.isGift ? '0' : it.priceText}
+                        editable={!it.isGift}
                         onChangeText={(txt) =>
                           setEditItems((prev) =>
-                            prev.map((row, i) => (i === idx ? { ...row, qtyText: txt } : row))
+                            prev.map((row, i) => (i === idx ? { ...row, priceText: txt } : row))
                           )
                         }
                         keyboardType="decimal-pad"
                       />
-                      <TouchableOpacity
-                        style={styles.editStepBtn}
-                        onPress={() =>
-                          setEditItems((prev) =>
-                            prev.map((row, i) => {
-                              if (i !== idx) return row;
-                              const curr = parseNormalizedDecimal(row.qtyText) ?? row.quantity ?? 1;
-                              const next = roundQuoteMoney(curr + 1);
-                              return { ...row, quantity: next, qtyText: String(next) };
-                            })
-                          )
-                        }
-                      >
-                        <Plus size={14} color={ui.text} />
-                      </TouchableOpacity>
                     </View>
                   </View>
+                </View>
+              ))}
+            </View>
 
-                  <View style={styles.editPriceBox}>
-                    <Text style={styles.editFieldLabel}>{it.isGift ? 'Regalo (S/ 0)' : 'P. Unit (S/)'}</Text>
-                    <TextInput
-                      style={[styles.editTextInput, it.isGift && { opacity: 0.6 }]}
-                      value={it.isGift ? '0' : it.priceText}
-                      editable={!it.isGift}
-                      onChangeText={(txt) =>
-                        setEditItems((prev) =>
-                          prev.map((row, i) => (i === idx ? { ...row, priceText: txt } : row))
-                        )
-                      }
-                      keyboardType="decimal-pad"
-                    />
-                  </View>
+            <View style={styles.itemsCard}>
+              <Text style={styles.itemsCardTitle}>Descuento, Envío y Notas</Text>
+              <View style={styles.editItemInputsRow}>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.editFieldLabel}>Descuento (S/)</Text>
+                  <TextInput
+                    style={styles.editTextInput}
+                    value={editDiscountText}
+                    onChangeText={setEditDiscountText}
+                    keyboardType="decimal-pad"
+                    placeholder="0.00"
+                    placeholderTextColor={ui.textMuted}
+                  />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.editFieldLabel}>Envío / Delivery (S/)</Text>
+                  <TextInput
+                    style={styles.editTextInput}
+                    value={editShippingText}
+                    onChangeText={setEditShippingText}
+                    keyboardType="decimal-pad"
+                    placeholder="0.00"
+                    placeholderTextColor={ui.textMuted}
+                  />
                 </View>
               </View>
-            ))}
-          </View>
 
-          <View style={styles.itemsCard}>
-            <Text style={styles.itemsCardTitle}>Descuento, Envío y Notas</Text>
-            <View style={styles.editItemInputsRow}>
-              <View style={{ flex: 1 }}>
-                <Text style={styles.editFieldLabel}>Descuento (S/)</Text>
+              <View style={{ marginTop: 10 }}>
+                <Text style={styles.editFieldLabel}>Observaciones</Text>
                 <TextInput
-                  style={styles.editTextInput}
-                  value={editDiscountText}
-                  onChangeText={setEditDiscountText}
-                  keyboardType="decimal-pad"
-                  placeholder="0.00"
-                  placeholderTextColor={ui.textMuted}
-                />
-              </View>
-              <View style={{ flex: 1 }}>
-                <Text style={styles.editFieldLabel}>Envío / Delivery (S/)</Text>
-                <TextInput
-                  style={styles.editTextInput}
-                  value={editShippingText}
-                  onChangeText={setEditShippingText}
-                  keyboardType="decimal-pad"
-                  placeholder="0.00"
+                  style={[styles.editTextInput, { minHeight: 72, textAlignVertical: 'top' }]}
+                  value={editNotesText}
+                  onChangeText={setEditNotesText}
+                  multiline
+                  placeholder="Condiciones, entrega u observaciones..."
                   placeholderTextColor={ui.textMuted}
                 />
               </View>
             </View>
 
-            <View style={{ marginTop: 10 }}>
-              <Text style={styles.editFieldLabel}>Observaciones</Text>
-              <TextInput
-                style={[styles.editTextInput, { minHeight: 72, textAlignVertical: 'top' }]}
-                value={editNotesText}
-                onChangeText={setEditNotesText}
-                multiline
-                placeholder="Condiciones, entrega u observaciones..."
-                placeholderTextColor={ui.textMuted}
-              />
-            </View>
-          </View>
-
-          <View style={styles.itemsCard}>
-            <View style={styles.summaryRow}>
-              <Text style={styles.summaryLabel}>Subtotal</Text>
-              <Text style={styles.summaryValue}>{formatPEN(editDraftTotals.subtotal)}</Text>
-            </View>
-            {editDraftTotals.discountAmount > 0 && (
+            <View style={styles.itemsCard}>
               <View style={styles.summaryRow}>
-                <Text style={styles.summaryLabel}>Descuento</Text>
-                <Text style={[styles.summaryValue, { color: ui.success }]}>
-                  -{formatPEN(editDraftTotals.discountAmount)}
-                </Text>
+                <Text style={styles.summaryLabel}>Subtotal</Text>
+                <Text style={styles.summaryValue}>{formatPEN(editDraftTotals.subtotal)}</Text>
               </View>
-            )}
-            {editDraftTotals.shippingAmount > 0 && (
-              <View style={styles.summaryRow}>
-                <Text style={styles.summaryLabel}>Envío / Delivery</Text>
-                <Text style={styles.summaryValue}>{formatPEN(editDraftTotals.shippingAmount)}</Text>
+              {editDraftTotals.discountAmount > 0 && (
+                <View style={styles.summaryRow}>
+                  <Text style={styles.summaryLabel}>Descuento</Text>
+                  <Text style={[styles.summaryValue, { color: ui.success }]}>
+                    -{formatPEN(editDraftTotals.discountAmount)}
+                  </Text>
+                </View>
+              )}
+              {editDraftTotals.shippingAmount > 0 && (
+                <View style={styles.summaryRow}>
+                  <Text style={styles.summaryLabel}>Envío / Delivery</Text>
+                  <Text style={styles.summaryValue}>{formatPEN(editDraftTotals.shippingAmount)}</Text>
+                </View>
+              )}
+              <View style={[styles.summaryRow, styles.totalHighlightRow]}>
+                <Text style={styles.totalHighlightLabel}>NUEVO TOTAL</Text>
+                <Text style={styles.totalHighlightValue}>{formatPEN(editDraftTotals.total)}</Text>
               </View>
-            )}
-            <View style={[styles.summaryRow, styles.totalHighlightRow]}>
-              <Text style={styles.totalHighlightLabel}>NUEVO TOTAL</Text>
-              <Text style={styles.totalHighlightValue}>{formatPEN(editDraftTotals.total)}</Text>
             </View>
-          </View>
 
-          <TouchableOpacity
-            style={[styles.primaryActionButton, isProcessing && styles.buttonDisabled]}
-            onPress={handleSaveQuoteEdit}
-            disabled={isProcessing}
-          >
-            {isProcessing ? (
-              <ActivityIndicator color="#FFFFFF" size="small" />
-            ) : (
-              <>
-                <Check size={18} color="#FFFFFF" />
-                <Text style={styles.primaryActionButtonText}>Guardar Cambios</Text>
-              </>
-            )}
-          </TouchableOpacity>
-        </ScrollView>
-      </KeyboardAvoidingView>
-    </Modal>
+            <TouchableOpacity
+              style={[styles.primaryActionButton, isProcessing && styles.buttonDisabled]}
+              onPress={handleSaveQuoteEdit}
+              disabled={isProcessing}
+            >
+              {isProcessing ? (
+                <ActivityIndicator color="#FFFFFF" size="small" />
+              ) : (
+                <>
+                  <Check size={18} color="#FFFFFF" />
+                  <Text style={styles.primaryActionButtonText}>Guardar Cambios</Text>
+                </>
+              )}
+            </TouchableOpacity>
+          </ScrollView>
+        </KeyboardAvoidingView>
+      </Modal>
+    )}
     </>
   );
 });

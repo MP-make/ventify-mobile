@@ -93,6 +93,7 @@ android {
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 3
         versionName "2.0.1"
+        resourceConfigurations += ['es', 'en']
     }
     def releaseStoreFile = findProperty('MYAPP_UPLOAD_STORE_FILE') ?: findProperty('VENTIFY_UPLOAD_STORE_FILE') ?: System.getenv('MYAPP_UPLOAD_STORE_FILE') ?: System.getenv('VENTIFY_UPLOAD_STORE_FILE')
     def releaseStorePassword = findProperty('MYAPP_UPLOAD_STORE_PASSWORD') ?: findProperty('VENTIFY_UPLOAD_STORE_PASSWORD') ?: System.getenv('MYAPP_UPLOAD_STORE_PASSWORD') ?: System.getenv('VENTIFY_UPLOAD_STORE_PASSWORD')

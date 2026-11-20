@@ -1,10 +1,10 @@
 module.exports = function (api) {
-  api.cache(true);
+  api.cache.using(() => process.env.NODE_ENV || 'development');
   return {
     presets: ['babel-preset-expo'],
     plugins: [
       ...(process.env.NODE_ENV === 'production' ? ['transform-remove-console'] : []),
-      'react-native-reanimated/plugin',
+      './plugins/babel-plugin-lucide-direct-imports',
     ],
   };
 };

@@ -454,6 +454,7 @@ export const getSuppliersAsync = async (
     if (onlyActive) {
       constraints.push(where('active', '==', true));
     }
+    constraints.push(firestoreLimit(300));
 
     const q = query(suppliersColl, ...constraints);
     const snap = await getDocs(q);
@@ -486,6 +487,7 @@ export const subscribeSuppliers = (
   if (onlyActive) {
     constraints.push(where('active', '==', true));
   }
+  constraints.push(firestoreLimit(300));
 
   const q = query(suppliersColl, ...constraints);
 
@@ -702,32 +704,85 @@ export const subscribePurchaseOrders = (
     constraints.push(where('status', '==', statusFilter));
   }
 
-  const q = query(coll, ...constraints, firestoreLimit(200));
+  const handleSnapshot = (snapshot: any) => {
+    let orders: PurchaseOrder[] = snapshot.docs.map(purchaseOrderFromDoc);
 
-  const unsubscribe = onSnapshot(
-    q,
-    (snapshot) => {
-      let orders = snapshot.docs.map(purchaseOrderFromDoc);
-
-      if (branchId && branchId !== 'all') {
-        orders = orders.filter((o) => !o.branchId || o.branchId === branchId);
-      }
-
-      orders.sort((a, b) => {
-        const tA = a.createdAt instanceof Date ? a.createdAt.getTime() : Number(a.createdAt) || 0;
-        const tB = b.createdAt instanceof Date ? b.createdAt.getTime() : Number(b.createdAt) || 0;
-        return tB - tA;
-      });
-
-      callback(orders);
-    },
-    (err) => {
-      console.warn('[suppliers-po-service] Error en suscripción a purchase_orders:', err);
-      callback([]);
+    if (branchId && branchId !== 'all') {
+      orders = orders.filter((o) => !o.branchId || o.branchId === branchId);
     }
-  );
 
-  return unsubscribe;
+    orders.sort((a, b) => {
+      const tA = a.createdAt instanceof Date ? a.createdAt.getTime() : Number(a.createdAt) || 0;
+      const tB = b.createdAt instanceof Date ? b.createdAt.getTime() : Number(b.createdAt) || 0;
+      return tB - tA;
+    });
+
+    callback(orders);
+  };
+
+  const isFirestoreIndexError = (err: any): boolean => {
+    const code = String(err?.code || '').toLowerCase();
+    const msg = String(err?.message || '').toLowerCase();
+    return (
+      code === 'failed-precondition' ||
+      msg.includes('requires an index') ||
+      msg.includes('failed-precondition')
+    );
+  };
+
+  let disposed = false;
+  let activeUnsubscribe: (() => void) | null = null;
+  let listenerGeneration = 0;
+
+  const startListener = (useIndexed: boolean) => {
+    if (disposed) return;
+    const generation = ++listenerGeneration;
+    let q;
+    try {
+      q = useIndexed
+        ? query(coll, ...constraints, orderBy('createdAt', 'desc'), firestoreLimit(200))
+        : query(coll, ...constraints, firestoreLimit(200));
+    } catch (err: any) {
+      if (useIndexed && isFirestoreIndexError(err)) {
+        console.warn('[suppliers-po-service] Índice faltante en purchase_orders, usando fallback sin orderBy:', err?.message || err);
+        startListener(false);
+        return;
+      }
+      console.warn('[suppliers-po-service] Error al construir consulta de purchase_orders:', err);
+      callback([]);
+      return;
+    }
+
+    const unsub = onSnapshot(
+      q,
+      handleSnapshot,
+      (err) => {
+        if (disposed || generation !== listenerGeneration) return;
+        if (useIndexed && isFirestoreIndexError(err)) {
+          console.warn('[suppliers-po-service] Índice faltante en suscripción a purchase_orders, usando fallback sin orderBy:', err?.message || err);
+          unsub?.();
+          startListener(false);
+          return;
+        }
+        console.warn('[suppliers-po-service] Error en suscripción a purchase_orders:', err);
+        callback([]);
+      }
+    );
+
+    if (disposed || generation !== listenerGeneration) {
+      unsub?.();
+    } else {
+      activeUnsubscribe = unsub;
+    }
+  };
+
+  startListener(true);
+
+  return () => {
+    disposed = true;
+    activeUnsubscribe?.();
+    activeUnsubscribe = null;
+  };
 };
 
 /**
@@ -956,18 +1011,21 @@ export const receivePurchaseOrder = async (
       throw new Error('La orden de compra no contiene productos para ingresar a stock.');
     }
 
-    // Leer una sola vez por productId único para cumplir lectura previa a escritura
+    // Leer una sola vez por productId único en paralelo para cumplir lectura previa a escritura
+    const uniqueProductIds = Array.from(
+      new Set(items.map((item) => item.productId).filter((id): id is string => Boolean(id)))
+    );
+    const productEntries = await Promise.all(
+      uniqueProductIds.map(async (productId) => {
+        const pRef = doc(db, PRODUCTS_COLLECTION, productId);
+        const pSnap = await tx.get(pRef);
+        return [productId, { ref: pRef, snap: pSnap }] as const;
+      })
+    );
     const productDocs = new Map<string, {
       ref: ReturnType<typeof doc>;
       snap: Awaited<ReturnType<typeof tx.get>>;
-    }>();
-
-    for (const item of items) {
-      if (!item.productId || productDocs.has(item.productId)) continue;
-      const pRef = doc(db, PRODUCTS_COLLECTION, item.productId);
-      const pSnap = await tx.get(pRef);
-      productDocs.set(item.productId, { ref: pRef, snap: pSnap });
-    }
+    }>(productEntries);
 
     // ----------------------------------------------------------------------
     // FASE 2: TODAS LAS ESCRITURAS (Updates de productos, Kardex y orden)

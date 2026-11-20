@@ -83,7 +83,7 @@ export const ModuleLauncherModal: React.FC<ModuleLauncherModalProps> = React.mem
         list.push({
           id: 'reports',
           title: 'Reportes',
-          subtitle: 'P&L y exportar',
+          subtitle: 'Ganancias y exportar',
           route: '/reports',
           tintBg: ui.accentSoft,
           tintColor: ui.accent,
@@ -118,19 +118,6 @@ export const ModuleLauncherModal: React.FC<ModuleLauncherModalProps> = React.mem
         });
       }
 
-      if (!isSeller) {
-        list.push({
-          id: 'notifications',
-          title: 'Notificaciones',
-          subtitle: unreadCount > 0 ? `${unreadCount} sin leer` : 'Alertas del negocio',
-          route: '/notifications',
-          tintBg: unreadCount > 0 ? ui.dangerSoft : ui.surfaceMuted,
-          tintColor: unreadCount > 0 ? ui.danger : ui.textSecondary,
-          badgeCount: unreadCount,
-          icon: Bell,
-        });
-      }
-
       if (isSeller && hasPermission('view_own_sales')) {
         list.push({
           id: 'seller',
@@ -154,7 +141,6 @@ export const ModuleLauncherModal: React.FC<ModuleLauncherModalProps> = React.mem
       isAdmin,
       isManager,
       isSeller,
-      unreadCount,
     ]);
 
     const handleNavigate = (route: string) => {

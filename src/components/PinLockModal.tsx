@@ -102,7 +102,7 @@ export const PinLockModal: React.FC = React.memo(() => {
       if (!updateRemaining()) {
         clearInterval(interval);
       }
-    }, 250);
+    }, 1000);
 
     return () => clearInterval(interval);
   }, [isPinLocked, pinLockoutUntil]);

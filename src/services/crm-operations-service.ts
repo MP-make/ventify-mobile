@@ -418,17 +418,19 @@ export const registerFiadoPayment = async (
   const paymentId = depositRef.id;
   const customerRef = doc(db, CUSTOMERS_COLLECTION, customer.id);
   const reservationRef = params.reservationId ? doc(db, RESERVATIONS_COLLECTION, params.reservationId) : null;
+  const sessionRef = sessionId ? doc(db, CASH_SESSIONS_COLLECTION, sessionId) : null;
 
   await runTransaction(db, async (tx) => {
-    // 1. Leer saldo actual del cliente y sesión de caja antes de escribir
-    const custSnap = await tx.get(customerRef);
+    // 1. Leer saldo actual del cliente, fiado y sesión de caja en paralelo antes de escribir
+    const [custSnap, reservationSnap, sessionSnap] = await Promise.all([
+      tx.get(customerRef),
+      reservationRef ? tx.get(reservationRef) : Promise.resolve(null),
+      sessionRef ? tx.get(sessionRef) : Promise.resolve(null),
+    ]);
     if (!custSnap.exists()) {
       throw new Error(`El cliente con ID ${customer.id} no existe.`);
     }
 
-    const reservationSnap = reservationRef ? await tx.get(reservationRef) : null;
-    const sessionRef = sessionId ? doc(db, CASH_SESSIONS_COLLECTION, sessionId) : null;
-    const sessionSnap = sessionRef ? await tx.get(sessionRef) : null;
     const sessionData = sessionSnap ? requireOpenSession(sessionSnap, accountId, branchId) : null;
 
     const cData = custSnap.data();
@@ -553,12 +555,14 @@ export const getCustomerFiadoHistory = async (
       where('accountId', '==', accountId),
       where('customerId', '==', customerId)
     );
-    const snapshot = await getDocs(q);
-    const reservationsSnapshot = await getDocs(query(
-      collection(db, RESERVATIONS_COLLECTION),
-      where('accountId', '==', accountId),
-      where('customerId', '==', customerId)
-    ));
+    const [snapshot, reservationsSnapshot] = await Promise.all([
+      getDocs(q),
+      getDocs(query(
+        collection(db, RESERVATIONS_COLLECTION),
+        where('accountId', '==', accountId),
+        where('customerId', '==', customerId)
+      )),
+    ]);
     const fiadoIds = reservationsSnapshot.docs
       .filter((d) => d.data().isFiado === true || d.data().isCreditSale === true || d.data().type === 'fiado')
       .map((d) => d.id);
@@ -1004,9 +1008,7 @@ export const getReservationsAndOrders = async (
   const maxResults = typeof typeOrMaxResults === 'number' ? typeOrMaxResults : (optionalMaxResults || 60);
 
   try {
-    const results: ReservationOrder[] = [];
-
-    const fetchCol = async (colName: string, t: 'reservation' | 'order') => {
+    const fetchCol = async (colName: string, t: 'reservation' | 'order'): Promise<ReservationOrder[]> => {
       const coll = collection(db, colName);
       let snap;
       try {
@@ -1028,21 +1030,21 @@ export const getReservationsAndOrders = async (
         );
         snap = await getDocs(fallbackQ);
       }
-      snap.docs.forEach((d) => {
-        results.push({
-          id: d.id,
-          type: t,
-          ...(d.data() as any),
-        });
-      });
+      return snap.docs.map((d) => ({
+        id: d.id,
+        type: t,
+        ...(d.data() as any),
+      }));
     };
 
+    const fetchTasks: Array<Promise<ReservationOrder[]>> = [];
     if (!type || type === 'reservation') {
-      await fetchCol(RESERVATIONS_COLLECTION, 'reservation');
+      fetchTasks.push(fetchCol(RESERVATIONS_COLLECTION, 'reservation'));
     }
     if (!type || type === 'order') {
-      await fetchCol(ORDERS_COLLECTION, 'order');
+      fetchTasks.push(fetchCol(ORDERS_COLLECTION, 'order'));
     }
+    const results = (await Promise.all(fetchTasks)).flat();
 
     // Ordenar descendente por fecha de creación
     results.sort((a, b) => {
@@ -1158,28 +1160,33 @@ export const createReservationOrOrder = async (
 
 
   await runTransaction(db, async (tx) => {
-    // 0. Ejecutar TODAS las lecturas (tx.get) antes de cualquier escritura (requisito de Firestore)
+    // 0. Ejecutar TODAS las lecturas (tx.get) en paralelo antes de cualquier escritura (requisito de Firestore)
+    const requirements = type === 'reservation' ? aggregateStockRequirements(items) : [];
+    const productRefs = requirements.map((requirement) => doc(db, PRODUCTS_COLLECTION, requirement.productId));
+    const sessionRef = normDeposit > 0 && sessionId ? doc(db, CASH_SESSIONS_COLLECTION, sessionId) : null;
+
+    const [productSnaps, sSnap] = await Promise.all([
+      Promise.all(productRefs.map((pRef) => tx.get(pRef))),
+      sessionRef ? tx.get(sessionRef) : Promise.resolve(null),
+    ]);
+
     const productReads: Array<{ pRef: any; pSnap: any; unitsToReserve: number }> = [];
-    if (type === 'reservation') {
-      for (const requirement of aggregateStockRequirements(items)) {
-        const unitsToReserve = requirement.units;
-        const pRef = doc(db, PRODUCTS_COLLECTION, requirement.productId);
-        const pSnap = await tx.get(pRef);
-        if (!pSnap.exists()) throw new Error(`No se encontró el producto ${requirement.items[0]?.name || requirement.items[0]?.productName || ''}.`);
-        const product = pSnap.data();
-        if (product.accountId !== accountId) throw new Error('Uno de los productos no pertenece a esta cuenta.');
-        const physical = Number(product.stock?.[branchId]) || 0;
-        const reserved = Number(product.reservedStock?.[branchId]) || 0;
-        if (physical - reserved < unitsToReserve) {
-          throw new Error(`Stock insuficiente para ${requirement.items[0]?.name || requirement.items[0]?.productName || 'un producto'}.`);
-        }
-        productReads.push({ pRef, pSnap, unitsToReserve });
+    for (let i = 0; i < requirements.length; i += 1) {
+      const requirement = requirements[i];
+      const unitsToReserve = requirement.units;
+      const pRef = productRefs[i];
+      const pSnap = productSnaps[i];
+      if (!pSnap.exists()) throw new Error(`No se encontró el producto ${requirement.items[0]?.name || requirement.items[0]?.productName || ''}.`);
+      const product = pSnap.data();
+      if (product.accountId !== accountId) throw new Error('Uno de los productos no pertenece a esta cuenta.');
+      const physical = Number(product.stock?.[branchId]) || 0;
+      const reserved = Number(product.reservedStock?.[branchId]) || 0;
+      if (physical - reserved < unitsToReserve) {
+        throw new Error(`Stock insuficiente para ${requirement.items[0]?.name || requirement.items[0]?.productName || 'un producto'}.`);
       }
+      productReads.push({ pRef, pSnap, unitsToReserve });
     }
 
-
-    const sessionRef = normDeposit > 0 && sessionId ? doc(db, CASH_SESSIONS_COLLECTION, sessionId) : null;
-    const sSnap = sessionRef ? await tx.get(sessionRef) : null;
     const sessionData = sSnap ? requireOpenSession(sSnap, accountId, branchId) : null;
 
     // 1. Apartar stock reservado en cada producto SIN enviar updatedAt (permitido para cajeros)
@@ -1334,14 +1341,17 @@ export const registerReservationPayment = async (
   const depositDocRef = doc(collection(db, depositColl));
   const depositId = depositDocRef.id;
 
+  const sessionRef = sessionId ? doc(db, CASH_SESSIONS_COLLECTION, sessionId) : null;
+
   await runTransaction(db, async (tx) => {
-    const resSnap = await tx.get(resDocRef);
+    const [resSnap, sSnap] = await Promise.all([
+      tx.get(resDocRef),
+      sessionRef ? tx.get(sessionRef) : Promise.resolve(null),
+    ]);
     if (!resSnap.exists()) {
       throw new Error(`La ${type === 'order' ? 'orden' : 'reserva'} no existe.`);
     }
 
-    const sessionRef = sessionId ? doc(db, CASH_SESSIONS_COLLECTION, sessionId) : null;
-    const sSnap = sessionRef ? await tx.get(sessionRef) : null;
     const sessionData = sSnap ? requireOpenSession(sSnap, accountId, branchId) : null;
 
     const rData = resSnap.data();
@@ -1429,10 +1439,15 @@ export const approveOrder = async (orderId: string): Promise<void> => {
     if (order.status !== 'pending') throw new Error('El pedido ya fue revisado.');
 
     const orderItems = (order.items || []).filter((item: any) => !item.isCustomProduct);
+    const requirements = aggregateStockRequirements(orderItems);
+    const productRefs = requirements.map((requirement) => doc(db, PRODUCTS_COLLECTION, requirement.productId));
+    const productSnaps = await Promise.all(productRefs.map((productRef) => tx.get(productRef)));
+
     const products: Array<{ ref: any; snap: any; units: number; productId: string; label: string }> = [];
-    for (const requirement of aggregateStockRequirements(orderItems)) {
-      const productRef = doc(db, PRODUCTS_COLLECTION, requirement.productId);
-      const productSnap = await tx.get(productRef);
+    for (let i = 0; i < requirements.length; i += 1) {
+      const requirement = requirements[i];
+      const productRef = productRefs[i];
+      const productSnap = productSnaps[i];
       const label = requirement.items[0]?.name || requirement.items[0]?.productName || '';
       if (!productSnap.exists()) throw new Error(`No se encontró el producto ${label}.`);
       if (productSnap.data().accountId !== order.accountId) throw new Error(`El producto ${label} no pertenece a esta cuenta.`);
@@ -1584,35 +1599,37 @@ export const completeOrCancelReservation = async (
     });
 
     if ((documentType === 'boleta' || documentType === 'factura') && finalizeRes?.saleId) {
-      try {
-        const { buildSunatEmitOptions, emitToSunatAsync } = await import('./sale-service');
-        const emitOptions = buildSunatEmitOptions(
-          documentType,
-          {
-            name: mergedCustomer.name || item.customerName || 'CLIENTE',
-            dni: cleanDoc.length === 8 ? cleanDoc : undefined,
-            ruc: cleanDoc.length === 11 ? cleanDoc : undefined,
-            documentNumber: cleanDoc || undefined,
-            address: mergedCustomer.address,
-            email: mergedCustomer.email,
-          },
-          item.notes
-        );
-        const sunatResult = await emitToSunatAsync(
-          finalizeRes.saleId,
-          item.accountId,
-          item.branchId,
-          emitOptions
-        );
-        paymentInfo.onSunatResult?.(sunatResult);
-      } catch (sunatErr) {
-        console.warn('[CRMService] Emisión SUNAT diferida o fallida al completar:', sunatErr);
-        paymentInfo.onSunatResult?.({
-          success: false,
-          sunatStatus: 'error',
-          error: (sunatErr as Error)?.message || 'Error al despachar comprobante a SUNAT',
-        });
-      }
+      void (async () => {
+        try {
+          const { buildSunatEmitOptions, emitToSunatAsync } = await import('./sale-service');
+          const emitOptions = buildSunatEmitOptions(
+            documentType,
+            {
+              name: mergedCustomer.name || item.customerName || 'CLIENTE',
+              dni: cleanDoc.length === 8 ? cleanDoc : undefined,
+              ruc: cleanDoc.length === 11 ? cleanDoc : undefined,
+              documentNumber: cleanDoc || undefined,
+              address: mergedCustomer.address,
+              email: mergedCustomer.email,
+            },
+            item.notes
+          );
+          const sunatResult = await emitToSunatAsync(
+            finalizeRes.saleId,
+            item.accountId,
+            item.branchId,
+            emitOptions
+          );
+          paymentInfo.onSunatResult?.(sunatResult);
+        } catch (sunatErr) {
+          console.warn('[CRMService] Emisión SUNAT diferida o fallida al completar:', sunatErr);
+          paymentInfo.onSunatResult?.({
+            success: false,
+            sunatStatus: 'error',
+            error: (sunatErr as Error)?.message || 'Error al despachar comprobante a SUNAT',
+          });
+        }
+      })();
     }
     return;
   }
@@ -1652,10 +1669,40 @@ export const completeOrCancelReservation = async (
     const releases: Array<{ ref: ReturnType<typeof doc>; reserved: number }> = [];
     // Web orders reserve on approval; pending orders have no held inventory.
     const hasReservedInventory = item.type === 'reservation' || current.status !== 'pending' || isLegacyReservedOrder(current);
-    const depositRef = queriedDepositRef;
-    const depositSnap = depositRef ? await tx.get(depositRef) : null;
-    let depositData: Record<string, any> | null = null;
+    const shouldRefundDeposit = Boolean(refundMethod && Number(current.depositAmount) > 0);
+    const depositRef = shouldRefundDeposit ? queriedDepositRef : null;
     let sessionRef: ReturnType<typeof doc> | null = null;
+    let percentage = 100;
+
+    if (shouldRefundDeposit) {
+      if (!paymentInfo?.sessionId) throw new Error('Abre una caja antes de registrar el reembolso.');
+      percentage = Number(paymentInfo.refundPercent ?? 100);
+      if (!Number.isFinite(percentage) || percentage <= 0 || percentage > 100) {
+        throw new Error('El porcentaje de reembolso debe estar entre 1 y 100.');
+      }
+      if (!depositRef && item.type !== 'order') {
+        throw new Error('No se encontró el depósito activo asociado a esta reserva.');
+      }
+      sessionRef = doc(db, CASH_SESSIONS_COLLECTION, paymentInfo.sessionId);
+    }
+
+    let stockRequirements: ReturnType<typeof aggregateStockRequirements> = [];
+    if (hasReservedInventory) {
+      if (!Array.isArray(current.items)) throw new Error('La reserva no tiene líneas válidas.');
+      const legacyMobileLines = current.items.every((line: any) => line.productId && !line.id);
+      const stockLines = current.items.filter((line: any) => !line.isCustomProduct).map((line: any) =>
+        current.attributionVersion === 1 || legacyMobileLines ? line : {...line,presentationQty:1,conversionFactor:1});
+      stockRequirements = aggregateStockRequirements(stockLines);
+    }
+    const productRefs = stockRequirements.map((requirement) => doc(db, PRODUCTS_COLLECTION, requirement.productId));
+
+    const [depositSnap, sessionSnap, ...productSnaps] = await Promise.all([
+      depositRef ? tx.get(depositRef) : Promise.resolve(null),
+      sessionRef ? tx.get(sessionRef) : Promise.resolve(null),
+      ...productRefs.map((ref) => tx.get(ref)),
+    ]);
+
+    let depositData: Record<string, any> | null = null;
     let sessionData: Record<string, any> | null = null;
     let refundAmount = 0;
     let nextRefundedAmount = 0;
@@ -1664,12 +1711,7 @@ export const completeOrCancelReservation = async (
     let refundMovementRef: ReturnType<typeof doc> | null = null;
     let manualLegacyOrderRefund = false;
 
-    if (refundMethod && Number(current.depositAmount) > 0) {
-      if (!paymentInfo?.sessionId) throw new Error('Abre una caja antes de registrar el reembolso.');
-      const percentage = Number(paymentInfo.refundPercent ?? 100);
-      if (!Number.isFinite(percentage) || percentage <= 0 || percentage > 100) {
-        throw new Error('El porcentaje de reembolso debe estar entre 1 y 100.');
-      }
+    if (shouldRefundDeposit) {
       if (depositRef) {
         if (!depositSnap?.exists()) throw new Error('El depósito activo ya no existe. Actualiza los datos antes de cancelar.');
         depositData = depositSnap.data();
@@ -1678,11 +1720,9 @@ export const completeOrCancelReservation = async (
         }
         if (depositData.status !== 'active') throw new Error('El depósito ya fue resuelto. Actualiza los datos antes de cancelar.');
         if (depositData.refundable === false) throw new Error('El depósito no es reembolsable.');
-      } else if (item.type === 'order') {
+      } else {
         // Historical orders without order_deposits still record the refund in the active cash session.
         manualLegacyOrderRefund = true;
-      } else {
-        throw new Error('No se encontró el depósito activo asociado a esta reserva.');
       }
 
       const depositAmount = Number(depositData?.amount ?? current.depositAmount) || 0;
@@ -1705,10 +1745,8 @@ export const completeOrCancelReservation = async (
         depositUpdate = { refundReason };
       }
 
-      sessionRef = doc(db, CASH_SESSIONS_COLLECTION, paymentInfo.sessionId);
-      const sessionSnap = await tx.get(sessionRef);
       sessionData = requireOpenSession(sessionSnap, item.accountId, item.branchId);
-      const refundIsCash = refundMethod.toLowerCase() === 'cash' || refundMethod.toLowerCase().includes('efectivo');
+      const refundIsCash = refundMethod!.toLowerCase() === 'cash' || refundMethod!.toLowerCase().includes('efectivo');
       if (manualLegacyOrderRefund) {
         sessionUpdate = {};
         if (refundIsCash) {
@@ -1743,13 +1781,10 @@ export const completeOrCancelReservation = async (
     }
 
     if (hasReservedInventory) {
-      if (!Array.isArray(current.items)) throw new Error('La reserva no tiene líneas válidas.');
-      const legacyMobileLines = current.items.every((line: any) => line.productId && !line.id);
-      const stockLines = current.items.filter((line: any) => !line.isCustomProduct).map((line: any) =>
-        current.attributionVersion === 1 || legacyMobileLines ? line : {...line,presentationQty:1,conversionFactor:1});
-      for (const requirement of aggregateStockRequirements(stockLines)) {
-        const ref = doc(db, PRODUCTS_COLLECTION, requirement.productId);
-        const snapshot = await tx.get(ref);
+      for (let i = 0; i < stockRequirements.length; i += 1) {
+        const requirement = stockRequirements[i];
+        const ref = productRefs[i];
+        const snapshot = productSnaps[i];
         if (!snapshot.exists() || snapshot.data().accountId !== item.accountId) throw new Error('No se encontró el producto de esta reserva.');
         const reserved = Number(snapshot.data().reservedStock?.[branchId]) || 0;
         if (requirement.units <= 0 || reserved < requirement.units) throw new Error('La reserva de stock no coincide. Actualiza los datos antes de cancelar.');
@@ -1850,7 +1885,10 @@ export const parseVentySseText = (
   onChunk?: (accumulatedText: string, delta: string) => void
 ): string => {
   const state: VentySseState = { buffer: '', reply: '' };
-  consumeVentySseChunk(`${rawSse}\n`, state, onChunk);
+  consumeVentySseChunk(`${rawSse}\n`, state);
+  if (onChunk && state.reply) {
+    onChunk(state.reply, state.reply);
+  }
   return state.reply;
 };
 

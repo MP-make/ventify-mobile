@@ -679,6 +679,7 @@ export const getActiveCashSession = async (
 ): Promise<CashSession | null> => {
   try {
     let activeSessionId: string | null = null;
+    let prefetchedSessionDoc: { id: string; data: Record<string, any> } | null = null;
 
     // 1. Probar puntero del usuario/operador si se proporcionan accountId y userId
     if (accountId && userId) {
@@ -703,7 +704,9 @@ export const getActiveCashSession = async (
         );
         const userSessionSnap = await getDocs(userSessionQ);
         if (!userSessionSnap.empty) {
-          activeSessionId = userSessionSnap.docs[0].id;
+          const docSnap = userSessionSnap.docs[0];
+          activeSessionId = docSnap.id;
+          prefetchedSessionDoc = { id: docSnap.id, data: docSnap.data() };
         }
       }
 
@@ -719,21 +722,30 @@ export const getActiveCashSession = async (
 
     if (!activeSessionId) return null;
 
-    const sessionRef = doc(db, CASH_SESSIONS_COLLECTION, activeSessionId);
-    const sessionSnap = await getDoc(sessionRef);
+    let sessionIdResolved = prefetchedSessionDoc?.id;
+    let data = prefetchedSessionDoc?.data;
 
-    if (!sessionSnap.exists() || sessionSnap.data()?.status !== 'open') {
+    if (!data) {
+      const sessionRef = doc(db, CASH_SESSIONS_COLLECTION, activeSessionId);
+      const sessionSnap = await getDoc(sessionRef);
+      if (!sessionSnap.exists()) {
+        return null;
+      }
+      sessionIdResolved = sessionSnap.id;
+      data = sessionSnap.data();
+    }
+
+    if (data?.status !== 'open') {
       return null;
     }
 
-    const data = sessionSnap.data();
     // Si se solicitó un usuario específico, verificar que startedBy coincida
     if (userId && data.startedBy && data.startedBy !== userId) {
       return null;
     }
 
     return {
-      id: sessionSnap.id,
+      id: sessionIdResolved!,
       ...data,
     } as CashSession;
   } catch (err) {
@@ -961,12 +973,20 @@ export const calculateCashAudit = (
 
   // Las devoluciones de una venta anulada ya no tienen una venta física que
   // revertir en este arqueo. Ignorar también su movimiento compensatorio.
-  const validSales = sales.filter(
-    (s) => s.status !== 'cancelled' && !s.isReturn && (s.sessionId === session.id || !s.sessionId)
-  );
-  const cancelledSaleIds = new Set(
-    sales.filter((s) => s.status === 'cancelled').map((s) => String(s.id || '')).filter(Boolean)
-  );
+  const validSales: any[] = [];
+  const cancelledSaleIds = new Set<string>();
+  const salesById = new Map<string, Sale & Record<string, any>>();
+  for (const s of sales) {
+    const id = String(s?.id || '');
+    if (id && !salesById.has(id)) {
+      salesById.set(id, s);
+    }
+    if (s?.status === 'cancelled') {
+      if (id) cancelledSaleIds.add(id);
+    } else if (!s?.isReturn && (s?.sessionId === session.id || !s?.sessionId)) {
+      validSales.push(s);
+    }
+  }
   const isDepositPayment = (sale: any): boolean => sale.isDepositPayment === true;
   const isCashMethod = (value: unknown): boolean => {
     const method = String(value || '').toLowerCase();
@@ -1139,7 +1159,7 @@ export const calculateCashAudit = (
         continue;
       }
 
-      const linkedSale = m.saleId ? sales.find((s) => String(s.id || '') === String(m.saleId)) : undefined;
+      const linkedSale = m.saleId ? salesById.get(String(m.saleId)) : undefined;
       const linkedMethod = linkedSale?.paymentMethod || linkedSale?.paymentCategory || linkedSale?.paymentMethodId;
       const isCashRefundOutflow = rawAmount < 0 || (m.type === 'expense' && rawAmount > 0);
       if (isCashRefundOutflow && (isCashMethod(method || linkedMethod) || (!method && !linkedMethod))) {
@@ -1237,9 +1257,19 @@ export const closeCashSession = async (
     throw new Error('El efectivo contado físico debe ser un valor válido igual o mayor a cero.');
   }
 
-  // 1. Obtener sesión, movimientos y ventas para auditoría precisa
+  // 1. Obtener sesión, movimientos y ventas en paralelo para auditoría precisa
   const sessionRef = doc(db, CASH_SESSIONS_COLLECTION, sessionId);
-  const sessionSnap = await getDoc(sessionRef);
+  const salesQuery = query(
+    collection(db, SALES_COLLECTION),
+    where('accountId', '==', accountId),
+    where('sessionId', '==', sessionId)
+  );
+
+  const [sessionSnap, movements, salesSnap] = await Promise.all([
+    getDoc(sessionRef),
+    getSessionMovements(accountId, branchId, sessionId),
+    getDocs(salesQuery),
+  ]);
 
   if (!sessionSnap.exists()) {
     throw new Error(`La sesión de caja ${sessionId} no existe.`);
@@ -1250,15 +1280,6 @@ export const closeCashSession = async (
     throw new Error('Esta sesión de caja ya fue cerrada previamente.');
   }
 
-  const movements = await getSessionMovements(accountId, branchId, sessionId);
-
-  // Consultar ventas vinculadas a la sesión
-  const salesQuery = query(
-    collection(db, SALES_COLLECTION),
-    where('accountId', '==', accountId),
-    where('sessionId', '==', sessionId)
-  );
-  const salesSnap = await getDocs(salesQuery);
   const sales = salesSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
 
   // 2. Calcular Arqueo Z y esquema web `computed` + `sellerSummary`

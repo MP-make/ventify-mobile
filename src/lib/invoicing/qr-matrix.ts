@@ -26,7 +26,12 @@ function gfMul(a: number, b: number): number {
   return GF_EXP[GF_LOG[a] + GF_LOG[b]];
 }
 
+const RS_POLY_CACHE = new Map<number, Uint8Array>();
+
 function getRsGeneratorPoly(ecCount: number): Uint8Array {
+  const cached = RS_POLY_CACHE.get(ecCount);
+  if (cached) return cached;
+
   let poly = new Uint8Array([1]);
   for (let i = 0; i < ecCount; i++) {
     const next = new Uint8Array(poly.length + 1);
@@ -37,6 +42,7 @@ function getRsGeneratorPoly(ecCount: number): Uint8Array {
     }
     poly = next;
   }
+  RS_POLY_CACHE.set(ecCount, poly);
   return poly;
 }
 
@@ -399,12 +405,29 @@ export interface QrMatrixResult {
   pathData: string;
 }
 
+interface QrCoreResult {
+  version: number;
+  size: number;
+  modules: Uint8Array;
+  pathData: string;
+}
+
+const QR_CORE_CACHE_LIMIT = 20;
+const QR_CORE_CACHE = new Map<string, QrCoreResult>();
+
 /**
- * Codifica cualquier texto (p. ej. cadena QR SUNAT o URL) en matriz QR binaria
- * con corrección de errores Nivel M.
+ * Computes and caches QR modules + merged horizontal-run SVG path without allocating `boolean[][]`.
  */
-export function generateQrMatrix(text: string): QrMatrixResult {
-  const bytes = utf8Encode(String(text || ''));
+function computeQrCore(text: string): QrCoreResult {
+  const cacheKey = String(text || '');
+  const cached = QR_CORE_CACHE.get(cacheKey);
+  if (cached) {
+    QR_CORE_CACHE.delete(cacheKey);
+    QR_CORE_CACHE.set(cacheKey, cached);
+    return cached;
+  }
+
+  const bytes = utf8Encode(cacheKey);
   let spec = VERSION_SPECS_M[VERSION_SPECS_M.length - 1];
 
   for (const candidate of VERSION_SPECS_M) {
@@ -417,12 +440,10 @@ export function generateQrMatrix(text: string): QrMatrixResult {
     }
   }
 
-  const trimmedBytes = (() => {
-    const totalDataCodewords = spec.groups.reduce((sum, [cnt, dc]) => sum + cnt * dc, 0);
-    const overheadBits = 4 + (spec.version <= 9 ? 8 : 16);
-    const maxBytes = Math.floor((totalDataCodewords * 8 - overheadBits) / 8);
-    return bytes.length > maxBytes ? bytes.subarray(0, maxBytes) : bytes;
-  })();
+  const totalDataCodewords = spec.groups.reduce((sum, [cnt, dc]) => sum + cnt * dc, 0);
+  const overheadBits = 4 + (spec.version <= 9 ? 8 : 16);
+  const maxBytes = Math.floor((totalDataCodewords * 8 - overheadBits) / 8);
+  const trimmedBytes = bytes.length > maxBytes ? bytes.subarray(0, maxBytes) : bytes;
 
   const bitStream = buildFinalBitStream(trimmedBytes, spec);
   const { modules: baseModules, isFunction } = placeFunctionPatterns(spec);
@@ -444,7 +465,6 @@ export function generateQrMatrix(text: string): QrMatrixResult {
     }
   }
 
-  let bestMask = 0;
   let bestScore = Infinity;
   let bestModules = baseModules;
 
@@ -461,32 +481,68 @@ export function generateQrMatrix(text: string): QrMatrixResult {
     const score = penaltyScore(candidate, n);
     if (score < bestScore) {
       bestScore = score;
-      bestMask = mask;
       bestModules = candidate;
     }
   }
 
-  void bestMask;
-
-  const matrix: boolean[][] = [];
   const pathParts: string[] = [];
   for (let r = 0; r < n; r++) {
-    const row: boolean[] = [];
-    for (let c = 0; c < n; c++) {
-      const dark = bestModules[r * n + c] === 1;
-      row.push(dark);
-      if (dark) {
-        pathParts.push(`M${c} ${r}h1v1h-1z`);
+    const rowOffset = r * n;
+    let c = 0;
+    while (c < n) {
+      if (bestModules[rowOffset + c] === 1) {
+        const startC = c;
+        c++;
+        while (c < n && bestModules[rowOffset + c] === 1) {
+          c++;
+        }
+        const runLen = c - startC;
+        pathParts.push(`M${startC} ${r}h${runLen}v1h-${runLen}z`);
+      } else {
+        c++;
       }
     }
-    matrix.push(row);
+  }
+
+  const core: QrCoreResult = {
+    version: spec.version,
+    size: n,
+    modules: bestModules,
+    pathData: pathParts.join(''),
+  };
+
+  if (QR_CORE_CACHE.size >= QR_CORE_CACHE_LIMIT) {
+    const oldestKey = QR_CORE_CACHE.keys().next().value;
+    if (oldestKey !== undefined) {
+      QR_CORE_CACHE.delete(oldestKey);
+    }
+  }
+  QR_CORE_CACHE.set(cacheKey, core);
+  return core;
+}
+
+/**
+ * Codifica cualquier texto (p. ej. cadena QR SUNAT o URL) en matriz QR binaria
+ * con corrección de errores Nivel M.
+ */
+export function generateQrMatrix(text: string): QrMatrixResult {
+  const core = computeQrCore(text);
+  const n = core.size;
+  const matrix: boolean[][] = new Array(n);
+  for (let r = 0; r < n; r++) {
+    const row: boolean[] = new Array(n);
+    const rowOffset = r * n;
+    for (let c = 0; c < n; c++) {
+      row[c] = core.modules[rowOffset + c] === 1;
+    }
+    matrix[r] = row;
   }
 
   return {
-    version: spec.version,
+    version: core.version,
     size: n,
     matrix,
-    pathData: pathParts.join(''),
+    pathData: core.pathData,
   };
 }
 
@@ -494,7 +550,7 @@ export function generateQrMatrix(text: string): QrMatrixResult {
  * Genera markup `<svg>` inline autocontenido listo para embeber en HTML / `expo-print`.
  */
 export function buildQrSvgMarkup(text: string, sizePx: number = 128, quietZone: number = 2): string {
-  const { size, pathData } = generateQrMatrix(text);
+  const { size, pathData } = computeQrCore(text);
   const totalViewBox = size + quietZone * 2;
   return (
     `<svg xmlns="http://www.w3.org/2000/svg" width="${sizePx}" height="${sizePx}" ` +

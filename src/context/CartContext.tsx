@@ -7,6 +7,7 @@ import React, {
   useMemo,
   useRef,
 } from 'react';
+import { InteractionManager } from 'react-native';
 import { cartKVStorage } from '@/lib/native-kv-storage';
 import * as Haptics from 'expo-haptics';
 import {
@@ -91,6 +92,47 @@ export interface CartContextType {
 }
 
 
+export type CartActionsContextType = Pick<
+  CartContextType,
+  | 'setCustomer'
+  | 'setDiscount'
+  | 'setNotes'
+  | 'setSaleRequestId'
+  | 'setSourceQuoteId'
+  | 'setShippingAmount'
+  | 'setInvoiceIntent'
+  | 'addItem'
+  | 'addGiftItem'
+  | 'updateQuantity'
+  | 'updateItemPrice'
+  | 'removeItem'
+  | 'clearCart'
+  | 'pauseCurrentSale'
+  | 'resumePausedSale'
+  | 'deletePausedSale'
+  | 'getItemQuantity'
+>;
+
+const CartActionsContext = createContext<CartActionsContextType>({
+  setCustomer: () => {},
+  setDiscount: () => {},
+  setNotes: () => {},
+  setSaleRequestId: () => {},
+  setSourceQuoteId: () => {},
+  setShippingAmount: () => {},
+  setInvoiceIntent: () => {},
+  addItem: () => {},
+  addGiftItem: () => {},
+  updateQuantity: () => {},
+  updateItemPrice: () => false,
+  removeItem: () => {},
+  clearCart: () => {},
+  pauseCurrentSale: async () => null,
+  resumePausedSale: async () => false,
+  deletePausedSale: async () => false,
+  getItemQuantity: () => 0,
+});
+
 const CartContext = createContext<CartContextType>({
   items: [],
   customer: null,
@@ -151,6 +193,22 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [pausedSales, setPausedSales] = useState<PausedSale[]>([]);
 
   const isRestored = useRef<boolean>(false);
+  const itemsRef = useRef<CartItem[]>(items);
+  itemsRef.current = items;
+  const pausedSalesRef = useRef<PausedSale[]>(pausedSales);
+  pausedSalesRef.current = pausedSales;
+  const customerRef = useRef<Customer | null>(customer);
+  customerRef.current = customer;
+  const discountRef = useRef<number>(discount);
+  discountRef.current = discount;
+  const notesRef = useRef<string>(notes);
+  notesRef.current = notes;
+  const saleRequestIdRef = useRef<string | null>(saleRequestId);
+  saleRequestIdRef.current = saleRequestId;
+  const sourceQuoteIdRef = useRef<string | null>(sourceQuoteId);
+  sourceQuoteIdRef.current = sourceQuoteId;
+  const shippingAmountRef = useRef<number>(shippingAmount);
+  shippingAmountRef.current = shippingAmount;
 
   // 1. Restaurar carrito y ventas en pausa desde AsyncStorage al iniciar
   useEffect(() => {
@@ -214,34 +272,40 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return () => { alive = false; };
   }, [storageKeys.cart, storageKeys.paused, accountId, branchId, user?.uid, setDiscount, setShippingAmount]);
 
-  // 2. Persistir carrito actual reactivamente con debounce (350ms) y payload ligero
+  // 2. Persistir carrito actual reactivamente con debounce (350ms) tras interacciones y payload ligero
   useEffect(() => {
     if (!isRestored.current) return;
 
+    let interactionTask: { cancel?: () => void } | undefined;
     const timer = setTimeout(() => {
-      // Omitir objeto pesado item.product en la serialización para máxima velocidad MMKV
-      const lightweightItems = items.map((item) => {
-        if (!item.product) return item;
-        const { product, ...rest } = item;
-        return rest;
-      });
+      interactionTask = InteractionManager.runAfterInteractions(() => {
+        // Omitir objeto pesado item.product en la serialización para máxima velocidad MMKV
+        const lightweightItems = items.map((item) => {
+          if (!item.product) return item;
+          const { product, ...rest } = item;
+          return rest;
+        });
 
-      const payload = JSON.stringify({
-        items: lightweightItems,
-        customer,
-        discount,
-        notes,
-        saleRequestId,
-        sourceQuoteId,
-        shippingAmount,
-      });
+        const payload = JSON.stringify({
+          items: lightweightItems,
+          customer,
+          discount,
+          notes,
+          saleRequestId,
+          sourceQuoteId,
+          shippingAmount,
+        });
 
-      cartKVStorage.setItem(storageKeys.cart, payload).catch((err) => {
-        console.warn('[CartContext] Error saving cart to storage:', err);
+        cartKVStorage.setItem(storageKeys.cart, payload).catch((err) => {
+          console.warn('[CartContext] Error saving cart to storage:', err);
+        });
       });
     }, 350);
 
-    return () => clearTimeout(timer);
+    return () => {
+      clearTimeout(timer);
+      if (interactionTask?.cancel) interactionTask.cancel();
+    };
   }, [items, customer, discount, notes, saleRequestId, sourceQuoteId, shippingAmount, storageKeys.cart]);
 
   // 3. Persistir lista de ventas en pausa cuando cambie
@@ -458,7 +522,7 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const updateItemPrice = useCallback(
     (cartItemId: string, newPrice: number, enableMinSalePrice: boolean = defaultMinPriceEnabled): boolean => {
       if (!Number.isFinite(newPrice) || newPrice < 0) return false;
-      const target = items.find((i) => i.id === cartItemId);
+      const target = itemsRef.current.find((i) => i.id === cartItemId);
       if (!target) return false;
 
       if (!target.isGift) {
@@ -486,7 +550,7 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
       return true;
     },
-    [items, defaultMinPriceEnabled]
+    [defaultMinPriceEnabled]
   );
 
   // 7. Remover ítem del carrito
@@ -506,41 +570,47 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setInvoiceIntent(null);
     setShippingAmountState(0);
     cartKVStorage.removeItem(storageKeys.cart).catch(() => {});
-  }, [storageKeys.cart]);
+  }, [storageKeys.cart, setDiscount]);
 
   // 9. Ventas en Pausa (Hold Carts)
   const pauseCurrentSale = useCallback(
     async (label?: string): Promise<string | null> => {
-      if (items.length === 0) return null;
+      const currentItems = itemsRef.current;
+      if (currentItems.length === 0) return null;
+
+      const currentPaused = pausedSalesRef.current;
+      const currentCustomer = customerRef.current;
+      const currentDiscount = discountRef.current;
+      const currentShipping = shippingAmountRef.current;
 
       const pausedId = `hold_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
       const defaultLabel =
         label ||
-        (customer ? `Cliente: ${customer.name}` : `Venta en espera #${pausedSales.length + 1}`);
+        (currentCustomer ? `Cliente: ${currentCustomer.name}` : `Venta en espera #${currentPaused.length + 1}`);
 
-      const currentSubtotal = items.reduce(
+      const currentSubtotal = currentItems.reduce(
         (sum, item) => sum + item.price * item.quantity,
         0
       );
-      const currentTotal = Math.max(0, currentSubtotal - discount) + shippingAmount;
+      const currentTotal = Math.max(0, currentSubtotal - currentDiscount) + currentShipping;
 
       const newPausedSale: PausedSale = {
         id: pausedId,
         label: defaultLabel,
         savedAt: Date.now(),
-        items: [...items],
-        customer,
-        note: notes,
+        items: [...currentItems],
+        customer: currentCustomer,
+        note: notesRef.current,
         branchId,
         accountId: accountId || undefined,
         total: Math.round(currentTotal * 100) / 100,
-        sourceSaleRequestId: saleRequestId,
-        sourceQuoteId,
-        shippingAmount,
-        discountAmount: discount,
+        sourceSaleRequestId: saleRequestIdRef.current,
+        sourceQuoteId: sourceQuoteIdRef.current,
+        shippingAmount: currentShipping,
+        discountAmount: currentDiscount,
       };
 
-      const updatedList = [newPausedSale, ...pausedSales];
+      const updatedList = [newPausedSale, ...currentPaused];
       await persistPausedSales(updatedList);
 
       // Limpiar carrito actual para atender al siguiente cliente
@@ -549,13 +619,14 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       return pausedId;
     },
-    [items, customer, discount, notes, saleRequestId, sourceQuoteId, shippingAmount, branchId, accountId, pausedSales, persistPausedSales, clearCart]
+    [branchId, accountId, persistPausedSales, clearCart]
   );
 
   // 10. Reanudar una venta en pausa
   const resumePausedSale = useCallback(
     async (pausedId: string): Promise<boolean> => {
-      const target = pausedSales.find((s) => s.id === pausedId);
+      const currentPaused = pausedSalesRef.current;
+      const target = currentPaused.find((s) => s.id === pausedId);
       if (!target || !canResumeCart(target, accountId || "", branchId)) return false;
 
       // Cargar en carrito activo
@@ -568,34 +639,37 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setShippingAmount(target.shippingAmount || 0);
 
       // Remover de lista de pausadas
-      const filtered = pausedSales.filter((s) => s.id !== pausedId);
+      const filtered = currentPaused.filter((s) => s.id !== pausedId);
       await persistPausedSales(filtered);
 
       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
       return true;
     },
-    [pausedSales, persistPausedSales, accountId, branchId, setShippingAmount]
+    [persistPausedSales, accountId, branchId, setDiscount, setShippingAmount]
   );
 
   // 11. Eliminar venta en pausa
   const deletePausedSale = useCallback(
     async (pausedId: string): Promise<boolean> => {
-      const filtered = pausedSales.filter((s) => s.id !== pausedId);
+      const filtered = pausedSalesRef.current.filter((s) => s.id !== pausedId);
       await persistPausedSales(filtered);
       return true;
     },
-    [pausedSales, persistPausedSales]
+    [persistPausedSales]
   );
 
   // 12. Helper para obtener cantidad ya existente de un producto en carrito
-  const getItemQuantity = useCallback(
-    (productId: string): number => {
-      return items
-        .filter((item) => item.id.startsWith(productId))
-        .reduce((sum, item) => sum + item.quantity, 0);
-    },
-    [items]
-  );
+  const getItemQuantity = useCallback((productId: string): number => {
+    const currentItems = itemsRef.current;
+    let sum = 0;
+    for (let i = 0; i < currentItems.length; i += 1) {
+      const item = currentItems[i];
+      if (item.id.startsWith(productId)) {
+        sum += item.quantity;
+      }
+    }
+    return sum;
+  }, []);
 
   // 13. Cálculos financieros contables (IGV 18% incluido según normativa SUNAT Perú)
   const { subtotal, discountAmount, taxAmount, netAmount, total, totalItemsCount } =
@@ -626,25 +700,8 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
       };
     }, [items, discount, shippingAmount]);
 
-  const contextValue = useMemo(
+  const actionsValue = useMemo<CartActionsContextType>(
     () => ({
-      items,
-      customer,
-      discount,
-      notes,
-      saleRequestId,
-      sourceQuoteId,
-      shippingAmount,
-      invoiceIntent,
-      subtotal,
-      discountAmount,
-      taxAmount,
-      netAmount,
-      total,
-      totalItemsCount,
-      totalAmount: total,
-      itemCount: totalItemsCount,
-      pausedSales,
       setCustomer,
       setDiscount,
       setNotes,
@@ -664,23 +721,8 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
       getItemQuantity,
     }),
     [
-      items,
-      customer,
-      discount,
-      notes,
-      saleRequestId,
-      sourceQuoteId,
-      shippingAmount,
-      invoiceIntent,
       setDiscount,
       setShippingAmount,
-      subtotal,
-      discountAmount,
-      taxAmount,
-      netAmount,
-      total,
-      totalItemsCount,
-      pausedSales,
       addItem,
       addGiftItem,
       updateQuantity,
@@ -694,7 +736,53 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
     ]
   );
 
-  return <CartContext.Provider value={contextValue}>{children}</CartContext.Provider>;
+  const contextValue = useMemo(
+    () => ({
+      items,
+      customer,
+      discount,
+      notes,
+      saleRequestId,
+      sourceQuoteId,
+      shippingAmount,
+      invoiceIntent,
+      subtotal,
+      discountAmount,
+      taxAmount,
+      netAmount,
+      total,
+      totalItemsCount,
+      totalAmount: total,
+      itemCount: totalItemsCount,
+      pausedSales,
+      ...actionsValue,
+    }),
+    [
+      items,
+      customer,
+      discount,
+      notes,
+      saleRequestId,
+      sourceQuoteId,
+      shippingAmount,
+      invoiceIntent,
+      subtotal,
+      discountAmount,
+      taxAmount,
+      netAmount,
+      total,
+      totalItemsCount,
+      pausedSales,
+      actionsValue,
+    ]
+  );
+
+  return (
+    <CartActionsContext.Provider value={actionsValue}>
+      <CartContext.Provider value={contextValue}>{children}</CartContext.Provider>
+    </CartActionsContext.Provider>
+  );
 };
 
 export const useCart = () => useContext(CartContext);
+export const useCartActions = () => useContext(CartActionsContext);

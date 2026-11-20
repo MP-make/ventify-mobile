@@ -86,6 +86,7 @@ export interface EscPosReceiptData {
 
 export const PRINTER_CONFIG_STORAGE_KEY = 'ventify_printer_config_v2';
 const BLUETOOTH_PRINT_TIMEOUT_MS = 10_000;
+let lastSharedPdfUri: string | null = null;
 
 // ============================================================================
 // TIPOS E INTERFACES
@@ -215,10 +216,27 @@ export const ensureBluetoothPermissions = async (requireScan: boolean = false): 
     PermissionsAndroid.PERMISSIONS?.BLUETOOTH_SCAN || 'android.permission.BLUETOOTH_SCAN';
   const requiredPerms = requireScan ? [connectPerm, scanPerm] : [connectPerm];
 
+  let permsToRequest = requiredPerms;
+  if (typeof PermissionsAndroid.check === 'function') {
+    const checks = await Promise.all(
+      requiredPerms.map(async (perm) => {
+        try {
+          return await PermissionsAndroid.check(perm as any);
+        } catch {
+          return false;
+        }
+      })
+    );
+    permsToRequest = requiredPerms.filter((_, index) => !checks[index]);
+    if (permsToRequest.length === 0) {
+      return;
+    }
+  }
+
   if (typeof PermissionsAndroid.requestMultiple === 'function') {
-    const statuses = await PermissionsAndroid.requestMultiple(requiredPerms as any);
+    const statuses = await PermissionsAndroid.requestMultiple(permsToRequest as any);
     const grantedStatus = PermissionsAndroid.RESULTS?.GRANTED || 'granted';
-    const allGranted = requiredPerms.every((perm) => statuses?.[perm] === grantedStatus);
+    const allGranted = permsToRequest.every((perm) => statuses?.[perm] === grantedStatus);
     if (!allGranted) {
       throw new Error(
         'Permiso de Bluetooth denegado. Habilita "Dispositivos cercanos" para Ventify POS en Ajustes de Android.'
@@ -229,7 +247,7 @@ export const ensureBluetoothPermissions = async (requireScan: boolean = false): 
 
   if (typeof PermissionsAndroid.request === 'function') {
     const grantedStatus = PermissionsAndroid.RESULTS?.GRANTED || 'granted';
-    for (const perm of requiredPerms) {
+    for (const perm of permsToRequest) {
       const status = await PermissionsAndroid.request(perm as any);
       if (status !== grantedStatus) {
         throw new Error(
@@ -313,8 +331,9 @@ export const printRawEscPos = async (
     return false;
   }
 
-  const config = await getPrinterConfig();
-  const address = (deviceAddress || config.selectedDevice?.address || '').trim();
+  const explicitAddress = deviceAddress?.trim();
+  const address =
+    explicitAddress || (await getPrinterConfig()).selectedDevice?.address?.trim() || '';
   if (!address) {
     return false;
   }
@@ -789,8 +808,7 @@ export const printTicketPDF = async (
   }
 ): Promise<void> => {
   try {
-    const currentConfig = await getPrinterConfig();
-    const width = config?.paperWidth || currentConfig.paperWidth;
+    const width = config?.paperWidth || (await getPrinterConfig()).paperWidth;
     const htmlOptions: EscPosOptions = {
       paperWidth: width,
       branch: config?.branch,
@@ -845,10 +863,12 @@ export const shareTicketWhatsApp = async (
   phoneOrConfig?: string | ShareTicketWhatsAppConfig
 ): Promise<void> => {
   try {
-    const currentConfig = await getPrinterConfig();
     const extraCfg: ShareTicketWhatsAppConfig =
       typeof phoneOrConfig === 'object' && phoneOrConfig !== null ? phoneOrConfig : {};
-    const rawWidth = extraCfg.paperWidth || receiptOrSale?.options?.paperWidth || currentConfig.paperWidth;
+    const rawWidth =
+      extraCfg.paperWidth ||
+      receiptOrSale?.options?.paperWidth ||
+      (await getPrinterConfig()).paperWidth;
     const width: PrinterPaperWidth = rawWidth === 58 || rawWidth === '58mm' ? 58 : 80;
 
     let htmlContent = '';
@@ -904,11 +924,23 @@ export const shareTicketWhatsApp = async (
       saleTotal = receiptOrSale?.total;
     }
 
-    // 1. Generar archivo PDF temporal
+    // 1. Generar archivo PDF temporal y limpiar temporal previo (best-effort)
+    const prevUri = lastSharedPdfUri;
     const { uri } = await Print.printToFileAsync({
       html: htmlContent,
       margins: { left: 0, top: 0, right: 0, bottom: 0 },
     });
+    lastSharedPdfUri = uri || null;
+    if (prevUri && prevUri !== uri) {
+      try {
+        const FileSystem = await import('expo-file-system');
+        if (typeof FileSystem?.deleteAsync === 'function') {
+          await FileSystem.deleteAsync(prevUri, { idempotent: true });
+        }
+      } catch {
+        // Best-effort cleanup of previous temporary PDF
+      }
+    }
 
     // 2. Si hay número de teléfono de WhatsApp, abrir chat directo opcional
     if (customerPhone) {

@@ -6,74 +6,41 @@ export interface NativeKVStorage extends CatalogCacheStorage {
   setItem(key: string, value: string): Promise<void>;
   removeItem(key: string): Promise<void>;
   multiRemove(keys: string[]): Promise<void>;
+  trim?: () => Promise<void>;
 }
 
 type MMKVInstance = {
   getString: (key: string) => string | undefined;
   set: (key: string, value: string | boolean | number) => void;
   delete: (key: string) => void;
+  trim?: () => void;
   clearAll?: () => void;
 };
 
 type MMKVConstructor = new (options?: { id: string }) => MMKVInstance;
 
 let MMKVClass: MMKVConstructor | null = null;
-let mmkvAvailable: boolean | null = null;
+let mmkvResolved = false;
 
-function getMMKVClass(): MMKVConstructor | null {
-  if (mmkvAvailable !== null) return MMKVClass;
+function resolveMMKVConstructor(): MMKVConstructor | null {
+  if (mmkvResolved) return MMKVClass;
+  mmkvResolved = true;
   try {
     // Dynamic require so bundlers or Node/Vitest don't fail at module load
     const mmkvModule = require('react-native-mmkv');
     const Candidate: MMKVConstructor = mmkvModule.MMKV || mmkvModule.default?.MMKV;
     if (typeof Candidate === 'function') {
-      // Test instantiate to ensure JSI is actually present in runtime
-      const testInstance = new Candidate({ id: '__ventify_probe__' });
-      if (typeof testInstance.getString === 'function' && typeof testInstance.set === 'function') {
-        MMKVClass = Candidate;
-        mmkvAvailable = true;
-        try {
-          testInstance.delete('__probe__');
-        } catch {}
-        return MMKVClass;
-      }
+      MMKVClass = Candidate;
+      return MMKVClass;
     }
   } catch {
     // JSI not available (Node/Vitest, Web, or environment without native binary)
   }
   MMKVClass = null;
-  mmkvAvailable = false;
   return null;
 }
 
-export function createNativeKVStorage(id: string): NativeKVStorage {
-  const MMKV = getMMKVClass();
-  if (MMKV) {
-    try {
-      const mmkv = new MMKV({ id });
-      return {
-        getItem: async (key: string) => {
-          const val = mmkv.getString(key);
-          return val !== undefined ? val : null;
-        },
-        setItem: async (key: string, value: string) => {
-          mmkv.set(key, value);
-        },
-        removeItem: async (key: string) => {
-          mmkv.delete(key);
-        },
-        multiRemove: async (keys: string[]) => {
-          for (const k of keys) {
-            mmkv.delete(k);
-          }
-        },
-      };
-    } catch (e) {
-      console.warn(`[native-kv-storage] Failed to instantiate MMKV for id '${id}', using AsyncStorage fallback:`, e);
-    }
-  }
-
-  // Fallback a AsyncStorage para Node/Vitest, Web o Expo Go
+function createAsyncStorageFallback(): NativeKVStorage {
   return {
     getItem: async (key: string) => {
       try {
@@ -83,11 +50,7 @@ export function createNativeKVStorage(id: string): NativeKVStorage {
       }
     },
     setItem: async (key: string, value: string) => {
-      try {
-        await AsyncStorage.setItem(key, value);
-      } catch (e) {
-        console.warn(`[native-kv-storage] AsyncStorage setItem error for key '${key}':`, e);
-      }
+      await AsyncStorage.setItem(key, value);
     },
     removeItem: async (key: string) => {
       try {
@@ -103,6 +66,57 @@ export function createNativeKVStorage(id: string): NativeKVStorage {
         }
       } catch {}
     },
+  };
+}
+
+export function createNativeKVStorage(id: string): NativeKVStorage {
+  let backend: NativeKVStorage | null = null;
+
+  const getBackend = (): NativeKVStorage => {
+    if (backend) return backend;
+
+    const MMKV = resolveMMKVConstructor();
+    if (MMKV) {
+      try {
+        const mmkv = new MMKV({ id });
+        if (typeof mmkv.getString === 'function' && typeof mmkv.set === 'function') {
+          backend = {
+            getItem: async (key: string) => {
+              const val = mmkv.getString(key);
+              return val !== undefined ? val : null;
+            },
+            setItem: async (key: string, value: string) => {
+              mmkv.set(key, value);
+            },
+            removeItem: async (key: string) => {
+              mmkv.delete(key);
+            },
+            multiRemove: async (keys: string[]) => {
+              for (const k of keys) {
+                mmkv.delete(k);
+              }
+            },
+            trim: async () => {
+              mmkv.trim?.();
+            },
+          };
+          return backend;
+        }
+      } catch (e) {
+        console.warn(`[native-kv-storage] Failed to instantiate MMKV for id '${id}', using AsyncStorage fallback:`, e);
+      }
+    }
+
+    backend = createAsyncStorageFallback();
+    return backend;
+  };
+
+  return {
+    getItem: (key: string) => getBackend().getItem(key),
+    setItem: (key: string, value: string) => getBackend().setItem(key, value),
+    removeItem: (key: string) => getBackend().removeItem(key),
+    multiRemove: (keys: string[]) => getBackend().multiRemove(keys),
+    trim: () => getBackend().trim?.() ?? Promise.resolve(),
   };
 }
 

@@ -3,7 +3,6 @@ import { useAuth } from '@/context/AuthContext';
 import {
   Permission,
   effectivePermissions,
-  roleHasPermission,
   normalizeRole,
   Role,
   type CustomPermissions,
@@ -25,189 +24,169 @@ export function usePermissions() {
   const canonicalRole: Role = useMemo(() => normalizeRole(role), [role]);
   const typedCustomPermissions = customPermissions as CustomPermissions | null | undefined;
 
-  // Permisos efectivos memoizados
-  const userPermissions = useMemo<Permission[]>(() => {
-    return effectivePermissions(canonicalRole, typedCustomPermissions);
-  }, [canonicalRole, typedCustomPermissions]);
-
-  const getEffectivePermissions = useCallback((): Permission[] => {
-    return userPermissions;
-  }, [userPermissions]);
-
-  const hasPermission = useCallback(
-    (permission: Permission): boolean => {
-      return roleHasPermission(canonicalRole, permission, typedCustomPermissions);
-    },
+  const userPermissions = useMemo<Permission[]>(
+    () => effectivePermissions(canonicalRole, typedCustomPermissions),
     [canonicalRole, typedCustomPermissions]
   );
 
+  const permissionSet = useMemo(() => new Set<Permission>(userPermissions), [userPermissions]);
+
+  const getEffectivePermissions = useCallback((): Permission[] => userPermissions, [userPermissions]);
+
+  const hasPermission = useCallback(
+    (permission: Permission): boolean => permissionSet.has(permission),
+    [permissionSet]
+  );
+
   const hasAnyPermission = useCallback(
-    (permissions: Permission[]): boolean => {
-      return permissions.some((p) => hasPermission(p));
-    },
-    [hasPermission]
+    (permissions: Permission[]): boolean => permissions.some((p) => permissionSet.has(p)),
+    [permissionSet]
   );
 
   const hasAllPermissions = useCallback(
-    (permissions: Permission[]): boolean => {
-      return permissions.every((p) => hasPermission(p));
-    },
-    [hasPermission]
+    (permissions: Permission[]): boolean => permissions.every((p) => permissionSet.has(p)),
+    [permissionSet]
   );
 
-  // Atajos semánticos de negocio (booleans para compatibilidad total en pantallas móviles)
-  const canManageProducts = useMemo(() => hasPermission('manage_products'), [hasPermission]);
-  const canManageUsers = useMemo(() => hasPermission('manage_users'), [hasPermission]);
-  const canViewReports = useMemo(() => hasPermission('view_reports'), [hasPermission]);
-  const canAccessDashboard = useMemo(() => hasPermission('access_dashboard'), [hasPermission]);
-  const canViewMargins = useMemo(() => hasPermission('view_margins'), [hasPermission]);
-  const canViewInventoryValue = useMemo(
-    () => hasPermission('view_inventory_value'),
-    [hasPermission]
-  );
-  const canModifyPrice = useMemo(() => hasPermission('modify_price'), [hasPermission]);
-  const canApplyDiscount = canModifyPrice;
-  const canManageDiscounts = useMemo(() => hasPermission('manage_discounts'), [hasPermission]);
-  const canProcessReturn = useMemo(() => hasPermission('process_return'), [hasPermission]);
-  const canCreateCreditNotes = useMemo(() => hasPermission('create_credit_notes'), [hasPermission]);
-  const canManageInventoryAdjustments = useMemo(
-    () => hasPermission('manage_inventory_adjustments'),
-    [hasPermission]
-  );
-  const canRequestTransfer = useMemo(() => hasPermission('request_transfer'), [hasPermission]);
-  const canApproveTransfer = useMemo(() => hasPermission('approve_transfer'), [hasPermission]);
-  const canManageTransfers = useMemo(() => hasPermission('manage_transfers'), [hasPermission]);
-  const canManageCashRegister = useMemo(() => hasPermission('manage_cash_register'), [hasPermission]);
-  const canManageCustomers = useMemo(() => hasPermission('manage_customers'), [hasPermission]);
-  const canManageSettings = useMemo(() => hasPermission('manage_settings'), [hasPermission]);
+  const derived = useMemo(() => {
+    const canManageProducts = permissionSet.has('manage_products');
+    const canManageUsers = permissionSet.has('manage_users');
+    const canViewReports = permissionSet.has('view_reports');
+    const canAccessDashboard = permissionSet.has('access_dashboard');
+    const canViewMargins = permissionSet.has('view_margins');
+    const canViewInventoryValue = permissionSet.has('view_inventory_value');
+    const canModifyPrice = permissionSet.has('modify_price');
+    const canApplyDiscount = canModifyPrice;
+    const canManageDiscounts = permissionSet.has('manage_discounts');
+    const canProcessReturn = permissionSet.has('process_return');
+    const canCreateCreditNotes = permissionSet.has('create_credit_notes');
+    const canManageInventoryAdjustments = permissionSet.has('manage_inventory_adjustments');
+    const canRequestTransfer = permissionSet.has('request_transfer');
+    const canApproveTransfer = permissionSet.has('approve_transfer');
+    const canManageTransfers = permissionSet.has('manage_transfers');
+    const canManageCashRegister = permissionSet.has('manage_cash_register');
+    const canManageCustomers = permissionSet.has('manage_customers');
+    const canManageSettings = permissionSet.has('manage_settings');
 
-  // Roles específicos
-  const isOwner = useMemo(() => canonicalRole === 'owner', [canonicalRole]);
-  const isAdmin = useMemo(() => canonicalRole === 'admin', [canonicalRole]);
-  const isManager = useMemo(() => canonicalRole === 'manager', [canonicalRole]);
-  const isCashier = useMemo(() => canonicalRole === 'cashier', [canonicalRole]);
-  const isSeller = useMemo(() => canonicalRole === 'seller', [canonicalRole]);
+    const isOwner = canonicalRole === 'owner';
+    const isAdmin = canonicalRole === 'admin';
+    const isManager = canonicalRole === 'manager';
+    const isCashier = canonicalRole === 'cashier';
+    const isSeller = canonicalRole === 'seller';
 
-  // Acceso a sucursales
-  const hasMultiBranchAccess = useMemo(
-    () => hasAllBranchesAccess({ role: canonicalRole, branchId, allBranchesAccess }),
-    [canonicalRole, branchId, allBranchesAccess]
-  );
+    const hasMultiBranchAccess = hasAllBranchesAccess({
+      role: canonicalRole,
+      branchId,
+      allBranchesAccess,
+    });
+    const canViewAllCashSessions = isOwner || isAdmin;
+    const canViewBranchCashSessions = isOwner || isAdmin || isManager || canManageCashRegister;
+    const canCreateDirectTransfer = isOwner || isAdmin;
+
+    return {
+      canManageProducts,
+      canManageUsers,
+      canViewReports,
+      canAccessDashboard,
+      canViewMargins,
+      canViewInventoryValue,
+      canModifyPrice,
+      canApplyDiscount,
+      canManageDiscounts,
+      canProcessReturn,
+      canCreateCreditNotes,
+      canManageInventoryAdjustments,
+      canRequestTransfer,
+      canApproveTransfer,
+      canManageTransfers,
+      canManageCashRegister,
+      canManageCustomers,
+      canManageSettings,
+      isOwner,
+      isAdmin,
+      isManager,
+      isCashier,
+      isSeller,
+      hasMultiBranchAccess,
+      canViewAllCashSessions,
+      canViewBranchCashSessions,
+      canCreateDirectTransfer,
+    };
+  }, [permissionSet, canonicalRole, branchId, allBranchesAccess]);
 
   const checkCanAccessBranch = useCallback(
-    (targetBranchId?: string | null): boolean => {
-      return canAccessBranch(
-        { role: canonicalRole, branchId, allBranchesAccess },
-        targetBranchId
-      );
-    },
+    (targetBranchId?: string | null): boolean =>
+      canAccessBranch({ role: canonicalRole, branchId, allBranchesAccess }, targetBranchId),
     [canonicalRole, branchId, allBranchesAccess]
   );
 
-  // Solo owner y admin pueden supervisar todas las cajas abiertas y entrar a cajas de otras sucursales
-  const canViewAllCashSessions = useMemo(
-    () => canonicalRole === 'owner' || canonicalRole === 'admin',
-    [canonicalRole]
-  );
-
-  const canViewBranchCashSessions = useMemo(
-    () =>
-      canonicalRole === 'owner' ||
-      canonicalRole === 'admin' ||
-      canonicalRole === 'manager' ||
-      canManageCashRegister,
-    [canonicalRole, canManageCashRegister]
-  );
-
-  const canViewOwnCashSession = true;
-
-  // Helpers específicos de transferencias sincronizados con la versión web
   const canRequestTransferFromBranch = useCallback(
     (targetBranchId: string): boolean => {
-      if (!canRequestTransfer) return false;
-      if (canonicalRole === 'owner' || canonicalRole === 'admin') {
-        return true;
-      }
-      if (canonicalRole === 'manager' || canonicalRole === 'cashier') {
-        return canAccessBranch(
-          { role: canonicalRole, branchId, allBranchesAccess },
-          targetBranchId
-        );
+      if (!derived.canRequestTransfer) return false;
+      if (derived.isOwner || derived.isAdmin) return true;
+      if (derived.isManager || derived.isCashier) {
+        return canAccessBranch({ role: canonicalRole, branchId, allBranchesAccess }, targetBranchId);
       }
       return false;
     },
-    [canRequestTransfer, canonicalRole, branchId, allBranchesAccess]
+    [derived.canRequestTransfer, derived.isOwner, derived.isAdmin, derived.isManager, derived.isCashier, canonicalRole, branchId, allBranchesAccess]
   );
 
   const canApproveTransferToBranch = useCallback(
     (targetBranchId: string): boolean => {
-      if (!canApproveTransfer) return false;
-      if (canonicalRole === 'owner' || canonicalRole === 'admin') {
-        return true;
-      }
-      if (canonicalRole === 'manager') {
-        return canAccessBranch(
-          { role: canonicalRole, branchId, allBranchesAccess },
-          targetBranchId
-        );
+      if (!derived.canApproveTransfer) return false;
+      if (derived.isOwner || derived.isAdmin) return true;
+      if (derived.isManager) {
+        return canAccessBranch({ role: canonicalRole, branchId, allBranchesAccess }, targetBranchId);
       }
       return false;
     },
-    [canApproveTransfer, canonicalRole, branchId, allBranchesAccess]
-  );
-
-  const canCreateDirectTransfer = useMemo(
-    () => canonicalRole === 'owner' || canonicalRole === 'admin',
-    [canonicalRole]
+    [derived.canApproveTransfer, derived.isOwner, derived.isAdmin, derived.isManager, canonicalRole, branchId, allBranchesAccess]
   );
 
   const canViewTransfer = useCallback(
     (transfer: TransferScopeTarget): boolean => {
-      if (canonicalRole === 'owner' || canonicalRole === 'admin') {
-        return true;
-      }
-      if (canonicalRole === 'manager' || canonicalRole === 'cashier') {
+      if (derived.isOwner || derived.isAdmin) return true;
+      if (derived.isManager || derived.isCashier) {
         return (
-          hasMultiBranchAccess ||
+          derived.hasMultiBranchAccess ||
           branchId === transfer.sourceBranchId ||
           branchId === transfer.destinationBranchId
         );
       }
       return false;
     },
-    [canonicalRole, hasMultiBranchAccess, branchId]
+    [derived.isOwner, derived.isAdmin, derived.isManager, derived.isCashier, derived.hasMultiBranchAccess, branchId]
   );
 
   const canUpdateTransferStatus = useCallback(
     (transfer: TransferStatusTarget, newStatus: string): boolean => {
-      if (canonicalRole === 'owner' || canonicalRole === 'admin') {
-        return true;
-      }
+      if (derived.isOwner || derived.isAdmin) return true;
       switch (newStatus) {
         case 'approved':
         case 'rejected':
           return (
-            canonicalRole === 'manager' &&
-            (hasMultiBranchAccess || branchId === transfer.destinationBranchId) &&
+            derived.isManager &&
+            (derived.hasMultiBranchAccess || branchId === transfer.destinationBranchId) &&
             transfer.status === 'pending'
           );
         case 'in_transit':
           return (
-            (canonicalRole === 'manager' || canonicalRole === 'cashier') &&
-            (hasMultiBranchAccess || branchId === transfer.sourceBranchId) &&
+            (derived.isManager || derived.isCashier) &&
+            (derived.hasMultiBranchAccess || branchId === transfer.sourceBranchId) &&
             transfer.status === 'approved'
           );
         case 'completed':
           return (
-            (canonicalRole === 'manager' || canonicalRole === 'cashier') &&
-            (hasMultiBranchAccess || branchId === transfer.destinationBranchId) &&
+            (derived.isManager || derived.isCashier) &&
+            (derived.hasMultiBranchAccess || branchId === transfer.destinationBranchId) &&
             (transfer.status === 'in_transit' || transfer.status === 'approved')
           );
         default:
           return false;
       }
     },
-    [canonicalRole, hasMultiBranchAccess, branchId]
+    [derived.isOwner, derived.isAdmin, derived.isManager, derived.isCashier, derived.hasMultiBranchAccess, branchId]
   );
 
   const getUserRole = useCallback((): Role => canonicalRole, [canonicalRole]);
@@ -223,40 +202,15 @@ export function usePermissions() {
       hasPermission,
       hasAnyPermission,
       hasAllPermissions,
-      canManageProducts,
-      canManageUsers,
-      canViewReports,
-      canAccessDashboard,
-      canViewMargins,
-      canViewInventoryValue,
-      canModifyPrice,
-      canApplyDiscount,
-      canManageDiscounts,
-      canProcessReturn,
-      canCreateCreditNotes,
-      canManageInventoryAdjustments,
-      canRequestTransfer,
-      canApproveTransfer,
-      canManageTransfers,
+      ...derived,
+      canViewOwnCashSession: true,
       canRequestTransferFromBranch,
       canApproveTransferToBranch,
-      canCreateDirectTransfer,
       canViewTransfer,
       canUpdateTransferStatus,
-      canManageCashRegister,
-      canManageCustomers,
-      canManageSettings,
-      canViewAllCashSessions,
-      canViewBranchCashSessions,
-      canViewOwnCashSession,
-      isOwner,
-      isAdmin,
-      isManager,
-      isCashier,
-      isSeller,
       isSuperAdmin,
-      hasAllBranchesAccess: hasMultiBranchAccess,
-      allBranchesAccess: hasMultiBranchAccess,
+      hasAllBranchesAccess: derived.hasMultiBranchAccess,
+      allBranchesAccess: derived.hasMultiBranchAccess,
       canAccessBranch: checkCanAccessBranch,
     }),
     [
@@ -268,39 +222,12 @@ export function usePermissions() {
       hasPermission,
       hasAnyPermission,
       hasAllPermissions,
-      canManageProducts,
-      canManageUsers,
-      canViewReports,
-      canAccessDashboard,
-      canViewMargins,
-      canViewInventoryValue,
-      canModifyPrice,
-      canApplyDiscount,
-      canManageDiscounts,
-      canProcessReturn,
-      canCreateCreditNotes,
-      canManageInventoryAdjustments,
-      canRequestTransfer,
-      canApproveTransfer,
-      canManageTransfers,
+      derived,
       canRequestTransferFromBranch,
       canApproveTransferToBranch,
-      canCreateDirectTransfer,
       canViewTransfer,
       canUpdateTransferStatus,
-      canManageCashRegister,
-      canManageCustomers,
-      canManageSettings,
-      canViewAllCashSessions,
-      canViewBranchCashSessions,
-      canViewOwnCashSession,
-      isOwner,
-      isAdmin,
-      isManager,
-      isCashier,
-      isSeller,
       isSuperAdmin,
-      hasMultiBranchAccess,
       checkCanAccessBranch,
     ]
   );

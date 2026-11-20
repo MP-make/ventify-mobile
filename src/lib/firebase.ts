@@ -9,6 +9,7 @@ import {
   getFirestore,
   Firestore,
   memoryLocalCache,
+  memoryEagerGarbageCollector,
 } from 'firebase/firestore';
 import {
   initializeAuth,
@@ -16,7 +17,7 @@ import {
   Auth,
   type Persistence,
 } from 'firebase/auth';
-import { getStorage, FirebaseStorage } from 'firebase/storage';
+import { APP_URL } from './env';
 
 // 1. Resolve environment variables (supporting EXPO_PUBLIC_* and NEXT_PUBLIC_*)
 const firebaseConfig = {
@@ -46,10 +47,7 @@ const firebaseConfig = {
     '1:954282952004:web:f29d5bccbd879933900311',
 };
 
-export const APP_URL: string =
-  process.env.EXPO_PUBLIC_APP_URL ||
-  process.env.NEXT_PUBLIC_APP_URL ||
-  'https://ventify.com.pe';
+export { APP_URL };
 
 type PersistenceFactory = (storage: unknown) => Persistence;
 
@@ -131,7 +129,7 @@ let dbInstance: Firestore;
 try {
   dbInstance = initializeFirestore(app, {
     experimentalAutoDetectLongPolling: true,
-    localCache: memoryLocalCache(),
+    localCache: memoryLocalCache({ garbageCollector: memoryEagerGarbageCollector() }),
   });
 } catch {
   // Fallback if firestore has already been initialized with a previous configuration
@@ -139,8 +137,5 @@ try {
 }
 
 export const db: Firestore = dbInstance;
-
-// 5. Initialize Firebase Storage for catalog & asset uploads
-export const storage: FirebaseStorage = getStorage(app);
 
 export { app };

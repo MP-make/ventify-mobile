@@ -385,10 +385,17 @@ function withVentifyGradleProperties(config) {
       }
     };
 
+    setProp('org.gradle.caching', 'true');
+    setProp('expo.gif.enabled', 'false');
+    setProp('expo.webp.enabled', 'false');
     setProp('reactNativeArchitectures', 'arm64-v8a');
     setProp('android.enableProguardInReleaseBuilds', 'true');
     setProp('android.enableShrinkResourcesInReleaseBuilds', 'true');
-    setProp('android.enableR8.fullMode', 'true');
+    setProp('android.enableR8.fullMode', 'false');
+    setProp(
+      'android.packagingOptions.excludes',
+      'DebugProbesKt.bin,kotlin-tooling-metadata.json,**/*.proto,org/apache/commons/codec/language/bm/**,META-INF/*.version,/*.properties'
+    );
 
     cfg.modResults = props;
     return cfg;
@@ -431,7 +438,14 @@ function withVentifyMainApplication(config) {
 function withVentifyAppBuildGradle(config) {
   return withAppBuildGradle(config, (cfg) => {
     let contents = cfg.modResults.contents;
+    if (!contents.includes("resourceConfigurations += ['es', 'en']")) {
+      contents = contents.replace(
+        /(defaultConfig\s*\{[\s\S]*?)(\n\s*\})/,
+        "$1\n        resourceConfigurations += ['es', 'en']$2"
+      );
+    }
     if (contents.includes('hasReleaseKeystore')) {
+      cfg.modResults.contents = contents;
       return cfg;
     }
 

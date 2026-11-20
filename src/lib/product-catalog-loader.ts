@@ -1,6 +1,7 @@
 /** Small first render batch and bounded mapping work for large Firestore snapshots. */
 export const PRODUCT_CATALOG_FIRST_BATCH_SIZE = 80;
 export const PRODUCT_CATALOG_WORK_BATCH_SIZE = 100;
+const EMPTY_ARRAY: never[] = [];
 
 export interface CatalogBatchMetrics {
   itemCount: number;
@@ -16,7 +17,7 @@ export function productsForCatalogScope<T>(
   productsScopeKey: string | null,
   activeScopeKey: string | null
 ): T[] {
-  return productsScopeKey && productsScopeKey === activeScopeKey ? products : [];
+  return productsScopeKey && productsScopeKey === activeScopeKey ? products : (EMPTY_ARRAY as T[]);
 }
 
 export function isAuthoritativeCatalogSnapshot(
@@ -72,19 +73,19 @@ export async function processCatalogIteratorInBatches<T>(
   const yieldControl = options.yieldControl ?? yieldToEventLoop;
   let offset = 0;
   let maxItemsPerBatch = 0;
+  let lookahead = items.next();
 
-  while (true) {
+  while (!lookahead.done) {
     const batch: T[] = [];
-    while (batch.length < batchSize) {
-      const next = items.next();
-      if (next.done) break;
-      batch.push(next.value);
+    while (batch.length < batchSize && !lookahead.done) {
+      batch.push(lookahead.value);
+      lookahead = items.next();
     }
     if (batch.length === 0) break;
     await processBatch(batch, offset);
     offset += batch.length;
     maxItemsPerBatch = Math.max(maxItemsPerBatch, batch.length);
-    if (batch.length === batchSize) await yieldControl();
+    if (!lookahead.done) await yieldControl();
   }
 
   return { itemCount: offset, batchCount: Math.ceil(offset / batchSize), maxItemsPerBatch };

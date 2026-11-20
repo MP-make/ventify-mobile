@@ -5,9 +5,14 @@ export const useDebouncedValue = <T,>(value: T, delayMs = 150): T => {
   const [debouncedValue, setDebouncedValue] = useState(value);
 
   useEffect(() => {
+    if (Object.is(value, debouncedValue)) return;
+    if (value === '' || delayMs <= 0) {
+      setDebouncedValue(value);
+      return;
+    }
     const timeout = setTimeout(() => setDebouncedValue(value), delayMs);
     return () => clearTimeout(timeout);
-  }, [value, delayMs]);
+  }, [value, debouncedValue, delayMs]);
 
   return debouncedValue;
 };

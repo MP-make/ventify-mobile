@@ -7,17 +7,17 @@ import {
   TextInput,
   Modal,
   ScrollView,
-  FlatList,
   StyleSheet,
   Alert,
   Platform,
   ActivityIndicator,
   KeyboardAvoidingView,
-  Image,
   InteractionManager,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useIsFocused } from '@react-navigation/native';
 import { FlashList } from '@shopify/flash-list';
+import { Image } from 'expo-image';
 import {
   Receipt,
   Bot,
@@ -57,6 +57,7 @@ import { type Href, useRouter } from 'expo-router';
 import { useAuth } from '@/context/AuthContext';
 import { useSettings } from '@/context/SettingsContext';
 import { usePermissions } from '@/hooks/usePermissions';
+import { useDebouncedValue } from '@/hooks/use-debounced-value';
 import { Header } from '@/components/Header';
 import { ui, theme, formatPEN, formatDatePE } from '@/lib/theme';
 import { ScreenHeading, SectionHeading } from '@/components/ui';
@@ -104,11 +105,25 @@ import { EinvoiceActionsModal } from '@/components/EinvoiceActionsModal';
 import { FinancialPnlModal } from '@/components/FinancialPnlModal';
 import { ReservationReceiptModal } from '@/components/ReservationReceiptModal';
 import { ReservationCancellationModal } from '@/components/ReservationCancellationModal';
+import { mergeSalesWithOfflinePending } from '@/lib/offline-sales-helpers';
 
 // Sub-módulos de Historial
 type HistoryTab = 'sales' | 'reservations' | 'ai';
 type DateRange = 'today' | 'week' | 'month' | 'custom' | 'all';
 type DocFilter = 'all' | 'factura' | 'boleta' | 'nota_venta';
+type HistorySale = Sale & { _dateMs?: number };
+
+const VENTY_ICON = require('../../assets/venty-icon.webp');
+const HISTORY_BARCODE_SETTINGS: any = {
+  barcodeTypes: ['qr', 'ean13', 'ean8', 'code128', 'code39', 'upc_a', 'upc_e'],
+};
+const AI_QUICK_CHIPS = [
+  '¿Cuánto vendí hoy y cuál es mi ganancia?',
+  '¿Qué productos están por agotarse?',
+  '¿Cuánto efectivo debe haber en caja?',
+  '¿Qué clientes tienen deuda de fiado?',
+] as const;
+let reservationsMissingCompositeIndex = false;
 
 interface ChatMessage {
   id: string;
@@ -117,11 +132,14 @@ interface ChatMessage {
   timestamp: number;
 }
 
+type DocMetaResult = ReturnType<typeof resolveReceiptDocumentMeta>;
+
 interface DocBadgeProps {
   sale: Sale;
+  docMeta?: DocMetaResult;
 }
 
-const DocBadge = React.memo<DocBadgeProps>(({ sale }) => {
+const DocBadge = React.memo<DocBadgeProps>(({ sale, docMeta }) => {
   const isCancelled = sale.status === 'cancelled';
 
   if (isCancelled) {
@@ -134,7 +152,7 @@ const DocBadge = React.memo<DocBadgeProps>(({ sale }) => {
     );
   }
 
-  const meta = resolveReceiptDocumentMeta(sale);
+  const meta = docMeta || resolveReceiptDocumentMeta(sale);
   if (meta.isFacturaAccepted) {
     return (
       <View style={[styles.badge, { backgroundColor: ui.accentSoft }]}>
@@ -182,11 +200,34 @@ const DocBadge = React.memo<DocBadgeProps>(({ sale }) => {
   );
 });
 
+const isOfflinePendingSale = (sale: Sale | null | undefined): boolean =>
+  Boolean(sale && ((sale as any).isOfflinePending || (sale as any).offlineQueued));
+
+const guardOfflinePendingSaleAction = (
+  sale: Sale | null | undefined,
+  actionLabel: string
+): boolean => {
+  if (!isOfflinePendingSale(sale)) return false;
+  Alert.alert(
+    'Venta pendiente de sincronización',
+    `Esta venta está esperando sincronización offline antes de poder ${actionLabel}. Sincronízala cuando tengas conexión.`
+  );
+  return true;
+};
+
 interface SunatBadgeProps {
   sale: Sale;
 }
 
 const SunatBadge = React.memo<SunatBadgeProps>(({ sale }) => {
+  if (isOfflinePendingSale(sale)) {
+    return (
+      <View style={[styles.miniBadge, { backgroundColor: ui.warningSoft }]}>
+        <Clock size={12} color={ui.warning} />
+        <Text style={[styles.miniBadgeText, { color: ui.warning }]}>Pendiente offline</Text>
+      </View>
+    );
+  }
   const status = sale.sunatStatus || 'not_applicable';
   if (status === 'accepted') {
     return (
@@ -235,10 +276,10 @@ const SaleCardItem = React.memo<SaleCardItemProps>(({ sale, onPress }) => {
       <View style={styles.saleCardTop}>
         <View style={{ flex: 1 }}>
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-            <DocBadge sale={sale} />
+            <DocBadge sale={sale} docMeta={docMeta} />
             <Text style={styles.saleDocNumber}>{docNumber}</Text>
           </View>
-          <Text style={styles.saleDateText}>{formatDatePE(sale.date)}</Text>
+          <Text style={styles.saleDateText}>{formatDatePE(sale.date || (sale as any).createdAt)}</Text>
         </View>
 
         <View style={{ alignItems: 'flex-end' }}>
@@ -267,8 +308,192 @@ const SaleCardItem = React.memo<SaleCardItemProps>(({ sale, onPress }) => {
   );
 });
 
+interface ReservationHistoryRowProps {
+  res: any;
+  onViewTicket: (res: any) => void;
+  onOpenPay: (res: any) => void;
+  onComplete: (res: any) => void;
+  onCancel: (res: any) => void;
+}
+
+const ReservationHistoryRow = React.memo<ReservationHistoryRowProps>(({
+  res,
+  onViewTicket,
+  onOpenPay,
+  onComplete,
+  onCancel,
+}) => {
+  const isPending = res.status === 'pending' || !res.status;
+  const isCompleted = res.status === 'completed';
+  const isCancelled = res.status === 'cancelled';
+  const deposit = Number(res.depositAmount || 0);
+  const total = Number(res.total || 0);
+  const remaining = Math.max(0, total - deposit);
+
+  return (
+    <View style={styles.reservationCard}>
+      <View style={styles.resCardHeader}>
+        <View style={{ flex: 1 }}>
+          <Text style={styles.resCustomerName}>{res.customer?.name || 'Cliente General'}</Text>
+          {res.customer?.phone ? (
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4, marginTop: 2 }}>
+              <Phone size={12} color={ui.textSecondary} />
+              <Text style={styles.resCustomerPhone}>{res.customer.phone}</Text>
+            </View>
+          ) : null}
+        </View>
+        <View
+          style={[
+            styles.badge,
+            isPending && { backgroundColor: ui.warningSoft },
+            isCompleted && { backgroundColor: ui.primarySoft },
+            isCancelled && { backgroundColor: ui.dangerSoft },
+          ]}
+        >
+          <Text
+            style={[
+              styles.badgeText,
+              isPending && { color: ui.warning },
+              isCompleted && { color: ui.primary },
+              isCancelled && { color: ui.danger },
+            ]}
+          >
+            {isCompleted ? 'ENTREGADO' : isCancelled ? 'CANCELADO' : 'PENDIENTE'}
+          </Text>
+        </View>
+      </View>
+
+      {Array.isArray(res.items) && res.items.length > 0 ? (
+        <View style={styles.resItemsBox}>
+          {res.items.map((it: any, i: number) => (
+            <Text key={i} style={styles.resItemLine} numberOfLines={1}>
+              • {it.quantity}x {it.productName || it.name || 'Producto'} ({formatPEN(it.price || 0)})
+            </Text>
+          ))}
+        </View>
+      ) : null}
+
+      <View style={styles.resFinancialRow}>
+        <View>
+          <Text style={styles.resFinLabel}>Total</Text>
+          <Text style={styles.resFinValue}>{formatPEN(total)}</Text>
+        </View>
+        <View>
+          <Text style={styles.resFinLabel}>Adelanto</Text>
+          <Text style={[styles.resFinValue, { color: ui.primary }]}>{formatPEN(deposit)}</Text>
+        </View>
+        <View>
+          <Text style={styles.resFinLabel}>Saldo Pendiente</Text>
+          <Text style={[styles.resFinValue, { color: remaining > 0 ? ui.danger : ui.textSecondary }]}>
+            {formatPEN(remaining)}
+          </Text>
+        </View>
+      </View>
+
+      {res.pickupDate ? (
+        <View style={styles.resPickupRow}>
+          <Clock size={12} color={ui.textSecondary} />
+          <Text style={styles.resPickupText}>
+            Límite de recojo: {String(res.pickupDate).slice(0, 10)}
+          </Text>
+        </View>
+      ) : null}
+
+      <View style={styles.resActionsRow}>
+        <TouchableOpacity
+          style={styles.resViewTicketBtn}
+          onPress={() => onViewTicket(res)}
+          activeOpacity={0.7}
+          accessibilityRole="button"
+          accessibilityLabel="Ver comprobante o ticket de reserva"
+        >
+          <FileText size={14} color={ui.primary} />
+          <Text style={styles.resViewTicketBtnText}>Ver Ticket</Text>
+        </TouchableOpacity>
+
+        {isPending && remaining > 0 && (
+          <TouchableOpacity
+            style={styles.resCompleteBtn}
+            onPress={() => onOpenPay(res)}
+            activeOpacity={0.7}
+            accessibilityRole="button"
+            accessibilityLabel="Cobrar saldo y entregar productos"
+          >
+            <CreditCard size={14} color={ui.onPrimary} />
+            <Text style={styles.resCompleteBtnText}>Cobrar y Entregar</Text>
+          </TouchableOpacity>
+        )}
+
+        {isPending && remaining === 0 && (
+          <TouchableOpacity
+            style={styles.resCompleteBtn}
+            onPress={() => onComplete(res)}
+            activeOpacity={0.7}
+            accessibilityRole="button"
+            accessibilityLabel="Entregar productos"
+          >
+            <CheckCircle2 size={14} color={ui.onPrimary} />
+            <Text style={styles.resCompleteBtnText}>Entregar</Text>
+          </TouchableOpacity>
+        )}
+
+        {isPending && (
+          <TouchableOpacity
+            style={styles.resCancelBtn}
+            onPress={() => onCancel(res)}
+            activeOpacity={0.7}
+            accessibilityRole="button"
+            accessibilityLabel="Cancelar reserva"
+          >
+            <X size={14} color={ui.danger} />
+            <Text style={styles.resCancelBtnText}>Cancelar</Text>
+          </TouchableOpacity>
+        )}
+      </View>
+    </View>
+  );
+});
+
+const ChatMessageRow = React.memo<{ msg: ChatMessage }>(({ msg }) => {
+  const isAi = msg.sender === 'ai';
+  return (
+    <View
+      style={[
+        styles.chatBubbleWrapper,
+        isAi ? styles.chatBubbleAiWrapper : styles.chatBubbleUserWrapper,
+      ]}
+    >
+      {isAi && (
+        <View style={styles.aiAvatar}>
+          <Image
+            source={VENTY_ICON}
+            style={{ width: 28, height: 28 }}
+            contentFit="contain"
+          />
+        </View>
+      )}
+      <View
+        style={[
+          styles.chatBubble,
+          isAi ? styles.chatBubbleAi : styles.chatBubbleUser,
+        ]}
+      >
+        <Text
+          style={[
+            styles.chatText,
+            isAi ? styles.chatTextAi : styles.chatTextUser,
+          ]}
+        >
+          {msg.text}
+        </Text>
+      </View>
+    </View>
+  );
+});
+
 export default function HistoryScreen() {
   const insets = useSafeAreaInsets();
+  const isFocused = useIsFocused();
   const router = useRouter();
   const { user, userProfile, accountId, branchId, role } = useAuth();
   const { canViewReports, canProcessReturn, canCreateCreditNotes } = usePermissions();
@@ -284,7 +509,12 @@ export default function HistoryScreen() {
     invoicingEnabled,
     taxProfile,
     emitterInfo,
+    pendingOfflineSales,
+    offlineQueueCount,
+    isOnline,
   } = useSettings();
+  const isOnlineRef = useRef(isOnline);
+  isOnlineRef.current = isOnline;
 
   const receiptBusiness = useMemo(
     () => ({
@@ -325,13 +555,18 @@ export default function HistoryScreen() {
     [branches, activeBranch]
   );
 
+  const reservationBusiness = useMemo(
+    () => ({ ...(businessSettings || {}), ...(activeBranch || {}) }),
+    [businessSettings, activeBranch]
+  );
+
   const [activeTab, setActiveTab] = useState<HistoryTab>('sales');
   const [pnlModalOpen, setPnlModalOpen] = useState<boolean>(false);
 
   // ============================================================================
   // ESTADOS DEL SUB-MÓDULO 1: HISTORIAL DE VENTAS Y SUNAT
   // ============================================================================
-  const [sales, setSales] = useState<Sale[]>([]);
+  const [sales, setSales] = useState<HistorySale[]>([]);
   const [loadingSales, setLoadingSales] = useState<boolean>(true);
   const [loadingMoreSales, setLoadingMoreSales] = useState<boolean>(false);
   const salesCursorRef = useRef<any>(null);
@@ -339,18 +574,27 @@ export default function HistoryScreen() {
   const salesScopeRef = useRef('');
   const [salesHasMore, setSalesHasMore] = useState<boolean>(false);
   const [searchQuery, setSearchQuery] = useState<string>('');
-  const [dateRange, setDateRange] = useState<DateRange>('all');
+  const debouncedSearchQuery = useDebouncedValue(searchQuery, 150);
+  const [dateRange, setDateRange] = useState<DateRange>('today');
   const [customStartDate, setCustomStartDate] = useState<string>('');
   const [customEndDate, setCustomEndDate] = useState<string>('');
+  const [draftStartDate, setDraftStartDate] = useState<string>('');
+  const [draftEndDate, setDraftEndDate] = useState<string>('');
   const [customDateModalOpen, setCustomDateModalOpen] = useState<boolean>(false);
   const [docFilter, setDocFilter] = useState<DocFilter>('all');
-  const salesScope = `${accountId || ''}|${branchId || ''}|${dateRange}|${customStartDate}|${customEndDate}`;
+  const effectiveCustomStart = dateRange === 'custom' ? customStartDate : '';
+  const effectiveCustomEnd = dateRange === 'custom' ? customEndDate : '';
+  const salesScope = `${accountId || ''}|${branchId || ''}|${dateRange}|${effectiveCustomStart}|${effectiveCustomEnd}`;
   // Keep the latest scope visible synchronously so an old request cannot commit
   // in the render/effect gap after the account, branch, or date range changes.
   salesScopeRef.current = salesScope;
 
   // Modal de Detalle de Comprobante
   const [selectedSale, setSelectedSale] = useState<Sale | null>(null);
+  const detailMeta = useMemo(
+    () => (selectedSale ? resolveReceiptDocumentMeta(selectedSale) : null),
+    [selectedSale]
+  );
   const [saleDetailModalVisible, setSaleDetailModalVisible] = useState<boolean>(false);
   const [detailViewMode, setDetailViewMode] = useState<'ticket' | 'summary'>('ticket');
   const [detailPaperWidth, setDetailPaperWidth] = useState<58 | 80>(80);
@@ -393,6 +637,22 @@ export default function HistoryScreen() {
   const [inlineScannerActive, setInlineScannerActive] = useState<boolean>(false);
   const [inlineTorchOn, setInlineTorchOn] = useState<boolean>(false);
   const scanCooldownRef = useRef<boolean>(false);
+  const scanCooldownTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    if (!isFocused) {
+      setInlineScannerActive(false);
+      setInlineTorchOn(false);
+    }
+  }, [isFocused]);
+
+  useEffect(() => {
+    return () => {
+      if (scanCooldownTimerRef.current) {
+        clearTimeout(scanCooldownTimerRef.current);
+      }
+    };
+  }, []);
 
   const toggleInlineScanner = async () => {
     if (!inlineScannerActive) {
@@ -416,8 +676,12 @@ export default function HistoryScreen() {
     const clean = code?.trim();
     if (!clean || scanCooldownRef.current) return;
     scanCooldownRef.current = true;
-    setTimeout(() => {
+    if (scanCooldownTimerRef.current) {
+      clearTimeout(scanCooldownTimerRef.current);
+    }
+    scanCooldownTimerRef.current = setTimeout(() => {
       scanCooldownRef.current = false;
+      scanCooldownTimerRef.current = null;
     }, 1200);
 
     Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
@@ -470,7 +734,7 @@ export default function HistoryScreen() {
     });
   }, [reservations, reservationSearch, reservationStatusFilter]);
 
-  const handleOpenPayReservation = (res: any) => {
+  const handleOpenPayReservation = useCallback((res: any) => {
     setReservationToPay(res);
     const totalVal = Number(res.total || 0);
     const depositVal = Number(res.depositAmount || 0);
@@ -478,7 +742,7 @@ export default function HistoryScreen() {
     setPayCashReceived(remaining.toFixed(2));
     setPayMethod('efectivo');
     setPaymentModalVisible(true);
-  };
+  }, []);
 
   const handleConfirmCompletePayment = async () => {
     if (!reservationToPay) return;
@@ -536,7 +800,7 @@ export default function HistoryScreen() {
     }
   };
 
-  const handleCompleteReservation = async (res: any) => {
+  const handleCompleteReservation = useCallback((res: any) => {
     Alert.alert(
       'Confirmar Entrega',
       `¿Confirmas la entrega de los productos a ${res.customer?.name || 'Cliente General'}? Se descontará el inventario físico y se marcará como entregado.`,
@@ -586,9 +850,14 @@ export default function HistoryScreen() {
         },
       ]
     );
-  };
+  }, [activeCashSession?.sessionId, activeCashSession?.id, accountId, branchId, user?.uid, user?.email, userProfile?.displayName]);
 
-  const handleCancelReservation = async (res: any) => setCancellationTarget(res);
+  const handleCancelReservation = useCallback((res: any) => setCancellationTarget(res), []);
+
+  const handleViewReservationTicket = useCallback((res: any) => {
+    setReceiptReservation(res);
+    setReceiptModalVisible(true);
+  }, []);
 
   const confirmReservationCancellation = async (refund: { refundMethod?: string; refundPercent?: number }) => {
     if (!cancellationTarget) return;
@@ -641,10 +910,16 @@ export default function HistoryScreen() {
   ]);
   const [chatInput, setChatInput] = useState<string>('');
   const [isAiLoading, setIsAiLoading] = useState<boolean>(false);
-  const chatScrollRef = useRef<ScrollView>(null);
+  const chatListRef = useRef<FlashList<ChatMessage>>(null);
+  const chatScrollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Contexto en vivo para la IA
-  const [kpiContext, setKpiContext] = useState<BusinessKPIContext>({});
+  useEffect(() => {
+    return () => {
+      if (chatScrollTimerRef.current) {
+        clearTimeout(chatScrollTimerRef.current);
+      }
+    };
+  }, []);
 
   // ============================================================================
   // CARGA PAGINADA DE VENTAS CON RANGO APLICADO EN FIRESTORE
@@ -661,13 +936,13 @@ export default function HistoryScreen() {
       salesGenerationRef.current += 1;
       salesScopeRef.current = salesScope;
       salesCursorRef.current = null;
-      setLoadingSales(true);
+      setLoadingSales(isOnlineRef.current);
     }
     else setLoadingMoreSales(true);
     const generation = salesGenerationRef.current;
     const requestScope = salesScope;
     try {
-      const bounds = getHistoryDateBounds(dateRange, customStartDate, customEndDate);
+      const bounds = getHistoryDateBounds(dateRange, effectiveCustomStart, effectiveCustomEnd);
       const constraints: any[] = [where('accountId', '==', accountId)];
       if (branchId && branchId !== 'main') constraints.push(where('branchId', '==', branchId));
       if (bounds.start !== undefined) constraints.push(where('date', '>=', bounds.start));
@@ -677,7 +952,14 @@ export default function HistoryScreen() {
       constraints.push(limit(100));
       const snapshot = await getDocs(query(collection(db, 'sales'), ...constraints));
       if (generation !== salesGenerationRef.current || requestScope !== salesScopeRef.current) return;
-      const page: Sale[] = snapshot.docs.map((entry) => ({ id: entry.id, ...(entry.data() as any) }));
+      const page: HistorySale[] = snapshot.docs.map((entry) => {
+        const data = entry.data() as any;
+        return {
+          id: entry.id,
+          ...data,
+          _dateMs: toEpochMillis(data.date || data.createdAt),
+        };
+      });
       setSales((current) => {
         if (reset) return page;
         const byId = new Map(current.map((sale) => [sale.id, sale]));
@@ -689,15 +971,31 @@ export default function HistoryScreen() {
     } catch (err: any) {
       if (generation !== salesGenerationRef.current || requestScope !== salesScopeRef.current) return;
       console.warn('Error cargando página de ventas:', err);
-      if (reset) setSales([]);
-      Alert.alert('No se pudo cargar el historial', err?.message || 'Revisa tu conexión y vuelve a intentar.');
+      if (isOnlineRef.current) {
+        if (reset) setSales([]);
+        Alert.alert('No se pudo cargar el historial', err?.message || 'Revisa tu conexión y vuelve a intentar.');
+      }
     } finally {
       if (generation === salesGenerationRef.current && requestScope === salesScopeRef.current) {
         setLoadingSales(false);
         setLoadingMoreSales(false);
       }
     }
-  }, [accountId, branchId, dateRange, customStartDate, customEndDate, salesScope]);
+  }, [accountId, branchId, dateRange, effectiveCustomStart, effectiveCustomEnd, salesScope]);
+
+  const prevOfflineQueueCountRef = useRef(offlineQueueCount);
+  const pendingSyncRefreshRef = useRef(false);
+
+  useEffect(() => {
+    if (prevOfflineQueueCountRef.current > offlineQueueCount) {
+      pendingSyncRefreshRef.current = true;
+    }
+    prevOfflineQueueCountRef.current = offlineQueueCount;
+    if (pendingSyncRefreshRef.current && isOnline && isFocused) {
+      pendingSyncRefreshRef.current = false;
+      void fetchSalesPage(true);
+    }
+  }, [offlineQueueCount, isOnline, isFocused, fetchSalesPage]);
 
   useEffect(() => {
     setSalesHasMore(false);
@@ -709,7 +1007,7 @@ export default function HistoryScreen() {
 
   // Escuchar Reservas de la Sucursal
   useEffect(() => {
-    if (!accountId || activeTab !== 'reservations') return;
+    if (!accountId || !isFocused || activeTab !== 'reservations') return;
     setLoadingReservations(true);
 
     let cancelled = false;
@@ -752,6 +1050,7 @@ export default function HistoryScreen() {
         (error: any) => {
           if (cancelled) return;
           if (useOrderedQuery && String(error?.code || '').includes('failed-precondition')) {
+            reservationsMissingCompositeIndex = true;
             if (unsubscribeActive) {
               unsubscribeActive();
               unsubscribeActive = null;
@@ -767,7 +1066,7 @@ export default function HistoryScreen() {
 
     const task = InteractionManager.runAfterInteractions(() => {
       if (!cancelled) {
-        attachListener(true);
+        attachListener(!reservationsMissingCompositeIndex);
       }
     });
 
@@ -776,16 +1075,27 @@ export default function HistoryScreen() {
       task.cancel();
       if (unsubscribeActive) unsubscribeActive();
     };
-  }, [accountId, branchId, activeTab]);
+  }, [accountId, branchId, isFocused, activeTab]);
 
   // ============================================================================
   // FILTRADO DE VENTAS POR FECHA, TIPO Y BÚSQUEDA
   // ============================================================================
-  const filteredSales = useMemo(() => {
-    const bounds = getHistoryDateBounds(dateRange, customStartDate, customEndDate);
+  const mergedSales = useMemo(
+    () =>
+      mergeSalesWithOfflinePending(sales, pendingOfflineSales, {
+        accountId,
+        branchId,
+        userId: user?.uid || null,
+      }) as HistorySale[],
+    [sales, pendingOfflineSales, accountId, branchId, user?.uid]
+  );
 
-    return sales.filter((sale) => {
-      const saleDate = toEpochMillis(sale.date || (sale as any).createdAt);
+  const filteredSales = useMemo(() => {
+    const bounds = getHistoryDateBounds(dateRange, effectiveCustomStart, effectiveCustomEnd);
+    const trimmedSearch = debouncedSearchQuery.toLowerCase().trim();
+
+    return mergedSales.filter((sale) => {
+      const saleDate = sale._dateMs ?? toEpochMillis(sale.date || (sale as any).createdAt);
 
       // 1. Filtro por Rango de Fechas
       if (bounds.start !== undefined && saleDate < bounds.start) return false;
@@ -808,19 +1118,18 @@ export default function HistoryScreen() {
       }
 
       // 3. Filtro por Búsqueda
-      if (searchQuery.trim().length > 0) {
-        const q = searchQuery.toLowerCase().trim();
+      if (trimmedSearch.length > 0) {
         const docNum = String(sale.documentNumber || sale.saleNumber || '').toLowerCase();
         const custName = String(sale.customerName || '').toLowerCase();
         const custDoc = String(sale.customerDni || sale.customerRuc || '').toLowerCase();
-        if (!docNum.includes(q) && !custName.includes(q) && !custDoc.includes(q)) {
+        if (!docNum.includes(trimmedSearch) && !custName.includes(trimmedSearch) && !custDoc.includes(trimmedSearch)) {
           return false;
         }
       }
 
       return true;
     });
-  }, [sales, dateRange, customStartDate, customEndDate, docFilter, searchQuery]);
+  }, [mergedSales, dateRange, effectiveCustomStart, effectiveCustomEnd, docFilter, debouncedSearchQuery]);
 
   // ============================================================================
   // KPIS FINANCIEROS DEL PERIODO SELECCIONADO
@@ -893,17 +1202,27 @@ export default function HistoryScreen() {
     };
   }, [accountId, activeTab]);
 
-  useEffect(() => {
-    if (!accountId) return;
-    setKpiContext({
+  const kpiContext = useMemo<BusinessKPIContext>(() => {
+    if (!accountId || activeTab !== 'ai') return {};
+    return {
       todaySales: periodKpis.totalSales,
       salesCount: periodKpis.salesCount,
       cashInDrawer: activeCashSession?.expectedAmount || 0,
       totalDebt: totalCustomerDebt,
       branchName: activeBranch?.name || 'Tienda Principal',
       activeOperator: userProfile?.displayName || user?.email || 'Operador',
-    });
-  }, [accountId, periodKpis, activeCashSession?.expectedAmount, totalCustomerDebt, activeBranch?.name, userProfile?.displayName, user?.email, setKpiContext]);
+    };
+  }, [
+    accountId,
+    activeTab,
+    periodKpis.totalSales,
+    periodKpis.salesCount,
+    activeCashSession?.expectedAmount,
+    totalCustomerDebt,
+    activeBranch?.name,
+    userProfile?.displayName,
+    user?.email,
+  ]);
 
   // ============================================================================
   // ACCIONES DEL COMPROBANTE: REIMPRESIÓN, COMPARTIR Y ANULACIÓN
@@ -1033,6 +1352,7 @@ export default function HistoryScreen() {
 
   const handleEmitMissingSunat = useCallback(
     async (sale: Sale) => {
+      if (guardOfflinePendingSaleAction(sale, 'emitir en SUNAT')) return;
       if (!accountId) return;
       const meta = resolveReceiptDocumentMeta(sale);
       const docType: '01' | '03' = meta.isFacturaDoc ? '01' : '03';
@@ -1082,6 +1402,7 @@ export default function HistoryScreen() {
 
   const handleOpenSunatActions = useCallback(
     async (sale: Sale) => {
+      if (guardOfflinePendingSaleAction(sale, 'emitir o gestionar en SUNAT')) return;
       if (!accountId) return;
       setLoadingSunatAction(true);
       try {
@@ -1124,6 +1445,7 @@ export default function HistoryScreen() {
 
   const handleQuickConsultOrRetrySunat = useCallback(
     async (sale: Sale) => {
+      if (guardOfflinePendingSaleAction(sale, 'consultar o reintentar en SUNAT')) return;
       if (!accountId) return;
       setLoadingSunatAction(true);
       try {
@@ -1157,6 +1479,7 @@ export default function HistoryScreen() {
 
   const handleConfirmCancelSale = async () => {
     if (!selectedSale) return;
+    if (guardOfflinePendingSaleAction(selectedSale, 'anularla')) return;
     if (!canProcessReturn) {
       Alert.alert('Acceso Denegado', 'No cuentas con permisos para anular ventas ni revertir inventario.');
       return;
@@ -1195,6 +1518,7 @@ export default function HistoryScreen() {
 
   const handleRefundSelectedLines = async () => {
     if (!selectedSale || !user) return;
+    if (guardOfflinePendingSaleAction(selectedSale, 'procesar una devolución')) return;
     if (!canProcessReturn) {
       Alert.alert('Acceso Denegado', 'No cuentas con permisos para procesar devoluciones.');
       return;
@@ -1239,7 +1563,17 @@ export default function HistoryScreen() {
   // ============================================================================
   // ACCIONES DE VENTY IA
   // ============================================================================
-  const handleSendAiMessage = async (customText?: string) => {
+  const scheduleChatScrollToEnd = useCallback(() => {
+    if (chatScrollTimerRef.current) {
+      clearTimeout(chatScrollTimerRef.current);
+    }
+    chatScrollTimerRef.current = setTimeout(() => {
+      chatListRef.current?.scrollToEnd({ animated: true });
+      chatScrollTimerRef.current = null;
+    }, 100);
+  }, []);
+
+  const handleSendAiMessage = useCallback(async (customText?: string) => {
     const textToSend = customText || chatInput;
     if (!textToSend.trim()) return;
 
@@ -1253,10 +1587,7 @@ export default function HistoryScreen() {
     setChatMessages((prev) => [...prev, userMsg]);
     if (!customText) setChatInput('');
     setIsAiLoading(true);
-
-    setTimeout(() => {
-      chatScrollRef.current?.scrollToEnd({ animated: true });
-    }, 100);
+    scheduleChatScrollToEnd();
 
     try {
       const response = await askVentyAI({
@@ -1282,19 +1613,9 @@ export default function HistoryScreen() {
       setChatMessages((prev) => [...prev, errReply]);
     } finally {
       setIsAiLoading(false);
-      setTimeout(() => {
-        chatScrollRef.current?.scrollToEnd({ animated: true });
-      }, 100);
+      scheduleChatScrollToEnd();
     }
-  };
-
-  // Chips de preguntas rápidas
-  const quickChips = [
-    '¿Cuánto vendí hoy y cuál es mi ganancia?',
-    '¿Qué productos están por agotarse?',
-    '¿Cuánto efectivo debe haber en caja?',
-    '¿Qué clientes tienen deuda de fiado?',
-  ];
+  }, [chatInput, kpiContext, scheduleChatScrollToEnd]);
 
   const handleSelectSale = useCallback((sale: Sale) => {
     setSelectedSale(sale);
@@ -1306,7 +1627,7 @@ export default function HistoryScreen() {
     [handleSelectSale]
   );
 
-  const saleKeyExtractor = useCallback((item: Sale) => item.id, []);
+  const saleKeyExtractor = useCallback((item: Sale) => item.id || (item as any).offlineId || '', []);
 
   const saleItemType = useCallback(() => 'sale', []);
 
@@ -1320,6 +1641,81 @@ export default function HistoryScreen() {
     () => ({ paddingHorizontal: 20, paddingTop: 12, paddingBottom: insets.bottom + 80 }),
     [insets.bottom]
   );
+
+  const renderReservationItem = useCallback(
+    ({ item }: { item: any }) => (
+      <ReservationHistoryRow
+        res={item}
+        onViewTicket={handleViewReservationTicket}
+        onOpenPay={handleOpenPayReservation}
+        onComplete={handleCompleteReservation}
+        onCancel={handleCancelReservation}
+      />
+    ),
+    [handleViewReservationTicket, handleOpenPayReservation, handleCompleteReservation, handleCancelReservation]
+  );
+  const reservationKeyExtractor = useCallback((item: any) => item.id, []);
+  const reservationItemType = useCallback(
+    (item: any) => (item.status === 'pending' || !item.status ? 'pending' : 'settled'),
+    []
+  );
+  const reservationsListContentStyle = useMemo(
+    () => ({ paddingHorizontal: 20, paddingBottom: insets.bottom + 80 }),
+    [insets.bottom]
+  );
+
+  const renderChatMessageItem = useCallback(
+    ({ item }: { item: ChatMessage }) => <ChatMessageRow msg={item} />,
+    []
+  );
+  const chatKeyExtractor = useCallback((item: ChatMessage) => item.id, []);
+  const chatItemType = useCallback((item: ChatMessage) => item.sender, []);
+  const chatListContentStyle = useMemo(() => ({ padding: 16, paddingBottom: 20 }), []);
+  const chatFooterElement = useMemo(() => (
+    <>
+      {isAiLoading && (
+        <View style={styles.aiTypingBox}>
+          <Image
+            source={VENTY_ICON}
+            style={{ width: 18, height: 18, marginRight: 6 }}
+            contentFit="contain"
+          />
+          <ActivityIndicator size="small" color={ui.primary} />
+          <Text style={styles.aiTypingText}>Venty IA está analizando los datos...</Text>
+        </View>
+      )}
+      <View style={styles.quickQuestionsContainer}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 8 }}>
+          <Sparkles size={16} color={ui.primary} />
+          <Text style={styles.quickQuestionsTitle}>Consultas rápidas:</Text>
+        </View>
+        <View style={styles.quickChipsGrid}>
+          {AI_QUICK_CHIPS.map((chip, idx) => (
+            <TouchableOpacity
+              key={idx}
+              style={styles.quickChip}
+              onPress={() => void handleSendAiMessage(chip)}
+            >
+              <Text style={styles.quickChipText}>{chip}</Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+      </View>
+    </>
+  ), [isAiLoading, handleSendAiMessage]);
+
+  const handleCloseEinvoiceModal = useCallback(() => {
+    setEinvoiceModalVisible(false);
+    setActiveEinvoice(null);
+    setAllAccountEinvoices([]);
+  }, []);
+
+  const handleEinvoiceUpdated = useCallback(() => {
+    void fetchSalesPage(true);
+    if (selectedSale) {
+      void refreshSelectedSaleSunat(selectedSale);
+    }
+  }, [fetchSalesPage, selectedSale, refreshSelectedSaleSunat]);
 
   // ============================================================================
   // RENDER PRINCIPAL
@@ -1396,9 +1792,9 @@ export default function HistoryScreen() {
           accessibilityState={{ selected: activeTab === 'ai' }}
         >
           <Image
-            source={require('../../assets/venty-icon.webp')}
+            source={VENTY_ICON}
             style={{ width: 18, height: 18 }}
-            resizeMode="contain"
+            contentFit="contain"
           />
           <Text style={[styles.tabButtonText, activeTab === 'ai' && styles.tabButtonTextActive]}>
             Asistente IA
@@ -1412,7 +1808,7 @@ export default function HistoryScreen() {
       {activeTab === 'sales' && (
         <View style={{ flex: 1 }}>
           <FlashList
-            data={loadingSales ? [] : filteredSales}
+            data={loadingSales && isOnline ? [] : filteredSales}
             renderItem={renderHistorySaleItem}
             keyExtractor={saleKeyExtractor}
             getItemType={saleItemType}
@@ -1434,7 +1830,7 @@ export default function HistoryScreen() {
             <View style={styles.filterChipRowCompact}>
               {[
                 { id: 'today', label: 'Hoy' },
-                { id: 'week', label: '7d' },
+                { id: 'week', label: '7 días' },
                 { id: 'month', label: 'Mes' },
                 {
                   id: 'custom',
@@ -1443,7 +1839,6 @@ export default function HistoryScreen() {
                       ? `${customStartDate.slice(5)}`
                       : 'Pers.',
                 },
-                { id: 'all', label: 'Todos' },
               ].map((item) => (
                 <TouchableOpacity
                   key={item.id}
@@ -1453,14 +1848,17 @@ export default function HistoryScreen() {
                   ]}
                   onPress={() => {
                     if (item.id === 'custom') {
-                      if (!customStartDate) {
+                      if (!customStartDate || !customEndDate) {
                         const now = new Date();
                         const pad = (n: number) => String(n).padStart(2, '0');
                         const endStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
                         const sevenAgo = new Date(Date.now() - 7 * 86400000);
                         const startStr = `${sevenAgo.getFullYear()}-${pad(sevenAgo.getMonth() + 1)}-${pad(sevenAgo.getDate())}`;
-                        setCustomStartDate(startStr);
-                        setCustomEndDate(endStr);
+                        setDraftStartDate(startStr);
+                        setDraftEndDate(endStr);
+                      } else {
+                        setDraftStartDate(customStartDate);
+                        setDraftEndDate(customEndDate);
                       }
                       setCustomDateModalOpen(true);
                     } else {
@@ -1487,11 +1885,25 @@ export default function HistoryScreen() {
           <View style={styles.kpiContainer}>
             <View style={styles.kpiGrid}>
               <View style={[styles.kpiBox, styles.totalSalesHero]}>
-                <Text style={styles.kpiBoxLabel}>Ventas totales</Text>
-                <Text style={[styles.kpiBoxValue, styles.totalSalesValue]}>
-                  {formatPEN(periodKpis.totalSales)}
-                </Text>
-                <Text style={styles.kpiBoxFoot}>En el período seleccionado</Text>
+                <View style={styles.totalSalesRow}>
+                  <View style={styles.totalSalesLeft}>
+                    <Text style={styles.kpiBoxLabel}>Ventas totales</Text>
+                    <Text style={[styles.kpiBoxValue, styles.totalSalesValue]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.8}>
+                      {formatPEN(periodKpis.totalSales)}
+                    </Text>
+                    <Text style={styles.kpiBoxFoot}>En el período seleccionado</Text>
+                  </View>
+                  <View style={styles.totalSalesDivider} />
+                  <View style={styles.totalSalesRight}>
+                    <Text style={styles.kpiBoxLabel}>Efectivo / Digital</Text>
+                    <Text style={[styles.kpiBoxValue, { color: ui.warning, fontSize: 16 }]} numberOfLines={1}>
+                      {periodKpis.cashPercent}% / {periodKpis.digitalPercent}%
+                    </Text>
+                    <Text style={styles.kpiBoxFoot} numberOfLines={1}>
+                      {formatPEN(periodKpis.cashSales)} / {formatPEN(periodKpis.digitalSales)}
+                    </Text>
+                  </View>
+                </View>
               </View>
 
               <View style={[styles.kpiBox, styles.secondaryKpiBox]}>
@@ -1508,16 +1920,6 @@ export default function HistoryScreen() {
                   {formatPEN(periodKpis.avgTicket)}
                 </Text>
                 <Text style={styles.kpiBoxFoot}>Por venta</Text>
-              </View>
-
-              <View style={[styles.kpiBox, styles.secondaryKpiBox]}>
-                <Text style={styles.kpiBoxLabel}>Efectivo y digital</Text>
-                <Text style={[styles.kpiBoxValue, { color: ui.warning, fontSize: 16 }]}>
-                  {periodKpis.cashPercent}% / {periodKpis.digitalPercent}%
-                </Text>
-                <Text style={styles.kpiBoxFoot}>
-                  {formatPEN(periodKpis.cashSales)} / {formatPEN(periodKpis.digitalSales)}
-                </Text>
               </View>
             </View>
           </View>
@@ -1560,7 +1962,7 @@ export default function HistoryScreen() {
           </View>
 
           {/* Ventanita de Lector de Código de Barras Inline (sin cambiar de página) */}
-          {inlineScannerActive && (
+          {inlineScannerActive && isFocused && (
             <View style={styles.inlineScannerCard}>
               <View style={styles.inlineScannerTopBar}>
                 <View style={styles.inlineScannerTitleWrap}>
@@ -1595,9 +1997,7 @@ export default function HistoryScreen() {
                   style={styles.inlineCamera}
                   facing="back"
                   enableTorch={inlineTorchOn}
-                  barcodeScannerSettings={{
-                    barcodeTypes: ['qr', 'ean13', 'ean8', 'code128', 'code39', 'upc_a', 'upc_e'],
-                  }}
+                  barcodeScannerSettings={HISTORY_BARCODE_SETTINGS}
                   onBarcodeScanned={(result) => handleInlineBarcodeScanned(result.data)}
                 />
                 <View style={styles.inlineReticle} />
@@ -1608,44 +2008,46 @@ export default function HistoryScreen() {
             </View>
           )}
 
-          {/* Filtros de Tipo de Documento */}
-          <View style={styles.docFilterRow}>
-            {(
-              [
-                { id: 'all', label: 'Todos' },
-                { id: 'factura', label: 'Facturas' },
-                { id: 'boleta', label: 'Boletas' },
-                { id: 'nota_venta', label: 'Notas' },
-              ] as const
-            ).map((d) => (
-              <TouchableOpacity
-                key={d.id}
-                style={[styles.docChip, docFilter === d.id && styles.docChipActive]}
-                onPress={() => setDocFilter(d.id)}
-                accessibilityRole="button"
-                accessibilityLabel={`Filtrar comprobantes: ${d.label}`}
-                accessibilityState={{ selected: docFilter === d.id }}
-              >
-                <Text style={[styles.docChipText, docFilter === d.id && styles.docChipTextActive]}>
-                  {d.label}
-                </Text>
-              </TouchableOpacity>
-            ))}
-          </View>
+          {/* Filtros de Tipo de Documento (solo si facturación electrónica está activa) */}
+          {invoicingEnabled ? (
+            <View style={styles.docFilterRow}>
+              {(
+                [
+                  { id: 'all', label: 'Todos' },
+                  { id: 'factura', label: 'Facturas' },
+                  { id: 'boleta', label: 'Boletas' },
+                  { id: 'nota_venta', label: 'Notas' },
+                ] as const
+              ).map((d) => (
+                <TouchableOpacity
+                  key={d.id}
+                  style={[styles.docChip, docFilter === d.id && styles.docChipActive]}
+                  onPress={() => setDocFilter(d.id)}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Filtrar comprobantes: ${d.label}`}
+                  accessibilityState={{ selected: docFilter === d.id }}
+                >
+                  <Text style={[styles.docChipText, docFilter === d.id && styles.docChipTextActive]}>
+                    {d.label}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          ) : null}
 
               </>
             }
             ListEmptyComponent={
-              loadingSales ? (
+              loadingSales && isOnline ? (
                 <ActivityIndicator color={ui.primary} style={{ marginVertical: 40 }} />
               ) : (
                 <View style={styles.emptyContainer}>
                   <Receipt size={44} color={ui.textMuted} />
                   <Text style={styles.emptyTitle}>
-                    {sales.length === 0 ? 'Aún no hay comprobantes' : 'Sin ventas con estos filtros'}
+                    {mergedSales.length === 0 ? 'Aún no hay comprobantes' : 'Sin ventas con estos filtros'}
                   </Text>
                   <Text style={styles.emptySub}>
-                    {sales.length === 0
+                    {mergedSales.length === 0
                       ? 'Las ventas registradas aparecerán aquí.'
                       : 'Prueba otro periodo, tipo de comprobante o búsqueda.'}
                   </Text>
@@ -1675,22 +2077,9 @@ export default function HistoryScreen() {
       {/* SUB-MÓDULO: RESERVAS Y STOCK APARTADO */}
       {/* ==================================================================== */}
       {activeTab === 'reservations' && (
-        <ScrollView
-          style={styles.contentContainer}
-          contentContainerStyle={{ paddingBottom: insets.bottom + 80 }}
-          keyboardShouldPersistTaps="handled"
-        >
-          <View style={styles.reservationsHeaderBanner}>
-            <View style={{ flex: 1 }}>
-              <Text style={styles.reservationsBannerTitle}>Reservas en Sucursal</Text>
-              <Text style={styles.reservationsBannerSub}>
-                {filteredReservations.length} {filteredReservations.length === 1 ? 'reserva encontrada' : 'reservas encontradas'}
-              </Text>
-            </View>
-          </View>
-
-          {/* Buscador de Reservas */}
-          <View style={[styles.searchRow, { marginTop: 10 }]}>
+        <View style={{ flex: 1 }}>
+          {/* Buscador de Reservas + Contador en la misma fila */}
+          <View style={[styles.searchRow, { marginTop: 12, paddingHorizontal: 20 }]}>
             <View style={[styles.searchBox, { flex: 1 }]}>
               <Search size={18} color={ui.textMuted} />
               <TextInput
@@ -1712,10 +2101,14 @@ export default function HistoryScreen() {
                 </TouchableOpacity>
               )}
             </View>
+            <View style={styles.reservationsCountBadge}>
+              <Text style={styles.reservationsCountNumber}>{filteredReservations.length}</Text>
+              <Text style={styles.reservationsCountLabel}>res.</Text>
+            </View>
           </View>
 
           {/* Filtros de estado de reserva */}
-          <View style={[styles.docFilterRow, { marginBottom: 12 }]}>
+          <View style={[styles.docFilterRow, { marginBottom: 12, paddingHorizontal: 20 }]}>
             <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 6 }}>
               {[
                 { id: 'all', label: 'Todas' },
@@ -1749,7 +2142,7 @@ export default function HistoryScreen() {
           {loadingReservations ? (
             <ActivityIndicator color={ui.primary} style={{ marginVertical: 40 }} />
           ) : filteredReservations.length === 0 ? (
-            <View style={styles.emptyContainer}>
+            <View style={[styles.emptyContainer, { paddingHorizontal: 20 }]}>
               <Calendar size={44} color={ui.textMuted} />
               <Text style={styles.emptyTitle}>
                 {reservations.length === 0 ? 'No hay reservas registradas' : 'No se encontraron reservas'}
@@ -1761,147 +2154,18 @@ export default function HistoryScreen() {
               </Text>
             </View>
           ) : (
-            <View style={styles.reservationsList}>
-              {filteredReservations.map((res) => {
-                const isPending = res.status === 'pending' || !res.status;
-                const isCompleted = res.status === 'completed';
-                const isCancelled = res.status === 'cancelled';
-                const deposit = Number(res.depositAmount || 0);
-                const total = Number(res.total || 0);
-                const remaining = Math.max(0, total - deposit);
-
-                return (
-                  <View key={res.id} style={styles.reservationCard}>
-                    <View style={styles.resCardHeader}>
-                      <View style={{ flex: 1 }}>
-                        <Text style={styles.resCustomerName}>{res.customer?.name || 'Cliente General'}</Text>
-                        {res.customer?.phone ? (
-                          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4, marginTop: 2 }}>
-                            <Phone size={12} color={ui.textSecondary} />
-                            <Text style={styles.resCustomerPhone}>{res.customer.phone}</Text>
-                          </View>
-                        ) : null}
-                      </View>
-                      <View
-                        style={[
-                          styles.badge,
-                          isPending && { backgroundColor: ui.warningSoft },
-                          isCompleted && { backgroundColor: ui.primarySoft },
-                          isCancelled && { backgroundColor: ui.dangerSoft },
-                        ]}
-                      >
-                        <Text
-                          style={[
-                            styles.badgeText,
-                            isPending && { color: ui.warning },
-                            isCompleted && { color: ui.primary },
-                            isCancelled && { color: ui.danger },
-                          ]}
-                        >
-                          {isCompleted ? 'ENTREGADO' : isCancelled ? 'CANCELADO' : 'PENDIENTE'}
-                        </Text>
-                      </View>
-                    </View>
-
-                    {/* Detalle de ítems */}
-                    {Array.isArray(res.items) && res.items.length > 0 ? (
-                      <View style={styles.resItemsBox}>
-                        {res.items.map((it: any, i: number) => (
-                          <Text key={i} style={styles.resItemLine} numberOfLines={1}>
-                            • {it.quantity}x {it.productName || it.name || 'Producto'} ({formatPEN(it.price || 0)})
-                          </Text>
-                        ))}
-                      </View>
-                    ) : null}
-
-                    {/* Fila Financiera */}
-                    <View style={styles.resFinancialRow}>
-                      <View>
-                        <Text style={styles.resFinLabel}>Total</Text>
-                        <Text style={styles.resFinValue}>{formatPEN(total)}</Text>
-                      </View>
-                      <View>
-                        <Text style={styles.resFinLabel}>Adelanto</Text>
-                        <Text style={[styles.resFinValue, { color: ui.primary }]}>{formatPEN(deposit)}</Text>
-                      </View>
-                      <View>
-                        <Text style={styles.resFinLabel}>Saldo Pendiente</Text>
-                        <Text style={[styles.resFinValue, { color: remaining > 0 ? ui.danger : ui.textSecondary }]}>
-                          {formatPEN(remaining)}
-                        </Text>
-                      </View>
-                    </View>
-
-                    {res.pickupDate ? (
-                      <View style={styles.resPickupRow}>
-                        <Clock size={12} color={ui.textSecondary} />
-                        <Text style={styles.resPickupText}>
-                          Límite de recojo: {String(res.pickupDate).slice(0, 10)}
-                        </Text>
-                      </View>
-                    ) : null}
-
-                    {/* Botones de acción para reservas */}
-                    <View style={styles.resActionsRow}>
-                      <TouchableOpacity
-                        style={styles.resViewTicketBtn}
-                        onPress={() => {
-                          setReceiptReservation(res);
-                          setReceiptModalVisible(true);
-                        }}
-                        activeOpacity={0.7}
-                        accessibilityRole="button"
-                        accessibilityLabel="Ver comprobante o ticket de reserva"
-                      >
-                        <FileText size={14} color={ui.primary} />
-                        <Text style={styles.resViewTicketBtnText}>Ver Ticket</Text>
-                      </TouchableOpacity>
-
-                      {isPending && remaining > 0 && (
-                        <TouchableOpacity
-                          style={styles.resCompleteBtn}
-                          onPress={() => handleOpenPayReservation(res)}
-                          activeOpacity={0.7}
-                          accessibilityRole="button"
-                          accessibilityLabel="Cobrar saldo y entregar productos"
-                        >
-                          <CreditCard size={14} color={ui.onPrimary} />
-                          <Text style={styles.resCompleteBtnText}>Cobrar y Entregar</Text>
-                        </TouchableOpacity>
-                      )}
-
-                      {isPending && remaining === 0 && (
-                        <TouchableOpacity
-                          style={styles.resCompleteBtn}
-                          onPress={() => handleCompleteReservation(res)}
-                          activeOpacity={0.7}
-                          accessibilityRole="button"
-                          accessibilityLabel="Entregar productos"
-                        >
-                          <CheckCircle2 size={14} color={ui.onPrimary} />
-                          <Text style={styles.resCompleteBtnText}>Entregar</Text>
-                        </TouchableOpacity>
-                      )}
-
-                      {isPending && (
-                        <TouchableOpacity
-                          style={styles.resCancelBtn}
-                          onPress={() => handleCancelReservation(res)}
-                          activeOpacity={0.7}
-                          accessibilityRole="button"
-                          accessibilityLabel="Cancelar reserva"
-                        >
-                          <X size={14} color={ui.danger} />
-                          <Text style={styles.resCancelBtnText}>Cancelar</Text>
-                        </TouchableOpacity>
-                      )}
-                    </View>
-                  </View>
-                );
-              })}
-            </View>
+            <FlashList
+              data={filteredReservations}
+              renderItem={renderReservationItem}
+              keyExtractor={reservationKeyExtractor}
+              getItemType={reservationItemType}
+              estimatedItemSize={220}
+              contentContainerStyle={reservationsListContentStyle}
+              keyboardShouldPersistTaps="handled"
+              showsVerticalScrollIndicator={false}
+            />
           )}
-        </ScrollView>
+        </View>
       )}
 
       {/* ==================================================================== */}
@@ -1912,83 +2176,21 @@ export default function HistoryScreen() {
           behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
           style={{ flex: 1 }}
         >
-          <ScrollView
-            ref={chatScrollRef}
-            style={styles.chatScroll}
-            contentContainerStyle={{ padding: 16, paddingBottom: 20 }}
-            keyboardShouldPersistTaps="handled"
-            keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
-          >
-            {/* Mensajes del Chat */}
-            {chatMessages.map((msg) => {
-              const isAi = msg.sender === 'ai';
-              return (
-                <View
-                  key={msg.id}
-                  style={[
-                    styles.chatBubbleWrapper,
-                    isAi ? styles.chatBubbleAiWrapper : styles.chatBubbleUserWrapper,
-                  ]}
-                >
-                  {isAi && (
-                    <View style={styles.aiAvatar}>
-                      <Image
-                        source={require('../../assets/venty-icon.webp')}
-                        style={{ width: 28, height: 28 }}
-                        resizeMode="contain"
-                      />
-                    </View>
-                  )}
-                  <View
-                    style={[
-                      styles.chatBubble,
-                      isAi ? styles.chatBubbleAi : styles.chatBubbleUser,
-                    ]}
-                  >
-                    <Text
-                      style={[
-                        styles.chatText,
-                        isAi ? styles.chatTextAi : styles.chatTextUser,
-                      ]}
-                    >
-                      {msg.text}
-                    </Text>
-                  </View>
-                </View>
-              );
-            })}
-
-            {isAiLoading && (
-              <View style={styles.aiTypingBox}>
-                <Image
-                  source={require('../../assets/venty-icon.webp')}
-                  style={{ width: 18, height: 18, marginRight: 6 }}
-                  resizeMode="contain"
-                />
-                <ActivityIndicator size="small" color={ui.primary} />
-                <Text style={styles.aiTypingText}>Venty IA está analizando los datos...</Text>
-              </View>
-            )}
-
-            {/* Chips de Preguntas Rápidas */}
-            <View style={styles.quickQuestionsContainer}>
-              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 8 }}>
-                <Sparkles size={16} color={ui.primary} />
-                <Text style={styles.quickQuestionsTitle}>Consultas rápidas:</Text>
-              </View>
-              <View style={styles.quickChipsGrid}>
-                {quickChips.map((chip, idx) => (
-                  <TouchableOpacity
-                    key={idx}
-                    style={styles.quickChip}
-                    onPress={() => handleSendAiMessage(chip)}
-                  >
-                    <Text style={styles.quickChipText}>{chip}</Text>
-                  </TouchableOpacity>
-                ))}
-              </View>
-            </View>
-          </ScrollView>
+          <View style={styles.chatScroll}>
+            <FlashList
+              ref={chatListRef}
+              data={chatMessages}
+              renderItem={renderChatMessageItem}
+              keyExtractor={chatKeyExtractor}
+              getItemType={chatItemType}
+              estimatedItemSize={88}
+              ListFooterComponent={chatFooterElement}
+              contentContainerStyle={chatListContentStyle}
+              keyboardShouldPersistTaps="handled"
+              keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
+              showsVerticalScrollIndicator={false}
+            />
+          </View>
 
           {/* Barra de Entrada de Chat */}
           <View style={[styles.chatInputBar, { paddingBottom: Math.max(insets.bottom, 12) }]}>
@@ -1999,12 +2201,12 @@ export default function HistoryScreen() {
               placeholderTextColor={ui.textMuted}
               value={chatInput}
               onChangeText={setChatInput}
-              onSubmitEditing={() => handleSendAiMessage()}
+              onSubmitEditing={() => void handleSendAiMessage()}
               returnKeyType="send"
             />
             <TouchableOpacity
               style={[styles.chatSendButton, !chatInput.trim() && { opacity: 0.5 }]}
-              onPress={() => handleSendAiMessage()}
+              onPress={() => void handleSendAiMessage()}
               disabled={!chatInput.trim() || isAiLoading}
               accessibilityRole="button"
               accessibilityLabel={isAiLoading ? 'Venty IA está respondiendo' : 'Enviar pregunta'}
@@ -2028,9 +2230,7 @@ export default function HistoryScreen() {
         >
         <View style={styles.modalOverlay}>
           <View style={[styles.modalContent, { maxHeight: '90%' }]}>
-            {selectedSale && (() => {
-              const detailMeta = resolveReceiptDocumentMeta(selectedSale);
-              return (
+            {selectedSale && detailMeta && (
               <>
                 <View style={styles.modalHeader}>
                   <View>
@@ -2119,7 +2319,7 @@ export default function HistoryScreen() {
                         <Text style={styles.detailSectionTitle}>DATOS DEL COMPROBANTE</Text>
                         <View style={styles.detailRow}>
                           <Text style={styles.detailLabel}>Fecha y Hora:</Text>
-                          <Text style={styles.detailValue}>{formatDatePE(selectedSale.date)}</Text>
+                          <Text style={styles.detailValue}>{formatDatePE(selectedSale.date || (selectedSale as any).createdAt)}</Text>
                         </View>
                         <View style={styles.detailRow}>
                           <Text style={styles.detailLabel}>Cliente:</Text>
@@ -2218,12 +2418,11 @@ export default function HistoryScreen() {
 
                       {/* Estado y Acciones SUNAT / CDR */}
                       {(() => {
-                        const meta = resolveReceiptDocumentMeta(selectedSale);
                         const showSunatPanel =
-                          !meta.isQuote &&
-                          !meta.isOfflinePending &&
-                          (meta.isFiscal ||
-                            meta.isFacturaDoc ||
+                          !detailMeta.isQuote &&
+                          !detailMeta.isOfflinePending &&
+                          (detailMeta.isFiscal ||
+                            detailMeta.isFacturaDoc ||
                             Boolean(
                               selectedSale.sunatStatus &&
                                 selectedSale.sunatStatus !== 'not_applicable'
@@ -2381,6 +2580,7 @@ export default function HistoryScreen() {
                   <TouchableOpacity
                     style={styles.cancelSaleBtn}
                     onPress={() => {
+                      if (guardOfflinePendingSaleAction(selectedSale, 'anularla')) return;
                       setCancelReason('');
                       setCancelModalVisible(true);
                     }}
@@ -2398,6 +2598,7 @@ export default function HistoryScreen() {
                   <TouchableOpacity
                     style={[styles.cancelSaleBtn, { borderColor: ui.warning, marginTop: 8 }]}
                     onPress={() => {
+                      if (guardOfflinePendingSaleAction(selectedSale, 'procesar una devolución')) return;
                       setRefundLineIndices([]);
                       setRefundPaymentMethod('cash');
                       setRefundModalVisible(true);
@@ -2410,8 +2611,7 @@ export default function HistoryScreen() {
                   </TouchableOpacity>
                 )}
               </>
-              );
-            })()}
+            )}
           </View>
         </View>
       </Modal>
@@ -2597,14 +2797,14 @@ export default function HistoryScreen() {
                     if (shortcut.days === 1) {
                       const yesterday = new Date(Date.now() - 86400000);
                       const yStr = `${yesterday.getFullYear()}-${pad(yesterday.getMonth() + 1)}-${pad(yesterday.getDate())}`;
-                      setCustomStartDate(yStr);
-                      setCustomEndDate(yStr);
+                      setDraftStartDate(yStr);
+                      setDraftEndDate(yStr);
                     } else {
                       const endStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
                       const past = new Date(Date.now() - shortcut.days * 86400000);
                       const startStr = `${past.getFullYear()}-${pad(past.getMonth() + 1)}-${pad(past.getDate())}`;
-                      setCustomStartDate(startStr);
-                      setCustomEndDate(endStr);
+                      setDraftStartDate(startStr);
+                      setDraftEndDate(endStr);
                     }
                   }}
                 >
@@ -2620,8 +2820,8 @@ export default function HistoryScreen() {
                   style={styles.input}
                   placeholder="2026-01-01"
                   placeholderTextColor={ui.textMuted}
-                  value={customStartDate}
-                  onChangeText={setCustomStartDate}
+                  value={draftStartDate}
+                  onChangeText={setDraftStartDate}
                   keyboardType="numbers-and-punctuation"
                   maxLength={10}
                 />
@@ -2632,8 +2832,8 @@ export default function HistoryScreen() {
                   style={styles.input}
                   placeholder="2026-01-31"
                   placeholderTextColor={ui.textMuted}
-                  value={customEndDate}
-                  onChangeText={setCustomEndDate}
+                  value={draftEndDate}
+                  onChangeText={setDraftEndDate}
                   keyboardType="numbers-and-punctuation"
                   maxLength={10}
                 />
@@ -2653,7 +2853,9 @@ export default function HistoryScreen() {
               <TouchableOpacity
                 style={styles.applyDateBtn}
                 onPress={() => {
-                  if (customStartDate && customEndDate) {
+                  if (draftStartDate && draftEndDate) {
+                    setCustomStartDate(draftStartDate);
+                    setCustomEndDate(draftEndDate);
                     setDateRange('custom');
                   }
                   setCustomDateModalOpen(false);
@@ -2677,7 +2879,7 @@ export default function HistoryScreen() {
             setReceiptReservation(null);
           }}
           reservation={receiptReservation}
-          business={{ ...businessSettings, ...activeBranch }}
+          business={reservationBusiness}
         />
       )}
 
@@ -2813,21 +3015,18 @@ export default function HistoryScreen() {
       </Modal>
       )}
 
-      <EinvoiceActionsModal
-        visible={einvoiceModalVisible}
-        einvoice={activeEinvoice}
-        allEinvoices={allAccountEinvoices}
-        accountId={accountId || ''}
-        taxRate={taxProfile.taxRate}
-        invoicingEnabled={invoicingEnabled}
-        onClose={() => setEinvoiceModalVisible(false)}
-        onUpdated={() => {
-          void fetchSalesPage(true);
-          if (selectedSale) {
-            void refreshSelectedSaleSunat(selectedSale);
-          }
-        }}
-      />
+      {einvoiceModalVisible && activeEinvoice && (
+        <EinvoiceActionsModal
+          visible={einvoiceModalVisible}
+          einvoice={activeEinvoice}
+          allEinvoices={allAccountEinvoices}
+          accountId={accountId || ''}
+          taxRate={taxProfile.taxRate}
+          invoicingEnabled={invoicingEnabled}
+          onClose={handleCloseEinvoiceModal}
+          onUpdated={handleEinvoiceUpdated}
+        />
+      )}
     </View>
   );
 }
@@ -2890,16 +3089,19 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   filterChipRowCompact: {
+    flex: 1,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 6,
-    paddingRight: 6,
   },
   rangeChipCompact: {
+    flex: 1,
+    minWidth: 0,
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 9,
-    paddingVertical: 5,
+    justifyContent: 'center',
+    paddingHorizontal: 6,
+    paddingVertical: 7,
     borderRadius: 12,
     backgroundColor: ui.surface,
     borderWidth: 1,
@@ -3081,10 +3283,51 @@ const styles = StyleSheet.create({
     flexBasis: '100%',
     backgroundColor: ui.primarySoft,
     borderColor: ui.primarySoft,
-    paddingVertical: 20,
+    paddingVertical: 14,
+  },
+  totalSalesRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+  },
+  totalSalesLeft: {
+    flex: 1.15,
+    minWidth: 0,
+  },
+  totalSalesDivider: {
+    width: 1,
+    alignSelf: 'stretch',
+    backgroundColor: ui.border,
+  },
+  totalSalesRight: {
+    flex: 0.95,
+    minWidth: 0,
+    alignItems: 'flex-end',
+  },
+  reservationsCountBadge: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: ui.surface,
+    borderWidth: 1,
+    borderColor: ui.border,
+    borderRadius: 12,
+    paddingHorizontal: 10,
+    minHeight: 46,
+  },
+  reservationsCountNumber: {
+    fontSize: 13,
+    fontWeight: '800',
+    color: ui.text,
+    lineHeight: 16,
+  },
+  reservationsCountLabel: {
+    fontSize: 10,
+    fontWeight: '600',
+    color: ui.textSecondary,
   },
   secondaryKpiBox: {
-    minHeight: 112,
+    minHeight: 88,
     justifyContent: 'center',
   },
   kpiBoxLabel: {
@@ -3583,6 +3826,7 @@ const styles = StyleSheet.create({
     borderColor: ui.border,
     padding: 14,
     gap: 10,
+    marginBottom: 12,
   },
   resCardHeader: {
     flexDirection: 'row',

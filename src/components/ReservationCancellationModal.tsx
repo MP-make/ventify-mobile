@@ -14,19 +14,19 @@ const METHODS = [
   { label: 'Digital', value: 'digital' },
 ];
 
-export function ReservationCancellationModal({
-  visible,
-  item,
-  sessionId,
-  onClose,
-  onConfirm,
-}: {
+export const ReservationCancellationModal: React.FC<{
   visible: boolean;
   item: CancellationItem | null;
   sessionId?: string;
   onClose: () => void;
   onConfirm: (choice: RefundChoice) => Promise<void>;
-}) {
+}> = React.memo(({
+  visible,
+  item,
+  sessionId,
+  onClose,
+  onConfirm,
+}) => {
   const [method, setMethod] = useState('');
   const [percent, setPercent] = useState('100');
   const [busy, setBusy] = useState(false);
@@ -49,8 +49,10 @@ export function ReservationCancellationModal({
     }
   };
 
-  const title = item?.type === 'order' ? 'Cancelar pedido' : 'Cancelar reserva';
-  const customer = item?.customer?.name || item?.customerName || 'el cliente';
+  if (!visible || !item) return null;
+
+  const title = item.type === 'order' ? 'Cancelar pedido' : 'Cancelar reserva';
+  const customer = item.customer?.name || item.customerName || 'el cliente';
 
   return (
     <Modal visible={visible} transparent animationType="fade" onRequestClose={() => { if (!busy) onClose(); }}>
@@ -133,7 +135,7 @@ export function ReservationCancellationModal({
       </SafeAreaView>
     </Modal>
   );
-}
+});
 
 const styles = StyleSheet.create({
   safeArea: { flex: 1 },

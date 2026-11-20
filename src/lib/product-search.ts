@@ -56,8 +56,12 @@ export function getBranchStock(product: Product, branchId: string): number {
     return Number(product.stock[branchId] ?? 0);
   }
   if (!branchId || branchId === 'main') {
-    const firstVal = Object.values(product.stock)[0];
-    return Number(firstVal ?? 0);
+    for (const key in product.stock) {
+      if (Object.prototype.hasOwnProperty.call(product.stock, key)) {
+        return Number(product.stock[key] ?? 0);
+      }
+    }
+    return 0;
   }
   return 0;
 }
@@ -338,20 +342,18 @@ export function resolveEffectiveUnitPrice(
   // 3. Apply volume pricing tiers (tiered pricing)
   const tiers = Array.isArray(pricing.priceTiers) ? pricing.priceTiers : [];
   if (tiers.length > 0 && quantity >= 1) {
-    const applicableTiers = tiers
-      .filter((t) => {
-        const minQty = Number(t.minQuantity ?? t.minQty ?? 0);
-        return minQty > 0 && quantity >= minQty;
-      })
-      .sort((a, b) => {
-        const qtyA = Number(a.minQuantity ?? a.minQty ?? 0);
-        const qtyB = Number(b.minQuantity ?? b.minQty ?? 0);
-        return qtyB - qtyA; // Highest threshold first
-      });
-
-    if (applicableTiers.length > 0) {
-      const topTier = applicableTiers[0];
-      unitPrice = Number(topTier.unitPrice ?? topTier.price ?? unitPrice);
+    let bestTierMinQty = -1;
+    let bestTierPrice = unitPrice;
+    for (let i = 0; i < tiers.length; i += 1) {
+      const t = tiers[i];
+      const minQty = Number(t.minQuantity ?? t.minQty ?? 0);
+      if (minQty > 0 && quantity >= minQty && minQty > bestTierMinQty) {
+        bestTierMinQty = minQty;
+        bestTierPrice = Number(t.unitPrice ?? t.price ?? unitPrice);
+      }
+    }
+    if (bestTierMinQty > 0) {
+      unitPrice = bestTierPrice;
     }
   }
 
@@ -548,7 +550,8 @@ const getBaseProductIdFromCartItem = (item: CartItem): string => {
 export function evaluateCartPromotions(
   items: readonly CartItem[],
   promotions: readonly PromotionRule[] | undefined | null,
-  products: readonly Product[] = []
+  products: readonly Product[] = [],
+  productsById?: ReadonlyMap<string, Product>
 ): PromotionSuggestion[] {
   if (!Array.isArray(promotions) || promotions.length === 0 || items.length === 0) {
     return [];
@@ -641,8 +644,11 @@ export function evaluateCartPromotions(
         Array.from(targetIds)[0] ||
         getBaseProductIdFromCartItem(matchingPaid[0]);
 
+      const candidateProduct = productsById
+        ? productsById.get(preferredGiftId)
+        : products.find((p) => p.id === preferredGiftId && p.active !== false);
       const freeProduct =
-        products.find((p) => p.id === preferredGiftId && p.active !== false) ||
+        (candidateProduct && candidateProduct.active !== false ? candidateProduct : undefined) ||
         matchingPaid.find((it) => getBaseProductIdFromCartItem(it) === preferredGiftId)?.product;
 
       if (!freeProduct) continue;

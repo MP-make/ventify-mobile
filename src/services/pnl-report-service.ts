@@ -34,6 +34,7 @@ export interface GeneratePnlReportParams {
   startDate: Date | number | string;
   endDate: Date | number | string;
   productsMap?: Map<string, Product> | Record<string, Product>;
+  includeDetails?: boolean;
 }
 
 export interface PaymentMethodShare {
@@ -567,34 +568,23 @@ export async function generatePnlReport(params: GeneratePnlReportParams): Promis
   });
   if (effectiveBranchId) search.set('branchId', effectiveBranchId);
 
-  let data: Record<string, any>;
+  let data: Record<string, any> | null = null;
+  let apiError: any = null;
   try {
     data = await apiRequest<Record<string, any>>(`/api/reports/pnl?${search.toString()}`);
   } catch (error: any) {
-    throw new Error(error?.status === 403
-      ? 'No tienes permiso para ver márgenes y reportes financieros.'
-      : error?.message || 'No se pudo generar el Estado de Resultados.');
+    if (error?.status === 403) {
+      throw new Error('No tienes permiso para ver márgenes y reportes financieros.');
+    }
+    apiError = error;
+    console.warn('[PnlReportService] Fallback local desde Firestore por error en API:', error?.message || error);
   }
 
-  const salesClosed = requireReportAmount(data, 'salesClosed');
-  const fiadosIssued = requireReportAmount(data, 'fiadosIssued');
-  const netRevenue = requireReportAmount(data, 'accruedSales');
-  const grossProfit = requireReportAmount(data, 'grossProfit');
-  const operatingExpenses = requireReportAmount(data, 'operatingExpenses');
-  const netProfit = requireReportAmount(data, 'netProfit');
-  const grossSales = roundToCents(salesClosed + fiadosIssued);
-  const canceled = requireReportAmount(data, 'returns');
-  const badDebt = requireReportAmount(data, 'badDebt');
-  const employeeAdvances = requireReportAmount(data, 'employeeAdvances');
-  const cashOperatingExpenses = requireReportAmount(data, 'cashOperatingExpenses');
-  const terminalCommissions = requireReportAmount(data, 'terminalCommissions');
+  const resolvedFromMs = Number(data?.fromMs) || startMs;
+  const resolvedToMs = Number(data?.toMs) || endMs;
+  const branchScope = data?.branchId && data.branchId !== 'all' ? data.branchId : effectiveBranchId;
 
-  const resolvedFromMs = Number(data.fromMs) || startMs;
-  const resolvedToMs = Number(data.toMs) || endMs;
-  const branchScope = data.branchId && data.branchId !== 'all' ? data.branchId : effectiveBranchId;
-
-  let details: PnlDetailsResult | null = null;
-  try {
+  const fetchDetailsFromFirestore = async () => {
     const salesQuery = query(
       collection(db, 'sales'),
       where('accountId', '==', params.accountId),
@@ -642,17 +632,134 @@ export async function generatePnlReport(params: GeneratePnlReportParams): Promis
       ...(d.data() as Record<string, any>),
     }));
 
-    details = buildPnlDetails({
-      sales: salesDocs,
-      fiados: fiadoDocs,
-      movements: movementDocs,
-      productsMap: params.productsMap,
-      terminalCommissions,
-      badDebt,
-    });
-  } catch (detailErr) {
-    console.warn('[PnlReportService] No se pudieron cargar desgloses de Firestore:', detailErr);
-    details = null;
+    return { salesDocs, fiadoDocs, movementDocs };
+  };
+
+  if (!data) {
+    try {
+      const { salesDocs, fiadoDocs, movementDocs } = await fetchDetailsFromFirestore();
+      let salesClosed = 0;
+      let returns = 0;
+      let fiadosIssued = 0;
+      let badDebt = 0;
+      let cashOperatingExpenses = 0;
+      let employeeAdvances = 0;
+      let terminalCommissions = 0;
+      let cogs = 0;
+
+      for (const s of salesDocs) {
+        if (s.status === 'cancelled' || s.status === 'voided' || s.isDepositPayment) continue;
+        const amt = Number(s.total || 0);
+        if (s.isReturn) {
+          returns += Number(s.refundAmount || amt);
+          continue;
+        }
+        salesClosed += amt;
+        terminalCommissions += Number(s.terminalFee || s.commissionAmount || 0);
+        if (Array.isArray(s.items)) {
+          for (const it of s.items) {
+            const qty = Number(it.quantity || 0) * Number(it.presentationQty || it.conversionFactor || 1);
+            const p = params.productsMap instanceof Map ? params.productsMap.get(it.productId) : params.productsMap?.[it.productId];
+            const unitCost = Number(it.costPrice ?? p?.costPrice ?? 0);
+            cogs += unitCost * qty;
+          }
+        }
+      }
+      for (const f of fiadoDocs) {
+        if (f.status === 'cancelled') continue;
+        fiadosIssued += Number(f.total || 0);
+        if (f.isBadDebt) badDebt += Number(f.remainingAmount ?? f.total ?? 0);
+      }
+      for (const m of movementDocs) {
+        const cls = classifyMovementForPnl(m);
+        if (cls === 'operating_expense') cashOperatingExpenses += Number(m.amount || 0);
+        else if (cls === 'employee_advance') employeeAdvances += Number(m.amount || 0);
+      }
+
+      const netRevenue = roundToCents(salesClosed + fiadosIssued - returns);
+      const grossSales = roundToCents(salesClosed + fiadosIssued);
+      const cogsRounded = roundToCents(cogs);
+      const grossProfit = roundToCents(netRevenue - cogsRounded);
+      const operatingExpenses = roundToCents(cashOperatingExpenses + terminalCommissions + badDebt);
+      const netProfit = roundToCents(grossProfit - operatingExpenses);
+      const details = buildPnlDetails({
+        sales: salesDocs,
+        fiados: fiadoDocs,
+        movements: movementDocs,
+        productsMap: params.productsMap,
+        terminalCommissions,
+        badDebt,
+      });
+
+      return {
+        accountId: params.accountId,
+        branchId: params.branchId,
+        startDate: resolvedFromMs,
+        endDate: resolvedToMs,
+        generatedAt: Date.now(),
+        grossSales,
+        salesClosed: roundToCents(salesClosed),
+        cancelledOrRefunded: roundToCents(returns),
+        netRevenue,
+        transactionCount: details.transactionCount,
+        cogs: cogsRounded,
+        grossProfit,
+        grossMarginPercent: netRevenue > 0 ? roundToCents((grossProfit / netRevenue) * 100) : 0,
+        operatingExpenses,
+        pettyCashExpenses: roundToCents(cashOperatingExpenses),
+        payrollExpenses: 0,
+        expensesByCategory: details.expensesByCategory,
+        expenseBreakdown: details.expenseBreakdown,
+        paymentBreakdown: details.paymentBreakdown,
+        topProductsByRevenue: details.topProductsByRevenue,
+        topProductsByProfit: details.topProductsByProfit,
+        sellerPerformance: details.sellerPerformance,
+        netProfit,
+        netMarginPercent: netRevenue > 0 ? roundToCents((netProfit / netRevenue) * 100) : 0,
+        detailsAvailable: true,
+        fiadosIssued: roundToCents(fiadosIssued),
+        returns: roundToCents(returns),
+        badDebt: roundToCents(badDebt),
+        employeeAdvances: roundToCents(employeeAdvances),
+        cashOperatingExpenses: roundToCents(cashOperatingExpenses),
+        terminalCommissions: roundToCents(terminalCommissions),
+      };
+    } catch (fallbackErr: any) {
+      throw new Error(apiError?.message || fallbackErr?.message || 'No se pudo generar el Estado de Resultados.');
+    }
+  }
+
+  const salesClosed = requireReportAmount(data, 'salesClosed');
+  const fiadosIssued = requireReportAmount(data, 'fiadosIssued');
+  const netRevenue = requireReportAmount(data, 'accruedSales');
+  const grossProfit = requireReportAmount(data, 'grossProfit');
+  const operatingExpenses = requireReportAmount(data, 'operatingExpenses');
+  const netProfit = requireReportAmount(data, 'netProfit');
+  const grossSales = roundToCents(salesClosed + fiadosIssued);
+  const canceled = requireReportAmount(data, 'returns');
+  const badDebt = requireReportAmount(data, 'badDebt');
+  const employeeAdvances = requireReportAmount(data, 'employeeAdvances');
+  const cashOperatingExpenses = requireReportAmount(data, 'cashOperatingExpenses');
+  const terminalCommissions = requireReportAmount(data, 'terminalCommissions');
+
+  const includeDetails = params.includeDetails !== false;
+  let details: PnlDetailsResult | null = null;
+  if (includeDetails) {
+    try {
+      const { salesDocs, fiadoDocs, movementDocs } = await fetchDetailsFromFirestore();
+
+      details = buildPnlDetails({
+        sales: salesDocs,
+        fiados: fiadoDocs,
+        movements: movementDocs,
+        productsMap: params.productsMap,
+        terminalCommissions,
+        badDebt,
+      });
+    } catch (detailErr) {
+      console.warn('[PnlReportService] No se pudieron cargar desgloses de Firestore:', detailErr);
+      details = null;
+    }
   }
 
   return {

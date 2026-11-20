@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -29,15 +29,15 @@ const DOC_TYPE_OPTIONS: Array<{ key: CompletionDocType; label: string }> = [
 ];
 
 /** Delivery collects only the remaining balance while retaining the full commercial sale. */
-export function ReservationCompletionModal({
-  item,
-  onClose,
-  onCompleted,
-}: {
+export const ReservationCompletionModal: React.FC<{
   item: ReservationOrder | null;
   onClose: () => void;
   onCompleted: (item: ReservationOrder) => void;
-}) {
+}> = React.memo(({
+  item,
+  onClose,
+  onCompleted,
+}) => {
   const { user, userProfile, branchId, role } = useAuth();
   const {
     paymentMethods,
@@ -48,7 +48,10 @@ export function ReservationCompletionModal({
     configurationError,
     refreshConfiguration,
   } = useSettings();
-  const methods = paymentMethods.filter((method) => method.enabled && method.kind !== 'credit' && method.kind !== 'mixed');
+  const methods = useMemo(
+    () => paymentMethods.filter((method) => method.enabled && method.kind !== 'credit' && method.kind !== 'mixed'),
+    [paymentMethods]
+  );
   const [methodId, setMethodId] = useState('');
   const [documentType, setDocumentType] = useState<CompletionDocType>('nota_venta');
   const [customerDocNumber, setCustomerDocNumber] = useState('');
@@ -348,7 +351,7 @@ export function ReservationCompletionModal({
       </SafeAreaView>
     </Modal>
   );
-}
+});
 
 const styles = StyleSheet.create({
   safeArea: { flex: 1 },

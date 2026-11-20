@@ -5,6 +5,7 @@ export interface CatalogCacheStorage {
   setItem(key: string, value: string): Promise<void>;
   removeItem?(key: string): Promise<void>;
   multiRemove?(keys: string[]): Promise<void>;
+  trim?: () => Promise<void>;
 }
 
 interface CatalogCacheManifest {
@@ -23,7 +24,10 @@ export interface CatalogCacheLoadResult {
 
 export const PRODUCT_CATALOG_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 export const PRODUCT_CATALOG_CACHE_CHUNK_SIZE = 150;
+const WRITE_YIELD_BUDGET_MS = 6;
 const writesByScope = new Map<string, Promise<void>>();
+const latestWriteIdByScope = new Map<string, number>();
+let nextWriteId = 0;
 
 function encodeScopePart(value: string): string {
   return encodeURIComponent(value.trim());
@@ -60,6 +64,8 @@ function parseManifest(raw: string | null): CatalogCacheManifest | null {
   }
 }
 
+const defaultYield = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
 /** Reads bounded JSON chunks and publishes them one at a time to keep parsing work small. */
 export async function loadProductCatalogCache(
   storage: CatalogCacheStorage,
@@ -82,6 +88,7 @@ export async function loadProductCatalogCache(
 
   let offset = 0;
   const chunkSize = Math.max(1, options.chunkSize ?? PRODUCT_CATALOG_CACHE_CHUNK_SIZE);
+  const yieldControl = options.yieldControl ?? defaultYield;
   for (let index = 0; index < manifest.chunks; index += 1) {
     const raw = await storage.getItem(chunkKey(key, manifest.generation, index));
     if (!raw) {
@@ -102,7 +109,7 @@ export async function loadProductCatalogCache(
     await onChunk(products, offset);
     offset += products.length;
     if (index + 1 < manifest.chunks) {
-      await (options.yieldControl ?? (() => new Promise<void>((resolve) => setTimeout(resolve, 0))))();
+      await yieldControl();
     }
   }
   if (offset !== manifest.count) {
@@ -117,18 +124,27 @@ export async function writeProductCatalogCache(
   storage: CatalogCacheStorage,
   key: string,
   products: readonly Product[],
-  options: { generation: string; now?: number; isCurrent?: () => boolean; chunkSize?: number }
+  options: {
+    generation: string;
+    now?: number;
+    isCurrent?: () => boolean;
+    chunkSize?: number;
+    yieldControl?: () => Promise<void>;
+  }
 ): Promise<boolean> {
+  const writeId = ++nextWriteId;
+  latestWriteIdByScope.set(key, writeId);
   const previous = writesByScope.get(key) || Promise.resolve();
   let committed = false;
   const writeOperation = previous.catch(() => {}).then(async () => {
-    committed = await writeProductCatalogCacheNow(storage, key, products, options);
+    committed = await writeProductCatalogCacheNow(storage, key, products, options, writeId);
   });
   writesByScope.set(key, writeOperation);
   try {
     await writeOperation;
   } finally {
     if (writesByScope.get(key) === writeOperation) writesByScope.delete(key);
+    if (latestWriteIdByScope.get(key) === writeId) latestWriteIdByScope.delete(key);
   }
   return committed;
 }
@@ -137,23 +153,43 @@ async function writeProductCatalogCacheNow(
   storage: CatalogCacheStorage,
   key: string,
   products: readonly Product[],
-  options: { generation: string; now?: number; isCurrent?: () => boolean; chunkSize?: number }
+  options: {
+    generation: string;
+    now?: number;
+    isCurrent?: () => boolean;
+    chunkSize?: number;
+    yieldControl?: () => Promise<void>;
+  },
+  writeId: number
 ): Promise<boolean> {
+  const isSuperseded = () =>
+    latestWriteIdByScope.get(key) !== writeId ||
+    (options.isCurrent ? !options.isCurrent() : false);
+
+  if (isSuperseded()) return false;
+
   const generation = options.generation;
   const chunkSize = Math.max(1, options.chunkSize ?? PRODUCT_CATALOG_CACHE_CHUNK_SIZE);
   const chunks = Math.ceil(products.length / chunkSize);
+  const yieldControl = options.yieldControl ?? defaultYield;
   const previousManifest = parseManifest(await storage.getItem(manifestKey(key)));
   let writtenChunks = 0;
+  let sliceStart = performance.now();
+
   for (let index = 0; index < chunks; index += 1) {
-    if (options.isCurrent && !options.isCurrent()) {
+    if (isSuperseded()) {
       await removeGeneration(storage, key, { schema: 1, generation, count: 0, chunks: writtenChunks, cachedAt: 0 });
       return false;
     }
     const chunk = products.slice(index * chunkSize, (index + 1) * chunkSize);
     await storage.setItem(chunkKey(key, generation, index), JSON.stringify(chunk));
     writtenChunks += 1;
+    if (index + 1 < chunks && performance.now() - sliceStart >= WRITE_YIELD_BUDGET_MS) {
+      await yieldControl();
+      sliceStart = performance.now();
+    }
   }
-  if (options.isCurrent && !options.isCurrent()) {
+  if (isSuperseded()) {
     await removeGeneration(storage, key, { schema: 1, generation, count: 0, chunks: writtenChunks, cachedAt: 0 });
     return false;
   }
@@ -167,6 +203,7 @@ async function writeProductCatalogCacheNow(
   await storage.setItem(manifestKey(key), JSON.stringify(manifest));
   if (previousManifest && previousManifest.generation !== generation) {
     await removeGeneration(storage, key, previousManifest);
+    await storage.trim?.().catch(() => {});
   }
   return true;
 }

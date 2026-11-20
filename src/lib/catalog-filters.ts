@@ -13,6 +13,8 @@ export interface IndexedCatalogProduct {
 
 export interface CatalogProductIndex {
   entries: IndexedCatalogProduct[];
+  entriesByCategory: Map<string, IndexedCatalogProduct[]>;
+  uncategorizedEntries: IndexedCatalogProduct[];
   categoryCounts: Map<string, number>;
   uncategorizedCount: number;
   brands: string[];
@@ -20,39 +22,6 @@ export interface CatalogProductIndex {
 }
 
 const indexedProductCache = new WeakMap<Product, IndexedCatalogProduct>();
-
-/** Normalize one immutable product ahead of publishing a catalog batch. */
-export const getIndexedCatalogProduct = (product: Product): IndexedCatalogProduct => {
-  const cached = indexedProductCache.get(product);
-  if (cached) return cached;
-
-  const category = product.category?.trim() || '';
-  const brand = catalogBrand(product);
-  const displaySizes = catalogSizes(product);
-  const sizes = displaySizes.map(normalizeCatalogLabel);
-  const references = [
-    product.id,
-    product.name,
-    product.sku,
-    product.barcode,
-    ...(Array.isArray((product as any).barcodes) ? (product as any).barcodes : []),
-    brand,
-    catalogSize(product),
-    ...sizes,
-  ];
-  const entry: IndexedCatalogProduct = {
-    product,
-    category,
-    brand,
-    sizes: displaySizes,
-    normalizedCategory: normalizeCatalogLabel(category),
-    normalizedBrand: normalizeCatalogLabel(brand),
-    normalizedSizes: sizes,
-    normalizedSearchText: references.map((value) => normalizeCatalogLabel(String(value || ''))).filter(Boolean).join('\u0000'),
-  };
-  indexedProductCache.set(product, entry);
-  return entry;
-};
 
 export const normalizeCatalogLabel = (label: string | undefined | null): string =>
   (label || '')
@@ -62,31 +31,108 @@ export const normalizeCatalogLabel = (label: string | undefined | null): string 
     .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase();
 
+const NORMALIZED_ALL = normalizeCatalogLabel('Todas');
+const NORMALIZED_UNCATEGORIZED = normalizeCatalogLabel('Sin Categoría');
+
+/** Normalize one immutable product ahead of publishing a catalog batch. */
+export const getIndexedCatalogProduct = (product: Product): IndexedCatalogProduct => {
+  const cached = indexedProductCache.get(product);
+  if (cached) return cached;
+
+  const category = product.category?.trim() || '';
+  const brand = catalogBrand(product);
+  const displaySizes = catalogSizes(product);
+  const normalizedSizes = displaySizes.map(normalizeCatalogLabel);
+  const normalizedCategory = normalizeCatalogLabel(category);
+  const normalizedBrand = normalizeCatalogLabel(brand);
+  const baseSize = catalogSize(product);
+
+  const searchParts: string[] = [];
+  const pushNorm = (raw: string | undefined | null) => {
+    const n = normalizeCatalogLabel(raw);
+    if (n) searchParts.push(n);
+  };
+  pushNorm(product.id);
+  pushNorm(product.name);
+  pushNorm(product.sku);
+  pushNorm(product.barcode);
+  const extraBarcodes = (product as any).barcodes;
+  if (Array.isArray(extraBarcodes)) {
+    for (let i = 0; i < extraBarcodes.length; i += 1) {
+      pushNorm(String(extraBarcodes[i] || ''));
+    }
+  }
+  if (normalizedBrand) searchParts.push(normalizedBrand);
+  pushNorm(baseSize);
+  for (let i = 0; i < normalizedSizes.length; i += 1) {
+    if (normalizedSizes[i]) searchParts.push(normalizedSizes[i]);
+  }
+
+  const entry: IndexedCatalogProduct = {
+    product,
+    category,
+    brand,
+    sizes: displaySizes,
+    normalizedCategory,
+    normalizedBrand,
+    normalizedSizes,
+    normalizedSearchText: searchParts.join('\u0000'),
+  };
+  indexedProductCache.set(product, entry);
+  return entry;
+};
+
 /** Build once per products-array change so input keystrokes only scan normalized strings. */
 export const buildCatalogProductIndex = (products: Product[]): CatalogProductIndex => {
-  const entries: IndexedCatalogProduct[] = [];
+  const entries: IndexedCatalogProduct[] = new Array(products.length);
+  const entriesByCategory = new Map<string, IndexedCatalogProduct[]>();
+  const uncategorizedEntries: IndexedCatalogProduct[] = [];
   const categoryCounts = new Map<string, number>();
   const brands = new Map<string, string>();
   const sizes = new Map<string, string>();
   let uncategorizedCount = 0;
 
-  for (const product of products) {
-    const category = product.category?.trim() || '';
-    if (category) categoryCounts.set(category, (categoryCounts.get(category) || 0) + 1);
-    else uncategorizedCount++;
+  for (let i = 0; i < products.length; i += 1) {
+    const product = products[i];
     const entry = getIndexedCatalogProduct(product);
-    entries.push(entry);
-    if (entry.brand) {
-      const normalizedBrand = normalizeCatalogLabel(entry.brand);
-      if (!brands.has(normalizedBrand)) brands.set(normalizedBrand, entry.brand);
+    entries[i] = entry;
+
+    if (entry.category) {
+      categoryCounts.set(entry.category, (categoryCounts.get(entry.category) || 0) + 1);
+      let bucket = entriesByCategory.get(entry.normalizedCategory);
+      if (!bucket) {
+        bucket = [];
+        entriesByCategory.set(entry.normalizedCategory, bucket);
+      }
+      bucket.push(entry);
+    } else {
+      uncategorizedCount += 1;
+      uncategorizedEntries.push(entry);
     }
-    for (const size of entry.sizes) {
-      const normalizedSize = normalizeCatalogLabel(size);
-      if (normalizedSize && !sizes.has(normalizedSize)) sizes.set(normalizedSize, size);
+
+    if (entry.normalizedBrand && entry.brand && !brands.has(entry.normalizedBrand)) {
+      brands.set(entry.normalizedBrand, entry.brand);
+    }
+
+    const entrySizes = entry.sizes;
+    const entryNormSizes = entry.normalizedSizes;
+    for (let j = 0; j < entrySizes.length; j += 1) {
+      const normalizedSize = entryNormSizes[j];
+      if (normalizedSize && !sizes.has(normalizedSize)) {
+        sizes.set(normalizedSize, entrySizes[j]);
+      }
     }
   }
 
-  return { entries, categoryCounts, uncategorizedCount, brands: [...brands.values()], sizes: [...sizes.values()] };
+  return {
+    entries,
+    entriesByCategory,
+    uncategorizedEntries,
+    categoryCounts,
+    uncategorizedCount,
+    brands: [...brands.values()],
+    sizes: [...sizes.values()],
+  };
 };
 
 export interface CatalogProductFilters {
@@ -95,6 +141,7 @@ export interface CatalogProductFilters {
   brand?: string;
   size?: string;
   include?: (product: Product) => boolean;
+  limit?: number;
 }
 
 export const filterCatalogIndex = (
@@ -105,19 +152,29 @@ export const filterCatalogIndex = (
   const category = normalizeCatalogLabel(filters.category);
   const brand = normalizeCatalogLabel(filters.brand);
   const size = normalizeCatalogLabel(filters.size);
-  const allCategories = !category || category === normalizeCatalogLabel('Todas');
-  const allBrands = !brand || brand === normalizeCatalogLabel('Todas');
-  const allSizes = !size || size === normalizeCatalogLabel('Todas');
+  const allCategories = !category || category === NORMALIZED_ALL;
+  const allBrands = !brand || brand === NORMALIZED_ALL;
+  const allSizes = !size || size === NORMALIZED_ALL;
+  const uncategorized = category === NORMALIZED_UNCATEGORIZED;
+  const maxResults = filters.limit && filters.limit > 0 ? filters.limit : Infinity;
+
+  const sourceEntries = allCategories
+    ? index.entries
+    : uncategorized
+      ? index.uncategorizedEntries
+      : index.entriesByCategory.get(category) || [];
+
+  if (sourceEntries.length === 0) return [];
 
   const filtered: Product[] = [];
-  const uncategorized = category === normalizeCatalogLabel('Sin Categoría');
-  for (const entry of index.entries) {
+  for (let i = 0; i < sourceEntries.length; i += 1) {
+    const entry = sourceEntries[i];
     if (filters.include && !filters.include(entry.product)) continue;
-    if (!allCategories && (uncategorized ? !!entry.category : entry.normalizedCategory !== category)) continue;
     if (!allBrands && entry.normalizedBrand !== brand) continue;
     if (!allSizes && !entry.normalizedSizes.includes(size)) continue;
     if (query && !entry.normalizedSearchText.includes(query)) continue;
     filtered.push(entry.product);
+    if (filtered.length >= maxResults) break;
   }
   return filtered;
 };
@@ -172,12 +229,13 @@ export const catalogSizes = (product: Product): string[] => {
   const extra = Array.isArray(product.sizes)
     ? product.sizes.map((s) => s?.trim()).filter(Boolean) as string[]
     : [];
+  const baseSize = catalogSize(product);
 
   if (product.variants?.length) {
     return [
       ...new Set([
         ...product.variants
-          .map((v) => (v as any).sizeLabel?.trim() || catalogSize(product))
+          .map((v) => (v as any).sizeLabel?.trim() || baseSize)
           .filter(Boolean),
         ...extra,
       ]),
@@ -186,7 +244,7 @@ export const catalogSizes = (product: Product): string[] => {
 
   return [
     ...new Set([
-      catalogSize(product),
+      baseSize,
       ...extra,
     ].filter(Boolean)),
   ];

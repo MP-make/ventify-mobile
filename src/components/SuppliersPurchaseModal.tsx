@@ -21,7 +21,6 @@ import {
   Platform,
   FlatList,
 } from 'react-native';
-import { FlashList } from '@shopify/flash-list';
 import * as Linking from 'expo-linking';
 import * as Haptics from 'expo-haptics';
 import {
@@ -425,6 +424,7 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
 
     setIsApplyingPriceSuggestions(true);
     try {
+      const updates: Promise<any>[] = [];
       for (const entry of selectedEntries) {
         const parsedUnit = roundToCents(parseFloat(entry.unitPriceInput) || 0);
         if (parsedUnit <= 0) continue;
@@ -436,8 +436,11 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
               costRose,
             })
           : undefined;
-        await applyProductSuggestedPrices(change.productId, parsedUnit, updatedPresentations);
+        updates.push(
+          applyProductSuggestedPrices(change.productId, parsedUnit, updatedPresentations)
+        );
       }
+      await Promise.all(updates);
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       setPriceSuggestionModalVisible(false);
       onStockUpdated?.();
@@ -849,70 +852,66 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
   const renderOrdersTab = () => {
     return (
       <View style={styles.tabContentContainer}>
-        <View style={styles.sectionIntro}>
-          <SectionHeading title="Órdenes de compra" subtitle="Abastecimiento y seguimiento de recepción." />
-        </View>
+        <Text style={styles.sectionSubOnly}>Abastecimiento y seguimiento de recepción.</Text>
 
-        {/* RESUMEN DE ABASTECIMIENTO */}
+        {/* RESUMEN COMPACTO DE ABASTECIMIENTO */}
         <View style={styles.kpiContainer}>
           <View style={[styles.kpiCard, { borderColor: ui.warningSoft, backgroundColor: ui.warningSoft }]}>
             <View style={styles.kpiHeaderRow}>
-              <Clock size={16} color={ui.warning} />
-              <Text style={[styles.kpiLabel, { color: ui.warning }]}>Pendientes</Text>
+              <Clock size={13} color={ui.warning} />
+              <Text style={[styles.kpiLabel, { color: ui.warning }]} numberOfLines={1}>Pendientes</Text>
             </View>
             <Text style={[styles.kpiValue, { color: ui.warning }]}>{orderStats.pendingCount}</Text>
-            <Text style={[styles.kpiSub, { color: ui.warning }]}>
+            <Text style={[styles.kpiSub, { color: ui.warning }]} numberOfLines={1}>
               {formatPEN(orderStats.totalPendingAmount)}
             </Text>
           </View>
 
           <View style={[styles.kpiCard, { borderColor: ui.success, backgroundColor: ui.successSoft }]}>
             <View style={styles.kpiHeaderRow}>
-              <CheckCircle2 size={16} color={ui.primary} />
-              <Text style={[styles.kpiLabel, { color: ui.success }]}>Recibidas</Text>
+              <CheckCircle2 size={13} color={ui.primary} />
+              <Text style={[styles.kpiLabel, { color: ui.success }]} numberOfLines={1}>Recibidas</Text>
             </View>
             <Text style={[styles.kpiValue, { color: ui.success }]}>{orderStats.receivedCount}</Text>
-            <Text style={[styles.kpiSub, { color: ui.success }]}>
+            <Text style={[styles.kpiSub, { color: ui.success }]} numberOfLines={1}>
               {formatPEN(orderStats.totalInvested)}
             </Text>
           </View>
 
           <View style={[styles.kpiCard, { borderColor: ui.border, backgroundColor: ui.background }]}>
             <View style={styles.kpiHeaderRow}>
-              <Boxes size={16} color={ui.textSecondary} />
-              <Text style={[styles.kpiLabel, { color: ui.textSecondary }]}>Total Órdenes</Text>
+              <Boxes size={13} color={ui.textSecondary} />
+              <Text style={[styles.kpiLabel, { color: ui.textSecondary }]} numberOfLines={1}>Total</Text>
             </View>
             <Text style={[styles.kpiValue, { color: ui.text }]}>{orderStats.totalOrders}</Text>
-            <Text style={[styles.kpiSub, { color: ui.textSecondary }]}>Histórico</Text>
+            <Text style={[styles.kpiSub, { color: ui.textSecondary }]} numberOfLines={1}>Histórico</Text>
           </View>
         </View>
 
-        {/* ACCIÓN PRINCIPAL & FILTROS */}
-        <View style={styles.actionsBar}>
+        {/* BUSCADOR + NUEVA ORDEN EN UNA MISMA FILA */}
+        <View style={styles.searchActionRow}>
+          <View style={styles.searchBarInline}>
+            <Search size={16} color={ui.textMuted} style={styles.searchIcon} />
+            <TextInput
+              style={styles.searchInput}
+              placeholder="N° orden o proveedor..."
+              placeholderTextColor={ui.textMuted}
+              value={orderSearchQuery}
+              onChangeText={setOrderSearchQuery}
+              clearButtonMode="while-editing"
+            />
+          </View>
           <TouchableOpacity
-            style={styles.newOrderButton}
+            style={styles.inlineActionBtn}
             onPress={handleOpenCreateOrderModal}
             activeOpacity={0.8}
           >
-            <Plus size={18} color={ui.surface} />
-            <Text style={styles.newOrderButtonText}>Nueva Orden de Compra</Text>
+            <Plus size={16} color={ui.surface} />
+            <Text style={styles.inlineActionBtnText}>Nueva</Text>
           </TouchableOpacity>
         </View>
 
-        {/* BUSCADOR */}
-        <View style={styles.searchBarContainer}>
-          <Search size={18} color={ui.textMuted} style={styles.searchIcon} />
-          <TextInput
-            style={styles.searchInput}
-            placeholder="Buscar por N° orden (PO-0001) o proveedor..."
-            placeholderTextColor={ui.textMuted}
-            value={orderSearchQuery}
-            onChangeText={setOrderSearchQuery}
-            clearButtonMode="while-editing"
-          />
-        </View>
-
-        {/* CHIPS DE FILTRO DE ESTADO */}
+        {/* CHIPS DE FILTRO DE ESTADO EN UNA SOLA FILA SIN SCROLL */}
         <View style={styles.filterChipsRow}>
           {[
             { id: 'all', label: 'Todas' },
@@ -928,19 +927,18 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
                 style={[styles.filterChip, isSelected && styles.filterChipActive]}
                 onPress={() => setOrderStatusFilter(chip.id)}
               >
-                <Text style={[styles.filterChipText, isSelected && styles.filterChipTextActive]}>
+                <Text
+                  style={[styles.filterChipText, isSelected && styles.filterChipTextActive]}
+                  numberOfLines={1}
+                  adjustsFontSizeToFit
+                  minimumFontScale={0.78}
+                >
                   {chip.label}
                 </Text>
               </TouchableOpacity>
             );
           })}
         </View>
-
-        {!ordersLoading && filteredOrders.length > 0 ? (
-          <View style={styles.listSectionIntro}>
-            <SectionHeading title="Órdenes" subtitle={`${filteredOrders.length} ${filteredOrders.length === 1 ? 'resultado' : 'resultados'}`} />
-          </View>
-        ) : null}
 
         {/* LISTADO DE ÓRDENES */}
         {ordersLoading && purchaseOrders.length === 0 ? (
@@ -1134,39 +1132,30 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
   const renderSuppliersTab = () => {
     return (
       <View style={styles.tabContentContainer}>
-        <View style={styles.sectionIntro}>
-          <SectionHeading title="Directorio de proveedores" subtitle="Contactos y condiciones comerciales." />
-        </View>
-        {/* BARRA DE ACCIÓN: NUEVO PROVEEDOR */}
-        <View style={styles.actionsBar}>
+        <Text style={styles.sectionSubOnly}>Directorio, contactos y condiciones comerciales.</Text>
+
+        {/* BUSCADOR + NUEVO PROVEEDOR EN UNA MISMA FILA */}
+        <View style={styles.searchActionRow}>
+          <View style={styles.searchBarInline}>
+            <Search size={16} color={ui.textMuted} style={styles.searchIcon} />
+            <TextInput
+              style={styles.searchInput}
+              placeholder="Buscar RUC, nombre o categoría..."
+              placeholderTextColor={ui.textMuted}
+              value={supplierSearchQuery}
+              onChangeText={setSupplierSearchQuery}
+              clearButtonMode="while-editing"
+            />
+          </View>
           <TouchableOpacity
-            style={styles.newSupplierButton}
+            style={styles.inlineActionBtn}
             onPress={() => handleOpenSupplierForm()}
             activeOpacity={0.8}
           >
-            <Plus size={18} color={ui.surface} />
-            <Text style={styles.newSupplierButtonText}>Nuevo Proveedor</Text>
+            <Plus size={16} color={ui.surface} />
+            <Text style={styles.inlineActionBtnText}>Nuevo</Text>
           </TouchableOpacity>
         </View>
-
-        {/* BUSCADOR DE PROVEEDORES */}
-        <View style={styles.searchBarContainer}>
-          <Search size={18} color={ui.textMuted} style={styles.searchIcon} />
-          <TextInput
-            style={styles.searchInput}
-            placeholder="Buscar por RUC, nombre, contacto o categoría..."
-            placeholderTextColor={ui.textMuted}
-            value={supplierSearchQuery}
-            onChangeText={setSupplierSearchQuery}
-            clearButtonMode="while-editing"
-          />
-        </View>
-
-        {!suppliersLoading && filteredSuppliers.length > 0 ? (
-          <View style={styles.listSectionIntro}>
-            <SectionHeading title="Proveedores" subtitle={`${filteredSuppliers.length} registrados`} />
-          </View>
-        ) : null}
 
         {/* LISTADO DE PROVEEDORES */}
         {suppliersLoading && suppliers.length === 0 ? (
@@ -1483,22 +1472,15 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
 
                 {/* Sugerencias de búsqueda */}
                 {filteredProductsForOrder.length > 0 && !selectedProductToAdd && (
-                  <View style={[styles.productSuggestionsList, { maxHeight: 220 }]}>
-                    <FlashList
-                      data={filteredProductsForOrder}
-                      estimatedItemSize={60}
-                      keyExtractor={(item) => item.id}
-                      renderItem={({ item: prod }) => {
-                        const stockInBranch = getProductStock(prod, branchId);
-                        return (
-                          <ProductSuggestionItem
-                            prod={prod}
-                            stockInBranch={stockInBranch}
-                            onSelect={handleSelectProductForOrder}
-                          />
-                        );
-                      }}
-                    />
+                  <View style={styles.productSuggestionsList}>
+                    {filteredProductsForOrder.slice(0, 10).map((prod) => (
+                      <ProductSuggestionItem
+                        key={prod.id}
+                        prod={prod}
+                        stockInBranch={getProductStock(prod, branchId)}
+                        onSelect={handleSelectProductForOrder}
+                      />
+                    ))}
                   </View>
                 )}
 
@@ -2285,17 +2267,26 @@ const styles = StyleSheet.create({
     paddingBottom: 2,
   },
   // KPIs
-  kpiContainer: {
-    flexDirection: 'row',
-    gap: 8,
-    paddingHorizontal: 20,
+  sectionSubOnly: {
+    fontSize: 12,
+    color: ui.textSecondary,
+    paddingHorizontal: 16,
     paddingTop: 8,
     paddingBottom: 4,
   },
+  kpiContainer: {
+    flexDirection: 'row',
+    gap: 6,
+    paddingHorizontal: 16,
+    paddingTop: 4,
+    paddingBottom: 6,
+  },
   kpiCard: {
     flex: 1,
-    padding: 10,
-    borderRadius: 12,
+    minWidth: 0,
+    paddingVertical: 7,
+    paddingHorizontal: 8,
+    borderRadius: 10,
     borderWidth: 1,
   },
   kpiHeaderRow: {
@@ -2304,19 +2295,65 @@ const styles = StyleSheet.create({
     gap: 4,
   },
   kpiLabel: {
-    fontSize: 11,
+    flexShrink: 1,
+    fontSize: 10,
     fontWeight: '700',
     textTransform: 'uppercase',
   },
   kpiValue: {
-    fontSize: 18,
+    fontSize: 15,
     fontWeight: '800',
-    marginTop: 4,
+    marginTop: 2,
   },
   kpiSub: {
-    fontSize: 11,
+    fontSize: 10,
     fontWeight: '600',
-    marginTop: 2,
+    marginTop: 1,
+  },
+  searchActionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingHorizontal: 16,
+    marginBottom: 8,
+  },
+  searchBarInline: {
+    flex: 1,
+    minWidth: 0,
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: ui.surface,
+    paddingHorizontal: 10,
+    height: 42,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: ui.border,
+  },
+  inlineActionBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 4,
+    backgroundColor: ui.primary,
+    height: 42,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    flexShrink: 0,
+  },
+  inlineActionBtnText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: ui.surface,
+  },
+  filterChipsScrollWrap: {
+    flexGrow: 0,
+    marginBottom: 8,
+  },
+  filterChipsScroll: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    gap: 6,
   },
   actionsBar: {
     paddingHorizontal: 20,
@@ -2375,17 +2412,18 @@ const styles = StyleSheet.create({
   },
   filterChipsRow: {
     flexDirection: 'row',
-    flexWrap: 'wrap',
-    paddingHorizontal: 20,
-    gap: 8,
+    paddingHorizontal: 16,
+    gap: 5,
     marginBottom: 8,
   },
   filterChip: {
-    minHeight: 48,
+    flex: 1,
+    minWidth: 0,
+    height: 34,
+    alignItems: 'center',
     justifyContent: 'center',
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    borderRadius: 20,
+    paddingHorizontal: 4,
+    borderRadius: 17,
     backgroundColor: ui.surfaceMuted,
     borderWidth: 1,
     borderColor: ui.border,
@@ -2395,7 +2433,7 @@ const styles = StyleSheet.create({
     borderColor: ui.primary,
   },
   filterChipText: {
-    fontSize: 12,
+    fontSize: 11,
     fontWeight: '600',
     color: ui.textSecondary,
   },

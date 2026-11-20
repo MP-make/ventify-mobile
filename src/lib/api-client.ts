@@ -37,12 +37,25 @@ export async function getApiRequestInit(
     throw new ApiError('Inicia sesión para continuar.', 401);
   }
   const token = await user.getIdToken();
+  if (options.signal?.aborted) {
+    throw new ApiError('Solicitud cancelada.', 499, 'ABORTED');
+  }
   if (auth.currentUser?.uid !== user.uid) {
     throw new ApiError('La sesión cambió. Repite la operación.', 409);
   }
 
+  const formDataBody =
+    typeof FormData !== 'undefined' && options.body instanceof FormData
+      ? options.body
+      : null;
+  const hasContentType = Object.keys(options.headers || {}).some(
+    (key) => key.toLowerCase() === 'content-type'
+  );
+
   const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
+    ...(options.body !== undefined && !formDataBody && !hasContentType
+      ? { 'Content-Type': 'application/json' }
+      : {}),
     ...(options.headers || {}),
     Authorization: `Bearer ${token}`,
     'x-ventify-client': VENTIFY_CLIENT_HEADER,
@@ -51,7 +64,9 @@ export async function getApiRequestInit(
   const init: RequestInit = {
     method: options.method || 'GET',
     headers,
-    ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
+    ...(options.body !== undefined
+      ? { body: formDataBody ?? JSON.stringify(options.body) }
+      : {}),
     ...(options.signal ? { signal: options.signal } : {}),
   };
 
@@ -70,15 +85,37 @@ export async function apiRawRequest(
   const prepared = await getApiRequestInit(path, options);
   const controller = new AbortController();
   const effectiveTimeoutMs = options.timeoutMs ?? DEFAULT_API_TIMEOUT_MS;
+  let timedOut = false;
+  let externallyAborted = false;
+
+  const onExternalAbort = () => {
+    externallyAborted = true;
+    controller.abort();
+  };
+
+  if (options.signal) {
+    if (options.signal.aborted) {
+      externallyAborted = true;
+      controller.abort();
+    } else {
+      options.signal.addEventListener?.('abort', onExternalAbort, { once: true });
+    }
+  }
+
   const timeout =
-    options.signal || effectiveTimeoutMs <= 0 || !Number.isFinite(effectiveTimeoutMs)
-      ? null
-      : setTimeout(() => controller.abort(), effectiveTimeoutMs);
+    effectiveTimeoutMs > 0 && Number.isFinite(effectiveTimeoutMs)
+      ? setTimeout(() => {
+          if (!controller.signal.aborted) {
+            timedOut = true;
+            controller.abort();
+          }
+        }, effectiveTimeoutMs)
+      : null;
 
   try {
     const response = await fetch(prepared.url, {
       ...prepared.init,
-      signal: options.signal || controller.signal,
+      signal: controller.signal,
     });
     if (auth.currentUser?.uid !== prepared.uid) {
       throw new ApiError('La sesión cambió. Repite la operación.', 409);
@@ -93,12 +130,16 @@ export async function apiRawRequest(
     }
     return response;
   } catch (error) {
-    if (controller.signal.aborted) {
+    if (externallyAborted && !timedOut) {
+      throw new ApiError('Solicitud cancelada.', 499, 'ABORTED');
+    }
+    if (timedOut || controller.signal.aborted) {
       throw new ApiError('El servidor tardó demasiado. Vuelve a intentarlo.', 408);
     }
     throw error;
   } finally {
     if (timeout !== null) clearTimeout(timeout);
+    options.signal?.removeEventListener?.('abort', onExternalAbort);
   }
 }
 

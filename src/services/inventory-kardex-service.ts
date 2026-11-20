@@ -196,34 +196,16 @@ export interface StockTransfer {
 // HELPERS PUROS (COMPARTIDOS ENTRE UI Y TESTS)
 // ============================================================================
 
+import {
+  isLocalFileUri,
+  normalizePriceTiers,
+  sanitizeRemoteImageUrls,
+} from '@/lib/product-normalization';
+export { isLocalFileUri, normalizePriceTiers, sanitizeRemoteImageUrls };
+
 const roundToCents = (value: number): number => {
   const n = Number(value) || 0;
   return Math.round((n + Number.EPSILON) * 100) / 100;
-};
-
-/** Detecta URIs locales del dispositivo que nunca deben persistirse crudas en Firestore. */
-export const isLocalFileUri = (uri?: string | null): boolean => {
-  if (!uri || typeof uri !== 'string') return false;
-  const trimmed = uri.trim();
-  if (!trimmed) return false;
-  if (/^https?:\/\//i.test(trimmed)) return false;
-  return (
-    /^(file|content|ph|assets-library):\/\//i.test(trimmed) ||
-    trimmed.startsWith('/') ||
-    trimmed.startsWith('data:')
-  );
-};
-
-/** Filtra galería conservando únicamente URLs remotas válidas. */
-export const sanitizeRemoteImageUrls = (urls?: string[] | null): string[] => {
-  if (!Array.isArray(urls)) return [];
-  return Array.from(
-    new Set(
-      urls
-        .map((u) => (typeof u === 'string' ? u.trim() : ''))
-        .filter((u) => u.length > 0 && !isLocalFileUri(u))
-    )
-  );
 };
 
 /**
@@ -449,24 +431,6 @@ export const mergeSingleBranchStock = (params: {
   }
 
   return base;
-};
-
-/** Sincroniza campos Web (`minQty`/`price`) y Mobile (`minQuantity`/`unitPrice`) en escalas. */
-export const normalizePriceTiers = (tiers?: PriceTier[] | null): PriceTier[] => {
-  if (!Array.isArray(tiers)) return [];
-  return tiers
-    .map((t) => {
-      const minQuantity = Math.max(1, Math.round(Number(t.minQuantity ?? t.minQty ?? 0)));
-      const unitPrice = roundToCents(Math.max(0, Number(t.unitPrice ?? t.price ?? 0)));
-      return {
-        minQuantity,
-        unitPrice,
-        minQty: minQuantity,
-        price: unitPrice,
-      };
-    })
-    .filter((t) => t.minQuantity >= 1)
-    .sort((a, b) => a.minQuantity - b.minQuantity);
 };
 
 /** Sincroniza presentaciones para lectura bidireccional Web (`quantity`) y Mobile (`conversionFactor`). */
@@ -876,37 +840,39 @@ export const saveProduct = async (
     // Si tiene stock inicial en alguna sucursal, registrar movimientos en inventory_movements
     const initialMovements = Object.entries(stockMap).filter(([_, qty]) => typeof qty === 'number' && qty > 0);
 
-    for (const [branchId, qty] of initialMovements) {
-      try {
-        const mvRef = doc(collection(db, INVENTORY_MOVEMENTS_COLLECTION));
-        await setDoc(mvRef, cleanFirestoreData({
-          accountId: productData.accountId,
-          branchId,
-          productId,
-          productName: payload.name,
-          productSku: payload.sku,
-          // Campos canónicos Web
-          movementType: 'add',
-          quantityBefore: 0,
-          quantityAfter: qty,
-          quantityChanged: qty,
-          userId: userProfile.uid,
-          userName: userProfile.displayName || userProfile.email || 'Usuario',
-          userRole: (userProfile as any)?.role || 'user',
-          // Campos alias Mobile
-          type: 'in',
-          previousStock: 0,
-          newStock: qty,
-          quantity: qty,
-          reason: 'initial_stock',
-          notes: 'Inventario inicial al crear producto',
-          createdAt: serverTimestamp(),
-          date: Date.now(),
-        }));
-      } catch (err) {
-        console.warn(`[InventoryService] Error registrando Kardex inicial para ${productId}:`, err);
-      }
-    }
+    await Promise.all(
+      initialMovements.map(async ([branchId, qty]) => {
+        try {
+          const mvRef = doc(collection(db, INVENTORY_MOVEMENTS_COLLECTION));
+          await setDoc(mvRef, cleanFirestoreData({
+            accountId: productData.accountId,
+            branchId,
+            productId,
+            productName: payload.name,
+            productSku: payload.sku,
+            // Campos canónicos Web
+            movementType: 'add',
+            quantityBefore: 0,
+            quantityAfter: qty,
+            quantityChanged: qty,
+            userId: userProfile.uid,
+            userName: userProfile.displayName || userProfile.email || 'Usuario',
+            userRole: (userProfile as any)?.role || 'user',
+            // Campos alias Mobile
+            type: 'in',
+            previousStock: 0,
+            newStock: qty,
+            quantity: qty,
+            reason: 'initial_stock',
+            notes: 'Inventario inicial al crear producto',
+            createdAt: serverTimestamp(),
+            date: Date.now(),
+          }));
+        } catch (err) {
+          console.warn(`[InventoryService] Error registrando Kardex inicial para ${productId}:`, err);
+        }
+      })
+    );
   } else {
     await updateDoc(existingRef!, cleanFirestoreData(payload));
   }
@@ -925,59 +891,45 @@ export const findByBarcodeRemote = async (
 ): Promise<ScannedProductMatch | null> => {
   if (!accountId || !code?.trim()) return null;
   const cleanCode = code.trim();
+  const productsColl = collection(db, PRODUCTS_COLLECTION);
 
-  // 1. Consultar por barcode directo con limit(1)
-  const barcodeSnap = await getDocs(
-    query(
-      collection(db, PRODUCTS_COLLECTION),
-      where('accountId', '==', accountId),
-      where('barcode', '==', cleanCode),
-      firestoreLimit(1)
-    )
-  );
-  if (barcodeSnap.docs?.length) {
-    const products = barcodeSnap.docs.map((productDoc) => ({
-      id: productDoc.id,
-      ...productDoc.data(),
-    })) as Product[];
-    const match = findProductByBarcode(products, cleanCode);
-    if (match) return match;
-  }
+  // Consultar barcode, SKU y barcodes alternativos en paralelo manteniendo precedencia
+  const [barcodeSnap, skuSnap, barcodesSnap] = await Promise.all([
+    getDocs(
+      query(
+        productsColl,
+        where('accountId', '==', accountId),
+        where('barcode', '==', cleanCode),
+        firestoreLimit(1)
+      )
+    ),
+    getDocs(
+      query(
+        productsColl,
+        where('accountId', '==', accountId),
+        where('sku', '==', cleanCode),
+        firestoreLimit(1)
+      )
+    ),
+    getDocs(
+      query(
+        productsColl,
+        where('accountId', '==', accountId),
+        where('barcodes', 'array-contains', cleanCode),
+        firestoreLimit(1)
+      )
+    ),
+  ]);
 
-  // 2. Consultar por SKU con limit(1)
-  const skuSnap = await getDocs(
-    query(
-      collection(db, PRODUCTS_COLLECTION),
-      where('accountId', '==', accountId),
-      where('sku', '==', cleanCode),
-      firestoreLimit(1)
-    )
-  );
-  if (skuSnap.docs?.length) {
-    const products = skuSnap.docs.map((productDoc) => ({
-      id: productDoc.id,
-      ...productDoc.data(),
-    })) as Product[];
-    const match = findProductByBarcode(products, cleanCode);
-    if (match) return match;
-  }
-
-  // 3. Consultar por barcodes alternativos (array-contains) con limit(1)
-  const barcodesSnap = await getDocs(
-    query(
-      collection(db, PRODUCTS_COLLECTION),
-      where('accountId', '==', accountId),
-      where('barcodes', 'array-contains', cleanCode),
-      firestoreLimit(1)
-    )
-  );
-  if (barcodesSnap.docs?.length) {
-    const products = barcodesSnap.docs.map((productDoc) => ({
-      id: productDoc.id,
-      ...productDoc.data(),
-    })) as Product[];
-    const match = findProductByBarcode(products, cleanCode);
-    if (match) return match;
+  for (const snap of [barcodeSnap, skuSnap, barcodesSnap]) {
+    if (snap.docs?.length) {
+      const products = snap.docs.map((productDoc) => ({
+        id: productDoc.id,
+        ...productDoc.data(),
+      })) as Product[];
+      const match = findProductByBarcode(products, cleanCode);
+      if (match) return match;
+    }
   }
 
   return null;
@@ -1296,12 +1248,15 @@ export const createStockTransfer = async (
       }
     }
 
-    const productReads = new Map<string, { ref: ReturnType<typeof doc>; snap: Awaited<ReturnType<typeof tx.get>> }>();
-    for (const productId of uniqueProductIds) {
-      const pRef = doc(db, PRODUCTS_COLLECTION, productId);
-      const pSnap = await tx.get(pRef);
-      productReads.set(productId, { ref: pRef, snap: pSnap });
-    }
+    const productReads = new Map<string, { ref: ReturnType<typeof doc>; snap: Awaited<ReturnType<typeof tx.get>> }>(
+      await Promise.all(
+        uniqueProductIds.map(async (productId) => {
+          const pRef = doc(db, PRODUCTS_COLLECTION, productId);
+          const pSnap = await tx.get(pRef);
+          return [productId, { ref: pRef, snap: pSnap }] as const;
+        })
+      )
+    );
 
     // Validar stock por variante cuando se transfieren variantes específicas
     for (const line of aggregatedLines) {
@@ -1507,13 +1462,14 @@ export const cancelStockTransfer = async (
     if (!srcBranchId) throw new Error('La transferencia no tiene una sucursal de origen válida.');
     const productTotals = aggregateTransferQuantitiesByProduct(tData.products || tData.items || []);
 
-    // Leer productos antes de liberar reservas para respetar el protocolo de Firestore.
-    const productReads: Array<{ productId: string; qty: number; ref: ReturnType<typeof doc>; snap: Awaited<ReturnType<typeof tx.get>> }> = [];
-    for (const [productId, qty] of productTotals.entries()) {
-      const pRef = doc(db, PRODUCTS_COLLECTION, productId);
-      const pSnap = await tx.get(pRef);
-      productReads.push({ productId, qty, ref: pRef, snap: pSnap });
-    }
+    // Leer productos en paralelo antes de liberar reservas para respetar el protocolo de Firestore.
+    const productReads = await Promise.all(
+      Array.from(productTotals.entries()).map(async ([productId, qty]) => {
+        const pRef = doc(db, PRODUCTS_COLLECTION, productId);
+        const pSnap = await tx.get(pRef);
+        return { productId, qty, ref: pRef, snap: pSnap };
+      })
+    );
 
     // Liberar reserva de stock en origen
     for (const { qty, ref: pRef, snap: pSnap } of productReads) {
@@ -1636,19 +1592,14 @@ export const completeStockTransfer = async (
       linesByProduct.set(item.productId, list);
     }
 
-    // FASE 1: LECTURAS (todos los gets antes de updates)
-    const productReads: Array<{
-      productId: string;
-      ref: ReturnType<typeof doc>;
-      snap: Awaited<ReturnType<typeof tx.get>>;
-      lines: typeof transferItems;
-    }> = [];
-
-    for (const [productId, lines] of linesByProduct.entries()) {
-      const pRef = doc(db, PRODUCTS_COLLECTION, productId);
-      const pSnap = await tx.get(pRef);
-      productReads.push({ productId, ref: pRef, snap: pSnap, lines });
-    }
+    // FASE 1: LECTURAS (todos los gets en paralelo antes de updates)
+    const productReads = await Promise.all(
+      Array.from(linesByProduct.entries()).map(async ([productId, lines]) => {
+        const pRef = doc(db, PRODUCTS_COLLECTION, productId);
+        const pSnap = await tx.get(pRef);
+        return { productId, ref: pRef, snap: pSnap, lines };
+      })
+    );
 
     // FASE 2: ESCRITURAS
     const effectiveTransferNumber = tData.transferNumber || `TRF-${transferId.slice(-4).toUpperCase()}`;
@@ -1832,8 +1783,27 @@ export const getStockTransfers = async (
       constraints.push(where('status', '==', status));
     }
 
-    const q = query(coll, ...constraints);
-    const snapshot = await getDocs(q);
+    let snapshot;
+    try {
+      const q = query(
+        coll,
+        ...constraints,
+        orderBy('createdAt', 'desc'),
+        firestoreLimit(100)
+      );
+      snapshot = await getDocs(q);
+    } catch (err: any) {
+      const code = String(err?.code || '').toLowerCase();
+      const msg = String(err?.message || '').toLowerCase();
+      const isIndexError =
+        code === 'failed-precondition' ||
+        msg.includes('requires an index') ||
+        msg.includes('failed-precondition');
+      if (!isIndexError) throw err;
+      console.warn('[InventoryService] Índice faltante en getStockTransfers, usando fallback sin orderBy:', err?.message || err);
+      const fallbackQ = query(coll, ...constraints, firestoreLimit(100));
+      snapshot = await getDocs(fallbackQ);
+    }
 
     let transfers: StockTransfer[] = snapshot.docs.map((d) => {
       const data = d.data();

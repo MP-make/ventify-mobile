@@ -108,6 +108,10 @@ export const ReceiptTicketPreview: React.FC<ReceiptTicketPreviewProps> = React.m
       () => receiptAmountsForSale(sale, sale.fiscalAmounts, taxProfile),
       [sale, taxProfile]
     );
+    const amountInWords = useMemo(
+      () => amountToWordsSoles(amounts.total),
+      [amounts.total]
+    );
 
     const logoUri = merged.receiptLogoDataUrl || merged.receiptLogo || '';
     const ruc = merged.ruc || '';
@@ -456,7 +460,9 @@ export const ReceiptTicketPreview: React.FC<ReceiptTicketPreviewProps> = React.m
           )}
 
           <Text style={styles.sonText}>
-            SON: {amountToWordsSoles(amounts.total)}
+            {String(amountInWords).toUpperCase().startsWith('SON:')
+              ? amountInWords
+              : `SON: ${amountInWords}`}
           </Text>
         </View>
 

@@ -7,7 +7,7 @@
  * desempeño de vendedores y exportación nativa a PDF (WhatsApp / Correo).
  */
 
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   View,
   Text,
@@ -145,6 +145,9 @@ export const FinancialPnlModal: React.FC<FinancialPnlModalProps> = React.memo(({
     return map;
   }, [visible, products]);
 
+  const productsMapRef = useRef(productsMap);
+  productsMapRef.current = productsMap;
+
   // Nombre de empresa y sucursal resueltos
   const businessName =
     businessSettings?.businessName ||
@@ -164,19 +167,19 @@ export const FinancialPnlModal: React.FC<FinancialPnlModalProps> = React.memo(({
         branchId: branchId && branchId !== 'all' ? branchId : undefined,
         startDate,
         endDate,
-        productsMap,
+        productsMap: productsMapRef.current,
       });
       setReport(result);
     } catch (err: any) {
       console.error('[FinancialPnlModal] Error generando reporte:', err);
       Alert.alert(
         'Error de Cálculo',
-        'No se pudo generar el Estado de Resultados. Por favor verifique su conexión.'
+        err?.message || 'No se pudo generar el Estado de Resultados. Por favor verifique su conexión.'
       );
     } finally {
       setLoading(false);
     }
-  }, [accountId, branchId, selectedPeriod, productsMap]);
+  }, [accountId, branchId, selectedPeriod]);
 
   useEffect(() => {
     if (visible) {
@@ -245,12 +248,18 @@ export const FinancialPnlModal: React.FC<FinancialPnlModalProps> = React.memo(({
     >
       <View style={[styles.container, { paddingTop: Math.max(insets.top, 16) }]}>
         {/* ================================================================= */}
-        {/* CABECERA SUPERIOR EJECUTIVA                                       */}
+        {/* CABECERA SUPERIOR COMPACTA                                        */}
         {/* ================================================================= */}
-        <ScreenHeading
-          title="Estado de resultados"
-          subtitle={`${branchName} · ${periodRangeInfo.label}`}
-          action={<View style={styles.headerActionsRow}>
+        <View style={styles.compactTopHeader}>
+          <View style={{ flex: 1, minWidth: 0 }}>
+            <Text style={styles.compactTopTitle} numberOfLines={1}>
+              Estado de resultados
+            </Text>
+            <Text style={styles.compactTopSubtitle} numberOfLines={1}>
+              {branchName} · {periodRangeInfo.label}
+            </Text>
+          </View>
+          <View style={styles.headerActionsRow}>
             {/* Botón Refrescar */}
             <TouchableOpacity
               onPress={() => {
@@ -291,50 +300,48 @@ export const FinancialPnlModal: React.FC<FinancialPnlModalProps> = React.memo(({
             >
               <X size={20} color={ui.textSecondary} />
             </TouchableOpacity>
-          </View>}
-        />
+          </View>
+        </View>
 
         {/* ================================================================= */}
-        {/* SELECTOR DE PERÍODO (SEGMENTED CONTROL)                          */}
+        {/* SELECTOR DE PERÍODO (SIN SCROLL HORIZONTAL)                      */}
         {/* ================================================================= */}
         <View style={styles.periodSelectorWrapper}>
-          <ScrollView
-            horizontal
-            showsHorizontalScrollIndicator={false}
-            contentContainerStyle={styles.periodSelectorContent}
-          >
-            {(['today', 'last_7_days', 'this_month', 'last_30_days'] as PnlPeriodType[]).map(
-              (period) => {
-                const isSelected = selectedPeriod === period;
-                const { label } = getPeriodRange(period);
-                return (
-                  <TouchableOpacity
-                    key={period}
-                    onPress={() => handleSelectPeriod(period)}
+          <View style={styles.periodSelectorRow}>
+            {(
+              [
+                { id: 'today', label: 'Hoy' },
+                { id: 'last_7_days', label: '7 días' },
+                { id: 'this_month', label: 'Este mes' },
+                { id: 'last_30_days', label: '30 días' },
+              ] as const
+            ).map(({ id: period, label }) => {
+              const isSelected = selectedPeriod === period;
+              return (
+                <TouchableOpacity
+                  key={period}
+                  onPress={() => handleSelectPeriod(period)}
+                  style={[
+                    styles.periodChip,
+                    isSelected && styles.periodChipActive,
+                  ]}
+                  activeOpacity={0.8}
+                >
+                  <Text
                     style={[
-                      styles.periodChip,
-                      isSelected && styles.periodChipActive,
+                      styles.periodChipText,
+                      isSelected && styles.periodChipTextActive,
                     ]}
-                    activeOpacity={0.8}
+                    numberOfLines={1}
+                    adjustsFontSizeToFit
+                    minimumFontScale={0.8}
                   >
-                    <Calendar
-                      size={13}
-                      color={isSelected ? ui.onPrimary : ui.textMuted}
-                      style={{ marginRight: 5 }}
-                    />
-                    <Text
-                      style={[
-                        styles.periodChipText,
-                        isSelected && styles.periodChipTextActive,
-                      ]}
-                    >
-                      {label}
-                    </Text>
-                  </TouchableOpacity>
-                );
-              }
-            )}
-          </ScrollView>
+                    {label}
+                  </Text>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
         </View>
 
         {/* ================================================================= */}
@@ -455,7 +462,7 @@ export const FinancialPnlModal: React.FC<FinancialPnlModalProps> = React.memo(({
                   <View style={styles.sectionHeader}>
                     <View style={styles.sectionHeaderTitleRow}>
                       <FileText size={18} color={ui.primary} />
-                      <Text style={styles.sectionTitle}>Cascada P&L Contable</Text>
+                      <Text style={styles.sectionTitle}>Desglose de Ganancias y Costos</Text>
                     </View>
                     <Text style={styles.sectionHeaderHint}>Método Devengado</Text>
                   </View>
@@ -888,7 +895,7 @@ export const FinancialPnlModal: React.FC<FinancialPnlModalProps> = React.memo(({
               <>
                 <Share2 size={20} color={ui.onPrimary} style={{ marginRight: 8 }} />
                 <Text style={styles.exportMainBtnText}>
-                  Exportar / Compartir Reporte P&L en PDF
+                  Exportar / Compartir Reporte en PDF
                 </Text>
               </>
             )}
@@ -985,24 +992,48 @@ const styles = StyleSheet.create({
   },
 
   // Selector de período
+  compactTopHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+    paddingHorizontal: 16,
+    paddingTop: 6,
+    paddingBottom: 10,
+  },
+  compactTopTitle: {
+    fontSize: 19,
+    fontWeight: '800',
+    color: ui.text,
+    letterSpacing: -0.4,
+  },
+  compactTopSubtitle: {
+    fontSize: 12,
+    color: ui.textSecondary,
+    marginTop: 2,
+  },
   periodSelectorWrapper: {
     backgroundColor: ui.surface,
-    paddingVertical: 10,
+    paddingVertical: 8,
+    paddingHorizontal: 14,
     borderBottomWidth: 1,
     borderBottomColor: ui.surfaceMuted,
   },
-  periodSelectorContent: {
-    paddingHorizontal: 16,
-    gap: 8,
-  },
-  periodChip: {
+  periodSelectorRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    minHeight: 48,
+    gap: 6,
+  },
+  periodChip: {
+    flex: 1,
+    minWidth: 0,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    height: 36,
     backgroundColor: ui.surfaceMuted,
-    paddingHorizontal: 14,
-    paddingVertical: 7,
-    borderRadius: 20,
+    paddingHorizontal: 4,
+    borderRadius: 18,
     borderWidth: 1,
     borderColor: ui.border,
   },
@@ -1138,25 +1169,31 @@ const styles = StyleSheet.create({
     borderRadius: 16,
     borderWidth: 1,
     borderColor: ui.surfaceMuted,
-    padding: 20,
+    padding: 14,
   },
   sectionHeader: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
+    flexWrap: 'wrap',
+    gap: 6,
     marginBottom: 12,
   },
   sectionHeaderTitleRow: {
+    flex: 1,
+    minWidth: 0,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
   },
   sectionTitle: {
-    fontSize: ui.font.section,
+    flexShrink: 1,
+    fontSize: 16,
     fontWeight: '700',
     color: ui.text,
   },
   sectionHeaderHint: {
+    flexShrink: 0,
     fontSize: 11,
     fontWeight: '600',
     color: ui.textMuted,

@@ -27,6 +27,7 @@ import {
 import { useAuth } from '@/context/AuthContext';
 import { useSettings } from '@/context/SettingsContext';
 import { usePermissions } from '@/hooks/usePermissions';
+import { useDebouncedValue } from '@/hooks/use-debounced-value';
 import { EinvoiceActionsModal } from '@/components/EinvoiceActionsModal';
 import { formatDatePE, formatPEN, ui } from '@/lib/theme';
 import {
@@ -66,6 +67,77 @@ const PRESETS: Array<{ key: DateRangePreset; label: string }> = [
   { key: '30d', label: '30 días' },
   { key: 'month', label: 'Este mes' },
 ];
+
+interface EinvoiceRowProps {
+  item: PublicEinvoice;
+  onSelect: (item: PublicEinvoice) => void;
+}
+
+const EinvoiceRow = React.memo<EinvoiceRowProps>(({ item, onSelect }) => {
+  const badgeStyle =
+    item.status === 'accepted'
+      ? { bg: ui.successSoft, color: ui.success }
+      : item.status === 'rejected' || item.status === 'error'
+        ? { bg: ui.dangerSoft, color: ui.danger }
+        : { bg: ui.warningSoft, color: ui.warning };
+
+  return (
+    <TouchableOpacity
+      onPress={() => onSelect(item)}
+      style={styles.rowCard}
+      activeOpacity={0.78}
+      accessibilityRole="button"
+      accessibilityLabel={`Comprobante ${item.documentNumber}, ${EINVOICE_STATUS_LABELS[item.status] || item.status}`}
+    >
+      <View style={styles.rowTop}>
+        <View style={styles.rowLeft}>
+          <View style={styles.typeChip}>
+            <Text style={styles.typeChipText}>
+              {EINVOICE_TYPE_LABELS[item.documentType] || item.documentType}
+            </Text>
+          </View>
+          <Text style={styles.docNumber}>{item.documentNumber}</Text>
+        </View>
+        <View style={[styles.statusBadge, { backgroundColor: badgeStyle.bg }]}>
+          <Text style={[styles.statusBadgeText, { color: badgeStyle.color }]}>
+            {EINVOICE_STATUS_LABELS[item.status] || item.status}
+          </Text>
+        </View>
+      </View>
+
+      <View style={styles.rowMiddle}>
+        <Text style={styles.rowDate}>{formatDatePE(item.createdAt)}</Text>
+        <Text style={styles.rowAmount}>
+          {item.documentType === '09' ? 'Guía' : formatPEN(item.amount)}
+        </Text>
+      </View>
+
+      {item.receiptCustomer?.name ? (
+        <Text style={styles.rowSub} numberOfLines={1}>
+          {item.receiptCustomer.name} · {item.receiptCustomer.identityNumber}
+        </Text>
+      ) : null}
+
+      {item.reference?.number ? (
+        <Text style={styles.rowSub} numberOfLines={1}>
+          Ref: {item.reference.number}
+        </Text>
+      ) : null}
+
+      {(item.status === 'rejected' || item.status === 'error') &&
+      (item.lastError || item.cdr?.description) ? (
+        <Text style={[styles.rowSub, { color: ui.danger }]} numberOfLines={2}>
+          {item.lastError || item.cdr?.description}
+        </Text>
+      ) : null}
+
+      <View style={styles.rowFooter}>
+        <Text style={styles.rowActionHint}>Tocar para CDR, XML o emitir notas</Text>
+        <ChevronRight size={15} color={ui.textMuted} />
+      </View>
+    </TouchableOpacity>
+  );
+});
 
 export default function FacturacionScreen() {
   const router = useRouter();
@@ -135,8 +207,10 @@ export default function FacturacionScreen() {
     void loadEinvoices();
   }, [loadEinvoices]);
 
+  const debouncedSearchQuery = useDebouncedValue(searchQuery, 150);
+
   const filtered = useMemo(() => {
-    const q = searchQuery.trim().toLowerCase();
+    const q = debouncedSearchQuery.trim().toLowerCase();
     return einvoices.filter((doc) => {
       if (typeFilter !== 'all' && doc.documentType !== typeFilter) return false;
       if (statusFilter !== 'all') {
@@ -162,7 +236,28 @@ export default function FacturacionScreen() {
       }
       return true;
     });
-  }, [einvoices, typeFilter, statusFilter, searchQuery]);
+  }, [einvoices, typeFilter, statusFilter, debouncedSearchQuery]);
+
+  const handleSelectEinvoice = useCallback((item: PublicEinvoice) => {
+    setSelectedEinvoice(item);
+  }, []);
+
+  const einvoiceKeyExtractor = useCallback((item: PublicEinvoice) => item.id, []);
+
+  const renderEinvoiceItem = useCallback(
+    ({ item }: { item: PublicEinvoice }) => (
+      <EinvoiceRow item={item} onSelect={handleSelectEinvoice} />
+    ),
+    [handleSelectEinvoice]
+  );
+
+  const handleCloseEinvoiceModal = useCallback(() => {
+    setSelectedEinvoice(null);
+  }, []);
+
+  const handleUpdatedEinvoiceModal = useCallback(() => {
+    void loadEinvoices(true);
+  }, [loadEinvoices]);
 
   const summary = useMemo(() => summarizeEinvoices(filtered), [filtered]);
 
@@ -250,7 +345,7 @@ export default function FacturacionScreen() {
 
       <FlatList
         data={filtered}
-        keyExtractor={(item) => item.id}
+        keyExtractor={einvoiceKeyExtractor}
         refreshControl={
           <RefreshControl
             refreshing={refreshing}
@@ -435,83 +530,21 @@ export default function FacturacionScreen() {
             </View>
           ) : null
         }
-        renderItem={({ item }) => {
-          const badgeStyle =
-            item.status === 'accepted'
-              ? { bg: ui.successSoft, color: ui.success }
-              : item.status === 'rejected' || item.status === 'error'
-                ? { bg: ui.dangerSoft, color: ui.danger }
-                : { bg: ui.warningSoft, color: ui.warning };
-
-          return (
-            <TouchableOpacity
-              onPress={() => setSelectedEinvoice(item)}
-              style={styles.rowCard}
-              activeOpacity={0.78}
-              accessibilityRole="button"
-              accessibilityLabel={`Comprobante ${item.documentNumber}, ${EINVOICE_STATUS_LABELS[item.status] || item.status}`}
-            >
-              <View style={styles.rowTop}>
-                <View style={styles.rowLeft}>
-                  <View style={styles.typeChip}>
-                    <Text style={styles.typeChipText}>
-                      {EINVOICE_TYPE_LABELS[item.documentType] || item.documentType}
-                    </Text>
-                  </View>
-                  <Text style={styles.docNumber}>{item.documentNumber}</Text>
-                </View>
-                <View style={[styles.statusBadge, { backgroundColor: badgeStyle.bg }]}>
-                  <Text style={[styles.statusBadgeText, { color: badgeStyle.color }]}>
-                    {EINVOICE_STATUS_LABELS[item.status] || item.status}
-                  </Text>
-                </View>
-              </View>
-
-              <View style={styles.rowMiddle}>
-                <Text style={styles.rowDate}>{formatDatePE(item.createdAt)}</Text>
-                <Text style={styles.rowAmount}>
-                  {item.documentType === '09' ? 'Guía' : formatPEN(item.amount)}
-                </Text>
-              </View>
-
-              {item.receiptCustomer?.name ? (
-                <Text style={styles.rowSub} numberOfLines={1}>
-                  {item.receiptCustomer.name} · {item.receiptCustomer.identityNumber}
-                </Text>
-              ) : null}
-
-              {item.reference?.number ? (
-                <Text style={styles.rowSub} numberOfLines={1}>
-                  Ref: {item.reference.number}
-                </Text>
-              ) : null}
-
-              {(item.status === 'rejected' || item.status === 'error') &&
-              (item.lastError || item.cdr?.description) ? (
-                <Text style={[styles.rowSub, { color: ui.danger }]} numberOfLines={2}>
-                  {item.lastError || item.cdr?.description}
-                </Text>
-              ) : null}
-
-              <View style={styles.rowFooter}>
-                <Text style={styles.rowActionHint}>Tocar para CDR, XML o emitir notas</Text>
-                <ChevronRight size={15} color={ui.textMuted} />
-              </View>
-            </TouchableOpacity>
-          );
-        }}
+        renderItem={renderEinvoiceItem}
       />
 
-      <EinvoiceActionsModal
-        visible={Boolean(selectedEinvoice)}
-        einvoice={selectedEinvoice}
-        allEinvoices={einvoices}
-        accountId={accountId || ''}
-        taxRate={effectiveTaxRate}
-        invoicingEnabled={invoicingEnabled}
-        onClose={() => setSelectedEinvoice(null)}
-        onUpdated={() => void loadEinvoices(true)}
-      />
+      {selectedEinvoice && (
+        <EinvoiceActionsModal
+          visible={Boolean(selectedEinvoice)}
+          einvoice={selectedEinvoice}
+          allEinvoices={einvoices}
+          accountId={accountId || ''}
+          taxRate={effectiveTaxRate}
+          invoicingEnabled={invoicingEnabled}
+          onClose={handleCloseEinvoiceModal}
+          onUpdated={handleUpdatedEinvoiceModal}
+        />
+      )}
     </SafeAreaView>
   );
 }

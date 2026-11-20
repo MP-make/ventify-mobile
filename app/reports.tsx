@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -37,14 +37,14 @@ import {
 } from '@/services/pnl-report-service';
 import {
   type CashClosureReportItem,
-  type DashboardOperationalSummary,
+  type DashboardSalesBreakdown,
   type DateRangePreset,
   downloadAndShareExportFile,
   type ExpensesReportSummary,
   fetchCanonicalPnlReport,
   fetchCashClosureReports,
-  fetchDashboardOperationalSummary,
   fetchExpensesReport,
+  fetchPeriodSalesSummaryOnly,
   fetchReceivablesReport,
   fetchSellerPerformanceReport,
   getDateRangeBounds,
@@ -132,7 +132,7 @@ export default function ReportsScreen() {
   const [tabError, setTabError] = useState<string | null>(null);
 
   // Per-tab data
-  const [salesData, setSalesData] = useState<DashboardOperationalSummary | null>(null);
+  const [salesData, setSalesData] = useState<{ salesSummary: DashboardSalesBreakdown } | null>(null);
   const [pnlReport, setPnlReport] = useState<PnlReportResult | null>(null);
   const [pnlModalVisible, setPnlModalVisible] = useState(false);
   const [kardexItems, setKardexItems] = useState<any[]>([]);
@@ -144,6 +144,7 @@ export default function ReportsScreen() {
   const [sellersData, setSellersData] = useState<SellerPerformanceApiResponse | null>(null);
   const [commissionRateInput, setCommissionRateInput] = useState('0');
   const [expensesData, setExpensesData] = useState<ExpensesReportSummary | null>(null);
+  const requestIdRef = useRef(0);
 
   const effectiveBranch = useMemo(() => {
     if (hasAllBranchesAccess && scopeAllBranches) return undefined;
@@ -154,6 +155,8 @@ export default function ReportsScreen() {
     setKardexBranchId(effectiveBranch || 'all');
   }, [effectiveBranch]);
 
+  const activeKardexBranch = activeTab === 'kardex' ? kardexBranchId : '';
+
   const bounds = useMemo(() => getDateRangeBounds(preset), [preset]);
 
   const productsMap = useMemo(() => {
@@ -163,8 +166,21 @@ export default function ReportsScreen() {
     }
     return map;
   }, [products]);
+  const productsMapRef = useRef(productsMap);
+  productsMapRef.current = productsMap;
 
   const inventorySummary = useMemo(() => {
+    if (activeTab !== 'inventory') {
+      return {
+        activeCount: 0,
+        totalUnits: 0,
+        costValuation: 0,
+        retailValuation: 0,
+        lowStockCount: 0,
+        outOfStockCount: 0,
+        criticalList: [] as Array<{ id: string; name: string; qty: number; minStock: number }>,
+      };
+    }
     let activeCount = 0;
     let totalUnits = 0;
     let costValuation = 0;
@@ -209,11 +225,24 @@ export default function ReportsScreen() {
       outOfStockCount,
       criticalList: criticalList.slice(0, 15),
     };
-  }, [products, effectiveBranch]);
+  }, [activeTab, products, effectiveBranch]);
+
+  const closuresSummary = useMemo(() => {
+    let expectedTotal = 0;
+    let totalDiff = 0;
+    let shortageCount = 0;
+    for (const c of closures) {
+      expectedTotal += c.expectedAmount;
+      totalDiff += c.difference;
+      if (c.difference < 0) shortageCount += 1;
+    }
+    return { expectedTotal, totalDiff, shortageCount };
+  }, [closures]);
 
   const loadTabData = useCallback(
     async (isRefresh = false) => {
       if (!accountId || !canViewReports) return;
+      const reqId = ++requestIdRef.current;
       if (activeTab === 'inventory') {
         setTabError(null);
         setLoading(false);
@@ -228,13 +257,14 @@ export default function ReportsScreen() {
       try {
         switch (activeTab) {
           case 'sales': {
-            const res = await fetchDashboardOperationalSummary(
+            const res = await fetchPeriodSalesSummaryOnly(
               accountId,
               effectiveBranch,
               bounds.fromMs,
               bounds.toMs,
-              productsMap
+              productsMapRef.current
             );
+            if (reqId !== requestIdRef.current) return;
             setSalesData(res);
             break;
           }
@@ -248,14 +278,17 @@ export default function ReportsScreen() {
               branchId: effectiveBranch,
               startDate: bounds.fromMs,
               endDate: bounds.toMs,
-              productsMap,
+              productsMap: productsMapRef.current,
+              includeDetails: false,
             });
+            if (reqId !== requestIdRef.current) return;
             setPnlReport(res);
             break;
           }
           case 'kardex': {
-            const branchScope = hasAllBranchesAccess ? kardexBranchId || 'all' : effectiveBranch || 'all';
+            const branchScope = hasAllBranchesAccess ? activeKardexBranch || 'all' : effectiveBranch || 'all';
             const list = await getProductKardex(accountId, branchScope, undefined, 80);
+            if (reqId !== requestIdRef.current) return;
             setKardexItems(list);
             break;
           }
@@ -266,11 +299,13 @@ export default function ReportsScreen() {
               bounds.fromMs,
               bounds.toMs
             );
+            if (reqId !== requestIdRef.current) return;
             setClosures(list);
             break;
           }
           case 'receivables': {
             const res = await fetchReceivablesReport(accountId, effectiveBranch);
+            if (reqId !== requestIdRef.current) return;
             setReceivables(res);
             break;
           }
@@ -281,6 +316,7 @@ export default function ReportsScreen() {
               bounds.toIso,
               effectiveBranch
             );
+            if (reqId !== requestIdRef.current) return;
             setSellersData(res);
             break;
           }
@@ -291,15 +327,19 @@ export default function ReportsScreen() {
               bounds.fromMs,
               bounds.toMs
             );
+            if (reqId !== requestIdRef.current) return;
             setExpensesData(res);
             break;
           }
         }
       } catch (err: any) {
+        if (reqId !== requestIdRef.current) return;
         setTabError(err?.message || 'No se pudo cargar este reporte.');
       } finally {
-        setLoading(false);
-        setRefreshing(false);
+        if (reqId === requestIdRef.current) {
+          setLoading(false);
+          setRefreshing(false);
+        }
       }
     },
     [
@@ -311,10 +351,9 @@ export default function ReportsScreen() {
       bounds.toMs,
       bounds.fromIso,
       bounds.toIso,
-      productsMap,
       canViewMargins,
       hasAllBranchesAccess,
-      kardexBranchId,
+      activeKardexBranch,
     ]
   );
 
@@ -353,8 +392,20 @@ export default function ReportsScreen() {
     if (!pnlReport) return;
     setExportingKey('pnl_pdf');
     try {
+      let reportToExport = pnlReport;
+      if (!reportToExport.detailsAvailable && accountId) {
+        reportToExport = await fetchCanonicalPnlReport({
+          accountId,
+          branchId: effectiveBranch,
+          startDate: bounds.fromMs,
+          endDate: bounds.toMs,
+          productsMap: productsMapRef.current,
+          includeDetails: true,
+        });
+        setPnlReport(reportToExport);
+      }
       await exportPnlReportPDF(
-        pnlReport,
+        reportToExport,
         businessName || 'Mi Negocio',
         effectiveBranch ? activeBranchName || 'Sucursal' : 'Todas las sucursales',
         bounds.label
@@ -886,30 +937,23 @@ export default function ReportsScreen() {
                 <Text style={styles.kpiLabel}>Cierres en Período</Text>
                 <Text style={styles.kpiValue}>{closures.length}</Text>
                 <Text style={styles.kpiMeta}>
-                  Esperado: {formatPEN(closures.reduce((s, c) => s + c.expectedAmount, 0))}
+                  Esperado: {formatPEN(closuresSummary.expectedTotal)}
                 </Text>
               </View>
               <View style={styles.kpiBox}>
                 <Text style={styles.kpiLabel}>Diferencia Acumulada</Text>
-                {(() => {
-                  const totalDiff = closures.reduce((s, c) => s + c.difference, 0);
-                  return (
-                    <>
-                      <Text
-                        style={[
-                          styles.kpiValue,
-                          { color: totalDiff >= 0 ? ui.success : ui.danger },
-                        ]}
-                      >
-                        {totalDiff >= 0 ? '+' : ''}
-                        {formatPEN(totalDiff)}
-                      </Text>
-                      <Text style={styles.kpiMeta}>
-                        {closures.filter((c) => c.difference < 0).length} con faltante
-                      </Text>
-                    </>
-                  );
-                })()}
+                <Text
+                  style={[
+                    styles.kpiValue,
+                    { color: closuresSummary.totalDiff >= 0 ? ui.success : ui.danger },
+                  ]}
+                >
+                  {closuresSummary.totalDiff >= 0 ? '+' : ''}
+                  {formatPEN(closuresSummary.totalDiff)}
+                </Text>
+                <Text style={styles.kpiMeta}>
+                  {closuresSummary.shortageCount} con faltante
+                </Text>
               </View>
             </View>
 
@@ -1271,116 +1315,118 @@ export default function ReportsScreen() {
       )}
 
       {/* Cierre Z Detail Modal */}
-      <Modal
-        visible={Boolean(selectedClosure)}
-        transparent
-        animationType="fade"
-        onRequestClose={() => setSelectedClosure(null)}
-      >
-        <TouchableOpacity
-          style={styles.overlay}
-          activeOpacity={1}
-          onPress={() => setSelectedClosure(null)}
+      {Boolean(selectedClosure) && (
+        <Modal
+          visible={Boolean(selectedClosure)}
+          transparent
+          animationType="fade"
+          onRequestClose={() => setSelectedClosure(null)}
         >
-          <View
-            style={[styles.sheet, { paddingBottom: Math.max(insets.bottom, 20) }]}
-            onStartShouldSetResponder={() => true}
+          <TouchableOpacity
+            style={styles.overlay}
+            activeOpacity={1}
+            onPress={() => setSelectedClosure(null)}
           >
-            <View style={styles.sheetHeader}>
-              <Text style={styles.sheetTitle}>Detalle de Cierre Z</Text>
-              <TouchableOpacity onPress={() => setSelectedClosure(null)} style={styles.iconBtn}>
-                <X size={20} color={ui.textSecondary} />
-              </TouchableOpacity>
+            <View
+              style={[styles.sheet, { paddingBottom: Math.max(insets.bottom, 20) }]}
+              onStartShouldSetResponder={() => true}
+            >
+              <View style={styles.sheetHeader}>
+                <Text style={styles.sheetTitle}>Detalle de Cierre Z</Text>
+                <TouchableOpacity onPress={() => setSelectedClosure(null)} style={styles.iconBtn}>
+                  <X size={20} color={ui.textSecondary} />
+                </TouchableOpacity>
+              </View>
+              {selectedClosure && (
+                <ScrollView contentContainerStyle={styles.sheetBody}>
+                  <View style={styles.lineRow}>
+                    <Text style={styles.lineLabel}>Sucursal / Operador</Text>
+                    <Text style={styles.lineValue}>
+                      {selectedClosure.branchName || 'Principal'} ·{' '}
+                      {selectedClosure.closedByName || selectedClosure.startedByName || '—'}
+                    </Text>
+                  </View>
+                  <View style={styles.lineRow}>
+                    <Text style={styles.lineLabel}>Fecha Cierre</Text>
+                    <Text style={styles.lineValue}>
+                      {formatDatePE(selectedClosure.closeTime || selectedClosure.createdAt)}
+                    </Text>
+                  </View>
+                  <View style={styles.lineRow}>
+                    <Text style={styles.lineLabel}>Efectivo Esperado</Text>
+                    <Text style={styles.lineValue}>{formatPEN(selectedClosure.expectedAmount)}</Text>
+                  </View>
+                  <View style={styles.lineRow}>
+                    <Text style={styles.lineLabel}>Efectivo Contado</Text>
+                    <Text style={styles.lineValue}>{formatPEN(selectedClosure.countedAmount)}</Text>
+                  </View>
+                  <View style={styles.lineRow}>
+                    <Text style={styles.lineLabel}>Diferencia</Text>
+                    <Text
+                      style={[
+                        styles.lineValue,
+                        {
+                          color:
+                            selectedClosure.difference === 0
+                              ? ui.success
+                              : selectedClosure.difference > 0
+                                ? ui.primary
+                                : ui.danger,
+                        },
+                      ]}
+                    >
+                      {selectedClosure.difference >= 0 ? '+' : ''}
+                      {formatPEN(selectedClosure.difference)}
+                    </Text>
+                  </View>
+                  {selectedClosure.computed && (
+                    <>
+                      <View style={styles.divider} />
+                      <View style={styles.lineRow}>
+                        <Text style={styles.lineLabel}>Ventas Totales Turno</Text>
+                        <Text style={styles.lineValue}>
+                          {formatPEN(selectedClosure.computed.totalSales || 0)}
+                        </Text>
+                      </View>
+                      <View style={styles.lineRow}>
+                        <Text style={styles.lineLabel}>Ventas Efectivo</Text>
+                        <Text style={styles.lineValue}>
+                          {formatPEN(selectedClosure.computed.cashSalesOnly || 0)}
+                        </Text>
+                      </View>
+                      <View style={styles.lineRow}>
+                        <Text style={styles.lineLabel}>Ventas Tarjeta</Text>
+                        <Text style={styles.lineValue}>
+                          {formatPEN(selectedClosure.computed.cardSalesOnly || 0)}
+                        </Text>
+                      </View>
+                      <View style={styles.lineRow}>
+                        <Text style={styles.lineLabel}>Yape / Plin</Text>
+                        <Text style={styles.lineValue}>
+                          {formatPEN(
+                            (selectedClosure.computed.yapeSalesOnly || 0) +
+                              (selectedClosure.computed.plinSalesOnly || 0)
+                          )}
+                        </Text>
+                      </View>
+                      <View style={styles.lineRow}>
+                        <Text style={styles.lineLabel}>Ingresos / Egresos Caja</Text>
+                        <Text style={styles.lineValue}>
+                          +{formatPEN(selectedClosure.computed.cashIncomes || 0)} / -
+                          {formatPEN(selectedClosure.computed.cashWithdrawals || 0)}
+                        </Text>
+                      </View>
+                    </>
+                  )}
+                  {selectedClosure.notes ? (
+                    <Text style={styles.mutedText}>Notas: {selectedClosure.notes}</Text>
+                  ) : null}
+                </ScrollView>
+              )}
             </View>
-            {selectedClosure && (
-              <ScrollView contentContainerStyle={styles.sheetBody}>
-                <View style={styles.lineRow}>
-                  <Text style={styles.lineLabel}>Sucursal / Operador</Text>
-                  <Text style={styles.lineValue}>
-                    {selectedClosure.branchName || 'Principal'} ·{' '}
-                    {selectedClosure.closedByName || selectedClosure.startedByName || '—'}
-                  </Text>
-                </View>
-                <View style={styles.lineRow}>
-                  <Text style={styles.lineLabel}>Fecha Cierre</Text>
-                  <Text style={styles.lineValue}>
-                    {formatDatePE(selectedClosure.closeTime || selectedClosure.createdAt)}
-                  </Text>
-                </View>
-                <View style={styles.lineRow}>
-                  <Text style={styles.lineLabel}>Efectivo Esperado</Text>
-                  <Text style={styles.lineValue}>{formatPEN(selectedClosure.expectedAmount)}</Text>
-                </View>
-                <View style={styles.lineRow}>
-                  <Text style={styles.lineLabel}>Efectivo Contado</Text>
-                  <Text style={styles.lineValue}>{formatPEN(selectedClosure.countedAmount)}</Text>
-                </View>
-                <View style={styles.lineRow}>
-                  <Text style={styles.lineLabel}>Diferencia</Text>
-                  <Text
-                    style={[
-                      styles.lineValue,
-                      {
-                        color:
-                          selectedClosure.difference === 0
-                            ? ui.success
-                            : selectedClosure.difference > 0
-                              ? ui.primary
-                              : ui.danger,
-                      },
-                    ]}
-                  >
-                    {selectedClosure.difference >= 0 ? '+' : ''}
-                    {formatPEN(selectedClosure.difference)}
-                  </Text>
-                </View>
-                {selectedClosure.computed && (
-                  <>
-                    <View style={styles.divider} />
-                    <View style={styles.lineRow}>
-                      <Text style={styles.lineLabel}>Ventas Totales Turno</Text>
-                      <Text style={styles.lineValue}>
-                        {formatPEN(selectedClosure.computed.totalSales || 0)}
-                      </Text>
-                    </View>
-                    <View style={styles.lineRow}>
-                      <Text style={styles.lineLabel}>Ventas Efectivo</Text>
-                      <Text style={styles.lineValue}>
-                        {formatPEN(selectedClosure.computed.cashSalesOnly || 0)}
-                      </Text>
-                    </View>
-                    <View style={styles.lineRow}>
-                      <Text style={styles.lineLabel}>Ventas Tarjeta</Text>
-                      <Text style={styles.lineValue}>
-                        {formatPEN(selectedClosure.computed.cardSalesOnly || 0)}
-                      </Text>
-                    </View>
-                    <View style={styles.lineRow}>
-                      <Text style={styles.lineLabel}>Yape / Plin</Text>
-                      <Text style={styles.lineValue}>
-                        {formatPEN(
-                          (selectedClosure.computed.yapeSalesOnly || 0) +
-                            (selectedClosure.computed.plinSalesOnly || 0)
-                        )}
-                      </Text>
-                    </View>
-                    <View style={styles.lineRow}>
-                      <Text style={styles.lineLabel}>Ingresos / Egresos Caja</Text>
-                      <Text style={styles.lineValue}>
-                        +{formatPEN(selectedClosure.computed.cashIncomes || 0)} / -
-                        {formatPEN(selectedClosure.computed.cashWithdrawals || 0)}
-                      </Text>
-                    </View>
-                  </>
-                )}
-                {selectedClosure.notes ? (
-                  <Text style={styles.mutedText}>Notas: {selectedClosure.notes}</Text>
-                ) : null}
-              </ScrollView>
-            )}
-          </View>
-        </TouchableOpacity>
-      </Modal>
+          </TouchableOpacity>
+        </Modal>
+      )}
     </SafeAreaView>
   );
 }

@@ -9,7 +9,7 @@ import React, {
   useRef,
 } from 'react';
 import { InteractionManager } from 'react-native';
-import { collection, query, where, onSnapshot } from 'firebase/firestore';
+import { collection, query, where, onSnapshot, getDocs, limit } from 'firebase/firestore';
 import NetInfo from '@react-native-community/netinfo';
 import { catalogKVStorage } from '@/lib/native-kv-storage';
 import { db } from '@/lib/firebase';
@@ -28,8 +28,13 @@ import {
   ProductCatalogInventoryIndex,
   ProductCatalogCategoryIndex,
   removeCatalogProduct,
+  type CatalogInventoryAlert,
 } from '@/lib/product-catalog-index';
-import { getIndexedCatalogProduct } from '@/lib/catalog-filters';
+import {
+  buildCatalogProductIndex,
+  getIndexedCatalogProduct,
+  type CatalogProductIndex,
+} from '@/lib/catalog-filters';
 import {
   PRODUCT_CATALOG_FIRST_BATCH_SIZE,
   isAuthoritativeCatalogSnapshot,
@@ -46,7 +51,7 @@ import {
 import {
   normalizePriceTiers,
   sanitizeRemoteImageUrls,
-} from '@/services/inventory-kardex-service';
+} from '@/lib/product-normalization';
 
 export interface InventoryStats {
   totalProducts: number;
@@ -74,22 +79,40 @@ export interface ProductPlanValidationResult {
 
 export interface ProductsContextType {
   products: Product[];
+  productsById: ReadonlyMap<string, Product>;
+  catalogIndex: CatalogProductIndex;
   loading: boolean;
   refreshing: boolean;
   catalogComplete: boolean;
   error: string | null;
   categories: string[];
   stats: InventoryStats;
-  criticalAlerts: Array<{ productId: string; name: string; currentStock: number; minStock: number }>;
+  criticalAlerts: CatalogInventoryAlert[];
   productPlanLimit: ProductPlanLimitSummary | null;
+  getProductById: (id: string) => Product | undefined;
   findByBarcode: (code: string) => ScannedProductMatch | null;
   findByBarcodeRemote: (code: string) => Promise<ScannedProductMatch | null>;
   getProductStock: (product: Product, branchIdOverride?: string) => number;
   getProductAvailableStock: (product: Product, branchIdOverride?: string) => number;
   refreshProducts: () => void;
   upsertProduct: (product: Product) => void;
+  upsertProductsBatch: (items: Product[]) => void;
   validateProductCreation: () => Promise<ProductPlanValidationResult>;
 }
+
+const EMPTY_PRODUCTS: Product[] = [];
+const EMPTY_PRODUCT_MAP: ReadonlyMap<string, Product> = new Map();
+const EMPTY_ALERTS: CatalogInventoryAlert[] = [];
+const DEFAULT_CATEGORIES: string[] = ['Todos'];
+const EMPTY_CATALOG_INDEX: CatalogProductIndex = {
+  entries: [],
+  entriesByCategory: new Map(),
+  uncategorizedEntries: [],
+  categoryCounts: new Map(),
+  uncategorizedCount: 0,
+  brands: [],
+  sizes: [],
+};
 
 const DEFAULT_STATS: InventoryStats = {
   totalProducts: 0,
@@ -100,147 +123,280 @@ const DEFAULT_STATS: InventoryStats = {
   outOfStockCount: 0,
 };
 
+function shallowRecordNumbersEqual(
+  a: Record<string, number> | undefined | null,
+  b: Record<string, number> | undefined | null
+): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  const keysA = Object.keys(a);
+  const keysB = Object.keys(b);
+  if (keysA.length !== keysB.length) return false;
+  for (let i = 0; i < keysA.length; i += 1) {
+    const k = keysA[i];
+    if (a[k] !== b[k]) return false;
+  }
+  return true;
+}
+
+function productsDifferForCache(prev: Product | undefined, next: Product): boolean {
+  if (!prev) return true;
+  if (
+    prev.name !== next.name ||
+    prev.category !== next.category ||
+    prev.sku !== next.sku ||
+    prev.barcode !== next.barcode ||
+    prev.costPrice !== next.costPrice ||
+    prev.suggestedPrice !== next.suggestedPrice ||
+    prev.price !== next.price ||
+    prev.minSalePrice !== next.minSalePrice ||
+    prev.imageUrl !== next.imageUrl ||
+    prev.thumbUrl !== next.thumbUrl ||
+    prev.active !== next.active ||
+    prev.brand !== next.brand ||
+    prev.sizeLabel !== next.sizeLabel ||
+    prev.unitOfMeasure !== next.unitOfMeasure ||
+    prev.allowDecimals !== next.allowDecimals ||
+    prev.stepDecimal !== next.stepDecimal ||
+    prev.taxExemptionCode !== next.taxExemptionCode ||
+    (prev as any).updatedAt !== (next as any).updatedAt
+  ) {
+    return true;
+  }
+  if (
+    !shallowRecordNumbersEqual(prev.stock, next.stock) ||
+    !shallowRecordNumbersEqual(prev.reservedStock, next.reservedStock)
+  ) {
+    return true;
+  }
+  if (
+    (prev.barcodes?.length || 0) !== (next.barcodes?.length || 0) ||
+    (prev.presentations?.length || 0) !== (next.presentations?.length || 0) ||
+    (prev.variants?.length || 0) !== (next.variants?.length || 0) ||
+    (prev.priceTiers?.length || 0) !== (next.priceTiers?.length || 0) ||
+    (prev.galleryImages?.length || 0) !== (next.galleryImages?.length || 0)
+  ) {
+    return true;
+  }
+  try {
+    return (
+      JSON.stringify(prev.barcodes) !== JSON.stringify(next.barcodes) ||
+      JSON.stringify(prev.presentations) !== JSON.stringify(next.presentations) ||
+      JSON.stringify(prev.variants) !== JSON.stringify(next.variants) ||
+      JSON.stringify(prev.branchPrices) !== JSON.stringify(next.branchPrices) ||
+      JSON.stringify(prev.priceTiers) !== JSON.stringify(next.priceTiers) ||
+      JSON.stringify(prev.attributes) !== JSON.stringify(next.attributes)
+    );
+  } catch {
+    return true;
+  }
+}
+
 const ProductsContext = createContext<ProductsContextType>({
-  products: [],
+  products: EMPTY_PRODUCTS,
+  productsById: EMPTY_PRODUCT_MAP,
+  catalogIndex: EMPTY_CATALOG_INDEX,
   loading: true,
   refreshing: false,
   catalogComplete: false,
   error: null,
-  categories: ['Todos'],
+  categories: DEFAULT_CATEGORIES,
   stats: DEFAULT_STATS,
-  criticalAlerts: [],
+  criticalAlerts: EMPTY_ALERTS,
   productPlanLimit: null,
+  getProductById: () => undefined,
   findByBarcode: () => null,
   findByBarcodeRemote: async () => null,
   getProductStock: () => 0,
   getProductAvailableStock: () => 0,
   refreshProducts: () => {},
   upsertProduct: () => {},
+  upsertProductsBatch: () => {},
   validateProductCreation: async () => ({ allowed: true }),
 });
 
 export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const { user, accountId, branchId, limits, isOnline, refreshAccess } = useAuth();
-  const [products, setProducts] = useState<Product[]>([]);
-  const [productsScopeKey, setProductsScopeKey] = useState<string | null>(null);
+  const [productsState, setProductsState] = useState<{
+    products: Product[];
+    byId: ReadonlyMap<string, Product>;
+    scopeKey: string | null;
+  }>({
+    products: EMPTY_PRODUCTS,
+    byId: EMPTY_PRODUCT_MAP,
+    scopeKey: null,
+  });
   const [refreshing, setRefreshing] = useState<boolean>(false);
   const [catalogComplete, setCatalogComplete] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
-  const [categories, setCategories] = useState<string[]>(['Todos']);
+  const [categories, setCategories] = useState<string[]>(DEFAULT_CATEGORIES);
   const [refreshTick, setRefreshTick] = useState<number>(0);
   const [inventorySummary, setInventorySummary] = useState<{
     stats: InventoryStats;
-    alerts: Array<{ productId: string; name: string; currentStock: number; minStock: number }>;
-  }>({ stats: DEFAULT_STATS, alerts: [] });
+    alerts: CatalogInventoryAlert[];
+  }>({ stats: DEFAULT_STATS, alerts: EMPTY_ALERTS });
 
   const previousAlertCount = useRef<number>(0);
   const isOnlineRef = useRef<boolean>(isOnline);
   isOnlineRef.current = isOnline;
+  const effectiveBranchId = branchId || 'main';
+  const branchIdRef = useRef<string>(effectiveBranchId);
   const localRecentProductsRef = useRef<Map<string, Product>>(new Map());
   const productMapRef = useRef<Map<string, Product>>(new Map());
   const barcodeIndexRef = useRef(new ProductCatalogIndex());
-  const inventoryIndexRef = useRef(new ProductCatalogInventoryIndex(branchId || 'main'));
+  const inventoryIndexRef = useRef(new ProductCatalogInventoryIndex(effectiveBranchId));
   const categoryIndexRef = useRef(new ProductCatalogCategoryIndex());
   const barcodeIndexScopeRef = useRef<string | null>(null);
   const activeScopeRef = useRef<string | null>(null);
   const effectGenerationRef = useRef(0);
   const authoritativeSnapshotReadyRef = useRef(false);
-  const cacheWriterRef = useRef<(nextProducts: Product[]) => void>(() => {});
+  const cacheWriterRef = useRef<(nextProducts?: Product[], incremental?: boolean) => void>(() => {});
   const catalogCompleteRef = useRef(catalogComplete);
   catalogCompleteRef.current = catalogComplete;
 
+  // Account-scoped cache key so branch switches only recompute branch stock KPIs in memory
   const activeCacheKey = user?.uid && accountId
-    ? productCatalogCacheKey(user.uid, accountId, branchId || 'main')
+    ? productCatalogCacheKey(user.uid, accountId, 'account')
     : null;
-  const visibleProducts = productsForCatalogScope(products, productsScopeKey, activeCacheKey);
 
-  const upsertProduct = useCallback((product: Product) => {
-    if (!product || !product.id) return;
-    if (product.accountId && accountId && product.accountId !== accountId) return;
-    if (!activeCacheKey || activeScopeRef.current !== activeCacheKey) return;
-    localRecentProductsRef.current.set(product.id, product);
-    getIndexedCatalogProduct(product);
-    productMapRef.current.set(product.id, product);
-    barcodeIndexRef.current.upsert(product);
-    inventoryIndexRef.current.upsert(product);
-    if (categoryIndexRef.current.upsert(product)) {
-      setCategories(categoryIndexRef.current.snapshot());
+  const visibleProducts = productsForCatalogScope(
+    productsState.products,
+    productsState.scopeKey,
+    activeCacheKey
+  );
+  const visibleProductsById =
+    productsState.scopeKey && productsState.scopeKey === activeCacheKey
+      ? productsState.byId
+      : EMPTY_PRODUCT_MAP;
+
+  const catalogIndex = useMemo<CatalogProductIndex>(
+    () => (visibleProducts.length === 0 ? EMPTY_CATALOG_INDEX : buildCatalogProductIndex(visibleProducts)),
+    [visibleProducts]
+  );
+
+  // Recompute only branch inventory KPIs when branchId changes without tearing down Firestore/MMKV
+  useEffect(() => {
+    if (branchIdRef.current === effectiveBranchId) return;
+    branchIdRef.current = effectiveBranchId;
+    const nextIndex = new ProductCatalogInventoryIndex(effectiveBranchId);
+    for (const product of productMapRef.current.values()) {
+      nextIndex.upsert(product);
     }
-    const nextProducts = Array.from(productMapRef.current.values());
-    setProductsScopeKey(activeCacheKey);
-    setProducts((prev) => {
-      const scoped = productsScopeKey === activeCacheKey ? prev : [];
-      return [product, ...scoped.filter((p) => p.id !== product.id)];
-    });
-    if (catalogCompleteRef.current) {
-      setInventorySummary(inventoryIndexRef.current.snapshot());
-      setCategories(categoryIndexRef.current.snapshot());
-      cacheWriterRef.current(nextProducts);
+    inventoryIndexRef.current = nextIndex;
+    if (catalogCompleteRef.current && activeScopeRef.current === activeCacheKey) {
+      setInventorySummary(nextIndex.snapshot());
     }
-  }, [accountId, activeCacheKey, catalogComplete, productsScopeKey]);
+  }, [effectiveBranchId, activeCacheKey]);
+
+  const upsertProductsBatch = useCallback(
+    (items: Product[]) => {
+      if (!items || items.length === 0) return;
+      if (!activeCacheKey || activeScopeRef.current !== activeCacheKey) return;
+
+      let categoryChanged = false;
+      let updatedCount = 0;
+
+      for (let i = 0; i < items.length; i += 1) {
+        const product = items[i];
+        if (!product || !product.id) continue;
+        if (product.accountId && accountId && product.accountId !== accountId) continue;
+
+        localRecentProductsRef.current.set(product.id, product);
+        getIndexedCatalogProduct(product);
+        productMapRef.current.set(product.id, product);
+        barcodeIndexRef.current.upsert(product);
+        inventoryIndexRef.current.upsert(product);
+        if (categoryIndexRef.current.upsert(product)) {
+          categoryChanged = true;
+        }
+        updatedCount += 1;
+      }
+
+      if (updatedCount === 0) return;
+
+      const nextProducts = Array.from(productMapRef.current.values());
+      const nextById = new Map(productMapRef.current);
+      setProductsState({ products: nextProducts, byId: nextById, scopeKey: activeCacheKey });
+      if (categoryChanged) {
+        setCategories(categoryIndexRef.current.snapshot());
+      }
+      if (catalogCompleteRef.current) {
+        setInventorySummary(inventoryIndexRef.current.snapshot());
+        cacheWriterRef.current(nextProducts, true);
+      }
+    },
+    [accountId, activeCacheKey]
+  );
+
+  const upsertProduct = useCallback(
+    (product: Product) => {
+      upsertProductsBatch([product]);
+    },
+    [upsertProductsBatch]
+  );
 
   const mapSnapshotDoc = useCallback(
-      (docSnap: any): Product => {
-        const data = docSnap.data();
-        const baseCost = Number(data.costPrice ?? 0);
-        const baseSuggested = Number(data.suggestedPrice ?? data.price ?? 0);
-        const baseMin = Number(data.minSalePrice ?? baseCost);
-        const sanitizedGallery = sanitizeRemoteImageUrls(
-          Array.isArray(data.galleryImages)
-            ? data.galleryImages
-            : data.imageUrl
-            ? [data.imageUrl]
-            : []
-        );
-        const safeImageUrl =
-          typeof data.imageUrl === 'string' && data.imageUrl.trim() && sanitizedGallery.includes(data.imageUrl.trim())
-            ? data.imageUrl.trim()
-            : sanitizedGallery[0] || (typeof data.imageUrl === 'string' ? data.imageUrl : '');
+    (docSnap: any): Product => {
+      const data = docSnap.data();
+      const baseCost = Number(data.costPrice ?? 0);
+      const baseSuggested = Number(data.suggestedPrice ?? data.price ?? 0);
+      const baseMin = Number(data.minSalePrice ?? baseCost);
+      const sanitizedGallery = sanitizeRemoteImageUrls(
+        Array.isArray(data.galleryImages)
+          ? data.galleryImages
+          : data.imageUrl
+          ? [data.imageUrl]
+          : []
+      );
+      const safeImageUrl =
+        typeof data.imageUrl === 'string' && data.imageUrl.trim() && sanitizedGallery.includes(data.imageUrl.trim())
+          ? data.imageUrl.trim()
+          : sanitizedGallery[0] || (typeof data.imageUrl === 'string' ? data.imageUrl : '');
 
-        return {
-          ...data,
-          id: docSnap.id,
-          name: data.name || 'Sin nombre',
-          category: data.category || 'General',
-          sku: data.sku || '',
-          barcode: data.barcode || '',
-          barcodes: Array.isArray(data.barcodes) ? data.barcodes : [],
-          costPrice: baseCost,
-          suggestedPrice: baseSuggested,
-          price: baseSuggested,
-          minSalePrice: baseMin,
-          stock: typeof data.stock === 'object' && data.stock !== null ? data.stock : {},
-          reservedStock:
-            typeof data.reservedStock === 'object' && data.reservedStock !== null
-              ? data.reservedStock
-              : {},
-          branchIds: Array.isArray(data.branchIds) ? data.branchIds : [],
-          lowStockBranches: Array.isArray(data.lowStockBranches) ? data.lowStockBranches : [],
-          branchPrices:
-            typeof data.branchPrices === 'object' && data.branchPrices !== null
-              ? data.branchPrices
-              : {},
-          variants: Array.isArray(data.variants) ? data.variants : [],
-          priceTiers: Array.isArray(data.priceTiers) ? normalizePriceTiers(data.priceTiers) : [],
-          presentations: Array.isArray(data.presentations)
-            ? data.presentations.map(normalizePresentation)
-            : [],
-          galleryImages: sanitizedGallery,
-          attributes:
-            typeof data.attributes === 'object' && data.attributes !== null
-              ? data.attributes
-              : {},
-          taxExemptionCode: data.taxExemptionCode || '10',
-          imageUrl: safeImageUrl,
-          thumbUrl: data.thumbUrl || safeImageUrl || '',
-          hint: data.hint || '',
-          unitOfMeasure: data.unitOfMeasure || 'unit',
-          allowDecimals: Boolean(data.allowDecimals),
-          stepDecimal: data.stepDecimal ? Number(data.stepDecimal) : undefined,
-          active: data.active !== false,
-          accountId: accountId || data.accountId || '',
-        };
-      },
+      return {
+        ...data,
+        id: docSnap.id,
+        name: data.name || 'Sin nombre',
+        category: data.category || 'General',
+        sku: data.sku || '',
+        barcode: data.barcode || '',
+        barcodes: Array.isArray(data.barcodes) ? data.barcodes : [],
+        costPrice: baseCost,
+        suggestedPrice: baseSuggested,
+        price: baseSuggested,
+        minSalePrice: baseMin,
+        stock: typeof data.stock === 'object' && data.stock !== null ? data.stock : {},
+        reservedStock:
+          typeof data.reservedStock === 'object' && data.reservedStock !== null
+            ? data.reservedStock
+            : {},
+        branchIds: Array.isArray(data.branchIds) ? data.branchIds : [],
+        lowStockBranches: Array.isArray(data.lowStockBranches) ? data.lowStockBranches : [],
+        branchPrices:
+          typeof data.branchPrices === 'object' && data.branchPrices !== null
+            ? data.branchPrices
+            : {},
+        variants: Array.isArray(data.variants) ? data.variants : [],
+        priceTiers: Array.isArray(data.priceTiers) ? normalizePriceTiers(data.priceTiers) : [],
+        presentations: Array.isArray(data.presentations)
+          ? data.presentations.map(normalizePresentation)
+          : [],
+        galleryImages: sanitizedGallery,
+        attributes:
+          typeof data.attributes === 'object' && data.attributes !== null
+            ? data.attributes
+            : {},
+        taxExemptionCode: data.taxExemptionCode || '10',
+        imageUrl: safeImageUrl,
+        thumbUrl: data.thumbUrl || safeImageUrl || '',
+        hint: data.hint || '',
+        unitOfMeasure: data.unitOfMeasure || 'unit',
+        allowDecimals: Boolean(data.allowDecimals),
+        stepDecimal: data.stepDecimal ? Number(data.stepDecimal) : undefined,
+        active: data.active !== false,
+        accountId: accountId || data.accountId || '',
+      };
+    },
     [accountId]
   );
 
@@ -259,13 +415,12 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       categoryIndexRef.current.clear();
       localRecentProductsRef.current.clear();
       previousAlertCount.current = 0;
-      setProducts([]);
-      setProductsScopeKey(null);
+      setProductsState({ products: EMPTY_PRODUCTS, byId: EMPTY_PRODUCT_MAP, scopeKey: null });
       setRefreshing(false);
       setCatalogComplete(false);
       setError(null);
-      setInventorySummary({ stats: DEFAULT_STATS, alerts: [] });
-      setCategories(['Todos']);
+      setInventorySummary({ stats: DEFAULT_STATS, alerts: EMPTY_ALERTS });
+      setCategories(DEFAULT_CATEGORIES);
       cacheWriterRef.current = () => {};
       return;
     }
@@ -277,48 +432,58 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     if (scopeChanged) {
       productMapRef.current.clear();
       barcodeIndexRef.current.clear();
-      inventoryIndexRef.current = new ProductCatalogInventoryIndex(branchId || 'main');
+      inventoryIndexRef.current = new ProductCatalogInventoryIndex(branchIdRef.current);
       categoryIndexRef.current.clear();
       localRecentProductsRef.current.clear();
       previousAlertCount.current = 0;
-      setProducts([]);
-      setProductsScopeKey(scopeKey);
+      setProductsState({ products: EMPTY_PRODUCTS, byId: EMPTY_PRODUCT_MAP, scopeKey });
       setCatalogComplete(false);
       setError(null);
-      setInventorySummary({ stats: DEFAULT_STATS, alerts: [] });
-      setCategories(['Todos']);
+      setInventorySummary({ stats: DEFAULT_STATS, alerts: EMPTY_ALERTS });
+      setCategories(DEFAULT_CATEGORIES);
     }
     setRefreshing(true);
 
     let unsubscribe: (() => void) | undefined;
     let cacheTimer: ReturnType<typeof setTimeout> | undefined;
     let processing = Promise.resolve();
-    let firstSnapshot = true;
     let cacheChunkPublished = false;
+    let cacheHydrated = false;
     let categoriesDirty = false;
+    let publishedOnce = false;
 
     const publishMap = () => {
       if (!isCurrent()) return;
-      setProductsScopeKey(scopeKey);
-      setProducts(Array.from(productMapRef.current.values()));
+      publishedOnce = true;
+      setProductsState({
+        products: Array.from(productMapRef.current.values()),
+        byId: new Map(productMapRef.current),
+        scopeKey,
+      });
       if (categoriesDirty) {
         categoriesDirty = false;
         setCategories(categoryIndexRef.current.snapshot());
       }
     };
 
-    const upsertMapped = (product: Product) => {
+    const upsertMapped = (product: Product): boolean => {
+      const existing = productMapRef.current.get(product.id);
+      if (existing && !productsDifferForCache(existing, product)) {
+        return false;
+      }
       getIndexedCatalogProduct(product);
       productMapRef.current.set(product.id, product);
       barcodeIndexRef.current.upsert(product);
       inventoryIndexRef.current.upsert(product);
       categoriesDirty = categoryIndexRef.current.upsert(product) || categoriesDirty;
+      return true;
     };
 
     let interactionTask: { cancel?: () => void } | undefined;
-    const scheduleCacheWrite = (sourceProducts?: Product[]) => {
+    const scheduleCacheWrite = (sourceProducts?: Product[], incremental = false) => {
       if (cacheTimer) clearTimeout(cacheTimer);
       if (interactionTask?.cancel) interactionTask.cancel();
+      const delayMs = incremental ? 8000 : 1500;
       cacheTimer = setTimeout(() => {
         interactionTask = InteractionManager.runAfterInteractions(() => {
           if (!isCurrent()) return;
@@ -331,9 +496,10 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
             console.warn('[ProductsContext] Could not persist catalog cache:', cacheError);
           });
         });
-      }, 1500);
+      }, delayMs);
     };
-    cacheWriterRef.current = (nextProducts) => scheduleCacheWrite(nextProducts);
+    cacheWriterRef.current = (nextProducts, incremental = true) =>
+      scheduleCacheWrite(nextProducts, incremental);
 
     let serverSnapshotApplied = false;
     let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
@@ -345,32 +511,48 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       completesFirstSnapshot: boolean,
       isServerAuthoritative: boolean
     ) => {
-      await processCatalogInBatches(changes, (batch) => {
-        if (!isCurrent()) return;
-        for (const change of batch) {
-          const productId = change.doc.id;
-          if (change.type === 'removed') {
-            localRecentProductsRef.current.delete(productId);
-            removeCatalogProduct(productMapRef.current, barcodeIndexRef.current, productId);
-            inventoryIndexRef.current.remove(productId);
-            categoriesDirty = categoryIndexRef.current.remove(productId) || categoriesDirty;
-          } else {
-            const mapped = mapSnapshotDoc(change.doc);
-            localRecentProductsRef.current.delete(productId);
-            upsertMapped(mapped);
+      let dirtyCount = 0;
+
+      if (changes.length > 0) {
+        await processCatalogInBatches(changes, (batch) => {
+          if (!isCurrent()) return;
+          for (const change of batch) {
+            const productId = change.doc.id;
+            if (change.type === 'removed') {
+              localRecentProductsRef.current.delete(productId);
+              if (productMapRef.current.has(productId)) {
+                removeCatalogProduct(productMapRef.current, barcodeIndexRef.current, productId);
+                inventoryIndexRef.current.remove(productId);
+                categoriesDirty = categoryIndexRef.current.remove(productId) || categoriesDirty;
+                dirtyCount += 1;
+              }
+            } else {
+              const mapped = mapSnapshotDoc(change.doc);
+              localRecentProductsRef.current.delete(productId);
+              if (upsertMapped(mapped)) {
+                dirtyCount += 1;
+              }
+            }
           }
-        }
-      });
+        });
+      }
 
       if (!isCurrent()) return;
       if (completesFirstSnapshot && isServerAuthoritative) {
         const serverIds = new Set<string>();
+        let publishedFirstNetBatch = productMapRef.current.size > 0;
         await processCatalogInBatches(authoritativeDocs, (batch) => {
           if (!isCurrent()) return;
           for (const docSnap of batch) {
             serverIds.add(docSnap.id);
             localRecentProductsRef.current.delete(docSnap.id);
-            upsertMapped(mapSnapshotDoc(docSnap));
+            if (upsertMapped(mapSnapshotDoc(docSnap))) {
+              dirtyCount += 1;
+            }
+          }
+          if (!publishedFirstNetBatch && productMapRef.current.size > 0) {
+            publishedFirstNetBatch = true;
+            publishMap();
           }
         });
         await processCatalogIteratorInBatches(productMapRef.current.keys(), (batch) => {
@@ -380,6 +562,7 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
               removeCatalogProduct(productMapRef.current, barcodeIndexRef.current, productId);
               inventoryIndexRef.current.remove(productId);
               categoriesDirty = categoryIndexRef.current.remove(productId) || categoriesDirty;
+              dirtyCount += 1;
             }
           }
         });
@@ -387,28 +570,33 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         await processCatalogInBatches(authoritativeDocs, (batch) => {
           if (!isCurrent()) return;
           for (const docSnap of batch) {
-            upsertMapped(mapSnapshotDoc(docSnap));
+            if (upsertMapped(mapSnapshotDoc(docSnap))) {
+              dirtyCount += 1;
+            }
           }
         });
       }
       if (!isCurrent()) return;
-      publishMap();
+      if (dirtyCount > 0 || !publishedOnce) {
+        publishMap();
+      }
       if (completesFirstSnapshot) {
-        // Solo el snapshot real del servidor se considera autoritativo y actualiza el caché completo.
         setCatalogComplete(true);
         if (isServerAuthoritative) {
           authoritativeSnapshotReadyRef.current = true;
         }
-        setInventorySummary(inventoryIndexRef.current.snapshot());
+        if (dirtyCount > 0 || !cacheHydrated) {
+          setInventorySummary(inventoryIndexRef.current.snapshot());
+        }
         setRefreshing(false);
         setError(null);
-        if (isServerAuthoritative) {
-          scheduleCacheWrite();
+        if (isServerAuthoritative && (dirtyCount > 0 || !cacheHydrated)) {
+          scheduleCacheWrite(undefined, false);
         }
-      } else if (catalogCompleteRef.current) {
+      } else if (catalogCompleteRef.current && dirtyCount > 0) {
         setInventorySummary(inventoryIndexRef.current.snapshot());
         if (isServerAuthoritative) {
-          scheduleCacheWrite();
+          scheduleCacheWrite(undefined, true);
         }
       }
     };
@@ -416,6 +604,24 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     const startNetworkLoad = () => {
       if (!isCurrent()) return;
       const realtimeQuery = query(collection(db, 'products'), where('accountId', '==', accountId));
+      if (productMapRef.current.size === 0) {
+        getDocs(query(realtimeQuery, limit(PRODUCT_CATALOG_FIRST_BATCH_SIZE)))
+          .then((quickSnap) => {
+            if (!isCurrent() || serverSnapshotApplied || quickSnap.empty) return;
+            let added = 0;
+            for (const docSnap of quickSnap.docs) {
+              if (!productMapRef.current.has(docSnap.id)) {
+                if (upsertMapped(mapSnapshotDoc(docSnap))) added += 1;
+              }
+            }
+            if (added > 0 && productMapRef.current.size > 0) {
+              publishMap();
+            }
+          })
+          .catch(() => {
+            // El listener completo de abajo maneja errores y reconexión.
+          });
+      }
       unsubscribe = onSnapshot(
         realtimeQuery,
         (snapshot) => {
@@ -503,32 +709,29 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     const hydrateCache = async () => {
       if (scopeChanged) {
         try {
-          const cacheResult = await loadProductCatalogCache(catalogKVStorage, scopeKey, async (chunk) => {
+          const cacheResult = await loadProductCatalogCache(catalogKVStorage, scopeKey, (chunk) => {
             if (!isCurrent()) return;
-            await processCatalogInBatches(chunk, (batch) => {
-              if (!isCurrent()) return;
-              for (const cachedProduct of batch) {
-                productMapRef.current.set(cachedProduct.id, cachedProduct);
-                getIndexedCatalogProduct(cachedProduct);
-                barcodeIndexRef.current.upsert(cachedProduct);
-                inventoryIndexRef.current.upsert(cachedProduct);
-                categoriesDirty = categoryIndexRef.current.upsert(cachedProduct) || categoriesDirty;
-              }
-              if (!cacheChunkPublished) {
-                cacheChunkPublished = true;
-                publishMap();
-              }
-            });
+            for (let i = 0; i < chunk.length; i += 1) {
+              const cachedProduct = chunk[i];
+              productMapRef.current.set(cachedProduct.id, cachedProduct);
+              getIndexedCatalogProduct(cachedProduct);
+              barcodeIndexRef.current.upsert(cachedProduct);
+              inventoryIndexRef.current.upsert(cachedProduct);
+              categoriesDirty = categoryIndexRef.current.upsert(cachedProduct) || categoriesDirty;
+            }
+            if (!cacheChunkPublished) {
+              cacheChunkPublished = true;
+              publishMap();
+            }
           });
           if (!isCurrent()) return;
-          if (cacheResult?.expired) {
-            await catalogKVStorage.removeItem?.(`${scopeKey}:manifest`);
-          } else if (cacheResult) {
+          if (cacheResult && !cacheResult.expired) {
+            cacheHydrated = true;
             publishMap();
             setInventorySummary(inventoryIndexRef.current.snapshot());
             setCatalogComplete(true);
             setRefreshing(false);
-          } else if (productMapRef.current.size) {
+          } else if (!cacheResult?.expired && productMapRef.current.size) {
             // A corrupt/incomplete cache must not leak partial stale data into an offline session.
             productMapRef.current.clear();
             barcodeIndexRef.current.clear();
@@ -562,20 +765,26 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     };
   }, [accountId, activeCacheKey, mapSnapshotDoc, refreshTick, user?.uid]);
 
+  const getProductById = useCallback(
+    (id: string): Product | undefined => {
+      if (!id) return undefined;
+      return visibleProductsById.get(id);
+    },
+    [visibleProductsById]
+  );
+
   // 2. Construcción de Índice en Memoria Hash O(1) para Códigos de Barras y SKUs
   // 3. Búsqueda instantánea O(1) por código de barras
   const findByBarcode = useCallback(
     (code: string): ScannedProductMatch | null => {
       if (!code) return null;
       const normalized = normalizeCode(code);
+      if (!normalized) return null;
 
-      // Intento en O(1) con el Map hash
-      const indexedMatch = barcodeIndexScopeRef.current === activeCacheKey
-        ? barcodeIndexRef.current.get(normalized)
-        : undefined;
-      if (indexedMatch) return indexedMatch;
+      if (barcodeIndexScopeRef.current === activeCacheKey) {
+        return barcodeIndexRef.current.get(normalized) || null;
+      }
 
-      // Fallback a motor exhaustivo de product-search usando productMapRef para mantener identidad de función estable
       const searchMatch = findProductByBarcode(Array.from(productMapRef.current.values()), code);
       return searchMatch || null;
     },
@@ -584,48 +793,43 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
   const findByBarcodeRemote = useCallback(async (code: string): Promise<ScannedProductMatch | null> => {
     if (!accountId || !code?.trim()) return null;
-    const indexedMatch = barcodeIndexScopeRef.current === activeCacheKey
+    const localMatch = barcodeIndexScopeRef.current === activeCacheKey
       ? barcodeIndexRef.current.get(code)
-      : undefined;
-    const localMatch = indexedMatch || findProductByBarcode(Array.from(productMapRef.current.values()), code);
+      : findProductByBarcode(Array.from(productMapRef.current.values()), code);
     if (localMatch) return localMatch;
     if (catalogComplete && authoritativeSnapshotReadyRef.current && !refreshing && !error) return null;
     const { findByBarcodeRemote: findRemote } = await import('@/services/inventory-kardex-service');
     return findRemote(accountId, code);
   }, [accountId, activeCacheKey, catalogComplete, error, refreshing]);
 
-  // Product changes adjust categories and stock KPIs incrementally.
-  const stats = catalogComplete && productsScopeKey === activeCacheKey
-    ? inventorySummary.stats
-    : DEFAULT_STATS;
-  const criticalAlerts = catalogComplete && productsScopeKey === activeCacheKey
-    ? inventorySummary.alerts
-    : [];
-  const visibleCategories = productsScopeKey === activeCacheKey ? categories : ['Todos'];
+  const isCurrentScopePublished = catalogComplete && productsState.scopeKey === activeCacheKey;
+  const stats = isCurrentScopePublished ? inventorySummary.stats : DEFAULT_STATS;
+  const criticalAlerts = isCurrentScopePublished ? inventorySummary.alerts : EMPTY_ALERTS;
+  const visibleCategories = productsState.scopeKey === activeCacheKey ? categories : DEFAULT_CATEGORIES;
 
   // 6. Monitoreo de stock crítico para alertas locales
   useEffect(() => {
     if (criticalAlerts.length > previousAlertCount.current && previousAlertCount.current > 0) {
-      console.log(`[ProductsContext] Alerta: ${criticalAlerts.length} productos con stock crítico en sucursal ${branchId}`);
+      console.log(`[ProductsContext] Alerta: ${criticalAlerts.length} productos con stock crítico en sucursal ${effectiveBranchId}`);
     }
     previousAlertCount.current = criticalAlerts.length;
-  }, [criticalAlerts.length, branchId]);
+  }, [criticalAlerts.length, effectiveBranchId]);
 
   // 7. Helpers de stock por sucursal
   const getProductStockHelper = useCallback(
     (product: Product, branchIdOverride?: string): number => {
-      const targetBranch = branchIdOverride || branchId || 'main';
+      const targetBranch = branchIdOverride || effectiveBranchId;
       return getBranchStock(product, targetBranch);
     },
-    [branchId]
+    [effectiveBranchId]
   );
 
   const getProductAvailableStockHelper = useCallback(
     (product: Product, branchIdOverride?: string): number => {
-      const targetBranch = branchIdOverride || branchId || 'main';
+      const targetBranch = branchIdOverride || effectiveBranchId;
       return getAvailableStock(product, targetBranch);
     },
-    [branchId]
+    [effectiveBranchId]
   );
 
   const refreshProducts = useCallback(() => {
@@ -721,42 +925,50 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     };
   }, [accountId, productPlanLimit, refreshAccess]);
 
-  const contextValue = useMemo(
+  const contextValue = useMemo<ProductsContextType>(
     () => ({
       products: visibleProducts,
+      productsById: visibleProductsById,
+      catalogIndex,
       loading: visibleProducts.length === 0 && !catalogComplete && refreshing,
       refreshing,
-      catalogComplete: catalogComplete && productsScopeKey === activeCacheKey,
+      catalogComplete: catalogComplete && productsState.scopeKey === activeCacheKey,
       error,
       categories: visibleCategories,
       stats,
       criticalAlerts,
       productPlanLimit,
+      getProductById,
       findByBarcode,
       findByBarcodeRemote,
       getProductStock: getProductStockHelper,
       getProductAvailableStock: getProductAvailableStockHelper,
       refreshProducts,
       upsertProduct,
+      upsertProductsBatch,
       validateProductCreation,
     }),
     [
       visibleProducts,
+      visibleProductsById,
+      catalogIndex,
       catalogComplete,
       refreshing,
-      productsScopeKey,
+      productsState.scopeKey,
       activeCacheKey,
       error,
       visibleCategories,
       stats,
       criticalAlerts,
       productPlanLimit,
+      getProductById,
       findByBarcode,
       findByBarcodeRemote,
       getProductStockHelper,
       getProductAvailableStockHelper,
       refreshProducts,
       upsertProduct,
+      upsertProductsBatch,
       validateProductCreation,
     ]
   );

@@ -1,5 +1,6 @@
 import type { Product } from '@/types';
-import { getAllPresentations, getBranchStock, normalizeCode, type ScannedProductMatch } from '@/lib/product-search';
+import { normalizePresentation } from '@/lib/presentation-parity';
+import { getBranchStock, normalizeCode, type ScannedProductMatch } from '@/lib/product-search';
 
 export interface CatalogInventoryStats {
   totalProducts: number;
@@ -10,9 +11,16 @@ export interface CatalogInventoryStats {
   outOfStockCount: number;
 }
 
+export interface CatalogInventoryAlert {
+  productId: string;
+  name: string;
+  currentStock: number;
+  minStock: number;
+}
+
 export interface CatalogInventorySummary {
   stats: CatalogInventoryStats;
-  alerts: Array<{ productId: string; name: string; currentStock: number; minStock: number }>;
+  alerts: CatalogInventoryAlert[];
 }
 
 interface ProductInventoryContribution {
@@ -20,17 +28,19 @@ interface ProductInventoryContribution {
   inventoryValue: number;
   lowStockCount: number;
   outOfStockCount: number;
-  alert: { productId: string; name: string; currentStock: number; minStock: number } | null;
+  alert: CatalogInventoryAlert | null;
 }
 
 /** Maintains stock KPIs from changed documents instead of rescanning the full catalog. */
 export class ProductCatalogInventoryIndex {
   private readonly contributions = new Map<string, ProductInventoryContribution>();
-  private readonly alerts = new Map<string, { productId: string; name: string; currentStock: number; minStock: number }>();
+  private readonly alerts = new Map<string, CatalogInventoryAlert>();
   private activeProducts = 0;
   private inventoryValue = 0;
   private lowStockCount = 0;
   private outOfStockCount = 0;
+  private alertsDirty = true;
+  private cachedAlerts: CatalogInventoryAlert[] = [];
 
   constructor(private readonly branchId: string) {}
 
@@ -43,7 +53,9 @@ export class ProductCatalogInventoryIndex {
     this.inventoryValue -= contribution.inventoryValue;
     this.lowStockCount -= contribution.lowStockCount;
     this.outOfStockCount -= contribution.outOfStockCount;
-    this.alerts.delete(productId);
+    if (this.alerts.delete(productId)) {
+      this.alertsDirty = true;
+    }
   }
 
   upsert(product: Product): void {
@@ -75,7 +87,10 @@ export class ProductCatalogInventoryIndex {
     this.inventoryValue += inventoryValue;
     this.lowStockCount += lowStockCount;
     this.outOfStockCount += outOfStockCount;
-    if (alert) this.alerts.set(product.id, alert);
+    if (alert) {
+      this.alerts.set(product.id, alert);
+      this.alertsDirty = true;
+    }
   }
 
   remove(productId: string): void {
@@ -89,10 +104,16 @@ export class ProductCatalogInventoryIndex {
     this.inventoryValue = 0;
     this.lowStockCount = 0;
     this.outOfStockCount = 0;
+    this.alertsDirty = false;
+    this.cachedAlerts = [];
   }
 
   snapshot(): CatalogInventorySummary {
     const roundedValue = Math.round(this.inventoryValue * 100) / 100;
+    if (this.alertsDirty) {
+      this.cachedAlerts = Array.from(this.alerts.values());
+      this.alertsDirty = false;
+    }
     return {
       stats: {
         totalProducts: this.activeProducts,
@@ -102,7 +123,7 @@ export class ProductCatalogInventoryIndex {
         lowStockCount: this.lowStockCount,
         outOfStockCount: this.outOfStockCount,
       },
-      alerts: Array.from(this.alerts.values()),
+      alerts: this.cachedAlerts,
     };
   }
 }
@@ -147,22 +168,37 @@ export class ProductCatalogCategoryIndex {
   }
 }
 
+interface CodeCandidate {
+  match: ScannedProductMatch;
+  unconditional: boolean;
+}
+
+interface SingleCodeEntry {
+  productId: string;
+  match: ScannedProductMatch;
+  unconditional: boolean;
+}
+
 /** Indexes only codes owned by each product, so snapshot changes touch O(codes in changed docs). */
 export class ProductCatalogIndex {
-  private readonly byCode = new Map<string, Map<string, { match: ScannedProductMatch; unconditional: boolean }>>();
-  private readonly codesByProduct = new Map<string, Set<string>>();
+  private readonly byCode = new Map<string, SingleCodeEntry | Map<string, CodeCandidate>>();
+  private readonly codesByProduct = new Map<string, string | string[]>();
 
   get(code: string): ScannedProductMatch | undefined {
     const normalized = normalizeCode(code);
-    const candidates = this.byCode.get(normalized);
-    if (!candidates?.size) return undefined;
+    if (!normalized) return undefined;
+    const entry = this.byCode.get(normalized);
+    if (!entry) return undefined;
+    if (!(entry instanceof Map)) return entry.match;
+    if (!entry.size) return undefined;
+
     // Firestore's un-ordered account query yields stable document-id ordering. Preserve its
     // previous last-writer behavior for duplicate codes without rebuilding the whole index.
     let unconditionalMatch: ScannedProductMatch | undefined;
     let unconditionalId = '';
     let conditionalMatch: ScannedProductMatch | undefined;
     let conditionalId = '';
-    for (const [productId, candidate] of candidates) {
+    for (const [productId, candidate] of entry) {
       if (candidate.unconditional) {
         if (!unconditionalMatch || productId.localeCompare(unconditionalId) > 0) {
           unconditionalId = productId;
@@ -176,13 +212,39 @@ export class ProductCatalogIndex {
     return unconditionalMatch || conditionalMatch;
   }
 
+  private removeCodeForProduct(code: string, productId: string): void {
+    const entry = this.byCode.get(code);
+    if (!entry) return;
+    if (!(entry instanceof Map)) {
+      if (entry.productId === productId) {
+        this.byCode.delete(code);
+      }
+      return;
+    }
+    entry.delete(productId);
+    if (entry.size === 0) {
+      this.byCode.delete(code);
+    } else if (entry.size === 1) {
+      const first = entry.entries().next().value;
+      if (first) {
+        this.byCode.set(code, {
+          productId: first[0],
+          match: first[1].match,
+          unconditional: first[1].unconditional,
+        });
+      }
+    }
+  }
+
   remove(productId: string): void {
     const codes = this.codesByProduct.get(productId);
     if (!codes) return;
-    for (const code of codes) {
-      const matches = this.byCode.get(code);
-      matches?.delete(productId);
-      if (matches?.size === 0) this.byCode.delete(code);
+    if (typeof codes === 'string') {
+      this.removeCodeForProduct(codes, productId);
+    } else {
+      for (let i = 0; i < codes.length; i += 1) {
+        this.removeCodeForProduct(codes[i], productId);
+      }
     }
     this.codesByProduct.delete(productId);
   }
@@ -190,7 +252,7 @@ export class ProductCatalogIndex {
   upsert(product: Product): void {
     this.remove(product.id);
     if (product.active === false) return;
-    const productMatches = new Map<string, { match: ScannedProductMatch; unconditional: boolean }>();
+    const productMatches = new Map<string, CodeCandidate>();
     const set = (code: string | undefined, match: ScannedProductMatch, overwrite: boolean) => {
       const normalized = normalizeCode(code);
       if (normalized && (overwrite || !productMatches.has(normalized))) {
@@ -198,26 +260,78 @@ export class ProductCatalogIndex {
       }
     };
 
-    set(product.barcode, { product }, true);
-    set(product.sku, { product }, false);
-    for (const code of Array.isArray(product.barcodes) ? product.barcodes : []) set(code, { product }, false);
-    for (const presentation of getAllPresentations(product)) {
-      set(presentation.barcode, { product, matchedPresentation: presentation }, true);
+    if (product.barcode) set(product.barcode, { product }, true);
+    if (product.sku) set(product.sku, { product }, false);
+    if (Array.isArray(product.barcodes)) {
+      for (let i = 0; i < product.barcodes.length; i += 1) {
+        set(product.barcodes[i], { product }, false);
+      }
     }
-    for (const variant of Array.isArray(product.variants) ? product.variants : []) {
-      set(variant.barcode, { product, matchedVariant: variant }, true);
-      set(variant.sku, { product, matchedVariant: variant }, false);
+    if (Array.isArray(product.presentations)) {
+      for (let i = 0; i < product.presentations.length; i += 1) {
+        const presentation = product.presentations[i];
+        if (presentation?.barcode) {
+          set(presentation.barcode, { product, matchedPresentation: normalizePresentation(presentation) }, true);
+        }
+      }
+    }
+    if (product.branchPrices) {
+      for (const config of Object.values(product.branchPrices)) {
+        if (Array.isArray(config?.presentations)) {
+          for (let i = 0; i < config.presentations.length; i += 1) {
+            const presentation = config.presentations[i];
+            if (presentation?.barcode) {
+              set(
+                presentation.barcode,
+                { product, matchedPresentation: normalizePresentation(presentation) },
+                true
+              );
+            }
+          }
+        }
+      }
+    }
+    if (Array.isArray(product.variants)) {
+      for (let i = 0; i < product.variants.length; i += 1) {
+        const variant = product.variants[i];
+        if (variant?.barcode) set(variant.barcode, { product, matchedVariant: variant }, true);
+        if (variant?.sku) set(variant.sku, { product, matchedVariant: variant }, false);
+      }
     }
 
-    const ownedCodes = new Set(productMatches.keys());
-    this.codesByProduct.set(product.id, ownedCodes);
+    if (productMatches.size === 0) return;
+
+    if (productMatches.size === 1) {
+      const onlyCode = productMatches.keys().next().value as string;
+      this.codesByProduct.set(product.id, onlyCode);
+    } else {
+      this.codesByProduct.set(product.id, Array.from(productMatches.keys()));
+    }
+
     for (const [code, candidate] of productMatches) {
-      let matches = this.byCode.get(code);
-      if (!matches) {
-        matches = new Map();
-        this.byCode.set(code, matches);
+      const existing = this.byCode.get(code);
+      if (!existing) {
+        this.byCode.set(code, {
+          productId: product.id,
+          match: candidate.match,
+          unconditional: candidate.unconditional,
+        });
+      } else if (!(existing instanceof Map)) {
+        if (existing.productId === product.id) {
+          existing.match = candidate.match;
+          existing.unconditional = candidate.unconditional;
+        } else {
+          const bucket = new Map<string, CodeCandidate>();
+          bucket.set(existing.productId, {
+            match: existing.match,
+            unconditional: existing.unconditional,
+          });
+          bucket.set(product.id, candidate);
+          this.byCode.set(code, bucket);
+        }
+      } else {
+        existing.set(product.id, candidate);
       }
-      matches.set(product.id, candidate);
     }
   }
 

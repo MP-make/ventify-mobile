@@ -9,7 +9,7 @@
 import * as Notifications from 'expo-notifications';
 import * as Haptics from 'expo-haptics';
 import Constants from 'expo-constants';
-import { Platform } from 'react-native';
+import { AppState, Platform } from 'react-native';
 import {
   collection,
   doc,
@@ -37,6 +37,7 @@ Notifications.setNotificationHandler({
 });
 
 let channelsInitialized = false;
+let initNotificationsPromise: Promise<boolean> | null = null;
 
 export type VentifyNotificationChannelId =
   | 'critical_stock'
@@ -96,73 +97,79 @@ export const getNotificationPermissionStatus = async (): Promise<Notifications.P
  */
 export const initNotifications = async (): Promise<boolean> => {
   if (channelsInitialized) return true;
+  if (initNotificationsPromise) return initNotificationsPromise;
 
-  try {
-    const { status: existingStatus } = await Notifications.getPermissionsAsync();
-    let finalStatus = existingStatus;
+  initNotificationsPromise = (async () => {
+    try {
+      const { status: existingStatus } = await Notifications.getPermissionsAsync();
+      let finalStatus = existingStatus;
 
-    if (existingStatus !== 'granted') {
-      const { status } = await Notifications.requestPermissionsAsync();
-      finalStatus = status;
-    }
+      if (existingStatus !== 'granted') {
+        const { status } = await Notifications.requestPermissionsAsync();
+        finalStatus = status;
+      }
 
-    if (finalStatus !== 'granted') {
-      console.warn('[NotificationService] Permiso de notificaciones denegado por el usuario.');
+      if (finalStatus !== 'granted') {
+        console.warn('[NotificationService] Permiso de notificaciones denegado por el usuario.');
+        return false;
+      }
+
+      if (Platform.OS === 'android') {
+        await Promise.all([
+          Notifications.setNotificationChannelAsync('critical_stock', {
+            name: 'Stock Crítico',
+            description: 'Alertas de productos con inventario bajo o agotado',
+            importance: Notifications.AndroidImportance.HIGH,
+            vibrationPattern: [0, 250, 250, 250],
+            lightColor: '#EF4444',
+            sound: 'default',
+            enableVibrate: true,
+            showBadge: true,
+          }),
+          Notifications.setNotificationChannelAsync('sunat_alerts', {
+            name: 'Alertas SUNAT',
+            description: 'Comprobantes observados o con incidencias tributarias',
+            importance: Notifications.AndroidImportance.HIGH,
+            vibrationPattern: [0, 300, 200, 300],
+            lightColor: '#F59E0B',
+            sound: 'default',
+            enableVibrate: true,
+            showBadge: true,
+          }),
+          Notifications.setNotificationChannelAsync('cash_shifts', {
+            name: 'Cierres de Turno y Caja',
+            description: 'Notificaciones de arqueos, aperturas y Cierres Z',
+            importance: Notifications.AndroidImportance.DEFAULT,
+            vibrationPattern: [0, 150, 150, 150],
+            lightColor: '#10B981',
+            sound: 'default',
+            enableVibrate: true,
+            showBadge: false,
+          }),
+          Notifications.setNotificationChannelAsync('general_alerts', {
+            name: 'Alertas Generales',
+            description: 'Avisos operativos, reservas, fiados y cotizaciones',
+            importance: Notifications.AndroidImportance.DEFAULT,
+            vibrationPattern: [0, 200, 150, 200],
+            lightColor: '#315BE8',
+            sound: 'default',
+            enableVibrate: true,
+            showBadge: true,
+          }),
+        ]);
+      }
+
+      channelsInitialized = true;
+      return true;
+    } catch (err) {
+      console.warn('[NotificationService] Error inicializando notificaciones:', err);
       return false;
+    } finally {
+      initNotificationsPromise = null;
     }
+  })();
 
-    if (Platform.OS === 'android') {
-      await Notifications.setNotificationChannelAsync('critical_stock', {
-        name: 'Stock Crítico',
-        description: 'Alertas de productos con inventario bajo o agotado',
-        importance: Notifications.AndroidImportance.HIGH,
-        vibrationPattern: [0, 250, 250, 250],
-        lightColor: '#EF4444',
-        sound: 'default',
-        enableVibrate: true,
-        showBadge: true,
-      });
-
-      await Notifications.setNotificationChannelAsync('sunat_alerts', {
-        name: 'Alertas SUNAT',
-        description: 'Comprobantes observados o con incidencias tributarias',
-        importance: Notifications.AndroidImportance.HIGH,
-        vibrationPattern: [0, 300, 200, 300],
-        lightColor: '#F59E0B',
-        sound: 'default',
-        enableVibrate: true,
-        showBadge: true,
-      });
-
-      await Notifications.setNotificationChannelAsync('cash_shifts', {
-        name: 'Cierres de Turno y Caja',
-        description: 'Notificaciones de arqueos, aperturas y Cierres Z',
-        importance: Notifications.AndroidImportance.DEFAULT,
-        vibrationPattern: [0, 150, 150, 150],
-        lightColor: '#10B981',
-        sound: 'default',
-        enableVibrate: true,
-        showBadge: false,
-      });
-
-      await Notifications.setNotificationChannelAsync('general_alerts', {
-        name: 'Alertas Generales',
-        description: 'Avisos operativos, reservas, fiados y cotizaciones',
-        importance: Notifications.AndroidImportance.DEFAULT,
-        vibrationPattern: [0, 200, 150, 200],
-        lightColor: '#315BE8',
-        sound: 'default',
-        enableVibrate: true,
-        showBadge: true,
-      });
-    }
-
-    channelsInitialized = true;
-    return true;
-  } catch (err) {
-    console.warn('[NotificationService] Error inicializando notificaciones:', err);
-    return false;
-  }
+  return initNotificationsPromise;
 };
 
 /**
@@ -313,40 +320,47 @@ const toEpochMillis = (value: any): number => {
   return Date.now();
 };
 
-/**
- * Suscribe en tiempo real a las notificaciones in-app de la cuenta (`account_notifications`),
- * compatible con el índice `(accountId ASC, createdAt DESC)` de Firestore.
- */
-export const subscribeAccountNotifications = (
-  accountId: string,
-  branchId: string | null | undefined,
-  cb: (notifications: AccountNotification[]) => void,
-  onError?: (error: Error) => void
-): Unsubscribe => {
-  if (!accountId) {
-    cb([]);
-    return () => {};
-  }
+interface NotificationSubscriber {
+  cb: (notifications: AccountNotification[]) => void;
+  onError?: (error: Error) => void;
+}
+
+interface SharedNotificationChannel {
+  key: string;
+  accountId: string;
+  branchId?: string | null;
+  subscribers: Set<NotificationSubscriber>;
+  lastItems: AccountNotification[] | null;
+  unsubscribeFirestore: Unsubscribe | null;
+  appStateSub: { remove: () => void } | null;
+  backgroundPauseTimer: ReturnType<typeof setTimeout> | null;
+}
+
+const sharedNotificationChannels = new Map<string, SharedNotificationChannel>();
+const NOTIFICATION_BACKGROUND_PAUSE_MS = 15_000;
+
+function attachNotificationFirestoreListener(channel: SharedNotificationChannel): void {
+  if (channel.unsubscribeFirestore || channel.subscribers.size === 0) return;
 
   const notifQuery = query(
     collection(db, 'account_notifications'),
-    where('accountId', '==', accountId),
+    where('accountId', '==', channel.accountId),
     orderBy('createdAt', 'desc'),
     limit(40)
   );
 
-  return onSnapshot(
+  channel.unsubscribeFirestore = onSnapshot(
     notifQuery,
     (snapshot) => {
       const items: AccountNotification[] = [];
       snapshot.forEach((docSnap) => {
         const data = docSnap.data() || {};
-        if (branchId && data.branchId && data.branchId !== branchId) {
+        if (channel.branchId && data.branchId && data.branchId !== channel.branchId) {
           return;
         }
         items.push({
           id: docSnap.id,
-          accountId: String(data.accountId || accountId),
+          accountId: String(data.accountId || channel.accountId),
           branchId: data.branchId ? String(data.branchId) : undefined,
           title: String(data.title || 'Notificación de Ventify'),
           body: String(data.body || ''),
@@ -359,15 +373,102 @@ export const subscribeAccountNotifications = (
           createdByName: data.createdByName ?? null,
         });
       });
-      cb(items);
+      channel.lastItems = items;
+      for (const sub of channel.subscribers) {
+        sub.cb(items);
+      }
     },
     (err) => {
       console.warn('[NotificationService] subscribeAccountNotifications error:', err);
-      if (onError) {
-        onError(err instanceof Error ? err : new Error('No se pudieron cargar las notificaciones.'));
+      const normalizedError = err instanceof Error ? err : new Error('No se pudieron cargar las notificaciones.');
+      for (const sub of channel.subscribers) {
+        sub.onError?.(normalizedError);
       }
     }
   );
+}
+
+/**
+ * Suscribe en tiempo real a las notificaciones in-app de la cuenta (`account_notifications`),
+ * multiplexando un único listener por `(accountId, branchId)` entre Header, Settings y Notifications.
+ */
+export const subscribeAccountNotifications = (
+  accountId: string,
+  branchId: string | null | undefined,
+  cb: (notifications: AccountNotification[]) => void,
+  onError?: (error: Error) => void
+): Unsubscribe => {
+  if (!accountId) {
+    cb([]);
+    return () => {};
+  }
+
+  const key = `${accountId}:${branchId || 'all'}`;
+  let channel = sharedNotificationChannels.get(key);
+  if (!channel) {
+    channel = {
+      key,
+      accountId,
+      branchId,
+      subscribers: new Set(),
+      lastItems: null,
+      unsubscribeFirestore: null,
+      appStateSub: null,
+      backgroundPauseTimer: null,
+    };
+    sharedNotificationChannels.set(key, channel);
+
+    if (typeof AppState?.addEventListener === 'function') {
+      const targetChannel = channel;
+      targetChannel.appStateSub = AppState.addEventListener('change', (nextState) => {
+        if (nextState === 'active') {
+          if (targetChannel.backgroundPauseTimer) {
+            clearTimeout(targetChannel.backgroundPauseTimer);
+            targetChannel.backgroundPauseTimer = null;
+          }
+          attachNotificationFirestoreListener(targetChannel);
+        } else if (nextState === 'background' || nextState === 'inactive') {
+          if (!targetChannel.backgroundPauseTimer && targetChannel.unsubscribeFirestore) {
+            targetChannel.backgroundPauseTimer = setTimeout(() => {
+              targetChannel.backgroundPauseTimer = null;
+              if (AppState.currentState !== 'active' && targetChannel.unsubscribeFirestore) {
+                targetChannel.unsubscribeFirestore();
+                targetChannel.unsubscribeFirestore = null;
+              }
+            }, NOTIFICATION_BACKGROUND_PAUSE_MS);
+          }
+        }
+      });
+    }
+  }
+
+  const subscriber: NotificationSubscriber = { cb, onError };
+  channel.subscribers.add(subscriber);
+  if (channel.lastItems) {
+    cb(channel.lastItems);
+  }
+  if (typeof AppState?.currentState !== 'string' || AppState.currentState === 'active') {
+    attachNotificationFirestoreListener(channel);
+  } else if (!channel.unsubscribeFirestore) {
+    attachNotificationFirestoreListener(channel);
+  }
+
+  return () => {
+    const activeChannel = sharedNotificationChannels.get(key);
+    if (!activeChannel) return;
+    activeChannel.subscribers.delete(subscriber);
+    if (activeChannel.subscribers.size === 0) {
+      if (activeChannel.backgroundPauseTimer) {
+        clearTimeout(activeChannel.backgroundPauseTimer);
+        activeChannel.backgroundPauseTimer = null;
+      }
+      activeChannel.appStateSub?.remove?.();
+      activeChannel.appStateSub = null;
+      activeChannel.unsubscribeFirestore?.();
+      activeChannel.unsubscribeFirestore = null;
+      sharedNotificationChannels.delete(key);
+    }
+  };
 };
 
 /**

@@ -8,6 +8,8 @@ import React, {
   useMemo,
   useRef,
 } from 'react';
+import { AppState } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   doc,
   onSnapshot,
@@ -19,7 +21,6 @@ import {
   setDoc,
   serverTimestamp,
 } from 'firebase/firestore';
-import NetInfo from '@react-native-community/netinfo';
 import { db, auth, APP_URL } from '@/lib/firebase';
 import { useAuth } from './AuthContext';
 import { hasAllBranchesAccess } from '@/lib/branch-access';
@@ -34,7 +35,63 @@ import {
 import {
   processOfflineQueue,
   getOfflineQueue,
+  subscribeOfflineQueueChanges,
+  offlineSaleBelongsToIdentity,
+  type PendingOfflineSale,
 } from '@/services/offline-sync-service';
+
+export const SETTINGS_CACHE_PREFIX = '@ventify_settings_cache_v1:';
+export const CASH_SESSION_CACHE_PREFIX = '@ventify_cash_session_cache_v1:';
+
+interface CachedAccountSettings {
+  primaryColor?: string;
+  businessSettings?: BusinessSettings;
+  posSettings?: PosSettings;
+  allPaymentMethods?: PosPaymentMethodConfig[];
+  discountSettings?: DiscountSettings;
+  branches?: Branch[];
+  invoicingEnabled?: boolean;
+  invoicingConfigRaw?: {
+    isAmazonExempt?: boolean;
+    taxExemptionCode?: string;
+    taxRate?: number;
+    printedFormatResolution?: string | null;
+    emitterRuc?: string;
+    emitterRazonSocial?: string;
+    emitterNombreComercial?: string;
+  } | null;
+}
+
+const safeStorageGet = async (key: string): Promise<string | null> => {
+  try {
+    const value = await Promise.resolve(AsyncStorage?.getItem?.(key));
+    return typeof value === 'string' ? value : null;
+  } catch {
+    return null;
+  }
+};
+
+const safeStorageSet = async (key: string, value: string): Promise<void> => {
+  try {
+    await Promise.resolve(AsyncStorage?.setItem?.(key, value));
+  } catch {
+    // Ignore storage persistence errors
+  }
+};
+
+const safeStorageRemove = async (key: string): Promise<void> => {
+  try {
+    await Promise.resolve(AsyncStorage?.removeItem?.(key));
+  } catch {
+    // Ignore storage removal errors
+  }
+};
+
+const getCashSessionCacheKey = (
+  targetAccountId: string,
+  targetBranchId: string,
+  targetUserId: string
+): string => `${CASH_SESSION_CACHE_PREFIX}${targetAccountId}:${targetBranchId}:${targetUserId}`;
 
 import {
   resolveAccountTaxProfile,
@@ -196,6 +253,7 @@ export interface SettingsContextType {
   allPaymentMethods: PosPaymentMethodConfig[];
   isOnline: boolean;
   offlineQueueCount: number;
+  pendingOfflineSales: PendingOfflineSale[];
   refreshOfflineCount: () => Promise<number>;
   updateBusinessSettings: (patch: Partial<BusinessSettings>) => Promise<void>;
   updateBusinessData: (patch: Partial<BusinessSettings>) => Promise<void>;
@@ -232,6 +290,7 @@ const SettingsContext = createContext<SettingsContextType>({
   allPaymentMethods: DEFAULT_PAYMENT_METHODS,
   isOnline: true,
   offlineQueueCount: 0,
+  pendingOfflineSales: [],
   refreshOfflineCount: async () => 0,
   updateBusinessSettings: async () => {},
   updateBusinessData: async () => {},
@@ -250,6 +309,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     userProfile,
     role,
     allBranchesAccess,
+    isOnline,
   } = useAuth();
   const configurationScope = `${user?.uid || ''}:${accountId || ''}`;
   const [configuration, setConfiguration] = useState({ scope: configurationScope, pos: false, account: false, posError: null as string | null, accountError: null as string | null });
@@ -281,64 +341,301 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     emitterNombreComercial?: string;
   } | null>(null);
   const [allPaymentMethods, setAllPaymentMethods] = useState<PosPaymentMethodConfig[]>(DEFAULT_PAYMENT_METHODS);
-  const [isOnline, setIsOnline] = useState<boolean>(true);
   const [offlineQueueCount, setOfflineQueueCount] = useState<number>(0);
+  const [pendingOfflineSales, setPendingOfflineSales] = useState<PendingOfflineSale[]>([]);
   const branchIdRef = useRef(branchId);
   branchIdRef.current = branchId;
+  const accountIdRef = useRef<string | null>(accountId);
+  accountIdRef.current = accountId;
+  const isOnlineRef = useRef<boolean>(isOnline);
+  isOnlineRef.current = isOnline;
   const activeCashSessionRef = useRef<ActiveCashSessionData | null>(activeCashSession);
   activeCashSessionRef.current = activeCashSession;
+  const wasOfflineRef = useRef<boolean>(!isOnline);
+  const startupSyncAttemptedScopeRef = useRef<string>('');
+  const inFlightCashCheckRef = useRef<{ scope: string; promise: Promise<ActiveCashSessionData | null> } | null>(null);
+  const settingsCacheSnapshotRef = useRef<{ accountId: string; data: CachedAccountSettings } | null>(null);
+  const hydratedSettingsAccountRef = useRef<string | null>(null);
+  const prevHydratedAccountRef = useRef<string | null>(null);
+  const hasHydratedSettingsRef = useRef<boolean>(false);
+  const authoritativeSettingsRef = useRef<Record<string, boolean>>({});
+  const cashScopeRef = useRef<string | null>(null);
+  const hydratedCashSessionRef = useRef<{ key: string; session: ActiveCashSessionData } | null>(null);
+  const serverConfirmedCashScopeRef = useRef<string | null>(null);
+  const cashHydrationPromiseRef = useRef<{ key: string; promise: Promise<ActiveCashSessionData | null> } | null>(null);
+  const refreshCashStatusRef = useRef<() => void>(() => {});
 
-  // 1. Refrescar el contador de ventas offline en cola local
+  const persistSettingsSnapshot = useCallback(
+    (targetAccountId: string, patch: Partial<CachedAccountSettings>) => {
+      if (!targetAccountId) return;
+      const current =
+        settingsCacheSnapshotRef.current?.accountId === targetAccountId
+          ? settingsCacheSnapshotRef.current.data
+          : {};
+      const nextData: CachedAccountSettings = {
+        ...current,
+        ...patch,
+      };
+      settingsCacheSnapshotRef.current = { accountId: targetAccountId, data: nextData };
+
+      if (hydratedSettingsAccountRef.current === targetAccountId) {
+        void safeStorageSet(`${SETTINGS_CACHE_PREFIX}${targetAccountId}`, JSON.stringify(nextData));
+      }
+    },
+    []
+  );
+
+  const reconcileActiveBranches = useCallback(
+    (activeList: Branch[]) => {
+      const currentBranchId = branchIdRef.current;
+      if (activeList.length > 0) {
+        if (
+          !hasAllBranchesAccess({ role, allBranchesAccess, branchId: currentBranchId }) &&
+          userProfile?.branchId
+        ) {
+          const assignedExists = activeList.some((b) => b.id === userProfile.branchId);
+          if (currentBranchId === 'main' && assignedExists) {
+            syncAssignedBranchId(userProfile.branchId);
+          } else if (currentBranchId !== userProfile.branchId) {
+            setBranchId(userProfile.branchId);
+          }
+        } else if (currentBranchId === 'main' || !activeList.some((b) => b.id === currentBranchId)) {
+          setBranchId(activeList[0].id!);
+        }
+      }
+    },
+    [role, allBranchesAccess, userProfile?.branchId, syncAssignedBranchId, setBranchId]
+  );
+  const reconcileActiveBranchesRef = useRef(reconcileActiveBranches);
+  reconcileActiveBranchesRef.current = reconcileActiveBranches;
+
+  // 1. Refrescar el contador y detalle de ventas offline en cola local
   const refreshOfflineCount = useCallback(async (): Promise<number> => {
     try {
       const queue = await getOfflineQueue();
-      const count = queue.length;
-      setOfflineQueueCount(count);
-      return count;
+      const scoped =
+        user?.uid && accountId
+          ? queue.filter((item) =>
+              offlineSaleBelongsToIdentity(item.salePayload, user.uid, accountId)
+            )
+          : queue;
+      setPendingOfflineSales(scoped);
+      setOfflineQueueCount(scoped.length);
+      return scoped.length;
     } catch {
       return 0;
     }
-  }, []);
+  }, [accountId, user?.uid]);
 
-  // 2. Monitoreo reactivo de conectividad de red con NetInfo
+  // 1.5. Hidratar ajustes cacheados para arranque en frío offline
   useEffect(() => {
-    let wasOffline = false;
-    let isMounted = true;
+    if (!accountId) {
+      prevHydratedAccountRef.current = null;
+      hydratedSettingsAccountRef.current = null;
+      hasHydratedSettingsRef.current = false;
+      settingsCacheSnapshotRef.current = null;
+      authoritativeSettingsRef.current = {};
+      return;
+    }
 
-    // Estado inicial protegido contra desmontaje
-    NetInfo.fetch().then((state) => {
-      if (!isMounted) return;
-      const online = Boolean(state.isConnected && state.isInternetReachable !== false);
-      setIsOnline(online);
-      refreshOfflineCount();
-    });
+    let cancelled = false;
+    if (prevHydratedAccountRef.current !== accountId) {
+      prevHydratedAccountRef.current = accountId;
+      hydratedSettingsAccountRef.current = null;
+      hasHydratedSettingsRef.current = false;
+      settingsCacheSnapshotRef.current = { accountId, data: {} };
+      authoritativeSettingsRef.current = {};
+    }
 
-    const unsubscribeNet = NetInfo.addEventListener((state) => {
-      if (!isMounted) return;
-      const online = Boolean(state.isConnected && state.isInternetReachable !== false);
-      setIsOnline(online);
+    const hydrateSettings = async () => {
+      const raw = await safeStorageGet(`${SETTINGS_CACHE_PREFIX}${accountId}`);
+      if (cancelled) return;
 
-      // Si se recupera la conexión, disparar la cola offline de inmediato
-      if (online && wasOffline) {
-        console.log('[SettingsContext] Red restablecida. Sincronizando cola offline...');
-        processOfflineQueue(accountId || undefined)
-          .then(() => {
-            if (isMounted) refreshOfflineCount();
-          })
-          .catch((err) => {
-            console.warn('[SettingsContext] Error procesando cola offline al volver conexión:', err);
-          });
+      hydratedSettingsAccountRef.current = accountId;
+      const alreadyApplied =
+        settingsCacheSnapshotRef.current?.accountId === accountId
+          ? settingsCacheSnapshotRef.current.data
+          : {};
+
+      if (!raw) {
+        if (Object.keys(alreadyApplied).length > 0) {
+          void safeStorageSet(
+            `${SETTINGS_CACHE_PREFIX}${accountId}`,
+            JSON.stringify(alreadyApplied)
+          );
+        }
+        return;
       }
 
-      wasOffline = !online;
-      refreshOfflineCount();
+      try {
+        const parsed = JSON.parse(raw) as CachedAccountSettings | null;
+        if (!parsed || typeof parsed !== 'object') return;
+
+        hasHydratedSettingsRef.current = true;
+        const merged: CachedAccountSettings = { ...parsed, ...alreadyApplied };
+        settingsCacheSnapshotRef.current = { accountId, data: merged };
+
+        if (parsed.primaryColor && !authoritativeSettingsRef.current.appearance) {
+          setPrimaryColor(parsed.primaryColor);
+        }
+        if (parsed.businessSettings && !authoritativeSettingsRef.current.business) {
+          setBusinessSettings(parsed.businessSettings);
+        }
+        if (parsed.posSettings) {
+          if (!authoritativeSettingsRef.current.pos) {
+            setPosSettings(parsed.posSettings);
+          }
+          setConfiguration((prev) => {
+            if (
+              prev.scope === configurationScope &&
+              prev.pos &&
+              prev.account &&
+              !prev.posError &&
+              !prev.accountError
+            ) {
+              return prev;
+            }
+            return {
+              scope: configurationScope,
+              pos: true,
+              account: true,
+              posError: null,
+              accountError: null,
+            };
+          });
+        }
+        if (
+          Array.isArray(parsed.allPaymentMethods) &&
+          parsed.allPaymentMethods.length > 0 &&
+          !authoritativeSettingsRef.current.pos
+        ) {
+          setAllPaymentMethods(parsed.allPaymentMethods);
+        }
+        if (parsed.discountSettings && !authoritativeSettingsRef.current.discounts) {
+          setDiscountSettings(parsed.discountSettings);
+        }
+        if (
+          Array.isArray(parsed.branches) &&
+          parsed.branches.length > 0 &&
+          !authoritativeSettingsRef.current.branches
+        ) {
+          setBranches(parsed.branches);
+          reconcileActiveBranchesRef.current(parsed.branches);
+        }
+        if (
+          typeof parsed.invoicingEnabled === 'boolean' &&
+          !authoritativeSettingsRef.current.account
+        ) {
+          setInvoicingEnabled(parsed.invoicingEnabled);
+        }
+        if (
+          parsed.invoicingConfigRaw !== undefined &&
+          !authoritativeSettingsRef.current.invoicingConfig
+        ) {
+          setInvoicingConfigRaw(parsed.invoicingConfigRaw);
+        }
+
+        if (Object.keys(alreadyApplied).length > 0) {
+          void safeStorageSet(`${SETTINGS_CACHE_PREFIX}${accountId}`, JSON.stringify(merged));
+        }
+      } catch {
+        // Ignore malformed cached settings JSON
+      }
+    };
+
+    void hydrateSettings();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [accountId, configurationScope]);
+
+  // 2. Suscripción reactiva a cambios en cola offline y retorno a primer plano
+  useEffect(() => {
+    let isMounted = true;
+    void refreshOfflineCount();
+
+    const unsubscribeQueue = subscribeOfflineQueueChanges((event) => {
+      if (!isMounted) return;
+      void refreshOfflineCount();
+      if (event.type === 'synced' && (event.successful || 0) > 0) {
+        refreshCashStatusRef.current();
+      }
     });
+
+    const appStateSubscription =
+      typeof AppState?.addEventListener === 'function'
+        ? AppState.addEventListener('change', (nextState) => {
+            if (!isMounted || nextState !== 'active') return;
+            const activeAccountId = accountIdRef.current;
+            if (!isOnlineRef.current || !activeAccountId) return;
+            void refreshOfflineCount().then((count) => {
+              if (isMounted && isOnlineRef.current && count > 0) {
+                processOfflineQueue(activeAccountId).catch((err) => {
+                  console.warn(
+                    '[SettingsContext] Error sincronizando cola offline al volver a primer plano:',
+                    err
+                  );
+                });
+              }
+            });
+          })
+        : null;
 
     return () => {
       isMounted = false;
-      unsubscribeNet();
+      unsubscribeQueue();
+      appStateSubscription?.remove?.();
     };
-  }, [accountId, refreshOfflineCount]);
+  }, [refreshOfflineCount]);
+
+  // 2.1. Sincronizar cola offline al arrancar online o tras transición offline -> online
+  useEffect(() => {
+    let isMounted = true;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const triggerSync = (targetAccountId: string) => {
+      processOfflineQueue(targetAccountId)
+        .then(() => {
+          if (isMounted) void refreshOfflineCount();
+        })
+        .catch((err) => {
+          console.warn('[SettingsContext] Error procesando cola offline:', err);
+        });
+    };
+
+    if (isOnline && accountId) {
+      const currentScope = `${user?.uid || ''}:${accountId}`;
+      if (wasOfflineRef.current) {
+        startupSyncAttemptedScopeRef.current = currentScope;
+        reconnectTimer = setTimeout(() => {
+          reconnectTimer = null;
+          if (isMounted && isOnlineRef.current) {
+            triggerSync(accountId);
+          }
+        }, 1_500);
+      } else if (startupSyncAttemptedScopeRef.current !== currentScope) {
+        startupSyncAttemptedScopeRef.current = currentScope;
+        void refreshOfflineCount().then((count) => {
+          if (isMounted && isOnlineRef.current && count > 0) {
+            triggerSync(accountId);
+          }
+        });
+      }
+    } else if (!accountId) {
+      startupSyncAttemptedScopeRef.current = '';
+    }
+
+    wasOfflineRef.current = !isOnline;
+
+    return () => {
+      isMounted = false;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+    };
+  }, [accountId, user?.uid, isOnline, refreshOfflineCount]);
 
   // 3. Cada listener entrega el valor inicial y las actualizaciones sin duplicar lecturas.
   useEffect(() => {
@@ -348,9 +645,11 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     const appearanceRef = doc(db, 'settings', `${accountId}_appearance`);
     const applyAppearance = (snap: any) => {
       if (snap.exists()) {
+        authoritativeSettingsRef.current.appearance = true;
         const data = snap.data();
         if (data.primaryColor) {
           setPrimaryColor(data.primaryColor);
+          persistSettingsSnapshot(accountId, { primaryColor: data.primaryColor });
         }
       }
     };
@@ -363,27 +662,42 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     // 3.2. Información de negocio (RUC, razón social, dirección, teléfono, logo, series)
     const businessRef = doc(db, 'settings', `${accountId}_business`);
     const applyBusiness = (snap: any) => {
-      if (snap.exists()) {
-        const data = snap.data();
-        setBusinessSettings({
-          id: snap.id,
-          accountId,
-          businessName: data.businessName || data.name || 'Ventify POS',
-          description: data.description || '',
-          ruc: data.ruc || data.taxId || '',
-          address: data.address || data.fiscalAddress || '',
-          phone: data.phone || data.commercialPhone || '',
-          email: data.email || '',
-          website: data.website || '',
-          enableFractionalUnits: data.enableFractionalUnits !== false,
-          enableMinSalePrice: data.enableMinSalePrice !== false,
-          createdAt: data.createdAt,
-          updatedAt: data.updatedAt,
-          ...data,
-        });
-      } else {
-        setBusinessSettings({ ...DEFAULT_BUSINESS_SETTINGS, accountId });
+      if (!snap.exists()) {
+        if (
+          snap.metadata?.fromCache === true &&
+          (!isOnlineRef.current || hasHydratedSettingsRef.current)
+        ) {
+          return;
+        }
+        const defaultBiz = { ...DEFAULT_BUSINESS_SETTINGS, accountId };
+        setBusinessSettings(defaultBiz);
+        if (snap.metadata?.fromCache === false) {
+          authoritativeSettingsRef.current.business = true;
+          persistSettingsSnapshot(accountId, { businessSettings: defaultBiz });
+        }
+        return;
       }
+
+      authoritativeSettingsRef.current.business = true;
+      const data = snap.data();
+      const loadedBiz: BusinessSettings = {
+        id: snap.id,
+        accountId,
+        businessName: data.businessName || data.name || 'Ventify POS',
+        description: data.description || '',
+        ruc: data.ruc || data.taxId || '',
+        address: data.address || data.fiscalAddress || '',
+        phone: data.phone || data.commercialPhone || '',
+        email: data.email || '',
+        website: data.website || '',
+        enableFractionalUnits: data.enableFractionalUnits !== false,
+        enableMinSalePrice: data.enableMinSalePrice !== false,
+        createdAt: data.createdAt,
+        updatedAt: data.updatedAt,
+        ...data,
+      };
+      setBusinessSettings(loadedBiz);
+      persistSettingsSnapshot(accountId, { businessSettings: loadedBiz });
     };
     const unsubBusiness = subscribeLiveDocument(
       businessRef,
@@ -395,63 +709,97 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     const posRef = doc(db, 'settings', `${accountId}_pos`);
     const applyPos = (snap: any) => {
       if (snap.exists() || snap.metadata?.fromCache === false) {
-        setConfiguration(previous => ({ ...(previous.scope === configurationScope ? previous : { scope: configurationScope, pos: false, account: false, posError: null, accountError: null }), pos: true, posError: null }));
+        setConfiguration((previous) => ({
+          ...(previous.scope === configurationScope
+            ? previous
+            : { scope: configurationScope, pos: false, account: false, posError: null, accountError: null }),
+          pos: true,
+          posError: null,
+        }));
       }
-      if (snap.exists()) {
-        const data = snap.data();
-
-        const loadedPosSettings: PosSettings = {
-          id: snap.id,
-          accountId,
-          methods: Array.isArray(data.methods) && data.methods.length > 0
-            ? data.methods
-            : DEFAULT_PAYMENT_METHODS,
-          allowMixedPayment: data.allowMixedPayment !== false,
-          enableQuickSale: data.enableQuickSale !== false,
-          enableLinkedScanner: data.enableLinkedScanner === true,
-          enableDeviceCameraScanner: data.enableDeviceCameraScanner !== false,
-          enableCatalogFilters: data.enableCatalogFilters !== false,
-          enableMobileBarcodeScanner: data.enableMobileBarcodeScanner !== false,
-          enableSellerAttribution: data.enableSellerAttribution === true,
-          requireSellerSelection: data.requireSellerSelection === true,
-          defaultMethodId: data.defaultMethodId || 'efectivo',
-          ticketTemplate: data.ticketTemplate || 'standard',
-          ...data,
-        };
-
-        setPosSettings(loadedPosSettings);
-
-        if (Array.isArray(data.methods) && data.methods.length > 0) {
-          const formatted = data.methods
-            .filter((m: any) => m.kind !== 'mixed')
-            .sort((a: any, b: any) => (a.order || 0) - (b.order || 0))
-            .map((m: any, idx: number) => ({
-              ...m,
-              id: m.id,
-              name: m.name,
-              kind: m.kind || 'digital',
-              enabled: m.enabled !== false,
-              order: m.order ?? idx,
-              reportCategory: m.reportCategory || (m.kind === 'cash' ? 'cash' : 'digital'),
-              qrUrl: m.qrUrl,
-              qrLabel: m.qrLabel,
-              provider: m.provider,
-            }));
-          setAllPaymentMethods(formatted);
-        } else {
-          setAllPaymentMethods(DEFAULT_PAYMENT_METHODS);
+      if (!snap.exists()) {
+        if (
+          snap.metadata?.fromCache === true &&
+          (!isOnlineRef.current || hasHydratedSettingsRef.current)
+        ) {
+          return;
         }
-      } else {
-        setPosSettings({ ...DEFAULT_POS_SETTINGS, id: `${accountId}_pos`, accountId });
+        const defaultPos = { ...DEFAULT_POS_SETTINGS, id: `${accountId}_pos`, accountId };
+        setPosSettings(defaultPos);
         setAllPaymentMethods(DEFAULT_PAYMENT_METHODS);
+        if (snap.metadata?.fromCache === false) {
+          authoritativeSettingsRef.current.pos = true;
+          persistSettingsSnapshot(accountId, {
+            posSettings: defaultPos,
+            allPaymentMethods: DEFAULT_PAYMENT_METHODS,
+          });
+        }
+        return;
       }
+
+      authoritativeSettingsRef.current.pos = true;
+      const data = snap.data();
+
+      const loadedPosSettings: PosSettings = {
+        id: snap.id,
+        accountId,
+        methods: Array.isArray(data.methods) && data.methods.length > 0
+          ? data.methods
+          : DEFAULT_PAYMENT_METHODS,
+        allowMixedPayment: data.allowMixedPayment !== false,
+        enableQuickSale: data.enableQuickSale !== false,
+        enableLinkedScanner: data.enableLinkedScanner === true,
+        enableDeviceCameraScanner: data.enableDeviceCameraScanner !== false,
+        enableCatalogFilters: data.enableCatalogFilters !== false,
+        enableMobileBarcodeScanner: data.enableMobileBarcodeScanner !== false,
+        enableSellerAttribution: data.enableSellerAttribution === true,
+        requireSellerSelection: data.requireSellerSelection === true,
+        defaultMethodId: data.defaultMethodId || 'efectivo',
+        ticketTemplate: data.ticketTemplate || 'standard',
+        ...data,
+      };
+
+      setPosSettings(loadedPosSettings);
+
+      let formattedMethods: PosPaymentMethodConfig[];
+      if (Array.isArray(data.methods) && data.methods.length > 0) {
+        formattedMethods = data.methods
+          .filter((m: any) => m.kind !== 'mixed')
+          .sort((a: any, b: any) => (a.order || 0) - (b.order || 0))
+          .map((m: any, idx: number) => ({
+            ...m,
+            id: m.id,
+            name: m.name,
+            kind: m.kind || 'digital',
+            enabled: m.enabled !== false,
+            order: m.order ?? idx,
+            reportCategory: m.reportCategory || (m.kind === 'cash' ? 'cash' : 'digital'),
+            qrUrl: m.qrUrl,
+            qrLabel: m.qrLabel,
+            provider: m.provider,
+          }));
+      } else {
+        formattedMethods = DEFAULT_PAYMENT_METHODS;
+      }
+      setAllPaymentMethods(formattedMethods);
+      persistSettingsSnapshot(accountId, {
+        posSettings: loadedPosSettings,
+        allPaymentMethods: formattedMethods,
+      });
     };
     const unsubPos = subscribeLiveDocument(
       posRef,
       applyPos,
       (err) => {
         console.warn('[SettingsContext] pos snapshot error:', err);
-        setConfiguration(previous => ({ ...(previous.scope === configurationScope ? previous : { scope: configurationScope, pos: false, account: false, posError: null, accountError: null }), pos: false, posError: 'No se pudo cargar la configuración de pagos. Comprueba la conexión y pulsa Reintentar.' }));
+        if (!isOnlineRef.current && hasHydratedSettingsRef.current) return;
+        setConfiguration((previous) => ({
+          ...(previous.scope === configurationScope
+            ? previous
+            : { scope: configurationScope, pos: false, account: false, posError: null, accountError: null }),
+          pos: false,
+          posError: 'No se pudo cargar la configuración de pagos. Comprueba la conexión y pulsa Reintentar.',
+        }));
       }
     );
 
@@ -459,40 +807,80 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     const accountRef = doc(db, 'accounts', accountId);
     const applyAccount = (snap: any) => {
       if (snap.exists() || snap.metadata?.fromCache === false) {
-        setConfiguration(previous => ({ ...(previous.scope === configurationScope ? previous : { scope: configurationScope, pos: false, account: false, posError: null, accountError: null }), account: true, accountError: null }));
+        setConfiguration((previous) => ({
+          ...(previous.scope === configurationScope
+            ? previous
+            : { scope: configurationScope, pos: false, account: false, posError: null, accountError: null }),
+          account: true,
+          accountError: null,
+        }));
       }
-      if (snap.exists()) {
-        const data = snap.data();
-        setInvoicingEnabled(Boolean(data.invoicingEnabled));
-      } else {
+      if (!snap.exists()) {
+        if (
+          snap.metadata?.fromCache === true &&
+          (!isOnlineRef.current || hasHydratedSettingsRef.current)
+        ) {
+          return;
+        }
         setInvoicingEnabled(false);
+        if (snap.metadata?.fromCache === false) {
+          authoritativeSettingsRef.current.account = true;
+          persistSettingsSnapshot(accountId, { invoicingEnabled: false });
+        }
+        return;
       }
+
+      authoritativeSettingsRef.current.account = true;
+      const data = snap.data();
+      const enabled = Boolean(data.invoicingEnabled);
+      setInvoicingEnabled(enabled);
+      persistSettingsSnapshot(accountId, { invoicingEnabled: enabled });
     };
     const unsubAccount = subscribeLiveDocument(
       accountRef,
       applyAccount,
       (err) => {
         console.warn('[SettingsContext] account snapshot error:', err);
-        setConfiguration(previous => ({ ...(previous.scope === configurationScope ? previous : { scope: configurationScope, pos: false, account: false, posError: null, accountError: null }), account: false, accountError: 'No se pudo verificar la configuración de comprobantes. Comprueba la conexión y pulsa Reintentar.' }));
+        if (!isOnlineRef.current && hasHydratedSettingsRef.current) return;
+        setConfiguration((previous) => ({
+          ...(previous.scope === configurationScope
+            ? previous
+            : { scope: configurationScope, pos: false, account: false, posError: null, accountError: null }),
+          account: false,
+          accountError: 'No se pudo verificar la configuración de comprobantes. Comprueba la conexión y pulsa Reintentar.',
+        }));
       }
     );
 
     // 3.5. Reglas de promociones y regalos (`settings/${accountId}_discounts`)
     const discountsRef = doc(db, 'settings', `${accountId}_discounts`);
     const applyDiscounts = (snap: any) => {
-      if (snap.exists()) {
-        const d = snap.data() || {};
-        setDiscountSettings({
-          enableGifts: d.enableGifts !== false,
-          giftProductIds: Array.isArray(d.giftProductIds) ? d.giftProductIds : undefined,
-          promotions: Array.isArray(d.promotions) ? d.promotions : [],
-          updatedAt: typeof d.updatedAt === 'number' ? d.updatedAt : undefined,
-        });
-      } else {
-        setDiscountSettings({
-          ...DEFAULT_DISCOUNT_SETTINGS,
-        });
+      if (!snap.exists()) {
+        if (
+          snap.metadata?.fromCache === true &&
+          (!isOnlineRef.current || hasHydratedSettingsRef.current)
+        ) {
+          return;
+        }
+        const defaultDiscounts = { ...DEFAULT_DISCOUNT_SETTINGS };
+        setDiscountSettings(defaultDiscounts);
+        if (snap.metadata?.fromCache === false) {
+          authoritativeSettingsRef.current.discounts = true;
+          persistSettingsSnapshot(accountId, { discountSettings: defaultDiscounts });
+        }
+        return;
       }
+
+      authoritativeSettingsRef.current.discounts = true;
+      const d = snap.data() || {};
+      const nextDiscounts: DiscountSettings = {
+        enableGifts: d.enableGifts !== false,
+        giftProductIds: Array.isArray(d.giftProductIds) ? d.giftProductIds : undefined,
+        promotions: Array.isArray(d.promotions) ? d.promotions : [],
+        updatedAt: typeof d.updatedAt === 'number' ? d.updatedAt : undefined,
+      };
+      setDiscountSettings(nextDiscounts);
+      persistSettingsSnapshot(accountId, { discountSettings: nextDiscounts });
     };
     const unsubDiscounts = subscribeLiveDocument(
       discountsRef,
@@ -507,7 +895,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       unsubAccount();
       unsubDiscounts();
     };
-  }, [accountId, configurationScope, configurationTick]);
+  }, [accountId, configurationScope, configurationTick, persistSettingsSnapshot]);
 
   // 3.5. Perfil tributario IGV/Amazonía y resolución SUNAT desde /api/invoicing/config
   useEffect(() => {
@@ -522,6 +910,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
     let cancelled = false;
     const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000);
 
     const loadInvoicingPublicConfig = async () => {
       try {
@@ -539,7 +928,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         if (!res.ok || cancelled) return;
         const data = await res.json().catch(() => null);
         if (!cancelled && data?.success && data?.config) {
-          setInvoicingConfigRaw({
+          const nextInvoicingConfig = {
             isAmazonExempt: data.config.isAmazonExempt,
             taxExemptionCode: data.config.taxExemptionCode,
             taxRate: data.config.taxRate,
@@ -547,10 +936,15 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
             emitterRuc: data.config.emitter?.ruc,
             emitterRazonSocial: data.config.emitter?.razonSocial,
             emitterNombreComercial: data.config.emitter?.nombreComercial,
-          });
+          };
+          authoritativeSettingsRef.current.invoicingConfig = true;
+          setInvoicingConfigRaw(nextInvoicingConfig);
+          persistSettingsSnapshot(accountId, { invoicingConfigRaw: nextInvoicingConfig });
         }
       } catch {
         // Silencioso: opera con fallback de businessSettings si no hay red o endpoint no configurado
+      } finally {
+        clearTimeout(timeoutId);
       }
     };
 
@@ -558,9 +952,10 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
     return () => {
       cancelled = true;
+      clearTimeout(timeoutId);
       controller.abort();
     };
-  }, [accountId, user?.uid, isOnline, invoicingEnabled, configurationTick]);
+  }, [accountId, user?.uid, isOnline, configurationTick, persistSettingsSnapshot]);
 
   // 4. Suscripción a sucursales de la cuenta
   useEffect(() => {
@@ -572,6 +967,15 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     );
 
     const applyBranchesSnap = (snap: any) => {
+      if (
+        snap.empty &&
+        snap.metadata?.fromCache === true &&
+        (!isOnlineRef.current || hasHydratedSettingsRef.current)
+      ) {
+        return;
+      }
+
+      authoritativeSettingsRef.current.branches = true;
       const list: Branch[] = snap.docs.map((d: any) => {
         const data = d.data();
         return {
@@ -593,19 +997,10 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
       const activeList = list.filter((b) => b.isActive !== false);
       setBranches(activeList);
+      reconcileActiveBranches(activeList);
 
-      const currentBranchId = branchIdRef.current;
-      if (activeList.length > 0) {
-        if (!hasAllBranchesAccess({ role, allBranchesAccess, branchId: currentBranchId }) && userProfile?.branchId) {
-          const assignedExists = activeList.some((b) => b.id === userProfile.branchId);
-          if (currentBranchId === 'main' && assignedExists) {
-            syncAssignedBranchId(userProfile.branchId);
-          } else if (currentBranchId !== userProfile.branchId) {
-            setBranchId(userProfile.branchId);
-          }
-        } else if (currentBranchId === 'main' || !activeList.some((b) => b.id === currentBranchId)) {
-          setBranchId(activeList[0].id!);
-        }
+      if (!snap.empty || snap.metadata?.fromCache === false) {
+        persistSettingsSnapshot(accountId, { branches: activeList });
       }
     };
 
@@ -616,25 +1011,88 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     );
 
     return () => unsubBranches();
-  }, [accountId, setBranchId, syncAssignedBranchId, role, allBranchesAccess, userProfile?.branchId]);
+  }, [accountId, persistSettingsSnapshot, reconcileActiveBranches]);
 
   // 5. Verificación y resolución determinista de la sesión activa de caja
-  const checkActiveSession = useCallback(async (): Promise<ActiveCashSessionData | null> => {
+  const checkActiveSession = useCallback(async (knownSessionId?: string | null): Promise<ActiveCashSessionData | null> => {
     if (!accountId || !user?.uid) {
+      activeCashSessionRef.current = null;
       setIsCashOpen(false);
       setActiveCashSession(null);
       return null;
     }
     const effectiveBranch = branchId || 'main';
+    const cashKey = getCashSessionCacheKey(accountId, effectiveBranch, user.uid);
+    const checkScope = `${accountId}:${effectiveBranch}:${user.uid}:${knownSessionId || ''}`;
+    if (inFlightCashCheckRef.current?.scope === checkScope) {
+      return inFlightCashCheckRef.current.promise;
+    }
 
-    try {
-      // 1. Verificar puntero determinista exclusivo del operador
-      const userPtrId = `active_${accountId}_${effectiveBranch}_${user.uid}`;
+    const getHydratedOrCachedSession = async (): Promise<ActiveCashSessionData | null> => {
+      if (hydratedCashSessionRef.current?.key === cashKey) {
+        return hydratedCashSessionRef.current.session;
+      }
+      if (cashHydrationPromiseRef.current?.key === cashKey) {
+        const hydrated = await cashHydrationPromiseRef.current.promise;
+        if (hydrated) return hydrated;
+      }
+      const raw = await safeStorageGet(cashKey);
+      if (!raw) return null;
       try {
-        const ptrSnap = await getDoc(doc(db, 'cash_register_sessions', userPtrId));
-        if (ptrSnap.exists()) {
-          const ptrData = ptrSnap.data();
-          const activeSessionId = ptrData.activeSessionId || ptrData.sessionId;
+        const parsed = JSON.parse(raw) as ActiveCashSessionData | null;
+        if (parsed && parsed.id && parsed.status === 'open') {
+          hydratedCashSessionRef.current = { key: cashKey, session: parsed };
+          return parsed;
+        }
+      } catch {
+        // Ignore malformed cached session JSON
+      }
+      return null;
+    };
+
+    const buildSessionObj = (
+      sessionId: string,
+      pointerId: string,
+      data: Record<string, any>,
+      fallbackInitialAmount?: number
+    ): ActiveCashSessionData => ({
+      id: sessionId,
+      sessionId,
+      pointerId,
+      branchId: data.branchId || effectiveBranch,
+      accountId,
+      status: 'open',
+      initialAmount: Number(data.initialAmount ?? fallbackInitialAmount ?? 0),
+      openTime: Number(data.openTime ?? data.openedAt ?? Date.now()),
+      startedBy: data.startedBy || user.uid,
+      startedByName: data.startedByName || user?.displayName || '',
+      cashSales: Number(data.cashSales ?? 0),
+      totalSales: Number(data.totalSales ?? 0),
+      expectedAmount: Number(data.expectedAmount ?? data.initialAmount ?? 0),
+      isOpen: true,
+      ...data,
+    });
+
+    const runCheck = async (): Promise<ActiveCashSessionData | null> => {
+      let ptrReadFailed = false;
+      let queryReadFailed = false;
+      let serverConfirmedClosed = false;
+
+      try {
+        // 1. Verificar puntero determinista exclusivo del operador
+        const userPtrId = `active_${accountId}_${effectiveBranch}_${user.uid}`;
+        try {
+          let activeSessionId = knownSessionId || null;
+          let ptrInitialAmount: number | undefined;
+
+          if (!activeSessionId) {
+            const ptrSnap = await getDoc(doc(db, 'cash_register_sessions', userPtrId));
+            if (ptrSnap.exists()) {
+              const ptrData = ptrSnap.data();
+              activeSessionId = ptrData.activeSessionId || ptrData.sessionId || null;
+              ptrInitialAmount = ptrData.initialAmount;
+            }
+          }
 
           if (activeSessionId) {
             const sessSnap = await getDoc(doc(db, 'cash_register_sessions', activeSessionId));
@@ -642,139 +1100,223 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
               const sData = sessSnap.data();
               // Validar que realmente sea de este operador
               if (!sData.startedBy || sData.startedBy === user.uid) {
-                const sessionObj: ActiveCashSessionData = {
-                  id: activeSessionId,
-                  sessionId: activeSessionId,
-                  pointerId: userPtrId,
-                  branchId: sData.branchId || effectiveBranch,
-                  accountId,
-                  status: 'open',
-                  initialAmount: Number(sData.initialAmount ?? ptrData.initialAmount ?? 0),
-                  openTime: Number(sData.openTime ?? Date.now()),
-                  startedBy: sData.startedBy || user.uid,
-                  startedByName: sData.startedByName || user?.displayName || '',
-                  cashSales: Number(sData.cashSales ?? 0),
-                  totalSales: Number(sData.totalSales ?? 0),
-                  expectedAmount: Number(sData.expectedAmount ?? 0),
-                  isOpen: true,
-                  ...sData,
-                };
+                const sessionObj = buildSessionObj(activeSessionId, userPtrId, sData, ptrInitialAmount);
+                hydratedCashSessionRef.current = { key: cashKey, session: sessionObj };
+                activeCashSessionRef.current = sessionObj;
+                if ((sessSnap as any).metadata?.fromCache === false || isOnlineRef.current) {
+                  serverConfirmedCashScopeRef.current = cashKey;
+                }
                 setIsCashOpen(true);
                 setActiveCashSession(sessionObj);
+                void safeStorageSet(cashKey, JSON.stringify(sessionObj));
                 return sessionObj;
               }
             }
           }
+        } catch (ptrErr) {
+          ptrReadFailed = true;
+          console.warn('[SettingsContext] Error reading user pointer:', ptrErr);
         }
-      } catch (ptrErr) {
-        console.warn('[SettingsContext] Error reading user pointer:', ptrErr);
-      }
 
-      // 2. Fallback de operador: consultar en Firestore sesión abierta donde startedBy == user.uid
-      try {
-        const q = query(
-          collection(db, 'cash_register_sessions'),
-          where('accountId', '==', accountId),
-          where('branchId', '==', effectiveBranch),
-          where('status', '==', 'open'),
-          where('startedBy', '==', user.uid)
-        );
-        const snap = await getDocs(q);
-        if (!snap.empty) {
-          const target = snap.docs[0];
-          const data = target.data();
-          const sId = target.id;
-          const sessionObj: ActiveCashSessionData = {
-            id: sId,
-            sessionId: sId,
-            pointerId: userPtrId,
-            branchId: data.branchId || effectiveBranch,
-            accountId,
-            status: 'open',
-            initialAmount: Number(data.initialAmount ?? 0),
-            openTime: Number(data.openTime ?? data.openedAt ?? Date.now()),
-            startedBy: data.startedBy,
-            startedByName: data.startedByName || user?.displayName || '',
-            cashSales: Number(data.cashSales ?? 0),
-            totalSales: Number(data.totalSales ?? 0),
-            expectedAmount: Number(data.expectedAmount ?? data.initialAmount ?? 0),
-            isOpen: true,
-            ...data,
-          };
+        // 2. Fallback de operador: consultar en Firestore sesión abierta donde startedBy == user.uid
+        try {
+          const q = query(
+            collection(db, 'cash_register_sessions'),
+            where('accountId', '==', accountId),
+            where('branchId', '==', effectiveBranch),
+            where('status', '==', 'open'),
+            where('startedBy', '==', user.uid)
+          );
+          const snap = await getDocs(q);
+          if (!snap.empty) {
+            const target = snap.docs[0];
+            const data = target.data();
+            const sId = target.id;
+            const sessionObj = buildSessionObj(sId, userPtrId, data);
 
-          // Reparar puntero del operador para lecturas directas ultra-rápidas
-          try {
-            await setDoc(
-              doc(db, 'cash_register_sessions', userPtrId),
-              {
-                activeSessionId: sId,
-                branchId: effectiveBranch,
-                accountId,
-                startedBy: user.uid,
-                status: 'open',
-                lastUpdated: serverTimestamp(),
-              },
-              { merge: true }
-            );
-          } catch {}
+            // Reparar puntero del operador para lecturas directas ultra-rápidas
+            try {
+              await setDoc(
+                doc(db, 'cash_register_sessions', userPtrId),
+                {
+                  activeSessionId: sId,
+                  branchId: effectiveBranch,
+                  accountId,
+                  startedBy: user.uid,
+                  status: 'open',
+                  lastUpdated: serverTimestamp(),
+                },
+                { merge: true }
+              );
+            } catch {}
 
+            hydratedCashSessionRef.current = { key: cashKey, session: sessionObj };
+            activeCashSessionRef.current = sessionObj;
+            if ((snap as any).metadata?.fromCache === false || isOnlineRef.current) {
+              serverConfirmedCashScopeRef.current = cashKey;
+            }
+            setIsCashOpen(true);
+            setActiveCashSession(sessionObj);
+            void safeStorageSet(cashKey, JSON.stringify(sessionObj));
+            return sessionObj;
+          } else {
+            const fromCache = (snap as any).metadata?.fromCache;
+            const confirmedEmptyServerQuery =
+              fromCache === false || (isOnlineRef.current && fromCache !== true);
+            if (confirmedEmptyServerQuery && !ptrReadFailed) {
+              serverConfirmedClosed = true;
+            }
+          }
+        } catch (queryErr) {
+          queryReadFailed = true;
+          console.warn('[SettingsContext] Fallback query by operator failed:', queryErr);
+        }
+
+        // Sin confirmación autoritativa del servidor o ante error/offline: preservar sesión cacheada
+        if (!serverConfirmedClosed || ptrReadFailed || queryReadFailed || !isOnlineRef.current) {
+          const cachedSession = await getHydratedOrCachedSession();
+          if (cachedSession) {
+            activeCashSessionRef.current = cachedSession;
+            setIsCashOpen(true);
+            setActiveCashSession(cachedSession);
+            return cachedSession;
+          }
+        }
+
+        // Servidor confirmó con cero errores que la caja está cerrada: limpiar caché
+        if (serverConfirmedClosed) {
+          serverConfirmedCashScopeRef.current = cashKey;
+          hydratedCashSessionRef.current = null;
+          void safeStorageRemove(cashKey);
+        }
+
+        activeCashSessionRef.current = null;
+        setIsCashOpen(false);
+        setActiveCashSession(null);
+        return null;
+      } catch (err) {
+        console.warn('[SettingsContext] checkActiveSession error:', err);
+        const cachedSession = await getHydratedOrCachedSession();
+        if (cachedSession) {
+          activeCashSessionRef.current = cachedSession;
           setIsCashOpen(true);
-          setActiveCashSession(sessionObj);
-          return sessionObj;
+          setActiveCashSession(cachedSession);
+          return cachedSession;
         }
-      } catch (queryErr) {
-        console.warn('[SettingsContext] Fallback query by operator failed:', queryErr);
+        activeCashSessionRef.current = null;
+        setIsCashOpen(false);
+        setActiveCashSession(null);
+        return null;
       }
+    };
 
-      // Si el operador no ha abierto caja en esta sucursal: CAJA CERRADA
-      setIsCashOpen(false);
-      setActiveCashSession(null);
-      return null;
-    } catch (err) {
-      console.warn('[SettingsContext] checkActiveSession error:', err);
-      setIsCashOpen(false);
-      setActiveCashSession(null);
-      return null;
-    }
+    const promise = runCheck().finally(() => {
+      if (inFlightCashCheckRef.current?.promise === promise) {
+        inFlightCashCheckRef.current = null;
+      }
+    });
+    inFlightCashCheckRef.current = { scope: checkScope, promise };
+    return promise;
   }, [accountId, branchId, user?.uid, user?.displayName]);
 
   const refreshCashStatus = useCallback(() => {
-    checkActiveSession();
+    void checkActiveSession();
   }, [checkActiveSession]);
+  refreshCashStatusRef.current = refreshCashStatus;
 
-  // Suscripción en tiempo real al estado de la Caja
+  // Suscripción en tiempo real al estado de la Caja e hidratación offline
   useEffect(() => {
     if (!accountId || !user?.uid) {
+      cashScopeRef.current = null;
+      hydratedCashSessionRef.current = null;
+      serverConfirmedCashScopeRef.current = null;
+      cashHydrationPromiseRef.current = null;
+      activeCashSessionRef.current = null;
       setIsCashOpen(false);
       setActiveCashSession(null);
       return;
     }
 
     let isSubscribed = true;
-    checkActiveSession();
+    let initialResolved = false;
 
     const effectiveBranch = branchId || 'main';
+    const cashKey = getCashSessionCacheKey(accountId, effectiveBranch, user.uid);
     const pointerId = `active_${accountId}_${effectiveBranch}_${user.uid}`;
+
+    if (cashScopeRef.current !== cashKey) {
+      cashScopeRef.current = cashKey;
+      hydratedCashSessionRef.current = null;
+      serverConfirmedCashScopeRef.current = null;
+      activeCashSessionRef.current = null;
+      setIsCashOpen(false);
+      setActiveCashSession(null);
+    }
+
+    const hydrateCashSession = async (): Promise<ActiveCashSessionData | null> => {
+      const raw = await safeStorageGet(cashKey);
+      if (!isSubscribed || !raw) return null;
+      try {
+        const parsed = JSON.parse(raw) as ActiveCashSessionData | null;
+        if (!parsed || !parsed.id || parsed.status !== 'open') return null;
+        hydratedCashSessionRef.current = { key: cashKey, session: parsed };
+        if (
+          serverConfirmedCashScopeRef.current !== cashKey &&
+          !activeCashSessionRef.current
+        ) {
+          activeCashSessionRef.current = parsed;
+          setIsCashOpen(true);
+          setActiveCashSession(parsed);
+        }
+        return parsed;
+      } catch {
+        return null;
+      }
+    };
+
+    cashHydrationPromiseRef.current = { key: cashKey, promise: hydrateCashSession() };
 
     const unsubPointer = onSnapshot(
       doc(db, 'cash_register_sessions', pointerId),
       (snap) => {
         if (!isSubscribed) return;
+        if (!snap.exists() && snap.metadata?.fromCache === true && !isOnlineRef.current) {
+          return;
+        }
         const data = snap.exists() ? snap.data() : null;
         const nextSessionId = data?.activeSessionId || data?.sessionId || null;
         const currentSessionId = activeCashSessionRef.current?.id || null;
 
         if (!nextSessionId || data?.status === 'closed') {
-          if (activeCashSessionRef.current) {
-            setIsCashOpen(false);
-            setActiveCashSession(null);
+          if (!initialResolved) {
+            initialResolved = true;
+            void checkActiveSession();
+          } else if (activeCashSessionRef.current) {
+            const serverConfirmed =
+              snap.metadata?.fromCache === false ||
+              (isOnlineRef.current && snap.metadata?.fromCache !== true);
+            if (serverConfirmed) {
+              serverConfirmedCashScopeRef.current = cashKey;
+              hydratedCashSessionRef.current = null;
+              activeCashSessionRef.current = null;
+              setIsCashOpen(false);
+              setActiveCashSession(null);
+              void safeStorageRemove(cashKey);
+            }
           }
-        } else if (nextSessionId !== currentSessionId) {
-          checkActiveSession();
+        } else if (!initialResolved || nextSessionId !== currentSessionId) {
+          initialResolved = true;
+          void checkActiveSession(nextSessionId);
+        } else {
+          initialResolved = true;
         }
       },
       (err) => {
         console.warn('[SettingsContext] pointer listener note:', err);
+        if (isSubscribed && !initialResolved) {
+          initialResolved = true;
+          void checkActiveSession();
+        }
       }
     );
 
@@ -846,6 +1388,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
             reportCategory: m.reportCategory,
             provider: m.provider,
             qrUrl: m.qrUrl,
+            qrLabel: m.qrLabel,
           })),
           updatedAt: serverTimestamp(),
         },
@@ -931,6 +1474,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       allPaymentMethods,
       isOnline,
       offlineQueueCount,
+      pendingOfflineSales,
       refreshOfflineCount,
       updateBusinessSettings,
       updateBusinessData: updateBusinessSettings,
@@ -958,6 +1502,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       allPaymentMethods,
       isOnline,
       offlineQueueCount,
+      pendingOfflineSales,
       refreshOfflineCount,
       updateBusinessSettings,
       updatePosSettings,

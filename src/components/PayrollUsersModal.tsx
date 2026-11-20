@@ -9,7 +9,7 @@
  *    el Administrador o Cajero apruebe, rechace o cargue directo al POS.
  */
 
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   Modal,
   View,
@@ -522,18 +522,51 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
   const [reqQuantity, setReqQuantity] = useState<string>('1');
   const [reqReason, setReqReason] = useState<string>('');
 
-  const loadBranches = useCallback(async () => {
+  const branchesLoadStateRef = useRef<{
+    loadedAccountId: string | null;
+    inFlight: { accountId: string; seq: number; promise: Promise<void> } | null;
+    requestSeq: number;
+  }>({ loadedAccountId: null, inFlight: null, requestSeq: 0 });
+
+  const loadBranches = useCallback(async (force: boolean = false) => {
     if (!accountId) return;
-    try {
-      const list = await getBranchesList(accountId);
-      setBranchesList(list);
-    } catch (err) {
-      console.warn('[PayrollUsersModal] Error cargando sucursales:', err);
+    const state = branchesLoadStateRef.current;
+    if (!force && state.loadedAccountId === accountId) {
+      return;
     }
+    if (!force && state.inFlight?.accountId === accountId) {
+      return state.inFlight.promise;
+    }
+
+    const seq = ++state.requestSeq;
+    const request = (async () => {
+      try {
+        const list = await getBranchesList(accountId);
+        if (branchesLoadStateRef.current.requestSeq === seq) {
+          setBranchesList(list);
+          branchesLoadStateRef.current.loadedAccountId = accountId;
+        }
+      } catch (err) {
+        console.warn('[PayrollUsersModal] Error cargando sucursales:', err);
+      } finally {
+        if (branchesLoadStateRef.current.inFlight?.seq === seq) {
+          branchesLoadStateRef.current.inFlight = null;
+        }
+      }
+    })();
+
+    state.inFlight = { accountId, seq, promise: request };
+    return request;
   }, [accountId]);
 
   useEffect(() => {
-    if (isVisible && accountId) {
+    if (!isVisible) {
+      branchesLoadStateRef.current.loadedAccountId = null;
+      branchesLoadStateRef.current.inFlight = null;
+      branchesLoadStateRef.current.requestSeq += 1;
+      return;
+    }
+    if (accountId) {
       void loadBranches();
     }
   }, [isVisible, accountId, loadBranches]);
@@ -542,6 +575,7 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
   useEffect(() => {
     if (!isVisible || !accountId) return;
 
+    let isActive = true;
     let unsubTeam: (() => void) | undefined;
     let unsubPayroll: (() => void) | undefined;
     let unsubRequests: (() => void) | undefined;
@@ -577,10 +611,13 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
     }
 
     if (activeTab === 'branches') {
-      void loadBranches().finally(() => setLoading(false));
+      void loadBranches().finally(() => {
+        if (isActive) setLoading(false);
+      });
     }
 
     return () => {
+      isActive = false;
       unsubTeam?.();
       unsubPayroll?.();
       unsubRequests?.();
@@ -954,7 +991,7 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
         receiptFooter: branchFormFooter.trim(),
         isActive: branchFormIsActive,
       });
-      await loadBranches();
+      await loadBranches(true);
       void refreshConfiguration();
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
       setBranchFormVisible(false);
@@ -988,7 +1025,7 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
     try {
       setIsSubmitting(true);
       await toggleBranchActive(branch.id, next);
-      await loadBranches();
+      await loadBranches(true);
       void refreshConfiguration();
     } catch (err: any) {
       Alert.alert('Error', err?.message || 'No se pudo actualizar el estado de la sucursal.');
@@ -1171,75 +1208,87 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
           )}
         />
 
-        {/* Barra de Sub-pestañas (Scroll horizontal para pantallas compactas) */}
+        {/* Barra de Sub-pestañas sin scroll: activo con título, inactivos solo ícono */}
         <View style={styles.tabsRow}>
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.tabsScrollContent}>
-            <TouchableOpacity
-              style={[styles.tabButton, activeTab === 'team' && styles.tabButtonActive]}
-              onPress={() => {
-                Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
-                setActiveTab('team');
-              }}
-              accessibilityRole="tab"
-              accessibilityState={{ selected: activeTab === 'team' }}
-            >
-              <Users size={15} color={activeTab === 'team' ? ui.primary : ui.textSecondary} />
-              <Text style={[styles.tabButtonText, activeTab === 'team' && styles.tabButtonTextActive]}>
+          <TouchableOpacity
+            style={[styles.tabButton, activeTab === 'team' ? styles.tabButtonActive : styles.tabButtonIconOnly]}
+            onPress={() => {
+              Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
+              setActiveTab('team');
+            }}
+            accessibilityRole="tab"
+            accessibilityLabel={`Equipo (${teamMembers.length})`}
+            accessibilityState={{ selected: activeTab === 'team' }}
+          >
+            <Users size={16} color={activeTab === 'team' ? ui.primary : ui.textSecondary} />
+            {activeTab === 'team' ? (
+              <Text style={[styles.tabButtonText, styles.tabButtonTextActive]} numberOfLines={1}>
                 Equipo ({teamMembers.length})
               </Text>
-            </TouchableOpacity>
+            ) : null}
+          </TouchableOpacity>
 
-            <TouchableOpacity
-              style={[styles.tabButton, activeTab === 'payroll' && styles.tabButtonActive]}
-              onPress={() => {
-                Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
-                setActiveTab('payroll');
-              }}
-              accessibilityRole="tab"
-              accessibilityState={{ selected: activeTab === 'payroll' }}
-            >
-              <Wallet size={15} color={activeTab === 'payroll' ? ui.primary : ui.textSecondary} />
-              <Text style={[styles.tabButtonText, activeTab === 'payroll' && styles.tabButtonTextActive]}>
+          <TouchableOpacity
+            style={[styles.tabButton, activeTab === 'payroll' ? styles.tabButtonActive : styles.tabButtonIconOnly]}
+            onPress={() => {
+              Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
+              setActiveTab('payroll');
+            }}
+            accessibilityRole="tab"
+            accessibilityLabel="Planilla"
+            accessibilityState={{ selected: activeTab === 'payroll' }}
+          >
+            <Wallet size={16} color={activeTab === 'payroll' ? ui.primary : ui.textSecondary} />
+            {activeTab === 'payroll' ? (
+              <Text style={[styles.tabButtonText, styles.tabButtonTextActive]} numberOfLines={1}>
                 Planilla
               </Text>
-            </TouchableOpacity>
+            ) : null}
+          </TouchableOpacity>
 
-            <TouchableOpacity
-              style={[styles.tabButton, activeTab === 'requests' && styles.tabButtonActive]}
-              onPress={() => {
-                Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
-                setActiveTab('requests');
-              }}
-              accessibilityRole="tab"
-              accessibilityState={{ selected: activeTab === 'requests' }}
-            >
-              <ClipboardList
-                size={15}
-                color={activeTab === 'requests' ? ui.primary : ui.textSecondary}
-              />
-              <Text style={[styles.tabButtonText, activeTab === 'requests' && styles.tabButtonTextActive]}>
+          <TouchableOpacity
+            style={[styles.tabButton, activeTab === 'requests' ? styles.tabButtonActive : styles.tabButtonIconOnly]}
+            onPress={() => {
+              Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
+              setActiveTab('requests');
+            }}
+            accessibilityRole="tab"
+            accessibilityLabel={`Solicitudes (${saleRequests.filter((r) => r.status === 'pending').length})`}
+            accessibilityState={{ selected: activeTab === 'requests' }}
+          >
+            <ClipboardList
+              size={16}
+              color={activeTab === 'requests' ? ui.primary : ui.textSecondary}
+            />
+            {activeTab === 'requests' ? (
+              <Text style={[styles.tabButtonText, styles.tabButtonTextActive]} numberOfLines={1}>
                 Solicitudes ({saleRequests.filter((r) => r.status === 'pending').length})
               </Text>
-            </TouchableOpacity>
+            ) : saleRequests.some((r) => r.status === 'pending') ? (
+              <View style={styles.tabPendingDot} />
+            ) : null}
+          </TouchableOpacity>
 
-            <TouchableOpacity
-              style={[styles.tabButton, activeTab === 'branches' && styles.tabButtonActive]}
-              onPress={() => {
-                Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
-                setActiveTab('branches');
-              }}
-              accessibilityRole="tab"
-              accessibilityState={{ selected: activeTab === 'branches' }}
-            >
-              <Building2
-                size={15}
-                color={activeTab === 'branches' ? ui.primary : ui.textSecondary}
-              />
-              <Text style={[styles.tabButtonText, activeTab === 'branches' && styles.tabButtonTextActive]}>
+          <TouchableOpacity
+            style={[styles.tabButton, activeTab === 'branches' ? styles.tabButtonActive : styles.tabButtonIconOnly]}
+            onPress={() => {
+              Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
+              setActiveTab('branches');
+            }}
+            accessibilityRole="tab"
+            accessibilityLabel={`Sucursales (${branchesList.length})`}
+            accessibilityState={{ selected: activeTab === 'branches' }}
+          >
+            <Building2
+              size={16}
+              color={activeTab === 'branches' ? ui.primary : ui.textSecondary}
+            />
+            {activeTab === 'branches' ? (
+              <Text style={[styles.tabButtonText, styles.tabButtonTextActive]} numberOfLines={1}>
                 Sucursales ({branchesList.length})
               </Text>
-            </TouchableOpacity>
-          </ScrollView>
+            ) : null}
+          </TouchableOpacity>
         </View>
 
         {/* CONTENIDO SEGÚN SUB-PESTAÑA */}
@@ -1253,10 +1302,24 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
             {/* PESTAÑA 1: EQUIPO Y ROLES */}
             {activeTab === 'team' && (
               <View style={{ flex: 1 }}>
-                <SectionHeading
-                  title="Equipo"
-                  subtitle={`${filteredTeam.length} colaboradores`}
-                  action={canManageUsers ? (
+                {/* Buscador + Botón Nuevo en una misma fila */}
+                <View style={styles.searchActionRow}>
+                  <View style={styles.searchBarInline}>
+                    <Search size={16} color={ui.textSecondary} />
+                    <TextInput
+                      style={styles.searchInput}
+                      placeholder="Buscar por nombre, rol o email..."
+                      placeholderTextColor={ui.textMuted}
+                      value={searchQuery}
+                      onChangeText={setSearchQuery}
+                    />
+                    {searchQuery.length > 0 && (
+                      <TouchableOpacity onPress={() => setSearchQuery('')}>
+                        <X size={14} color={ui.textMuted} />
+                      </TouchableOpacity>
+                    )}
+                  </View>
+                  {canManageUsers ? (
                     <TouchableOpacity
                       style={styles.newRequestBtn}
                       onPress={handleOpenCreateUser}
@@ -1266,23 +1329,7 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
                       <Plus size={16} color={ui.onPrimary} />
                       <Text style={styles.newRequestBtnText}>Nuevo</Text>
                     </TouchableOpacity>
-                  ) : undefined}
-                />
-                {/* Buscador */}
-                <View style={styles.searchBar}>
-                  <Search size={16} color={ui.textSecondary} />
-                  <TextInput
-                    style={styles.searchInput}
-                    placeholder="Buscar colaborador por nombre, rol o email..."
-                    placeholderTextColor={ui.textMuted}
-                    value={searchQuery}
-                    onChangeText={setSearchQuery}
-                  />
-                  {searchQuery.length > 0 && (
-                    <TouchableOpacity onPress={() => setSearchQuery('')}>
-                      <X size={14} color={ui.textMuted} />
-                    </TouchableOpacity>
-                  )}
+                  ) : null}
                 </View>
 
                 <FlashList
@@ -1305,7 +1352,7 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
             {/* PESTAÑA 2: PLANILLAS Y ADELANTOS */}
             {activeTab === 'payroll' && (
               <View style={{ flex: 1 }}>
-                <SectionHeading title="Planilla" subtitle="Control de remuneraciones y adelantos" />
+                <Text style={styles.sectionSubOnly}>Control de remuneraciones y adelantos</Text>
                 {/* Sub-navegación: Historial vs Registrar Pago */}
                 <View style={styles.payrollSubTabsRow}>
                   <TouchableOpacity
@@ -1505,7 +1552,6 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
                 ) : (
                   /* HISTORIAL DE MOVIMIENTOS DE PLANILLA */
                   <View style={{ flex: 1 }}>
-                    <SectionHeading title="Historial de pagos" />
                     {payrollLoadError ? (
                       <Text style={{ color: ui.danger, marginBottom: 12 }}>
                         No se pudo cargar el historial completo. {payrollLoadError}
@@ -1559,27 +1605,22 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
             {/* PESTAÑA 3: BANDEJA DE SOLICITUDES DE VENTA */}
             {activeTab === 'requests' && (
               <View style={{ flex: 1 }}>
-                <SectionHeading
-                  title="Solicitudes de venta"
-                  subtitle="Revisa descuentos y autoriza pedidos del equipo"
-                  action={(
-                    <TouchableOpacity
-                      style={styles.newRequestBtn}
-                      onPress={() => setShowCreateRequestModal(true)}
-                      accessibilityRole="button"
-                      accessibilityLabel="Crear solicitud de venta"
-                    >
-                      <Plus size={16} color={ui.onPrimary} />
-                      <Text style={styles.newRequestBtnText}>Nueva</Text>
-                    </TouchableOpacity>
-                  )}
-                />
-                <View style={styles.requestsHeaderRow}>
-                  <ScrollView
-                    horizontal
-                    showsHorizontalScrollIndicator={false}
-                    contentContainerStyle={styles.filterChipsRow}
+                <View style={styles.sectionCompactRow}>
+                  <Text style={styles.sectionCompactSub} numberOfLines={1}>
+                    Revisa descuentos y autoriza pedidos
+                  </Text>
+                  <TouchableOpacity
+                    style={styles.newRequestBtn}
+                    onPress={() => setShowCreateRequestModal(true)}
+                    accessibilityRole="button"
+                    accessibilityLabel="Crear solicitud de venta"
                   >
+                    <Plus size={15} color={ui.onPrimary} />
+                    <Text style={styles.newRequestBtnText}>Nueva</Text>
+                  </TouchableOpacity>
+                </View>
+                <View style={styles.requestsHeaderRow}>
+                  <View style={styles.filterChipsRow}>
                     {(
                       [
                         { key: 'all', label: 'Todas' },
@@ -1594,13 +1635,17 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
                         style={[styles.filterChip, requestFilter === f.key && styles.filterChipActive]}
                         onPress={() => setRequestFilter(f.key)}
                       >
-                        <Text style={[styles.filterChipText, requestFilter === f.key && styles.filterChipTextActive]}>
+                        <Text
+                          style={[styles.filterChipText, requestFilter === f.key && styles.filterChipTextActive]}
+                          numberOfLines={1}
+                          adjustsFontSizeToFit
+                          minimumFontScale={0.75}
+                        >
                           {f.label}
                         </Text>
                       </TouchableOpacity>
                     ))}
-                  </ScrollView>
-
+                  </View>
                 </View>
 
                 {filteredRequests.length === 0 ? (
@@ -1636,21 +1681,22 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
             {/* PESTAÑA 4: SUCURSALES (BRANCHES CRUD) */}
             {activeTab === 'branches' && (
               <View style={{ flex: 1 }}>
-                <SectionHeading
-                  title="Sucursales"
-                  subtitle={`${branchesList.length} sedes registradas`}
-                  action={canManageBranches ? (
+                <View style={styles.sectionCompactRow}>
+                  <Text style={styles.sectionCompactSub} numberOfLines={1}>
+                    {branchesList.length} sedes registradas
+                  </Text>
+                  {canManageBranches ? (
                     <TouchableOpacity
                       style={styles.newRequestBtn}
                       onPress={handleOpenCreateBranch}
                       accessibilityRole="button"
                       accessibilityLabel="Crear sucursal"
                     >
-                      <Plus size={16} color={ui.onPrimary} />
+                      <Plus size={15} color={ui.onPrimary} />
                       <Text style={styles.newRequestBtnText}>Nueva</Text>
                     </TouchableOpacity>
-                  ) : undefined}
-                />
+                  ) : null}
+                </View>
                 {branchesList.length === 0 ? (
                   <View style={styles.centerBox}>
                     <Building2 size={44} color={ui.textMuted} />
@@ -2397,33 +2443,43 @@ const styles = StyleSheet.create({
   // Pestañas
   tabsRow: {
     flexDirection: 'row',
-    marginHorizontal: 20,
+    alignItems: 'center',
+    gap: 4,
+    marginHorizontal: 16,
     marginBottom: 8,
     padding: 4,
     borderRadius: 14,
     backgroundColor: ui.surfaceMuted,
   },
-  tabsScrollContent: {
-    flexGrow: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-  },
   tabButton: {
-    flexGrow: 1,
-    minWidth: 92,
-    minHeight: 48,
+    minHeight: 42,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    paddingHorizontal: 10,
+    paddingHorizontal: 12,
     borderRadius: 11,
     gap: 5,
+    position: 'relative',
+  },
+  tabButtonIconOnly: {
+    flex: 1,
+    minWidth: 0,
+    paddingHorizontal: 6,
   },
   tabButtonActive: {
+    flexShrink: 0,
     backgroundColor: ui.surface,
     borderWidth: 1,
     borderColor: ui.border,
+  },
+  tabPendingDot: {
+    position: 'absolute',
+    top: 8,
+    right: 8,
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+    backgroundColor: ui.danger,
   },
   tabButtonText: {
     fontSize: 12,
@@ -2436,6 +2492,27 @@ const styles = StyleSheet.create({
   },
   tabContentContainer: {
     flex: 1,
+  },
+  searchActionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginHorizontal: 16,
+    marginTop: 4,
+    marginBottom: 8,
+  },
+  searchBarInline: {
+    flex: 1,
+    minWidth: 0,
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: ui.surface,
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    height: 42,
+    gap: 6,
+    borderWidth: 1,
+    borderColor: ui.border,
   },
   // Buscador
   searchBar: {
@@ -2859,22 +2936,45 @@ const styles = StyleSheet.create({
     color: ui.text,
   },
   // Solicitudes
-  requestsHeaderRow: {
+  sectionSubOnly: {
+    fontSize: 12,
+    color: ui.textSecondary,
+    paddingHorizontal: 16,
+    paddingTop: 2,
+    paddingBottom: 6,
+  },
+  sectionCompactRow: {
     flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
     paddingHorizontal: 16,
-    paddingVertical: 8,
-    gap: 8,
+    paddingTop: 4,
+    paddingBottom: 8,
+  },
+  sectionCompactSub: {
+    flex: 1,
+    minWidth: 0,
+    fontSize: 12,
+    color: ui.textSecondary,
+    fontWeight: '500',
+  },
+  requestsHeaderRow: {
+    paddingHorizontal: 16,
+    paddingBottom: 8,
   },
   filterChipsRow: {
-    gap: 6,
+    flexDirection: 'row',
+    gap: 5,
   },
   filterChip: {
-    minHeight: 48,
+    flex: 1,
+    minWidth: 0,
+    height: 34,
+    alignItems: 'center',
     justifyContent: 'center',
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 16,
+    paddingHorizontal: 4,
+    borderRadius: 17,
     backgroundColor: ui.surface,
     borderWidth: 1,
     borderColor: ui.border,

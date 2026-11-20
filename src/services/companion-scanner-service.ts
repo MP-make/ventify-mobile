@@ -25,6 +25,8 @@ export const SCANNER_APP_VERSION = '2.0.1';
 const READER_REQUEST_TIMEOUT_MS = 8000;
 const STATUS_POLL_INTERVAL_MS = 1500;
 const STATUS_ERROR_BACKOFF_MS = 3000;
+const STATUS_MAX_ERROR_BACKOFF_MS = 12000;
+const MAX_SESSION_BASE_URLS = 20;
 
 const SESSION_ID_REGEX = /^[A-Za-z0-9]{20}$/;
 const PAIR_TOKEN_REGEX = /^[a-f0-9]{64}$/;
@@ -106,6 +108,18 @@ export class ScannerApiError extends Error {
 
 const sessionBaseUrlMap = new Map<string, string>();
 
+const setSessionBaseUrl = (sessionId: string, baseUrl: string): void => {
+  if (sessionBaseUrlMap.has(sessionId)) {
+    sessionBaseUrlMap.delete(sessionId);
+  } else if (sessionBaseUrlMap.size >= MAX_SESSION_BASE_URLS) {
+    const oldestKey = sessionBaseUrlMap.keys().next().value;
+    if (oldestKey !== undefined) {
+      sessionBaseUrlMap.delete(oldestKey);
+    }
+  }
+  sessionBaseUrlMap.set(sessionId, baseUrl);
+};
+
 const normalizeBaseUrl = (url?: string | null): string => {
   const candidate = (url || APP_URL || 'https://ventify.com.pe').trim().replace(/\/+$/, '');
   return candidate || 'https://ventify.com.pe';
@@ -114,7 +128,7 @@ const normalizeBaseUrl = (url?: string | null): string => {
 const resolveSessionBaseUrl = (sessionId: string, overrideBaseUrl?: string): string => {
   if (overrideBaseUrl) {
     const normalized = normalizeBaseUrl(overrideBaseUrl);
-    sessionBaseUrlMap.set(sessionId, normalized);
+    setSessionBaseUrl(sessionId, normalized);
     return normalized;
   }
   return sessionBaseUrlMap.get(sessionId) || normalizeBaseUrl(APP_URL);
@@ -345,7 +359,7 @@ export async function connectScannerSession(
     token,
   });
 
-  sessionBaseUrlMap.set(sessionId, resolvedBaseUrl);
+  setSessionBaseUrl(sessionId, resolvedBaseUrl);
 
   const now = Date.now();
   const resolvedDeviceInfo: CompanionDeviceInfo = {
@@ -483,9 +497,25 @@ export async function getScannerSessionStatus(
   };
 }
 
+const buildSessionSignature = (
+  purpose: ScannerPurpose,
+  expiresAt: number,
+  scan: ScannerScan | null | undefined,
+  revoked: boolean
+): string =>
+  JSON.stringify([
+    purpose,
+    expiresAt,
+    scan?.id ?? null,
+    scan?.result ?? null,
+    scan?.code ?? null,
+    scan?.message ?? null,
+    revoked,
+  ]);
+
 /**
  * Sondea el estado de la sesión vinculada contra `/api/scanner/reader` (`action: 'status'`)
- * con control de backpressure y pausa cuando la app pasa a segundo plano.
+ * con control de backpressure, diff real de estado y pausa cuando la app pasa a segundo plano.
  */
 export function subscribeToScannerSession(
   sessionId: string,
@@ -495,39 +525,77 @@ export function subscribeToScannerSession(
 ): () => void {
   const resolvedBaseUrl = resolveSessionBaseUrl(sessionId, baseUrl);
   let isActive = true;
+  let isPollingInFlight = false;
+  let hasEmittedFirst = false;
+  let lastSignature = '';
+  let consecutiveErrors = 0;
   let timer: ReturnType<typeof setTimeout> | null = null;
 
+  const hasAppStateListener = typeof AppState?.addEventListener === 'function';
+  let listenerTriggered = false;
+  let isPausedByAppState = Boolean(AppState?.currentState && AppState.currentState !== 'active');
+  let appStateSubscription: { remove?: () => void } | null = null;
+
+  const clearPollTimer = () => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+
+  const cleanupAppStateListener = () => {
+    if (appStateSubscription && typeof appStateSubscription.remove === 'function') {
+      appStateSubscription.remove();
+    }
+    appStateSubscription = null;
+  };
+
+  const isAppBackgrounded = () => {
+    if (listenerTriggered) return isPausedByAppState;
+    return isPausedByAppState || Boolean(AppState?.currentState && AppState.currentState !== 'active');
+  };
+
   const scheduleNext = (delayMs: number) => {
-    if (!isActive) return;
-    if (timer) clearTimeout(timer);
+    if (!isActive || (hasAppStateListener && isAppBackgrounded())) return;
+    clearPollTimer();
     timer = setTimeout(() => {
       void pollOnce();
     }, delayMs);
   };
 
   const pollOnce = async () => {
-    if (!isActive) return;
+    if (!isActive || isPollingInFlight) return;
 
-    if (AppState?.currentState && AppState.currentState !== 'active') {
-      scheduleNext(STATUS_POLL_INTERVAL_MS);
+    if (isAppBackgrounded()) {
+      isPausedByAppState = true;
+      if (!hasAppStateListener) {
+        scheduleNext(STATUS_POLL_INTERVAL_MS);
+      }
       return;
     }
 
+    isPollingInFlight = true;
     try {
       const state = await getScannerSessionStatus(sessionId, resolvedBaseUrl);
       if (!isActive) return;
 
-      onUpdate({
-        sessionId,
-        baseUrl: resolvedBaseUrl,
-        purpose: state.purpose,
-        expiresAt: state.expiresAt,
-        paired: true,
-        revoked: false,
-        status: 'connected',
-        lastHeartbeatAt: Date.now(),
-        scan: state.scan,
-      });
+      consecutiveErrors = 0;
+      const signature = buildSessionSignature(state.purpose, state.expiresAt, state.scan, false);
+      if (!hasEmittedFirst || signature !== lastSignature) {
+        hasEmittedFirst = true;
+        lastSignature = signature;
+        onUpdate({
+          sessionId,
+          baseUrl: resolvedBaseUrl,
+          purpose: state.purpose,
+          expiresAt: state.expiresAt,
+          paired: true,
+          revoked: false,
+          status: 'connected',
+          lastHeartbeatAt: Date.now(),
+          scan: state.scan,
+        });
+      }
 
       scheduleNext(STATUS_POLL_INTERVAL_MS);
     } catch (err: any) {
@@ -536,11 +604,17 @@ export function subscribeToScannerSession(
 
       if (status === 401 || status === 403 || status === 410) {
         isActive = false;
+        clearPollTimer();
+        cleanupAppStateListener();
+        sessionBaseUrlMap.delete(sessionId);
+        const revokedExpiresAt = Date.now();
+        hasEmittedFirst = true;
+        lastSignature = buildSessionSignature('sale', revokedExpiresAt, null, true);
         onUpdate({
           sessionId,
           baseUrl: resolvedBaseUrl,
           purpose: 'sale',
-          expiresAt: Date.now(),
+          expiresAt: revokedExpiresAt,
           paired: false,
           revoked: true,
           status: 'disconnected',
@@ -552,18 +626,40 @@ export function subscribeToScannerSession(
       if (onError) {
         onError(err instanceof Error ? err : new Error('Error consultando estado del escáner'));
       }
-      scheduleNext(STATUS_ERROR_BACKOFF_MS);
+      const backoffMs = Math.min(
+        STATUS_MAX_ERROR_BACKOFF_MS,
+        STATUS_ERROR_BACKOFF_MS * Math.pow(2, consecutiveErrors)
+      );
+      consecutiveErrors += 1;
+      scheduleNext(backoffMs);
+    } finally {
+      isPollingInFlight = false;
     }
   };
+
+  if (hasAppStateListener) {
+    appStateSubscription = AppState.addEventListener('change', (nextState) => {
+      if (!isActive) return;
+      listenerTriggered = true;
+      if (nextState === 'active') {
+        if (isPausedByAppState) {
+          isPausedByAppState = false;
+          clearPollTimer();
+          void pollOnce();
+        }
+      } else {
+        isPausedByAppState = true;
+        clearPollTimer();
+      }
+    });
+  }
 
   void pollOnce();
 
   return () => {
     isActive = false;
-    if (timer) {
-      clearTimeout(timer);
-      timer = null;
-    }
+    cleanupAppStateListener();
+    clearPollTimer();
   };
 }
 

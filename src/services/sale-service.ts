@@ -26,6 +26,7 @@ import {
 } from 'firebase/firestore';
 import { cleanFirestoreData } from '@/lib/firebase-utils';
 import { apiRequest } from '@/lib/api-client';
+import { sharedRequestCache } from '@/lib/request-cache';
 import {
   deriveBranchIds,
   deriveLowStockBranches,
@@ -63,10 +64,12 @@ export interface SaleSellerOption {
 }
 
 export const getAvailableSaleSellers = async (branchId: string): Promise<SaleSellerOption[]> => {
-  const response = await apiRequest<{ sellers: SaleSellerOption[] }>(
-    `/api/sales/sellers?branchId=${encodeURIComponent(branchId)}`,
-  );
-  return Array.isArray(response.sellers) ? response.sellers : [];
+  return sharedRequestCache.getOrLoad(`sellers:${branchId}`, 300_000, async () => {
+    const response = await apiRequest<{ sellers: SaleSellerOption[] }>(
+      `/api/sales/sellers?branchId=${encodeURIComponent(branchId)}`,
+    );
+    return Array.isArray(response.sellers) ? response.sellers : [];
+  });
 };
 
 // ============================================================================
@@ -191,6 +194,8 @@ export interface CreateSaleTransactionParams {
   sellerName?: string;
   notes?: string;
   offlineId?: string;
+  skipOfflineDedup?: boolean;
+  enableSellerAttribution?: boolean;
   isQuote?: boolean;
   taxExemptionCode?: '10' | '20' | string;
   isAmazonExempt?: boolean;
@@ -725,7 +730,7 @@ export const createSaleTransaction = async (
   }
 
   // 1. DEDUPLICACIÓN POR OFFLINE ID (Idempotencia previa a transacción)
-  if (offlineId) {
+  if (offlineId && params.skipOfflineDedup !== true) {
     try {
       const existingQ = query(
         collection(db, SALES_COLLECTION),
@@ -756,14 +761,19 @@ export const createSaleTransaction = async (
 
   // 1.5. CHECK SERVER CHECKOUT / SELLER ATTRIBUTION POLICY
   if (!isQuote) {
-    let enableSellerAttribution = false;
-    try {
-      const posSettingsSnap = await getDoc(doc(db, 'settings', `${accountId}_pos`));
-      if (posSettingsSnap.exists()) {
-        enableSellerAttribution = posSettingsSnap.data()?.enableSellerAttribution === true;
+    let enableSellerAttribution =
+      typeof params.enableSellerAttribution === 'boolean'
+        ? params.enableSellerAttribution
+        : false;
+    if (typeof params.enableSellerAttribution !== 'boolean') {
+      try {
+        const posSettingsSnap = await getDoc(doc(db, 'settings', `${accountId}_pos`));
+        if (posSettingsSnap.exists()) {
+          enableSellerAttribution = posSettingsSnap.data()?.enableSellerAttribution === true;
+        }
+      } catch (e) {
+        console.warn('[SaleService] Error checking settings for seller attribution:', e);
       }
-    } catch (e) {
-      console.warn('[SaleService] Error checking settings for seller attribution:', e);
     }
 
     if (enableSellerAttribution || params.sourceSaleRequestId || params.sourceQuoteId) {
@@ -796,24 +806,27 @@ export const createSaleTransaction = async (
     let resolvedSessionId = params.sessionId;
     const activePointerRef = doc(db, CASH_SESSIONS_COLLECTION, `active_${branchId}`);
     const userPointerRef = userId ? doc(db, CASH_SESSIONS_COLLECTION, `active_${accountId}_${branchId}_${userId}`) : null;
+    let cachedActivePointerSnap: any = undefined;
+    let cachedUserPointerSnap: any = undefined;
 
     if (!isQuote && !resolvedSessionId) {
-      if (userPointerRef) {
-        const userPointerSnap = await tx.get(userPointerRef);
-        if (userPointerSnap.exists()) {
-          const uData = userPointerSnap.data();
-          if (uData.status === 'open' && uData.activeSessionId) {
-            resolvedSessionId = uData.activeSessionId;
-          }
+      const [userPtrSnap, activePtrSnap] = await Promise.all([
+        userPointerRef ? tx.get(userPointerRef) : Promise.resolve(null),
+        tx.get(activePointerRef),
+      ]);
+      cachedUserPointerSnap = userPtrSnap;
+      cachedActivePointerSnap = activePtrSnap;
+
+      if (userPtrSnap?.exists()) {
+        const uData = userPtrSnap.data();
+        if (uData.status === 'open' && uData.activeSessionId) {
+          resolvedSessionId = uData.activeSessionId;
         }
       }
-      if (!resolvedSessionId) {
-        const activePointerSnap = await tx.get(activePointerRef);
-        if (activePointerSnap.exists()) {
-          const pointerData = activePointerSnap.data();
-          if (pointerData.status === 'open' && pointerData.activeSessionId) {
-            resolvedSessionId = pointerData.activeSessionId;
-          }
+      if (!resolvedSessionId && activePtrSnap?.exists()) {
+        const pointerData = activePtrSnap.data();
+        if (pointerData.status === 'open' && pointerData.activeSessionId) {
+          resolvedSessionId = pointerData.activeSessionId;
         }
       }
     }
@@ -1063,19 +1076,9 @@ export const createSaleTransaction = async (
 
     const series = resolveDocumentSeries(normalizedDocType);
     const counterRef = doc(db, NOTA_COUNTERS_COLLECTION, branchId);
-    const counterSnap = await tx.get(counterRef);
 
-    let nextNumber = 1;
-    if (counterSnap.exists()) {
-      const counterData = counterSnap.data();
-      nextNumber = (counterData?.counter || 0) + 1;
-    }
-
-    const correlative = formatCorrelative(series, nextNumber);
-
-    // D. Gestionar cuenta por cobrar y deuda si es 'fiado' / crédito
+    // D. Preparar referencias independientes para lectura paralela (cuenta por cobrar, sesión y punteros)
     let customerRef: any = null;
-    let customerSnap: any = null;
     let newCustomerDebt: number | null = null;
     const isPrepaidCredits = isPrepaidCreditMethod(paymentMethod) || effectivePrepaidCredits > 0;
     const isFiado = !isPrepaidCredits && (paymentMethod === 'fiado' || paymentMethod === 'credit' || effectiveCredit > 0);
@@ -1087,35 +1090,64 @@ export const createSaleTransaction = async (
           : 'Para usar créditos prepagados debes seleccionar un cliente.');
       }
       customerRef = doc(db, CUSTOMERS_COLLECTION, customerId);
-      customerSnap = await tx.get(customerRef);
-      if (!customerSnap.exists()) {
-        throw new Error('El cliente seleccionado no existe.');
-      }
-      if (customerSnap.exists()) {
-        const custData = (customerSnap.data() as any) || {};
-        if (isPrepaidCredits) {
-          const availableCredits = Number(custData.credits || 0);
-          if (!Number.isFinite(availableCredits) || availableCredits < effectivePrepaidCredits) {
-            throw new Error('El cliente no dispone de créditos prepagados suficientes.');
-          }
-        } else {
-          const currentDebt = Number(custData.currentDebt || 0);
-          const debtToAdd = effectiveCredit > 0 ? effectiveCredit : total;
-          newCustomerDebt = Math.round((currentDebt + debtToAdd) * 100) / 100;
-        }
-      }
     }
 
     // Firestore requires every transactional read to finish before the first write.
     const sessionRef = resolvedSessionId
       ? doc(db, CASH_SESSIONS_COLLECTION, resolvedSessionId)
       : null;
-    const sessionSnap = sessionRef ? await tx.get(sessionRef) : null;
+    const needActivePointerRead = Boolean(resolvedSessionId) && cachedActivePointerSnap === undefined;
+    const needUserPointerRead = Boolean(resolvedSessionId && userPointerRef) && cachedUserPointerSnap === undefined;
+
+    const [
+      counterSnap,
+      customerSnap,
+      sessionSnap,
+      fetchedActivePointerSnap,
+      fetchedUserPointerSnap,
+    ] = await Promise.all([
+      tx.get(counterRef),
+      customerRef ? tx.get(customerRef) : Promise.resolve(null),
+      sessionRef ? tx.get(sessionRef) : Promise.resolve(null),
+      needActivePointerRead
+        ? tx.get(activePointerRef)
+        : Promise.resolve(cachedActivePointerSnap ?? null),
+      needUserPointerRead
+        ? tx.get(userPointerRef!)
+        : Promise.resolve(cachedUserPointerSnap ?? null),
+    ]);
+
+    const activePointerSnap = resolvedSessionId ? fetchedActivePointerSnap : null;
+    const userPointerSnap = resolvedSessionId && userPointerRef ? fetchedUserPointerSnap : null;
+
+    let nextNumber = 1;
+    if (counterSnap.exists()) {
+      const counterData = counterSnap.data();
+      nextNumber = (counterData?.counter || 0) + 1;
+    }
+
+    const correlative = formatCorrelative(series, nextNumber);
+
+    if (customerRef) {
+      if (!customerSnap?.exists()) {
+        throw new Error('El cliente seleccionado no existe.');
+      }
+      const custData = (customerSnap.data() as Record<string, any> | undefined) || {};
+      if (isPrepaidCredits) {
+        const availableCredits = Number(custData.credits || 0);
+        if (!Number.isFinite(availableCredits) || availableCredits < effectivePrepaidCredits) {
+          throw new Error('El cliente no dispone de créditos prepagados suficientes.');
+        }
+      } else {
+        const currentDebt = Number(custData.currentDebt || 0);
+        const debtToAdd = effectiveCredit > 0 ? effectiveCredit : total;
+        newCustomerDebt = Math.round((currentDebt + debtToAdd) * 100) / 100;
+      }
+    }
+
     if (sessionRef && (!sessionSnap?.exists() || sessionSnap.data()?.status !== 'open')) {
       throw new Error('La sesión de caja asociada a esta venta ya está cerrada. Abre una nueva caja para continuar.');
     }
-    const activePointerSnap = resolvedSessionId ? await tx.get(activePointerRef) : null;
-    const userPointerSnap = resolvedSessionId && userPointerRef ? await tx.get(userPointerRef) : null;
 
     if (!counterSnap.exists()) {
       tx.set(counterRef, {
@@ -1138,7 +1170,8 @@ export const createSaleTransaction = async (
       });
     }
     if (customerRef && customerSnap?.exists() && isPrepaidCredits) {
-      const currentCredits = Number(customerSnap.data()?.credits || 0);
+      const custData = (customerSnap.data() as Record<string, any> | undefined) || {};
+      const currentCredits = Number(custData.credits || 0);
       tx.update(customerRef, {
         credits: Math.round((currentCredits - effectivePrepaidCredits) * 100) / 100,
       });
@@ -1636,6 +1669,10 @@ export const emitToSunatAsync = async (
 // ANULACIÓN Y REVERSAL TRANSACCIONAL
 // ============================================================================
 
+export interface CancelSaleOptions {
+  enableSellerAttribution?: boolean;
+}
+
 /**
  * Anula una venta existente devolviendo el stock, registrando la compensación en Kardex
  * y emitiendo el contra-movimiento en la caja registradora de forma atómica.
@@ -1643,7 +1680,8 @@ export const emitToSunatAsync = async (
 export const cancelSaleWithReversal = async (
   saleId: string,
   reason: string,
-  userProfile: UserProfileInfo
+  userProfile: UserProfileInfo,
+  optionsOrEnableSellerAttribution?: CancelSaleOptions | boolean
 ): Promise<CancelSaleResult> => {
   if (!saleId) {
     throw new Error('Se requiere saleId para anular la venta.');
@@ -1651,6 +1689,13 @@ export const cancelSaleWithReversal = async (
   if (!reason || reason.trim().length === 0) {
     throw new Error('Debe proporcionar un motivo de anulación justificado.');
   }
+
+  const providedSellerAttribution =
+    typeof optionsOrEnableSellerAttribution === 'boolean'
+      ? optionsOrEnableSellerAttribution
+      : typeof optionsOrEnableSellerAttribution?.enableSellerAttribution === 'boolean'
+        ? optionsOrEnableSellerAttribution.enableSellerAttribution
+        : undefined;
 
   const legacySaleSnapshot = await getDoc(doc(db, SALES_COLLECTION, saleId));
   const legacySaleData = legacySaleSnapshot.exists() ? legacySaleSnapshot.data() : null;
@@ -1675,14 +1720,17 @@ export const cancelSaleWithReversal = async (
       Array.isArray(legacySaleData.items) &&
       legacySaleData.items.length > 0
     ) {
-      let enableSellerAttribution = false;
-      try {
-        const posSnap = await getDoc(doc(db, 'settings', `${legacyAccountId}_pos`));
-        if (posSnap.exists()) {
-          enableSellerAttribution = posSnap.data()?.enableSellerAttribution === true;
+      let enableSellerAttribution =
+        typeof providedSellerAttribution === 'boolean' ? providedSellerAttribution : false;
+      if (typeof providedSellerAttribution !== 'boolean') {
+        try {
+          const posSnap = await getDoc(doc(db, 'settings', `${legacyAccountId}_pos`));
+          if (posSnap.exists()) {
+            enableSellerAttribution = posSnap.data()?.enableSellerAttribution === true;
+          }
+        } catch {
+          // continuar con verificación de attributionVersion y rol
         }
-      } catch {
-        // continuar con verificación de attributionVersion y rol
       }
 
       if (
@@ -1868,10 +1916,6 @@ export const cancelSaleWithReversal = async (
     const sessionRef = saleData.sessionId
       ? doc(db, CASH_SESSIONS_COLLECTION, saleData.sessionId)
       : null;
-    const sessionSnap = sessionRef ? await tx.get(sessionRef) : null;
-    if (cashRefundAmount > 0 && (!sessionSnap?.exists() || sessionSnap.data()?.status !== 'open')) {
-      throw new Error('No se puede devolver efectivo en una caja cerrada. Abre una caja activa y registra la devolución desde el historial.');
-    }
     const creditParts = (saleData.payments || []).filter((part: PaymentSplit) => part.category === 'credit');
     const creditAmount = creditParts.length
       ? creditParts.reduce((sum: number, part: PaymentSplit) => sum + (Number(part.amount) || 0), 0)
@@ -1886,10 +1930,18 @@ export const cancelSaleWithReversal = async (
     const customerRef = (isFiadoSale || isPrepaidCreditSale) && saleData.customerId
       ? doc(db, CUSTOMERS_COLLECTION, saleData.customerId)
       : null;
-    const customerSnap = customerRef ? await tx.get(customerRef) : null;
-    const fiadoReservationSnapshots = isFiadoSale
-      ? await Promise.all(linkedFiadoReservations.docs.map((entry) => tx.get(entry.ref)))
-      : [];
+
+    const [sessionSnap, customerSnap, fiadoReservationSnapshots] = await Promise.all([
+      sessionRef ? tx.get(sessionRef) : Promise.resolve(null),
+      customerRef ? tx.get(customerRef) : Promise.resolve(null),
+      isFiadoSale
+        ? Promise.all(linkedFiadoReservations.docs.map((entry) => tx.get(entry.ref)))
+        : Promise.resolve([]),
+    ]);
+
+    if (cashRefundAmount > 0 && (!sessionSnap?.exists() || sessionSnap.data()?.status !== 'open')) {
+      throw new Error('No se puede devolver efectivo en una caja cerrada. Abre una caja activa y registra la devolución desde el historial.');
+    }
     const fiadoReservations = fiadoReservationSnapshots
       .filter((entry) => entry.exists())
       .map((entry) => ({ ref: entry.ref, data: entry.data()! }));

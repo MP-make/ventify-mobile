@@ -127,20 +127,29 @@ export class EscPosBuilder {
       .replace(/[^\x20-\x7E\n\r]/g, ''); // ASCII printable only
   }
 
+  /** Push already-sanitized ASCII characters directly into buffer */
+  private pushRawAscii(ascii: string): void {
+    for (let i = 0; i < ascii.length; i++) {
+      this.buffer.push(ascii.charCodeAt(i));
+    }
+  }
+
+  /** Push already-sanitized ASCII line + LF without re-running sanitizeText */
+  private rawSanitizedLine(sanitized: string): this {
+    this.pushRawAscii(sanitized);
+    this.buffer.push(0x0a);
+    return this;
+  }
+
   /** Append raw sanitized text */
   text(str: string): this {
-    const sanitized = this.sanitizeText(str);
-    for (let i = 0; i < sanitized.length; i++) {
-      this.buffer.push(sanitized.charCodeAt(i));
-    }
+    this.pushRawAscii(this.sanitizeText(str));
     return this;
   }
 
   /** Append line with Line Feed (LF 0x0A) */
   line(str: string = ''): this {
-    this.text(str);
-    this.buffer.push(0x0a);
-    return this;
+    return this.rawSanitizedLine(this.sanitizeText(str));
   }
 
   /** ESC d - Feed N lines */
@@ -159,7 +168,7 @@ export class EscPosBuilder {
     const cleanLeft = this.sanitizeText(left);
     const cleanRight = this.sanitizeText(right);
     const spaceCount = Math.max(1, this.cols - cleanLeft.length - cleanRight.length);
-    return this.line(`${cleanLeft}${' '.repeat(spaceCount)}${cleanRight}`);
+    return this.rawSanitizedLine(`${cleanLeft}${' '.repeat(spaceCount)}${cleanRight}`);
   }
 
   /** Three columns: quantity/sku, name, total */
@@ -176,8 +185,7 @@ export class EscPosBuilder {
 
     // Line 2: Product Name indented
     const cleanName = this.sanitizeText(name);
-    this.line(`  ${cleanName}`);
-    return this;
+    return this.rawSanitizedLine(`  ${cleanName}`);
   }
 
   /** Native ESC/POS QR Code Model 2 */
@@ -220,51 +228,48 @@ export class EscPosBuilder {
 // 3. BASE64 CONVERTER
 // ============================================================================
 
+const BASE64_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+
 /**
  * Encodes Uint8Array binary buffer to Base64 string
  * Safe for React Native native modules and Bluetooth bridges
  */
 export function uint8ArrayToBase64(bytes: Uint8Array): string {
-  const CHUNK_SIZE = 32768; // 32KB chunks
-  let binary = '';
   const len = bytes.length;
-  for (let i = 0; i < len; i += CHUNK_SIZE) {
-    const chunk = bytes.subarray(i, Math.min(i + CHUNK_SIZE, len));
-    binary += String.fromCharCode.apply(null, chunk as any);
+  if (len === 0) return '';
+
+  const chunkCount = Math.ceil(len / 3);
+  const out = new Array<string>(chunkCount);
+  const fullTripletsEnd = len - (len % 3);
+  let outIdx = 0;
+
+  for (let i = 0; i < fullTripletsEnd; i += 3) {
+    const triplet = (bytes[i] << 16) | (bytes[i + 1] << 8) | bytes[i + 2];
+    out[outIdx++] =
+      BASE64_CHARS[(triplet >> 18) & 0x3f] +
+      BASE64_CHARS[(triplet >> 12) & 0x3f] +
+      BASE64_CHARS[(triplet >> 6) & 0x3f] +
+      BASE64_CHARS[triplet & 0x3f];
   }
 
-  // In modern React Native / JS environments, btoa is available globally
-  if (typeof btoa === 'function') {
-    return btoa(binary);
+  const rem = len - fullTripletsEnd;
+  if (rem === 1) {
+    const b1 = bytes[fullTripletsEnd];
+    out[outIdx++] =
+      BASE64_CHARS[b1 >> 2] +
+      BASE64_CHARS[(b1 & 0x03) << 4] +
+      '==';
+  } else if (rem === 2) {
+    const b1 = bytes[fullTripletsEnd];
+    const b2 = bytes[fullTripletsEnd + 1];
+    out[outIdx++] =
+      BASE64_CHARS[b1 >> 2] +
+      BASE64_CHARS[((b1 & 0x03) << 4) | (b2 >> 4)] +
+      BASE64_CHARS[(b2 & 0x0f) << 2] +
+      '=';
   }
-  if (typeof Buffer !== 'undefined') {
-    return Buffer.from(binary, 'binary').toString('base64');
-  }
 
-  // Fallback to manual base64 encoder if btoa is unavailable
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-  let result = '';
-  let i = 0;
-  while (i < len) {
-    const b1 = bytes[i++];
-    const b2 = i < len ? bytes[i++] : 0;
-    const b3 = i < len ? bytes[i++] : 0;
-
-    const cp1 = b1 >> 2;
-    const cp2 = ((b1 & 3) << 4) | (b2 >> 4);
-    let cp3 = ((b2 & 15) << 2) | (b3 >> 6);
-    let cp4 = b3 & 63;
-
-    if (i - 1 > len) {
-      cp3 = 64;
-      cp4 = 64;
-    } else if (i > len) {
-      cp4 = 64;
-    }
-
-    result += chars[cp1] + chars[cp2] + (cp3 === 64 ? '=' : chars[cp3]) + (cp4 === 64 ? '=' : chars[cp4]);
-  }
-  return result;
+  return out.join('');
 }
 
 /** Alias export */

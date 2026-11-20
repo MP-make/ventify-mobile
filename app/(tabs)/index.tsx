@@ -51,6 +51,7 @@ import {
   Sparkles,
 } from 'lucide-react-native';
 import { CameraView, useCameraPermissions, BarcodeScanningResult } from 'expo-camera';
+import { useIsFocused } from '@react-navigation/native';
 import * as Haptics from 'expo-haptics';
 import NetInfo from '@react-native-community/netinfo';
 
@@ -93,42 +94,43 @@ import {
   DEFAULT_CATALOG_BRANDS,
   DEFAULT_CATALOG_SIZES,
   mergeCatalogOptions,
-  buildCatalogProductIndex,
   filterCatalogIndex,
   getCatalogCategoryCounts,
 } from '@/lib/catalog-filters';
 import { useDebouncedValue } from '@/hooks/use-debounced-value';
+import { catalogSizeInput } from '@/lib/product-attributes';
 import type { Product, CartItem, PausedSale, ProductPresentation } from '@/types';
+
+const BARCODE_SCANNER_SETTINGS: any = {
+  barcodeTypes: ['qr', 'ean13', 'ean8', 'code128', 'code39', 'upc_a', 'upc_e'],
+};
 
 export const triggerScanHaptic = () => {
   Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
 };
 
-const normalizeStr = (str: string = '') =>
-  str
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .trim();
-
 interface PosProductCardProps {
   item: Product;
   stock: number;
+  showAttributes?: boolean;
   onSelect: (product: Product) => void;
 }
 
-const PosProductCard = React.memo<PosProductCardProps>(({ item, stock, onSelect }) => {
+const PosProductCard = React.memo<PosProductCardProps>(({ item, stock, showAttributes = false, onSelect }) => {
   const minStock = (item as any).minStock || 3;
   const isOutOfStock = stock <= 0;
   const isLowStock = stock > 0 && stock <= minStock;
   const price = Number(item.suggestedPrice ?? item.price ?? 0);
+  const formattedPrice = formatPEN(price);
+  const brandLabel = showAttributes ? (item.brand || '').trim() : '';
+  const sizeLabel = showAttributes ? catalogSizeInput(item).trim() : '';
 
   return (
     <TouchableOpacity
       style={styles.productCard}
       onPress={() => onSelect(item)}
       accessibilityRole="button"
-      accessibilityLabel={`Agregar ${item.name}, ${formatPEN(price)}${isOutOfStock ? ', agotado' : `, stock ${stock}`}`}
+      accessibilityLabel={`Agregar ${item.name}, ${formattedPrice}${isOutOfStock ? ', agotado' : `, stock ${stock}`}`}
       activeOpacity={0.7}
     >
       <View style={styles.productInfo}>
@@ -157,10 +159,15 @@ const PosProductCard = React.memo<PosProductCardProps>(({ item, stock, onSelect 
             </Text>
           </View>
         </View>
+        {(brandLabel || sizeLabel) ? (
+          <Text style={styles.productAttrText} numberOfLines={1}>
+            {[brandLabel ? `Marca: ${brandLabel}` : '', sizeLabel ? `Medida: ${sizeLabel}` : ''].filter(Boolean).join(' · ')}
+          </Text>
+        ) : null}
       </View>
 
       <View style={styles.productPriceCol}>
-        <Text style={styles.productPrice}>{formatPEN(price)}</Text>
+        <Text style={styles.productPrice}>{formattedPrice}</Text>
         <View style={styles.addPlusBtn}>
           <Plus size={16} color={ui.onPrimary} />
         </View>
@@ -304,6 +311,7 @@ const CartItemRow = React.memo<CartItemRowProps>(({
 
 export default function PosCounterScreen() {
   const insets = useSafeAreaInsets();
+  const isFocused = useIsFocused();
   const { branchId, accountId, user, userProfile } = useAuth();
   const scanScope = `${user?.uid}:${accountId}:${branchId}`;
   const scanScopeRef = useRef(scanScope);
@@ -323,9 +331,23 @@ export default function PosCounterScreen() {
     invoicingEnabled,
     taxProfile,
     isOnline: settingsIsOnline,
+    refreshOfflineCount,
   } = useSettings();
   const { canModifyPrice } = usePermissions();
-  const { products, categories, loading: productsLoading, refreshing, catalogComplete, error: productsError, refreshProducts, findByBarcode, findByBarcodeRemote, getProductStock } = useProducts();
+  const {
+    products,
+    productsById,
+    catalogIndex,
+    categories,
+    loading: productsLoading,
+    refreshing,
+    catalogComplete,
+    error: productsError,
+    refreshProducts,
+    findByBarcode,
+    findByBarcodeRemote,
+    getProductStock,
+  } = useProducts();
   const {
     items,
     customer,
@@ -355,13 +377,12 @@ export default function PosCounterScreen() {
   } = useCart();
 
   const safeTotal = totalAmount ?? total ?? 0;
+  const formattedTotal = formatPEN(safeTotal);
   const safeCount = itemCount ?? totalItemsCount ?? 0;
 
   // 1. Buscador, Categorías y Filtros de Catálogo
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedCategory, setSelectedCategory] = useState('Todas');
-  const [categoryDropdownExpanded, setCategoryDropdownExpanded] = useState(false);
-  const [categorySearchQuery, setCategorySearchQuery] = useState('');
   const [selectedBrand, setSelectedBrand] = useState('Todas');
   const [selectedSize, setSelectedSize] = useState('Todas');
   const [isCameraActive, setIsCameraActive] = useState(false);
@@ -370,6 +391,22 @@ export default function PosCounterScreen() {
   const [fullscreenScannerOpen, setFullscreenScannerOpen] = useState(false);
   const lastScannedCodeRef = useRef<string>('');
   const scanCooldownRef = useRef<boolean>(false);
+  const scanCooldownTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    if (!isFocused) {
+      setIsCameraActive(false);
+      setTorchOn(false);
+    }
+  }, [isFocused]);
+
+  useEffect(() => {
+    return () => {
+      if (scanCooldownTimerRef.current) {
+        clearTimeout(scanCooldownTimerRef.current);
+      }
+    };
+  }, []);
 
   // Modal Reserva
   const [reservationModalOpen, setReservationModalOpen] = useState(false);
@@ -415,12 +452,42 @@ export default function PosCounterScreen() {
   const [promoModalOpen, setPromoModalOpen] = useState(false);
   const [giftSearchQuery, setGiftSearchQuery] = useState('');
 
+  // 3. Venta Rápida (Concepto Libre) y Venta Rápida Express (1 toque)
+  const [quickSaleModalOpen, setQuickSaleModalOpen] = useState(false);
+  const [quickConcept, setQuickConcept] = useState('Venta Rápida');
+  const [quickAmountStr, setQuickAmountStr] = useState('');
+  const [isProcessingQuickSale, setIsProcessingQuickSale] = useState(false);
+  const [quickSaleBanner, setQuickSaleBanner] = useState<{ text: string; isOffline?: boolean } | null>(null);
+  const quickSaleInFlightRef = useRef(false);
+  const quickSaleBannerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (quickSaleBannerTimerRef.current) {
+        clearTimeout(quickSaleBannerTimerRef.current);
+      }
+    };
+  }, []);
+
+  // 4. Ventas en Pausa
+  const [pausedModalOpen, setPausedModalOpen] = useState(false);
+
+  // 5. Drawer del Carrito
+  const [cartDrawerOpen, setCartDrawerOpen] = useState(false);
+  const [editingPriceItemId, setEditingPriceItemId] = useState<string | null>(null);
+  const [newPriceStr, setNewPriceStr] = useState('');
+  const newPriceStrRef = useRef(newPriceStr);
+  newPriceStrRef.current = newPriceStr;
+  const [drawerDiscountStr, setDrawerDiscountStr] = useState('');
+  const [showDrawerDiscount, setShowDrawerDiscount] = useState(false);
+
   // Promociones, regalos e ICBPER
-  const eligibleGiftProducts = useMemo(
-    () => getEligibleGiftProducts(products, discountSettings, branchId || 'main'),
-    [products, discountSettings, branchId]
-  );
+  const eligibleGiftProducts = useMemo(() => {
+    if (!promoModalOpen) return [];
+    return getEligibleGiftProducts(products, discountSettings, branchId || 'main');
+  }, [promoModalOpen, products, discountSettings, branchId]);
   const filteredGiftProducts = useMemo(() => {
+    if (!promoModalOpen) return [];
     const q = giftSearchQuery.trim().toLowerCase();
     if (!q) return eligibleGiftProducts.slice(0, 40);
     return eligibleGiftProducts
@@ -431,12 +498,25 @@ export default function PosCounterScreen() {
           String(p.category || '').toLowerCase().includes(q)
       )
       .slice(0, 40);
-  }, [eligibleGiftProducts, giftSearchQuery]);
-  const promoSuggestions = useMemo(
-    () => evaluateCartPromotions(items, discountSettings?.promotions, products),
-    [items, discountSettings?.promotions, products]
-  );
-  const hasBagOrPlasticItem = useMemo(() => cartHasPlasticBagProducts(items), [items]);
+  }, [promoModalOpen, eligibleGiftProducts, giftSearchQuery]);
+  const weighableProducts = useMemo(() => {
+    if (!weightSelectorOpen) return [];
+    return products.filter(
+      (p) =>
+        p.allowDecimals ||
+        p.unitOfMeasure === 'kg' ||
+        p.unitOfMeasure === 'KGM' ||
+        (p as any).unit === 'kg'
+    );
+  }, [weightSelectorOpen, products]);
+  const promoSuggestions = useMemo(() => {
+    if (items.length === 0 || (!cartDrawerOpen && !promoModalOpen)) return [];
+    return evaluateCartPromotions(items, discountSettings?.promotions, products, productsById);
+  }, [items, cartDrawerOpen, promoModalOpen, discountSettings?.promotions, products, productsById]);
+  const hasBagOrPlasticItem = useMemo(() => {
+    if (items.length === 0 || !cartDrawerOpen) return false;
+    return cartHasPlasticBagProducts(items);
+  }, [items, cartDrawerOpen]);
   const icbperCartItem = useMemo(
     () => items.find((i) => i.id.startsWith(ICBPER_CART_ITEM_ID)),
     [items]
@@ -465,33 +545,6 @@ export default function PosCounterScreen() {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
   }, [icbperCartItem, removeItem, addItem, branchId, accountId]);
 
-  // 3. Venta Rápida (Concepto Libre) y Venta Rápida Express (1 toque)
-  const [quickSaleModalOpen, setQuickSaleModalOpen] = useState(false);
-  const [quickConcept, setQuickConcept] = useState('Venta Rápida');
-  const [quickAmountStr, setQuickAmountStr] = useState('');
-  const [isProcessingQuickSale, setIsProcessingQuickSale] = useState(false);
-  const [quickSaleBanner, setQuickSaleBanner] = useState<{ text: string; isOffline?: boolean } | null>(null);
-  const quickSaleInFlightRef = useRef(false);
-  const quickSaleBannerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  useEffect(() => {
-    return () => {
-      if (quickSaleBannerTimerRef.current) {
-        clearTimeout(quickSaleBannerTimerRef.current);
-      }
-    };
-  }, []);
-
-  // 4. Ventas en Pausa
-  const [pausedModalOpen, setPausedModalOpen] = useState(false);
-
-  // 5. Drawer del Carrito
-  const [cartDrawerOpen, setCartDrawerOpen] = useState(false);
-  const [editingPriceItemId, setEditingPriceItemId] = useState<string | null>(null);
-  const [newPriceStr, setNewPriceStr] = useState('');
-  const [drawerDiscountStr, setDrawerDiscountStr] = useState('');
-  const [showDrawerDiscount, setShowDrawerDiscount] = useState(false);
-
   // Activar visor de cámara embebida
   const toggleInlineCamera = async () => {
     if (!isCameraActive) {
@@ -519,9 +572,13 @@ export default function PosCounterScreen() {
       if (!cleanCode || scanCooldownRef.current || scanLookupInFlight.current) return;
 
       scanCooldownRef.current = true;
-      setTimeout(() => {
+      if (scanCooldownTimerRef.current) {
+        clearTimeout(scanCooldownTimerRef.current);
+      }
+      scanCooldownTimerRef.current = setTimeout(() => {
         scanCooldownRef.current = false;
         lastScannedCodeRef.current = '';
+        scanCooldownTimerRef.current = null;
       }, 1200);
 
       let match = findByBarcode(cleanCode);
@@ -593,16 +650,15 @@ export default function PosCounterScreen() {
   );
 
   // Escaneo desde la cámara embebida
-  const handleCameraScan = (result: BarcodeScanningResult) => {
+  const handleCameraScan = useCallback((result: BarcodeScanningResult) => {
     if (result.data && (!scanCooldownRef.current || result.data !== lastScannedCodeRef.current)) {
       lastScannedCodeRef.current = result.data;
       handleBarcodeDetected(result.data);
     }
-  };
+  }, [handleBarcodeDetected]);
 
   const enableCatalogFilters = !!posSettings?.enableCatalogFilters;
   const debouncedSearchQuery = useDebouncedValue(searchQuery, 150);
-  const catalogIndex = useMemo(() => buildCatalogProductIndex(products), [products]);
 
   // Marcas únicas del catálogo (incluye atributos y marcas predeterminadas como en la web)
   const availableBrands = useMemo(() => {
@@ -782,14 +838,18 @@ export default function PosCounterScreen() {
   }, [addItem]);
 
   const keyExtractor = useCallback((item: Product) => item.id, []);
-  const getItemType = useCallback(() => 'product', []);
+  const getItemType = useCallback(
+    (item: Product) => (enableCatalogFilters && (item.brand || catalogSizeInput(item)) ? 'product_attr' : 'product'),
+    [enableCatalogFilters]
+  );
   const renderPosItem = useCallback(({ item }: { item: Product }) => (
     <PosProductCard
       item={item}
       stock={getProductStock(item)}
+      showAttributes={enableCatalogFilters}
       onSelect={handleProductSelect}
     />
-  ), [getProductStock, handleProductSelect]);
+  ), [getProductStock, enableCatalogFilters, handleProductSelect]);
 
   const handleUpdateCartQty = useCallback((id: string, qty: number) => {
     updateQuantity(id, qty);
@@ -803,6 +863,61 @@ export default function PosCounterScreen() {
     setEditingPriceItemId(cartItem.id);
     setNewPriceStr(String(cartItem.price));
   }, []);
+
+  const enableMinSalePrice =
+    posSettings?.enableMinSalePrice !== false &&
+    businessSettings?.enableMinSalePrice !== false;
+
+  // Guardar Nuevo Precio Editado
+  const handleSaveItemPrice = useCallback((item: CartItem) => {
+    const priceVal = parseNormalizedDecimal(newPriceStrRef.current);
+    if (isNaN(priceVal) || priceVal <= 0) {
+      Alert.alert('Precio Inválido', 'Ingresa un precio válido en soles.');
+      return;
+    }
+
+    const minFloor = resolveCartItemMinPrice(item, enableMinSalePrice);
+    if (minFloor > 0 && priceVal < minFloor) {
+      Alert.alert(
+        'Precio Mínimo no Permitido',
+        `El precio no puede ser menor al precio mínimo autorizado (${formatPEN(minFloor)}).`
+      );
+      return;
+    }
+
+    const ok = updateItemPrice(item.id, priceVal, enableMinSalePrice);
+    if (ok) {
+      setEditingPriceItemId(null);
+      setNewPriceStr('');
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    }
+  }, [enableMinSalePrice, updateItemPrice]);
+
+  const cartKeyExtractor = useCallback((item: CartItem) => item.id, []);
+  const renderCartItem = useCallback(({ item }: { item: CartItem }) => {
+    const isEditing = editingPriceItemId === item.id;
+    return (
+      <CartItemRow
+        item={item}
+        isEditingPrice={isEditing}
+        newPriceStr={isEditing ? newPriceStr : ''}
+        canModifyPrice={canModifyPrice}
+        onUpdateQuantity={handleUpdateCartQty}
+        onRemoveItem={handleRemoveCartItem}
+        onStartEditPrice={handleStartEditPrice}
+        onChangeNewPrice={setNewPriceStr}
+        onSavePrice={handleSaveItemPrice}
+      />
+    );
+  }, [
+    editingPriceItemId,
+    newPriceStr,
+    canModifyPrice,
+    handleUpdateCartQty,
+    handleRemoveCartItem,
+    handleStartEditPrice,
+    handleSaveItemPrice,
+  ]);
 
   // Confirmar Venta Rápida (concepto libre)
   const handleConfirmQuickSale = () => {
@@ -854,34 +969,6 @@ export default function PosCounterScreen() {
     await resumePausedSale(id);
     setPausedModalOpen(false);
     Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-  };
-
-  // Guardar Nuevo Precio Editado
-  const handleSaveItemPrice = (item: CartItem) => {
-    const priceVal = parseNormalizedDecimal(newPriceStr);
-    if (isNaN(priceVal) || priceVal <= 0) {
-      Alert.alert('Precio Inválido', 'Ingresa un precio válido en soles.');
-      return;
-    }
-
-    const enableMinSalePrice =
-      posSettings?.enableMinSalePrice !== false &&
-      businessSettings?.enableMinSalePrice !== false;
-    const minFloor = resolveCartItemMinPrice(item, enableMinSalePrice);
-    if (minFloor > 0 && priceVal < minFloor) {
-      Alert.alert(
-        'Precio Mínimo no Permitido',
-        `El precio no puede ser menor al precio mínimo autorizado (${formatPEN(minFloor)}).`
-      );
-      return;
-    }
-
-    const ok = updateItemPrice(item.id, priceVal, enableMinSalePrice);
-    if (ok) {
-      setEditingPriceItemId(null);
-      setNewPriceStr('');
-      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    }
   };
 
   // Venta Rápida Express (1 toque: Efectivo exacto -> Nota de Venta sin abrir comprobante)
@@ -1069,6 +1156,7 @@ export default function PosCounterScreen() {
         labelText = `Venta rápida ${corr} · ${formatPEN(safeTotal)}`;
       } else {
         await enqueueOfflineSale(salePayload);
+        void refreshOfflineCount();
         labelText = `Venta rápida offline · ${formatPEN(safeTotal)}`;
       }
 
@@ -1153,7 +1241,7 @@ export default function PosCounterScreen() {
         </View>
 
         {/* Ventanita de Lector de Código de Barras Inline (sin cambiar de página ni abrir modal) */}
-        {isCameraActive && (
+        {isCameraActive && isFocused && (
           <View style={styles.inlineScannerCard}>
             <View style={styles.inlineScannerTopBar}>
               <View style={styles.inlineScannerTitleWrap}>
@@ -1188,9 +1276,7 @@ export default function PosCounterScreen() {
                 style={styles.inlineCamera}
                 facing="back"
                 enableTorch={torchOn}
-                barcodeScannerSettings={{
-                  barcodeTypes: ['qr', 'ean13', 'ean8', 'code128', 'code39', 'upc_a', 'upc_e'],
-                }}
+                barcodeScannerSettings={BARCODE_SCANNER_SETTINGS}
                 onBarcodeScanned={handleCameraScan}
               />
               <View style={styles.inlineReticle} />
@@ -1257,7 +1343,7 @@ export default function PosCounterScreen() {
         ) : (
           <FlashList
             data={filteredProducts}
-            estimatedItemSize={76}
+            estimatedItemSize={enableCatalogFilters ? 94 : 82}
             keyExtractor={keyExtractor}
             getItemType={getItemType}
             contentContainerStyle={styles.listContent}
@@ -1286,7 +1372,7 @@ export default function PosCounterScreen() {
           style={styles.cartSummaryToggle}
           onPress={() => setCartDrawerOpen(true)}
           accessibilityRole="button"
-          accessibilityLabel={`Ver carrito, ${safeCount} ${safeCount === 1 ? 'ítem' : 'ítems'}, total ${formatPEN(safeTotal)}`}
+          accessibilityLabel={`Ver carrito, ${safeCount} ${safeCount === 1 ? 'ítem' : 'ítems'}, total ${formattedTotal}`}
           activeOpacity={0.8}
         >
           <View style={styles.cartIconWrapper}>
@@ -1299,9 +1385,11 @@ export default function PosCounterScreen() {
           </View>
           <View style={{ flex: 1, minWidth: 0 }}>
             <Text style={styles.cartDrawerHint} numberOfLines={1}>
-              {safeCount} {safeCount === 1 ? 'producto' : 'productos'}
+              {safeCount} {safeCount === 1 ? 'prod.' : 'prods.'}
             </Text>
-            <Text style={styles.cartTotalSummaryText}>Ver carrito</Text>
+            <Text style={styles.cartTotalSummaryText} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.78}>
+              Ver carrito
+            </Text>
           </View>
           <ChevronUp size={16} color={ui.textSecondary} />
         </TouchableOpacity>
@@ -1313,7 +1401,7 @@ export default function PosCounterScreen() {
             onPress={handleInstantQuickSale}
             disabled={isProcessingQuickSale}
             accessibilityRole="button"
-            accessibilityLabel={`Venta rápida en efectivo por ${formatPEN(safeTotal)}`}
+            accessibilityLabel={`Venta rápida en efectivo por ${formattedTotal}`}
             activeOpacity={0.8}
           >
             {isProcessingQuickSale ? (
@@ -1333,10 +1421,10 @@ export default function PosCounterScreen() {
           onPress={() => setCheckoutModalOpen(true)}
           disabled={safeCount === 0 || safeTotal <= 0}
           accessibilityRole="button"
-          accessibilityLabel={`Cobrar ${formatPEN(safeTotal)}`}
+          accessibilityLabel={`Cobrar ${formattedTotal}`}
           activeOpacity={0.8}
         >
-            <Text style={styles.checkoutBtnText} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.8}>Cobrar · {formatPEN(safeTotal)}</Text>
+            <Text style={styles.checkoutBtnText} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.8}>Cobrar · {formattedTotal}</Text>
           <ArrowRight size={20} color={ui.onPrimary} />
         </TouchableOpacity>
       </View>
@@ -1386,29 +1474,28 @@ export default function PosCounterScreen() {
               </View>
 
               {/* Lista de Ítems en Carrito */}
-              <ScrollView style={styles.drawerItemsList}>
-                {items.length === 0 ? (
-                  <View style={styles.drawerEmptyBox}>
-                    <ShoppingBag size={36} color={ui.border} />
-                    <Text style={styles.drawerEmptyText}>El carrito está vacío</Text>
-                  </View>
-                ) : (
-                  items.map((item) => (
-                    <CartItemRow
-                      key={item.id}
-                      item={item}
-                      isEditingPrice={editingPriceItemId === item.id}
-                      newPriceStr={newPriceStr}
-                      canModifyPrice={canModifyPrice}
-                      onUpdateQuantity={handleUpdateCartQty}
-                      onRemoveItem={handleRemoveCartItem}
-                      onStartEditPrice={handleStartEditPrice}
-                      onChangeNewPrice={setNewPriceStr}
-                      onSavePrice={handleSaveItemPrice}
-                    />
-                  ))
-                )}
-              </ScrollView>
+              {items.length === 0 ? (
+                <View style={styles.drawerEmptyBox}>
+                  <ShoppingBag size={36} color={ui.border} />
+                  <Text style={styles.drawerEmptyText}>El carrito está vacío</Text>
+                </View>
+              ) : (
+                <View
+                  style={{
+                    height: Math.min(320, Math.max(120, items.length * 104 + 20)),
+                  }}
+                >
+                  <FlashList
+                    data={items}
+                    estimatedItemSize={94}
+                    extraData={editingPriceItemId ? `${editingPriceItemId}:${newPriceStr}` : null}
+                    keyExtractor={cartKeyExtractor}
+                    renderItem={renderCartItem}
+                    contentContainerStyle={styles.drawerItemsList}
+                    keyboardShouldPersistTaps="handled"
+                  />
+                </View>
+              )}
 
               {/* Footer del Carrito */}
               <View style={styles.drawerFooter}>
@@ -1579,7 +1666,7 @@ export default function PosCounterScreen() {
                       onPress={handleInstantQuickSale}
                       disabled={isProcessingQuickSale}
                       accessibilityRole="button"
-                      accessibilityLabel={`Venta rápida en efectivo por ${formatPEN(safeTotal)}`}
+                      accessibilityLabel={`Venta rápida en efectivo por ${formattedTotal}`}
                     >
                       {isProcessingQuickSale ? (
                         <ActivityIndicator size="small" color={ui.primary} />
@@ -1599,7 +1686,7 @@ export default function PosCounterScreen() {
                     }}
                     disabled={safeCount === 0 || safeTotal <= 0}
                   >
-                    <Text style={styles.checkoutBtnText} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.8}>Cobrar · {formatPEN(safeTotal)}</Text>
+                    <Text style={styles.checkoutBtnText} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.8}>Cobrar · {formattedTotal}</Text>
                   </TouchableOpacity>
                 </View>
               </View>
@@ -1937,15 +2024,7 @@ export default function PosCounterScreen() {
               </View>
 
               <ScrollView style={{ maxHeight: 320 }}>
-                {products
-                  .filter(
-                    (p) =>
-                      p.allowDecimals ||
-                      p.unitOfMeasure === 'kg' ||
-                      p.unitOfMeasure === 'KGM' ||
-                      (p as any).unit === 'kg'
-                  )
-                  .map((p) => (
+                {weighableProducts.map((p) => (
                     <TouchableOpacity
                       key={p.id}
                       style={styles.weightItemRow}
@@ -2688,16 +2767,16 @@ const styles = StyleSheet.create({
     borderTopColor: ui.border,
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 20,
-    paddingTop: 12,
-    gap: 12,
+    paddingHorizontal: 12,
+    paddingTop: 10,
+    gap: 8,
   },
   cartSummaryToggle: {
-    flex: 1,
+    flex: 1.1,
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
-    minHeight: 48,
+    gap: 6,
+    minHeight: 46,
   },
   cartIconWrapper: {
     width: 32,
@@ -2730,19 +2809,19 @@ const styles = StyleSheet.create({
     color: ui.textSecondary,
   },
   cartTotalSummaryText: {
-    fontSize: 14,
+    fontSize: 13,
     fontWeight: '700',
     color: ui.text,
   },
   checkoutBtn: {
-    flex: 1.2,
+    flex: 1.15,
     flexDirection: 'row',
-    gap: 8,
+    gap: 6,
     backgroundColor: ui.primary,
-    borderRadius: 14,
-    minHeight: 52,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
+    borderRadius: 12,
+    minHeight: 46,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -2795,8 +2874,8 @@ const styles = StyleSheet.create({
     color: ui.text,
   },
   drawerItemsList: {
-    padding: 14,
-    maxHeight: 320,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
   },
   drawerEmptyBox: {
     alignItems: 'center',
@@ -3229,19 +3308,24 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 5,
+    gap: 4,
     backgroundColor: ui.primarySoft,
     borderWidth: 1.5,
     borderColor: ui.primary,
-    borderRadius: 14,
-    minHeight: 52,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
+    borderRadius: 12,
+    minHeight: 46,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
   },
   quickSaleBtnText: {
     color: ui.primary,
-    fontSize: 13,
+    fontSize: 12,
     fontWeight: '800',
+  },
+  productAttrText: {
+    fontSize: 11,
+    color: ui.textSecondary,
+    marginTop: 4,
   },
   drawerQuickSaleBtn: {
     flexDirection: 'row',

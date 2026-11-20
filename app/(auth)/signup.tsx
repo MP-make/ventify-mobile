@@ -30,7 +30,7 @@ import {
 import * as Haptics from 'expo-haptics';
 import { useAuth } from '@/context/AuthContext';
 import { BrandLogo } from '@/components/ui';
-import { APP_URL } from '@/lib/firebase';
+import { APP_URL } from '@/lib/env';
 import { ui } from '@/lib/theme';
 
 function evaluatePasswordStrength(password: string): {

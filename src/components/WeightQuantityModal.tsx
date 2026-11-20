@@ -27,7 +27,20 @@ export interface WeightQuantityModalProps {
   onConfirm: (product: Product, quantity: number, customPrice?: number) => void;
 }
 
-export const WeightQuantityModal: React.FC<WeightQuantityModalProps> = ({
+const WEIGHT_PRESET_CHIPS = [
+  { label: '100g (0.10)', val: 0.1 },
+  { label: '250g (0.25)', val: 0.25 },
+  { label: '500g (0.50)', val: 0.5 },
+  { label: '1 Kg (1.0)', val: 1.0 },
+  { label: '1.5 Kg', val: 1.5 },
+  { label: '2 Kg', val: 2.0 },
+] as const;
+
+const KEYPAD_ROW_1 = ['1', '2', '3'] as const;
+const KEYPAD_ROW_2 = ['4', '5', '6'] as const;
+const KEYPAD_ROW_3 = ['7', '8', '9'] as const;
+
+export const WeightQuantityModal: React.FC<WeightQuantityModalProps> = React.memo(({
   product,
   visible,
   isOpen,
@@ -234,14 +247,7 @@ export const WeightQuantityModal: React.FC<WeightQuantityModalProps> = ({
 
           {/* Chips Rápidos de Peso */}
           <View style={styles.presetChips}>
-            {[
-              { label: '100g (0.10)', val: 0.1 },
-              { label: '250g (0.25)', val: 0.25 },
-              { label: '500g (0.50)', val: 0.5 },
-              { label: '1 Kg (1.0)', val: 1.0 },
-              { label: '1.5 Kg', val: 1.5 },
-              { label: '2 Kg', val: 2.0 },
-            ].map((chip) => (
+            {WEIGHT_PRESET_CHIPS.map((chip) => (
               <TouchableOpacity
                 key={chip.label}
                 onPress={() => handlePreset(chip.val)}
@@ -258,7 +264,7 @@ export const WeightQuantityModal: React.FC<WeightQuantityModalProps> = ({
           {/* Teclado Numérico Táctil */}
           <View style={styles.keypad}>
             <View style={styles.keyRow}>
-              {['1', '2', '3'].map((d) => (
+              {KEYPAD_ROW_1.map((d) => (
                 <TouchableOpacity
                   key={d}
                   onPress={() => handleDigit(d)}
@@ -272,7 +278,7 @@ export const WeightQuantityModal: React.FC<WeightQuantityModalProps> = ({
               ))}
             </View>
             <View style={styles.keyRow}>
-              {['4', '5', '6'].map((d) => (
+              {KEYPAD_ROW_2.map((d) => (
                 <TouchableOpacity
                   key={d}
                   onPress={() => handleDigit(d)}
@@ -286,7 +292,7 @@ export const WeightQuantityModal: React.FC<WeightQuantityModalProps> = ({
               ))}
             </View>
             <View style={styles.keyRow}>
-              {['7', '8', '9'].map((d) => (
+              {KEYPAD_ROW_3.map((d) => (
                 <TouchableOpacity
                   key={d}
                   onPress={() => handleDigit(d)}
@@ -353,7 +359,7 @@ export const WeightQuantityModal: React.FC<WeightQuantityModalProps> = ({
       </View>
     </Modal>
   );
-};
+});
 
 const styles = StyleSheet.create({
   overlay: { flex: 1, backgroundColor: 'rgba(0, 0, 0, 0.35)', justifyContent: 'flex-end' },

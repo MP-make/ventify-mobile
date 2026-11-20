@@ -39,3 +39,15 @@ export function profilePermissions(data: { customPermissions?: { granted?: strin
 export function liveProfileAccount(profileAccount: string | undefined, resolvedAccount: string | null, hasSeenExplicitAccount: boolean): string | null {
   return profileAccount || (hasSeenExplicitAccount ? null : resolvedAccount);
 }
+
+/** Only deactivate a user for a missing profile doc when confirmed online from server,
+ * never on local cache misses or offline snapshots. */
+export function shouldDeactivateUserOnMissingDoc(params: {
+  exists: boolean;
+  fromCache?: boolean;
+  isOnline: boolean;
+}): boolean {
+  if (params.exists) return false;
+  if (params.fromCache === true || !params.isOnline) return false;
+  return true;
+}

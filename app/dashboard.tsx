@@ -84,6 +84,8 @@ export default function DashboardScreen() {
   const [intelError, setIntelError] = useState<string | null>(null);
 
   const intelTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const intelAbortRef = useRef<AbortController | null>(null);
+  const isMountedRef = useRef(true);
 
   const effectiveBranch = useMemo(() => {
     if (hasAllBranchesAccess && scopeAllBranches) return undefined;
@@ -99,6 +101,8 @@ export default function DashboardScreen() {
     }
     return map;
   }, [products]);
+  const productsMapRef = useRef(productsMap);
+  productsMapRef.current = productsMap;
 
   const loadIntelligence = useCallback(async () => {
     if (!accountId || !canAccessDashboard) return;
@@ -106,21 +110,31 @@ export default function DashboardScreen() {
       clearTimeout(intelTimerRef.current);
       intelTimerRef.current = null;
     }
+    intelAbortRef.current?.abort();
+    const controller = new AbortController();
+    intelAbortRef.current = controller;
+
     setIntelLoading(true);
     setIntelError(null);
     try {
-      const res = await fetchInventoryIntelligence(accountId, effectiveBranch);
+      const res = await fetchInventoryIntelligence(accountId, effectiveBranch, {
+        signal: controller.signal,
+      });
+      if (!isMountedRef.current || controller.signal.aborted) return;
       setIntelligence(res);
       if ('building' in res && res.building) {
         const delayMs = Math.min(Math.max(res.retryAfter || 5, 3), 20) * 1000;
         intelTimerRef.current = setTimeout(() => {
-          void loadIntelligence();
+          if (isMountedRef.current) void loadIntelligence();
         }, delayMs);
       }
     } catch (err: any) {
+      if (!isMountedRef.current || controller.signal.aborted || err?.code === 'ABORTED') return;
       setIntelError(err?.message || 'No se pudo cargar inteligencia de inventario.');
     } finally {
-      setIntelLoading(false);
+      if (isMountedRef.current && intelAbortRef.current === controller) {
+        setIntelLoading(false);
+      }
     }
   }, [accountId, canAccessDashboard, effectiveBranch]);
 
@@ -143,7 +157,7 @@ export default function DashboardScreen() {
             effectiveBranch,
             bounds.fromMs,
             bounds.toMs,
-            productsMap
+            productsMapRef.current
           ),
         ]);
 
@@ -165,7 +179,7 @@ export default function DashboardScreen() {
         setRefreshing(false);
       }
     },
-    [accountId, canAccessDashboard, bounds.fromMs, bounds.toMs, effectiveBranch, productsMap]
+    [accountId, canAccessDashboard, bounds.fromMs, bounds.toMs, effectiveBranch]
   );
 
   useEffect(() => {
@@ -173,8 +187,12 @@ export default function DashboardScreen() {
   }, [loadDashboard]);
 
   useEffect(() => {
+    isMountedRef.current = true;
     void loadIntelligence();
     return () => {
+      isMountedRef.current = false;
+      intelAbortRef.current?.abort();
+      intelAbortRef.current = null;
       if (intelTimerRef.current) {
         clearTimeout(intelTimerRef.current);
         intelTimerRef.current = null;

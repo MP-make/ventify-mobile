@@ -3,15 +3,23 @@ import { StyleSheet, Text, View } from 'react-native';
 import { Image } from 'expo-image';
 import { ui } from '@/lib/theme';
 
+const BRAND_LOGO_SOURCE = require('../../../assets/brand/ventify-logo.png');
+
 /** The original Ventify mark, shared with the web product. */
-export function BrandLogo({ size = 40, wordmark = true }: { size?: number; wordmark?: boolean }) {
+export const BrandLogo = React.memo(function BrandLogo({
+  size = 40,
+  wordmark = true,
+}: {
+  size?: number;
+  wordmark?: boolean;
+}) {
   const logoStyle = useMemo(() => ({ width: size, height: size }), [size]);
   const isLarge = size > 50;
 
   return (
     <View style={styles.brand} accessibilityLabel="Ventify" accessible>
       <Image
-        source={require('../../../assets/brand/ventify-logo.png')}
+        source={BRAND_LOGO_SOURCE}
         style={logoStyle}
         contentFit="contain"
         cachePolicy="memory-disk"
@@ -24,10 +32,14 @@ export function BrandLogo({ size = 40, wordmark = true }: { size?: number; wordm
       )}
     </View>
   );
-}
+});
 
 type HeadingProps = { title: string; subtitle?: string; action?: React.ReactNode };
-export function ScreenHeading({ title, subtitle, action }: HeadingProps) {
+export const ScreenHeading = React.memo(function ScreenHeading({
+  title,
+  subtitle,
+  action,
+}: HeadingProps) {
   return (
     <View style={styles.heading}>
       <View style={styles.headingCopy}>
@@ -37,8 +49,13 @@ export function ScreenHeading({ title, subtitle, action }: HeadingProps) {
       {action ? <View style={styles.headingAction}>{action}</View> : null}
     </View>
   );
-}
-export function SectionHeading({ title, subtitle, action }: HeadingProps) {
+});
+
+export const SectionHeading = React.memo(function SectionHeading({
+  title,
+  subtitle,
+  action,
+}: HeadingProps) {
   return (
     <View style={styles.sectionHeading}>
       <View style={styles.headingCopy}>
@@ -48,7 +65,7 @@ export function SectionHeading({ title, subtitle, action }: HeadingProps) {
       {action}
     </View>
   );
-}
+});
 
 const styles = StyleSheet.create({
   brand: { flexDirection: 'row', alignItems: 'center', gap: 9 },

@@ -25,7 +25,11 @@ export const OFFLINE_QUEUE_STORAGE_KEY = 'ventify_offline_sales_queue_v2';
 export const QUARANTINED_STORAGE_KEY = 'ventify_quarantined_offline_sales_v2';
 export const OFFLINE_SYNC_LOCK_KEY = 'ventify_offline_sync_lock_v2';
 
-export const MAX_OFFLINE_RETRIES = 3;
+export const MAX_OFFLINE_RETRIES = 5;
+export const MAX_QUARANTINED_SALES = 100;
+export const NETWORK_RECONNECT_DEBOUNCE_MS = 2_500;
+export const RETRY_BACKOFF_BASE_MS = 5_000;
+export const RETRY_BACKOFF_MAX_MS = 300_000;
 export const SYNC_LOCK_TTL_MS = 45_000;
 
 // ============================================================================
@@ -46,6 +50,7 @@ export interface PendingOfflineSale {
   salePayload: CreateSaleTransactionParams;
   timestamp: number;
   retryCount: number;
+  nextRetryAt?: number;
   status: 'pending_offline' | 'quarantined' | 'synced';
   lastErrorReason?: string;
   failureCategory?: OfflineFailureCategory;
@@ -65,6 +70,13 @@ export interface SyncProcessResult {
   quarantined: number;
   retried: number;
   errors: Array<{ offlineId: string; reason: string }>;
+}
+
+export interface OfflineQueueChangeEvent {
+  type: 'enqueued' | 'synced' | 'updated' | 'quarantined_changed';
+  queueCount: number;
+  successful?: number;
+  quarantined?: number;
 }
 
 export const offlineSaleBelongsToIdentity = (
@@ -205,7 +217,17 @@ export const classifySyncError = (
     lower.includes('unavailable') ||
     lower.includes('failed-precondition') ||
     lower.includes('deadline-exceeded') ||
-    lower.includes('offline')
+    lower.includes('offline') ||
+    lower.includes('could not reach') ||
+    lower.includes('connection') ||
+    lower.includes('socket') ||
+    lower.includes('dns') ||
+    lower.includes('timed out') ||
+    lower.includes('tiempo de espera') ||
+    lower.includes('sin conexión') ||
+    lower.includes('network-request-failed') ||
+    lower.includes('econnreset') ||
+    lower.includes('etimedout')
   ) {
     return {
       category: 'network_error',
@@ -225,9 +247,65 @@ export const classifySyncError = (
 // SERVICIO OFFLINE SYNC
 // ============================================================================
 
+const deduplicateAndCapQuarantine = (
+  items: QuarantinedOfflineSale[]
+): QuarantinedOfflineSale[] => {
+  const byKey = new Map<string, QuarantinedOfflineSale>();
+  for (const item of items) {
+    const key = item.offlineId || item.id;
+    if (!key) continue;
+    const existing = byKey.get(key);
+    const existingTs = existing ? (existing.quarantinedAt || existing.timestamp || 0) : -1;
+    const nextTs = item.quarantinedAt || item.timestamp || 0;
+    if (!existing || nextTs >= existingTs) {
+      if (existing) byKey.delete(key);
+      byKey.set(key, item);
+    }
+  }
+  const deduped = Array.from(byKey.values());
+  deduped.sort(
+    (a, b) => (a.quarantinedAt || a.timestamp || 0) - (b.quarantinedAt || b.timestamp || 0)
+  );
+  return deduped.length > MAX_QUARANTINED_SALES
+    ? deduped.slice(-MAX_QUARANTINED_SALES)
+    : deduped;
+};
+
 class OfflineSyncService {
   private isProcessingInMemory = false;
   private netInfoUnsubscribe: (() => void) | null = null;
+  private networkSyncTimer: ReturnType<typeof setTimeout> | null = null;
+  private retryWakeupTimer: ReturnType<typeof setTimeout> | null = null;
+  private queueMutex: Promise<void> = Promise.resolve();
+  private listeners = new Set<(event: OfflineQueueChangeEvent) => void>();
+
+  public subscribeQueueChanges(
+    listener: (event: OfflineQueueChangeEvent) => void
+  ): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  private emitQueueChange(event: OfflineQueueChangeEvent): void {
+    for (const listener of Array.from(this.listeners)) {
+      try {
+        listener(event);
+      } catch (err) {
+        console.warn('[OfflineSync] Queue change listener error:', err);
+      }
+    }
+  }
+
+  private runWithQueueMutex<T>(task: () => Promise<T>): Promise<T> {
+    const result = this.queueMutex.then(task);
+    this.queueMutex = result.then(
+      () => undefined,
+      () => undefined
+    );
+    return result;
+  }
 
   /**
    * Genera un identificador único e idempotente para la venta offline
@@ -245,8 +323,10 @@ class OfflineSyncService {
     salePayload: CreateSaleTransactionParams
   ): Promise<PendingOfflineSale> {
     const offlineId = salePayload.offlineId || this.generateOfflineId();
+    const { skipOfflineDedup: _omit, ...sanitizedPayload } =
+      salePayload as CreateSaleTransactionParams & { skipOfflineDedup?: unknown };
     const enrichedPayload: CreateSaleTransactionParams = {
-      ...salePayload,
+      ...(sanitizedPayload as CreateSaleTransactionParams),
       offlineId,
     };
 
@@ -260,12 +340,16 @@ class OfflineSyncService {
     };
 
     try {
-      const currentQueue = await this.getOfflineQueue();
-      // Evitar duplicados por offlineId
-      const filtered = currentQueue.filter((q) => q.offlineId !== offlineId);
-      filtered.push(pendingItem);
+      const queueCount = await this.runWithQueueMutex(async () => {
+        const currentQueue = await this.getOfflineQueue();
+        // Evitar duplicados por offlineId
+        const filtered = currentQueue.filter((q) => q.offlineId !== offlineId);
+        filtered.push(pendingItem);
 
-      await AsyncStorage.setItem(OFFLINE_QUEUE_STORAGE_KEY, JSON.stringify(filtered));
+        await AsyncStorage.setItem(OFFLINE_QUEUE_STORAGE_KEY, JSON.stringify(filtered));
+        return filtered.length;
+      });
+      this.emitQueueChange({ type: 'enqueued', queueCount });
       console.log(`[OfflineSync] Venta encolada exitosamente: ${offlineId}`);
       return pendingItem;
     } catch (err) {
@@ -309,33 +393,42 @@ class OfflineSyncService {
    */
   public async retryQuarantinedSale(offlineId: string): Promise<boolean> {
     try {
-      const quarantined = await this.getQuarantinedSales();
-      const target = quarantined.find((q) => q.offlineId === offlineId);
+      const result = await this.runWithQueueMutex(async () => {
+        const quarantined = await this.getQuarantinedSales();
+        const target = quarantined.find((q) => q.offlineId === offlineId);
 
-      if (!target) {
-        console.warn(`[OfflineSync] No se encontró la venta ${offlineId} en cuarentena.`);
-        return false;
-      }
+        if (!target) {
+          console.warn(`[OfflineSync] No se encontró la venta ${offlineId} en cuarentena.`);
+          return { moved: false, queueCount: 0 };
+        }
 
-      // Remover de cuarentena
-      const remainingQuarantine = quarantined.filter((q) => q.offlineId !== offlineId);
-      await AsyncStorage.setItem(
-        QUARANTINED_STORAGE_KEY,
-        JSON.stringify(remainingQuarantine)
-      );
+        // Remover de cuarentena
+        const remainingQuarantine = quarantined.filter((q) => q.offlineId !== offlineId);
+        await AsyncStorage.setItem(
+          QUARANTINED_STORAGE_KEY,
+          JSON.stringify(remainingQuarantine)
+        );
 
-      // Re-encolar con retryCount reseteado
-      const resetItem: PendingOfflineSale = {
-        ...target,
-        retryCount: 0,
-        status: 'pending_offline',
-        lastErrorReason: undefined,
-        failureCategory: undefined,
-      };
+        // Re-encolar con retryCount y nextRetryAt reseteados
+        const resetItem: PendingOfflineSale = {
+          ...target,
+          retryCount: 0,
+          nextRetryAt: undefined,
+          status: 'pending_offline',
+          lastErrorReason: undefined,
+          failureCategory: undefined,
+        };
 
-      const queue = await this.getOfflineQueue();
-      queue.push(resetItem);
-      await AsyncStorage.setItem(OFFLINE_QUEUE_STORAGE_KEY, JSON.stringify(queue));
+        const queue = await this.getOfflineQueue();
+        const filteredQueue = queue.filter((q) => q.offlineId !== offlineId);
+        filteredQueue.push(resetItem);
+        await AsyncStorage.setItem(OFFLINE_QUEUE_STORAGE_KEY, JSON.stringify(filteredQueue));
+        return { moved: true, queueCount: filteredQueue.length };
+      });
+
+      if (!result.moved) return false;
+
+      this.emitQueueChange({ type: 'quarantined_changed', queueCount: result.queueCount });
 
       // Disparar procesamiento si hay internet
       const net = await NetInfo.fetch();
@@ -357,9 +450,14 @@ class OfflineSyncService {
    */
   public async removeQuarantinedSale(offlineId: string): Promise<boolean> {
     try {
-      const quarantined = await this.getQuarantinedSales();
-      const filtered = quarantined.filter((q) => q.offlineId !== offlineId);
-      await AsyncStorage.setItem(QUARANTINED_STORAGE_KEY, JSON.stringify(filtered));
+      const queueCount = await this.runWithQueueMutex(async () => {
+        const quarantined = await this.getQuarantinedSales();
+        const filtered = quarantined.filter((q) => q.offlineId !== offlineId);
+        await AsyncStorage.setItem(QUARANTINED_STORAGE_KEY, JSON.stringify(filtered));
+        const queue = await this.getOfflineQueue();
+        return queue.length;
+      });
+      this.emitQueueChange({ type: 'quarantined_changed', queueCount });
       return true;
     } catch (err) {
       console.error('[OfflineSync] Error eliminando venta en cuarentena:', err);
@@ -380,9 +478,24 @@ class OfflineSyncService {
       errors: [],
     };
 
+    if (this.isProcessingInMemory) {
+      console.log('[OfflineSync] Candado de sincronización ocupado por otro proceso.');
+      return summary;
+    }
+
+    // 0. Verificar cola local PRIMERO antes de consultar NetInfo, claims o Firestore
+    const initialQueue = await this.getOfflineQueue();
+    if (initialQueue.length === 0) {
+      this.clearRetryWakeupTimer();
+      return summary;
+    }
+
     // 1. Verificar estado de red
     const netState = await NetInfo.fetch();
     if (!netState.isConnected || netState.isInternetReachable === false) {
+      if (netState.isConnected && netState.isInternetReachable === false) {
+        this.scheduleRetryWakeup(2_500, accountIdOverride);
+      }
       console.log('[OfflineSync] Sin conexión a internet. Omitiendo sincronización.');
       return summary;
     }
@@ -394,9 +507,32 @@ class OfflineSyncService {
       return summary;
     }
 
+    let emittedEvent: OfflineQueueChangeEvent | null = null;
+
     try {
-      const queue = await this.getOfflineQueue();
+      const queue = await this.runWithQueueMutex(() => this.getOfflineQueue());
       summary.total = queue.length;
+
+      if (queue.length === 0) {
+        this.clearRetryWakeupTimer();
+        return summary;
+      }
+
+      const checkNow = Date.now();
+      const hasDueItems = queue.some(
+        (item) => typeof item.nextRetryAt !== 'number' || checkNow >= item.nextRetryAt
+      );
+      if (!hasDueItems) {
+        const futureRetryTimes = queue
+          .map((item) => item.nextRetryAt)
+          .filter((t): t is number => typeof t === 'number' && t > checkNow);
+        if (futureRetryTimes.length > 0) {
+          const earliestNextRetryAt = Math.min(...futureRetryTimes);
+          const delay = Math.max(1_500, Math.min(60_000, earliestNextRetryAt - checkNow));
+          this.scheduleRetryWakeup(delay, accountIdOverride);
+        }
+        return summary;
+      }
 
       const currentUser = auth.currentUser;
       if (!currentUser) return summary;
@@ -432,18 +568,17 @@ class OfflineSyncService {
       }
       if (!currentAccountId) return summary;
 
-      if (queue.length === 0) {
-        return summary;
-      }
-
       console.log(`[OfflineSync] Procesando ${queue.length} ventas offline pendientes...`);
 
-      const nextQueue: PendingOfflineSale[] = [];
+      const completedTimestamps = new Map<string, number>();
+      const retriedByOfflineId = new Map<string, PendingOfflineSale>();
       const quarantinedToAdd: QuarantinedOfflineSale[] = [];
 
       for (const item of queue) {
         if (!offlineSaleBelongsToIdentity(item.salePayload, currentUser.uid, currentAccountId)) {
-          nextQueue.push(item);
+          continue;
+        }
+        if (typeof item.nextRetryAt === 'number' && Date.now() < item.nextRetryAt) {
           continue;
         }
         summary.processed++;
@@ -451,27 +586,51 @@ class OfflineSyncService {
         try {
           // A. DEDUPLICACIÓN EN FIRESTORE
           // Verifica si la venta ya fue registrada previamente en el servidor
-          const existingQ = query(
-            collection(db, 'sales'),
-            where('accountId', '==', item.salePayload.accountId),
-            where('userId', '==', item.salePayload.userId),
-            where('offlineId', '==', item.offlineId),
-            limit(1)
-          );
-          const existingSnap = await getDocs(existingQ);
-
-          if (!existingSnap.empty) {
-            console.log(
-              `[OfflineSync] Venta ${item.offlineId} ya existe en Firestore (id: ${existingSnap.docs[0].id}). Marcada como exitosa.`
+          let alreadySynced = false;
+          try {
+            const existingQ = query(
+              collection(db, 'sales'),
+              where('accountId', '==', item.salePayload.accountId),
+              where('offlineId', '==', item.offlineId),
+              limit(1)
             );
-            summary.successful++;
+            const existingSnap = await getDocs(existingQ);
+
+            if (!existingSnap.empty) {
+              console.log(
+                `[OfflineSync] Venta ${item.offlineId} ya existe en Firestore (id: ${existingSnap.docs[0].id}). Marcada como exitosa.`
+              );
+              completedTimestamps.set(item.offlineId, item.timestamp);
+              summary.successful++;
+              alreadySynced = true;
+            }
+          } catch (dedupErr) {
+            console.warn(
+              `[OfflineSync] Pre-check de deduplicación falló para ${item.offlineId}; continuando con createSaleTransaction:`,
+              sanitizeErrorMessage(dedupErr)
+            );
+          }
+
+          if (alreadySynced) {
             continue; // Se descarta de la cola activa
           }
 
-          // B. EJECUTAR TRANSACCIÓN ATÓMICA DE VENTA
-          await createSaleTransaction(item.salePayload);
+          // B. EJECUTAR TRANSACCIÓN ATÓMICA DE VENTA (mantener offlineId deduplication activo)
+          const payloadToSync =
+            item.salePayload &&
+            'skipOfflineDedup' in (item.salePayload as unknown as Record<string, unknown>)
+              ? (() => {
+                  const { skipOfflineDedup: _omit, ...rest } =
+                    item.salePayload as CreateSaleTransactionParams & {
+                      skipOfflineDedup?: unknown;
+                    };
+                  return rest as CreateSaleTransactionParams;
+                })()
+              : item.salePayload;
+          await createSaleTransaction(payloadToSync);
 
           console.log(`[OfflineSync] Venta sincronizada con éxito: ${item.offlineId}`);
+          completedTimestamps.set(item.offlineId, item.timestamp);
           summary.successful++;
         } catch (itemErr: any) {
           const classified = classifySyncError(itemErr);
@@ -497,17 +656,23 @@ class OfflineSyncService {
               ...item,
               status: 'quarantined',
               retryCount: currentRetries,
+              nextRetryAt: undefined,
               quarantinedAt: Date.now(),
               lastErrorReason: classified.sanitizedReason,
               failureCategory: classified.category,
             });
-
+            completedTimestamps.set(item.offlineId, item.timestamp);
             summary.quarantined++;
           } else {
-            // Reintento permitido en la próxima pasada
-            nextQueue.push({
+            // Reintento diferido con backoff exponencial
+            const backoffMs = Math.min(
+              RETRY_BACKOFF_MAX_MS,
+              RETRY_BACKOFF_BASE_MS * Math.pow(3, item.retryCount || 0)
+            );
+            retriedByOfflineId.set(item.offlineId, {
               ...item,
               retryCount: currentRetries,
+              nextRetryAt: Date.now() + backoffMs,
               lastErrorReason: classified.sanitizedReason,
               failureCategory: classified.category,
             });
@@ -516,22 +681,114 @@ class OfflineSyncService {
         }
       }
 
-      // Guardar cola activa actualizada
-      await AsyncStorage.setItem(OFFLINE_QUEUE_STORAGE_KEY, JSON.stringify(nextQueue));
+      let remainingCount = queue.length;
+      let nextQueueSnapshot: PendingOfflineSale[] = queue;
+      if (summary.processed > 0) {
+        nextQueueSnapshot = await this.runWithQueueMutex(async () => {
+          const latestQueue = await this.getOfflineQueue();
+          const nextQueue: PendingOfflineSale[] = [];
 
-      // Guardar cuarentena acumulada
-      if (quarantinedToAdd.length > 0) {
-        const existingQuarantine = await this.getQuarantinedSales();
-        const combined = [...existingQuarantine, ...quarantinedToAdd];
-        await AsyncStorage.setItem(QUARANTINED_STORAGE_KEY, JSON.stringify(combined));
+          for (const latestItem of latestQueue) {
+            const removedTs = completedTimestamps.get(latestItem.offlineId);
+            if (removedTs !== undefined && latestItem.timestamp <= removedTs) {
+              continue;
+            }
+
+            const retriedItem = retriedByOfflineId.get(latestItem.offlineId);
+            if (retriedItem && latestItem.timestamp <= retriedItem.timestamp) {
+              nextQueue.push(retriedItem);
+              continue;
+            }
+
+            nextQueue.push(latestItem);
+          }
+
+          // Guardar cola activa actualizada
+          await AsyncStorage.setItem(OFFLINE_QUEUE_STORAGE_KEY, JSON.stringify(nextQueue));
+
+          // Guardar cuarentena acumulada (deduplicada y acotada a 100 entradas)
+          if (quarantinedToAdd.length > 0) {
+            const existingQuarantine = await this.getQuarantinedSales();
+            const combined = deduplicateAndCapQuarantine([
+              ...existingQuarantine,
+              ...quarantinedToAdd,
+            ]);
+            await AsyncStorage.setItem(QUARANTINED_STORAGE_KEY, JSON.stringify(combined));
+          }
+
+          return nextQueue;
+        });
+        remainingCount = nextQueueSnapshot.length;
+      }
+
+      const nowAfter = Date.now();
+      const pendingRetryTimes = nextQueueSnapshot
+        .map((item) => item.nextRetryAt)
+        .filter((t): t is number => typeof t === 'number' && t > nowAfter);
+      if (pendingRetryTimes.length > 0) {
+        const earliestNextRetryAt = Math.min(...pendingRetryTimes);
+        const delay = Math.max(1_500, Math.min(60_000, earliestNextRetryAt - nowAfter));
+        this.scheduleRetryWakeup(delay, accountIdOverride);
+      } else if (remainingCount === 0) {
+        this.clearRetryWakeupTimer();
+      }
+
+      if (summary.processed > 0 || summary.successful > 0 || summary.quarantined > 0) {
+        emittedEvent = {
+          type:
+            summary.successful > 0
+              ? 'synced'
+              : summary.quarantined > 0
+              ? 'quarantined_changed'
+              : 'updated',
+          queueCount: remainingCount,
+          successful: summary.successful,
+          quarantined: summary.quarantined,
+        };
       }
 
       console.log(
-        `[OfflineSync] Sincronización completada. Éxitos: ${summary.successful}, Cuarentena: ${summary.quarantined}, Pendientes: ${nextQueue.length}`
+        `[OfflineSync] Sincronización completada. Éxitos: ${summary.successful}, Cuarentena: ${summary.quarantined}, Pendientes: ${remainingCount}`
       );
       return summary;
     } finally {
       await this.releaseLock();
+      if (emittedEvent) {
+        this.emitQueueChange(emittedEvent);
+      }
+    }
+  }
+
+  private clearNetworkSyncTimer(): void {
+    if (this.networkSyncTimer) {
+      clearTimeout(this.networkSyncTimer);
+      this.networkSyncTimer = null;
+    }
+  }
+
+  private clearRetryWakeupTimer(): void {
+    if (this.retryWakeupTimer) {
+      clearTimeout(this.retryWakeupTimer);
+      this.retryWakeupTimer = null;
+    }
+  }
+
+  private scheduleRetryWakeup(delayMs: number, accountIdOverride?: string): void {
+    this.clearRetryWakeupTimer();
+    this.retryWakeupTimer = setTimeout(() => {
+      this.retryWakeupTimer = null;
+      void this.processOfflineQueue(accountIdOverride).catch((err) =>
+        console.warn('[OfflineSync] Error en reintento automático de cola offline:', err)
+      );
+    }, delayMs);
+  }
+
+  private teardownNetworkListener(): void {
+    this.clearNetworkSyncTimer();
+    this.clearRetryWakeupTimer();
+    if (this.netInfoUnsubscribe) {
+      this.netInfoUnsubscribe();
+      this.netInfoUnsubscribe = null;
     }
   }
 
@@ -539,24 +796,34 @@ class OfflineSyncService {
    * Inicia el listener automático de NetInfo para sincronizar cuando regresa la conexión
    */
   public initNetworkListener(): () => void {
-    if (this.netInfoUnsubscribe) {
-      this.netInfoUnsubscribe();
-    }
+    this.teardownNetworkListener();
+
+    let wasOffline = false;
 
     this.netInfoUnsubscribe = NetInfo.addEventListener((state: NetInfoState) => {
-      if (state.isConnected && state.isInternetReachable !== false) {
-        console.log('[OfflineSync] Red restaurada. Disparando sincronización automática...');
-        this.processOfflineQueue().catch((err) =>
-          console.warn('[OfflineSync] Error en sincronización por evento de red:', err)
-        );
+      const isOnline = Boolean(state.isConnected && state.isInternetReachable !== false);
+
+      if (!isOnline) {
+        wasOffline = true;
+        this.clearNetworkSyncTimer();
+        return;
+      }
+
+      if (wasOffline) {
+        wasOffline = false;
+        this.clearNetworkSyncTimer();
+        this.networkSyncTimer = setTimeout(() => {
+          this.networkSyncTimer = null;
+          console.log('[OfflineSync] Red restaurada. Disparando sincronización automática...');
+          this.processOfflineQueue().catch((err) =>
+            console.warn('[OfflineSync] Error en sincronización por evento de red:', err)
+          );
+        }, NETWORK_RECONNECT_DEBOUNCE_MS);
       }
     });
 
     return () => {
-      if (this.netInfoUnsubscribe) {
-        this.netInfoUnsubscribe();
-        this.netInfoUnsubscribe = null;
-      }
+      this.teardownNetworkListener();
     };
   }
 
@@ -600,3 +867,7 @@ export const removeQuarantinedSale = (offlineId: string) =>
 
 export const initOfflineSyncListener = () =>
   offlineSyncService.initNetworkListener();
+
+export const subscribeOfflineQueueChanges = (
+  listener: (event: OfflineQueueChangeEvent) => void
+): (() => void) => offlineSyncService.subscribeQueueChanges(listener);

@@ -96,11 +96,16 @@ export const BarcodeScannerModal: React.FC<BarcodeScannerModalProps> = React.mem
   const lastScannedTime = useRef<number>(0);
   const isCooldownActive = useRef<boolean>(false);
   const feedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cooldownTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [cooldownBlocked, setCooldownBlocked] = useState(false);
 
   useEffect(() => {
     return () => {
       if (feedbackTimerRef.current) {
         clearTimeout(feedbackTimerRef.current);
+      }
+      if (cooldownTimerRef.current) {
+        clearTimeout(cooldownTimerRef.current);
       }
     };
   }, []);
@@ -125,6 +130,7 @@ export const BarcodeScannerModal: React.FC<BarcodeScannerModalProps> = React.mem
       lastScannedCode.current = trimmed;
       lastScannedTime.current = now;
       isCooldownActive.current = true;
+      setCooldownBlocked(true);
 
       // Feedback háptico
       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
@@ -141,15 +147,21 @@ export const BarcodeScannerModal: React.FC<BarcodeScannerModalProps> = React.mem
       // Emitir resultado al callback
       onScan(trimmed);
 
+      if (cooldownTimerRef.current) {
+        clearTimeout(cooldownTimerRef.current);
+      }
+
       // Si no es modo continuo, cerrar de inmediato
       if (!continuousMode) {
-        setTimeout(() => {
+        cooldownTimerRef.current = setTimeout(() => {
           isCooldownActive.current = false;
+          setCooldownBlocked(false);
           onClose();
         }, 200);
       } else {
-        setTimeout(() => {
+        cooldownTimerRef.current = setTimeout(() => {
           isCooldownActive.current = false;
+          setCooldownBlocked(false);
         }, 800);
       }
     },
@@ -222,13 +234,13 @@ export const BarcodeScannerModal: React.FC<BarcodeScannerModalProps> = React.mem
               <Text style={styles.secondaryCloseText}>Cerrar</Text>
             </TouchableOpacity>
           </SafeAreaView>
-        ) : isAppActive ? (
+        ) : isAppActive && !manualInputVisible ? (
           <CameraView
             style={StyleSheet.absoluteFillObject}
             facing="back"
             enableTorch={torch}
             barcodeScannerSettings={BARCODE_SCANNER_CONFIG}
-            onBarcodeScanned={handleBarcodeScanned}
+            onBarcodeScanned={cooldownBlocked ? undefined : handleBarcodeScanned}
           />
         ) : (
           <View style={styles.centerContainer}>
@@ -346,66 +358,68 @@ export const BarcodeScannerModal: React.FC<BarcodeScannerModalProps> = React.mem
         )}
 
         {/* Modal de Entrada Manual de Código */}
-        <Modal
-          visible={manualInputVisible}
-          transparent
-          animationType="fade"
-          onRequestClose={() => setManualInputVisible(false)}
-        >
-          <KeyboardAvoidingView
-            style={styles.manualOverlay}
-                  behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        {manualInputVisible && (
+          <Modal
+            visible={manualInputVisible}
+            transparent
+            animationType="fade"
+            onRequestClose={() => setManualInputVisible(false)}
           >
-            <View style={styles.manualCard}>
-              <View style={styles.manualHeader}>
-                <Text style={styles.manualTitle}>Ingresar Código Manual</Text>
-                <TouchableOpacity
-                  onPress={() => setManualInputVisible(false)}
-                  style={styles.manualClose}
-                  accessibilityRole="button"
-                  accessibilityLabel="Cerrar ingreso manual"
-                >
-                  <X size={18} color={ui.textMuted} />
-                </TouchableOpacity>
+            <KeyboardAvoidingView
+              style={styles.manualOverlay}
+                    behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+            >
+              <View style={styles.manualCard}>
+                <View style={styles.manualHeader}>
+                  <Text style={styles.manualTitle}>Ingresar Código Manual</Text>
+                  <TouchableOpacity
+                    onPress={() => setManualInputVisible(false)}
+                    style={styles.manualClose}
+                    accessibilityRole="button"
+                    accessibilityLabel="Cerrar ingreso manual"
+                  >
+                    <X size={18} color={ui.textMuted} />
+                  </TouchableOpacity>
+                </View>
+
+                <Text style={styles.manualSubtitle}>
+                  Escribe el código de barras o SKU del producto
+                </Text>
+
+                <TextInput
+                  accessibilityLabel="Código de barras o SKU"
+                  value={manualCode}
+                  onChangeText={setManualCode}
+                  placeholder="Ej. 7751234567891 o SKU-001"
+                  placeholderTextColor="#6B7280"
+                  style={styles.manualInput}
+                  autoFocus
+                  returnKeyType="done"
+                  onSubmitEditing={handleManualSubmit}
+                />
+
+                <View style={styles.manualActions}>
+                  <TouchableOpacity
+                    onPress={() => setManualInputVisible(false)}
+                    style={styles.manualCancelButton}
+                    accessibilityRole="button"
+                  >
+                    <Text style={styles.manualCancelText}>Cancelar</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    onPress={handleManualSubmit}
+                    style={styles.manualSubmitButton}
+                    activeOpacity={0.8}
+                    accessibilityRole="button"
+                    accessibilityLabel="Buscar y agregar código"
+                  >
+                    <Text style={styles.manualSubmitText}>Buscar y Agregar</Text>
+                  </TouchableOpacity>
+                </View>
               </View>
-
-              <Text style={styles.manualSubtitle}>
-                Escribe el código de barras o SKU del producto
-              </Text>
-
-              <TextInput
-                accessibilityLabel="Código de barras o SKU"
-                value={manualCode}
-                onChangeText={setManualCode}
-                placeholder="Ej. 7751234567891 o SKU-001"
-                placeholderTextColor="#6B7280"
-                style={styles.manualInput}
-                autoFocus
-                returnKeyType="done"
-                onSubmitEditing={handleManualSubmit}
-              />
-
-              <View style={styles.manualActions}>
-                <TouchableOpacity
-                  onPress={() => setManualInputVisible(false)}
-                  style={styles.manualCancelButton}
-                  accessibilityRole="button"
-                >
-                  <Text style={styles.manualCancelText}>Cancelar</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  onPress={handleManualSubmit}
-                  style={styles.manualSubmitButton}
-                  activeOpacity={0.8}
-                  accessibilityRole="button"
-                  accessibilityLabel="Buscar y agregar código"
-                >
-                  <Text style={styles.manualSubmitText}>Buscar y Agregar</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-          </KeyboardAvoidingView>
-        </Modal>
+            </KeyboardAvoidingView>
+          </Modal>
+        )}
       </View>
     </Modal>
   );

@@ -2,6 +2,7 @@ import { normalizePresentation, presentationFactor } from '@/lib/presentation-pa
 import { catalogAttributeUpdate, catalogSizeInput } from '@/lib/product-attributes';
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import {
+  AppState,
   View,
   Text,
   TextInput,
@@ -247,8 +248,18 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
 
   // Cámara para escanear código
   const [scannerActive, setScannerActive] = useState(false);
+  const [isAppActive, setIsAppActive] = useState(true);
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [isSaving, setIsSaving] = useState(false);
+  const wasVisibleRef = useRef(false);
+
+  useEffect(() => {
+    if (typeof AppState?.addEventListener !== 'function') return;
+    const sub = AppState.addEventListener('change', (nextState) => {
+      setIsAppActive(nextState === 'active');
+    });
+    return () => sub.remove();
+  }, []);
 
   const appendGalleryUris = (uris: string[]) => {
     setGalleryImages((prev) => {
@@ -318,9 +329,14 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
   };
 
   useEffect(() => {
-    if (visible) {
-      setUploadStatus(null);
-      if (product) {
+    if (!visible) {
+      wasVisibleRef.current = false;
+      return;
+    }
+    if (wasVisibleRef.current) return;
+    wasVisibleRef.current = true;
+    setUploadStatus(null);
+    if (product) {
         setName(product.name || '');
         setCategory(product.category || 'Abarrotes');
         setBarcode(product.barcode || '');
@@ -455,8 +471,7 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
       setEditingPresId(null);
       setVariantModalOpen(false);
       setEditingVariantId(null);
-    }
-  }, [visible, product, branchId, branches]);
+  }, [visible, product, branchId]);
 
   // Cálculos de márgenes
   const priceVal = parseFloat(priceStr) || 0;
@@ -741,21 +756,42 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
         throw new Error('No se detectó accountId para subir imágenes a la nube.');
       }
 
-      const resolvedGallery: string[] = [];
-      let uploadedIdx = 0;
-      for (const uri of galleryImages) {
+      const resolvedGallery: string[] = new Array(galleryImages.length).fill('');
+      const localIndices: number[] = [];
+      for (let i = 0; i < galleryImages.length; i += 1) {
+        const uri = galleryImages[i];
         if (isLocalFileUri(uri)) {
-          uploadedIdx += 1;
-          setUploadStatus(`Subiendo imagen ${uploadedIdx} de ${localCount}...`);
-          const remoteUrl = await uploadProductImageToStorage(
-            uri,
-            effectiveAccountId,
-            product?.id
-          );
-          resolvedGallery.push(remoteUrl);
+          localIndices.push(i);
         } else if (uri) {
-          resolvedGallery.push(uri);
+          resolvedGallery[i] = uri;
         }
+      }
+
+      if (localIndices.length > 0) {
+        let completedUploads = 0;
+        let nextPtr = 0;
+        const workerCount = Math.min(3, localIndices.length);
+        setUploadStatus(
+          `Subiendo ${localIndices.length} ${localIndices.length === 1 ? 'imagen' : 'imágenes'}...`
+        );
+        await Promise.all(
+          Array.from({ length: workerCount }, async () => {
+            while (nextPtr < localIndices.length) {
+              const targetIdx = localIndices[nextPtr++];
+              const uri = galleryImages[targetIdx];
+              const remoteUrl = await uploadProductImageToStorage(
+                uri,
+                effectiveAccountId,
+                product?.id
+              );
+              resolvedGallery[targetIdx] = remoteUrl;
+              completedUploads += 1;
+              if (localIndices.length > 1) {
+                setUploadStatus(`Subiendo imagen ${completedUploads} de ${localIndices.length}...`);
+              }
+            }
+          })
+        );
       }
       setUploadStatus(null);
 
@@ -881,7 +917,7 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
         </View>
 
         {/* Visor de Escáner Integrado para Código de Barras */}
-        {scannerActive ? (
+        {scannerActive && isAppActive ? (
           <View style={styles.scannerWrapper}>
             <CameraView
               style={styles.cameraView}
@@ -970,7 +1006,13 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
                       accessibilityRole="button"
                       accessibilityLabel={idx === 0 ? 'Imagen principal' : 'Marcar como principal'}
                     >
-                      <Image source={{ uri }} style={styles.galleryThumb} contentFit="cover" />
+                      <Image
+                        source={{ uri }}
+                        style={styles.galleryThumb}
+                        contentFit="cover"
+                        cachePolicy="memory-disk"
+                        recyclingKey={uri}
+                      />
                       {idx === 0 ? (
                         <View style={styles.galleryMainBadge}>
                           <Star size={10} color={ui.onPrimary} />
@@ -1814,227 +1856,231 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
         </View>
 
         {/* Modal Secundario para Crear / Editar Presentación */}
-        <Modal
-          visible={presModalOpen}
-          animationType="fade"
-          transparent
-          onRequestClose={() => setPresModalOpen(false)}
-        >
-          <View style={styles.subModalOverlay}>
-            <View style={styles.subModalCard}>
-              <View style={styles.subModalHeader}>
-                <Text style={styles.subModalTitle}>
-                  {editingPresId ? 'Editar Presentación' : 'Nueva Presentación'}
-                </Text>
-                <TouchableOpacity
-                  onPress={() => setPresModalOpen(false)}
-                  style={styles.closeBtn}
-                  accessibilityRole="button"
-                  accessibilityLabel="Cerrar presentación"
-                >
-                  <X size={20} color={ui.textSecondary} />
-                </TouchableOpacity>
-              </View>
-
-              <View style={styles.formGroup}>
-                <Text style={styles.label}>Nombre de Presentación</Text>
-                <TextInput
-                  style={styles.input}
-                  value={presName}
-                  onChangeText={setPresName}
-                  accessibilityLabel="Nombre de la presentación"
-                  placeholder="Ej. Pack x6 o Caja x12"
-                  placeholderTextColor={ui.textMuted}
-                />
-              </View>
-
-              <View style={[styles.rowTwoCols, compactLayout && styles.rowTwoColsCompact]}>
-                <View style={[styles.formGroup, styles.colFlex, compactLayout && styles.colFlexCompact]}>
-                  <Text style={styles.label}>Unidades Contenidas</Text>
-                  <TextInput
-                    style={styles.input}
-                    value={presFactor}
-                    onChangeText={setPresFactor}
-                    accessibilityLabel="Unidades contenidas en la presentación"
-                    placeholder="Ej. 6"
-                    keyboardType="numeric"
-                    placeholderTextColor={ui.textMuted}
-                  />
-                </View>
-                <View style={[styles.formGroup, styles.colFlex, compactLayout && styles.colFlexCompact]}>
-                  <Text style={styles.label}>Precio Especial (S/)</Text>
-                  <TextInput
-                    style={styles.input}
-                    value={presPrice}
-                    onChangeText={setPresPrice}
-                    accessibilityLabel="Precio especial en soles"
-                    placeholder="S/ 0.00"
-                    keyboardType="decimal-pad"
-                    placeholderTextColor={ui.textMuted}
-                  />
-                </View>
-              </View>
-
-              <View style={styles.formGroup}>
-                <Text style={styles.label}>Código de Barras Propio (Opcional)</Text>
-                <TextInput
-                  style={styles.input}
-                  value={presBarcode}
-                  onChangeText={setPresBarcode}
-                  accessibilityLabel="Código de barras propio de la presentación, opcional"
-                  placeholder="Código del empaque"
-                  placeholderTextColor={ui.textMuted}
-                />
-              </View>
-
-              <View style={styles.subModalActions}>
-                <TouchableOpacity
-                  style={styles.subModalCancel}
-                  onPress={() => setPresModalOpen(false)}
-                  accessibilityRole="button"
-                >
-                  <Text style={styles.subModalCancelText}>Cancelar</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={styles.subModalConfirm}
-                  onPress={handleAddPresentation}
-                  accessibilityRole="button"
-                >
-                  <Check size={16} color={ui.surface} />
-                  <Text style={styles.subModalConfirmText}>
-                    {editingPresId ? 'Guardar' : 'Agregar'}
+        {presModalOpen && (
+          <Modal
+            visible={presModalOpen}
+            animationType="fade"
+            transparent
+            onRequestClose={() => setPresModalOpen(false)}
+          >
+            <View style={styles.subModalOverlay}>
+              <View style={styles.subModalCard}>
+                <View style={styles.subModalHeader}>
+                  <Text style={styles.subModalTitle}>
+                    {editingPresId ? 'Editar Presentación' : 'Nueva Presentación'}
                   </Text>
-                </TouchableOpacity>
+                  <TouchableOpacity
+                    onPress={() => setPresModalOpen(false)}
+                    style={styles.closeBtn}
+                    accessibilityRole="button"
+                    accessibilityLabel="Cerrar presentación"
+                  >
+                    <X size={20} color={ui.textSecondary} />
+                  </TouchableOpacity>
+                </View>
+
+                <View style={styles.formGroup}>
+                  <Text style={styles.label}>Nombre de Presentación</Text>
+                  <TextInput
+                    style={styles.input}
+                    value={presName}
+                    onChangeText={setPresName}
+                    accessibilityLabel="Nombre de la presentación"
+                    placeholder="Ej. Pack x6 o Caja x12"
+                    placeholderTextColor={ui.textMuted}
+                  />
+                </View>
+
+                <View style={[styles.rowTwoCols, compactLayout && styles.rowTwoColsCompact]}>
+                  <View style={[styles.formGroup, styles.colFlex, compactLayout && styles.colFlexCompact]}>
+                    <Text style={styles.label}>Unidades Contenidas</Text>
+                    <TextInput
+                      style={styles.input}
+                      value={presFactor}
+                      onChangeText={setPresFactor}
+                      accessibilityLabel="Unidades contenidas en la presentación"
+                      placeholder="Ej. 6"
+                      keyboardType="numeric"
+                      placeholderTextColor={ui.textMuted}
+                    />
+                  </View>
+                  <View style={[styles.formGroup, styles.colFlex, compactLayout && styles.colFlexCompact]}>
+                    <Text style={styles.label}>Precio Especial (S/)</Text>
+                    <TextInput
+                      style={styles.input}
+                      value={presPrice}
+                      onChangeText={setPresPrice}
+                      accessibilityLabel="Precio especial en soles"
+                      placeholder="S/ 0.00"
+                      keyboardType="decimal-pad"
+                      placeholderTextColor={ui.textMuted}
+                    />
+                  </View>
+                </View>
+
+                <View style={styles.formGroup}>
+                  <Text style={styles.label}>Código de Barras Propio (Opcional)</Text>
+                  <TextInput
+                    style={styles.input}
+                    value={presBarcode}
+                    onChangeText={setPresBarcode}
+                    accessibilityLabel="Código de barras propio de la presentación, opcional"
+                    placeholder="Código del empaque"
+                    placeholderTextColor={ui.textMuted}
+                  />
+                </View>
+
+                <View style={styles.subModalActions}>
+                  <TouchableOpacity
+                    style={styles.subModalCancel}
+                    onPress={() => setPresModalOpen(false)}
+                    accessibilityRole="button"
+                  >
+                    <Text style={styles.subModalCancelText}>Cancelar</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.subModalConfirm}
+                    onPress={handleAddPresentation}
+                    accessibilityRole="button"
+                  >
+                    <Check size={16} color={ui.surface} />
+                    <Text style={styles.subModalConfirmText}>
+                      {editingPresId ? 'Guardar' : 'Agregar'}
+                    </Text>
+                  </TouchableOpacity>
+                </View>
               </View>
             </View>
-          </View>
-        </Modal>
+          </Modal>
+        )}
 
         {/* Modal Secundario para Crear / Editar Variante */}
-        <Modal
-          visible={variantModalOpen}
-          animationType="fade"
-          transparent
-          onRequestClose={() => setVariantModalOpen(false)}
-        >
-          <View style={styles.subModalOverlay}>
-            <View style={styles.subModalCard}>
-              <View style={styles.subModalHeader}>
-                <Text style={styles.subModalTitle}>
-                  {editingVariantId ? 'Editar Variante' : 'Nueva Variante'}
-                </Text>
-                <TouchableOpacity
-                  onPress={() => setVariantModalOpen(false)}
-                  style={styles.closeBtn}
-                >
-                  <X size={20} color={ui.textSecondary} />
-                </TouchableOpacity>
-              </View>
+        {variantModalOpen && (
+          <Modal
+            visible={variantModalOpen}
+            animationType="fade"
+            transparent
+            onRequestClose={() => setVariantModalOpen(false)}
+          >
+            <View style={styles.subModalOverlay}>
+              <View style={styles.subModalCard}>
+                <View style={styles.subModalHeader}>
+                  <Text style={styles.subModalTitle}>
+                    {editingVariantId ? 'Editar Variante' : 'Nueva Variante'}
+                  </Text>
+                  <TouchableOpacity
+                    onPress={() => setVariantModalOpen(false)}
+                    style={styles.closeBtn}
+                  >
+                    <X size={20} color={ui.textSecondary} />
+                  </TouchableOpacity>
+                </View>
 
-              <View style={styles.formGroup}>
-                <Text style={styles.label}>Nombre *</Text>
-                <TextInput
-                  style={styles.input}
-                  value={varName}
-                  onChangeText={setVarName}
-                  placeholder="Ej. Rojo / Vainilla"
-                  placeholderTextColor={ui.textMuted}
-                />
-              </View>
-
-              <View style={[styles.rowTwoCols, compactLayout && styles.rowTwoColsCompact]}>
-                <View style={[styles.formGroup, styles.colFlex]}>
-                  <Text style={styles.label}>Talla / Medida</Text>
+                <View style={styles.formGroup}>
+                  <Text style={styles.label}>Nombre *</Text>
                   <TextInput
                     style={styles.input}
-                    value={varSize}
-                    onChangeText={setVarSize}
-                    placeholder="Ej. M, L, 500ml"
+                    value={varName}
+                    onChangeText={setVarName}
+                    placeholder="Ej. Rojo / Vainilla"
                     placeholderTextColor={ui.textMuted}
                   />
                 </View>
-                <View style={[styles.formGroup, styles.colFlex]}>
-                  <Text style={styles.label}>Stock ({branchId})</Text>
-                  <TextInput
-                    style={styles.input}
-                    value={varStockStr}
-                    onChangeText={setVarStockStr}
-                    keyboardType={allowDecimals ? 'decimal-pad' : 'numeric'}
-                    placeholder="0"
-                    placeholderTextColor={ui.textMuted}
-                  />
-                </View>
-              </View>
 
-              <View style={[styles.rowTwoCols, compactLayout && styles.rowTwoColsCompact]}>
-                <View style={[styles.formGroup, styles.colFlex]}>
-                  <Text style={styles.label}>Ajuste Precio (S/)</Text>
-                  <TextInput
-                    style={styles.input}
-                    value={varPriceAdjStr}
-                    onChangeText={setVarPriceAdjStr}
-                    keyboardType="numeric"
-                    placeholder="0.00"
-                    placeholderTextColor={ui.textMuted}
-                  />
+                <View style={[styles.rowTwoCols, compactLayout && styles.rowTwoColsCompact]}>
+                  <View style={[styles.formGroup, styles.colFlex]}>
+                    <Text style={styles.label}>Talla / Medida</Text>
+                    <TextInput
+                      style={styles.input}
+                      value={varSize}
+                      onChangeText={setVarSize}
+                      placeholder="Ej. M, L, 500ml"
+                      placeholderTextColor={ui.textMuted}
+                    />
+                  </View>
+                  <View style={[styles.formGroup, styles.colFlex]}>
+                    <Text style={styles.label}>Stock ({branchId})</Text>
+                    <TextInput
+                      style={styles.input}
+                      value={varStockStr}
+                      onChangeText={setVarStockStr}
+                      keyboardType={allowDecimals ? 'decimal-pad' : 'numeric'}
+                      placeholder="0"
+                      placeholderTextColor={ui.textMuted}
+                    />
+                  </View>
                 </View>
-                <View style={[styles.formGroup, styles.colFlex]}>
-                  <Text style={styles.label}>SKU Variante</Text>
+
+                <View style={[styles.rowTwoCols, compactLayout && styles.rowTwoColsCompact]}>
+                  <View style={[styles.formGroup, styles.colFlex]}>
+                    <Text style={styles.label}>Ajuste Precio (S/)</Text>
+                    <TextInput
+                      style={styles.input}
+                      value={varPriceAdjStr}
+                      onChangeText={setVarPriceAdjStr}
+                      keyboardType="numeric"
+                      placeholder="0.00"
+                      placeholderTextColor={ui.textMuted}
+                    />
+                  </View>
+                  <View style={[styles.formGroup, styles.colFlex]}>
+                    <Text style={styles.label}>SKU Variante</Text>
+                    <TextInput
+                      style={styles.input}
+                      value={varSku}
+                      onChangeText={setVarSku}
+                      placeholder="Opcional"
+                      placeholderTextColor={ui.textMuted}
+                    />
+                  </View>
+                </View>
+
+                <View style={styles.formGroup}>
+                  <Text style={styles.label}>Código de Barras Variante</Text>
                   <TextInput
                     style={styles.input}
-                    value={varSku}
-                    onChangeText={setVarSku}
+                    value={varBarcode}
+                    onChangeText={setVarBarcode}
                     placeholder="Opcional"
                     placeholderTextColor={ui.textMuted}
                   />
                 </View>
-              </View>
 
-              <View style={styles.formGroup}>
-                <Text style={styles.label}>Código de Barras Variante</Text>
-                <TextInput
-                  style={styles.input}
-                  value={varBarcode}
-                  onChangeText={setVarBarcode}
-                  placeholder="Opcional"
-                  placeholderTextColor={ui.textMuted}
-                />
-              </View>
+                <View style={styles.formGroup}>
+                  <Text style={styles.label}>Color identificador</Text>
+                  <View style={styles.colorSwatchesRow}>
+                    {VARIANT_COLORS.map((hex) => (
+                      <TouchableOpacity
+                        key={hex}
+                        onPress={() => setVarColorHex(hex)}
+                        style={[
+                          styles.colorSwatchBtn,
+                          { backgroundColor: hex },
+                          varColorHex === hex && styles.colorSwatchSelected,
+                        ]}
+                      />
+                    ))}
+                  </View>
+                </View>
 
-              <View style={styles.formGroup}>
-                <Text style={styles.label}>Color identificador</Text>
-                <View style={styles.colorSwatchesRow}>
-                  {VARIANT_COLORS.map((hex) => (
-                    <TouchableOpacity
-                      key={hex}
-                      onPress={() => setVarColorHex(hex)}
-                      style={[
-                        styles.colorSwatchBtn,
-                        { backgroundColor: hex },
-                        varColorHex === hex && styles.colorSwatchSelected,
-                      ]}
-                    />
-                  ))}
+                <View style={styles.subModalActions}>
+                  <TouchableOpacity
+                    style={styles.subModalCancel}
+                    onPress={() => setVariantModalOpen(false)}
+                  >
+                    <Text style={styles.subModalCancelText}>Cancelar</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={styles.subModalConfirm} onPress={handleSaveVariant}>
+                    <Check size={16} color={ui.surface} />
+                    <Text style={styles.subModalConfirmText}>
+                      {editingVariantId ? 'Guardar' : 'Agregar'}
+                    </Text>
+                  </TouchableOpacity>
                 </View>
               </View>
-
-              <View style={styles.subModalActions}>
-                <TouchableOpacity
-                  style={styles.subModalCancel}
-                  onPress={() => setVariantModalOpen(false)}
-                >
-                  <Text style={styles.subModalCancelText}>Cancelar</Text>
-                </TouchableOpacity>
-                <TouchableOpacity style={styles.subModalConfirm} onPress={handleSaveVariant}>
-                  <Check size={16} color={ui.surface} />
-                  <Text style={styles.subModalConfirmText}>
-                    {editingVariantId ? 'Guardar' : 'Agregar'}
-                  </Text>
-                </TouchableOpacity>
-              </View>
             </View>
-          </View>
-        </Modal>
+          </Modal>
+        )}
       </KeyboardAvoidingView>
     </Modal>
   );

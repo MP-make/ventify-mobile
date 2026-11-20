@@ -1,7 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import { View, Text, TouchableOpacity, Modal, ScrollView, StyleSheet } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { Store, ChevronDown, Lock, WifiOff, CloudOff, Check, X, MapPin, LayoutGrid } from 'lucide-react-native';
+import { Store, ChevronDown, Bell, WifiOff, CloudOff, Check, X, MapPin, LayoutGrid } from 'lucide-react-native';
+import { useRouter } from 'expo-router';
 import { useAuth } from '@/context/AuthContext';
 import { useSettings } from '@/context/SettingsContext';
 import { subscribeAccountNotifications } from '@/services/notification-service';
@@ -12,7 +13,8 @@ export interface HeaderProps { title?: string; showBranchSelector?: boolean }
 
 export const Header: React.FC<HeaderProps> = React.memo(({ title, showBranchSelector = true }) => {
   const insets = useSafeAreaInsets();
-  const { accountId, lockTerminal, branchId, setActiveBranchId, allBranchesAccess, role } = useAuth();
+  const router = useRouter();
+  const { accountId, branchId, setActiveBranchId, allBranchesAccess, role } = useAuth();
   const { businessName, activeBranchName, branches, isCashOpen, isOnline, offlineQueueCount } = useSettings();
   const [branchModalVisible, setBranchModalVisible] = useState(false);
   const [launcherVisible, setLauncherVisible] = useState(false);
@@ -74,24 +76,24 @@ export const Header: React.FC<HeaderProps> = React.memo(({ title, showBranchSele
                 {isCashOpen ? 'Caja abierta' : 'Caja cerrada'}
               </Text>
             </View>
-            <TouchableOpacity
-              onPress={lockTerminal}
-              style={styles.lockButton}
-              accessibilityRole="button"
-              accessibilityLabel="Bloquear terminal con PIN"
-              accessibilityHint="Solicita el PIN para volver a usar el terminal"
-            >
-              <Lock size={15} color={ui.textSecondary} />
-            </TouchableOpacity>
+            {role !== 'seller' && (
+              <TouchableOpacity
+                onPress={() => router.push('/notifications')}
+                style={styles.notifButton}
+                accessibilityRole="button"
+                accessibilityLabel={unreadCount > 0 ? `Notificaciones, ${unreadCount} sin leer` : 'Notificaciones'}
+              >
+                <Bell size={16} color={unreadCount > 0 ? ui.primary : ui.textSecondary} />
+                {unreadCount > 0 && <View style={styles.unreadDot} />}
+              </TouchableOpacity>
+            )}
             <TouchableOpacity
               onPress={() => setLauncherVisible(true)}
               style={styles.moreButton}
               accessibilityRole="button"
-              accessibilityLabel={unreadCount > 0 ? `Más módulos, ${unreadCount} notificaciones sin leer` : 'Más módulos'}
+              accessibilityLabel="Más módulos"
             >
-              <LayoutGrid size={15} color={ui.primary} />
-              <Text style={styles.moreButtonText}>Más</Text>
-              {unreadCount > 0 && <View style={styles.unreadDot} />}
+              <LayoutGrid size={16} color={ui.primary} />
             </TouchableOpacity>
           </View>
         </View>
@@ -146,9 +148,8 @@ const styles = StyleSheet.create({
   storeIconMini: { width: 26, height: 26, borderRadius: 7, backgroundColor: ui.primarySoft, alignItems: 'center', justifyContent: 'center' },
   branchName: { flexShrink: 1, color: ui.text, fontSize: 13, fontWeight: '700' },
   rightActions: { flexDirection: 'row', alignItems: 'center', gap: 6, flexShrink: 0 },
-  lockButton: { width: 32, height: 32, alignItems: 'center', justifyContent: 'center', borderRadius: 9, backgroundColor: ui.surfaceMuted },
-  moreButton: { height: 32, paddingHorizontal: 9, flexDirection: 'row', alignItems: 'center', gap: 4, borderRadius: 9, backgroundColor: ui.primarySoft, position: 'relative' },
-  moreButtonText: { fontSize: 11, fontWeight: '700', color: ui.primary },
+  notifButton: { width: 32, height: 32, alignItems: 'center', justifyContent: 'center', borderRadius: 9, backgroundColor: ui.surfaceMuted, position: 'relative' },
+  moreButton: { width: 32, height: 32, alignItems: 'center', justifyContent: 'center', borderRadius: 9, backgroundColor: ui.primarySoft },
   unreadDot: { position: 'absolute', top: -2, right: -2, width: 9, height: 9, borderRadius: 5, backgroundColor: '#EF4444', borderWidth: 1.5, borderColor: ui.surface },
   sheetCloseButton: { width: 38, height: 38, alignItems: 'center', justifyContent: 'center', borderRadius: 10, backgroundColor: ui.surfaceMuted },
   cashStatus: { flexDirection: 'row', alignItems: 'center', gap: 4, paddingHorizontal: 7, paddingVertical: 5, borderRadius: 8 },

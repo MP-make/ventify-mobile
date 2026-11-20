@@ -84,6 +84,8 @@ const SellerSaleRow = React.memo(({ sale, branchName, onPress }: SellerSaleRowPr
   </TouchableOpacity>
 ));
 
+const EMPTY_SALES: RecentSaleItem[] = [];
+
 export default function SellerScreen() {
   const insets = useSafeAreaInsets();
   const { user, accountId, logout } = useAuth();
@@ -219,7 +221,7 @@ export default function SellerScreen() {
     if (metadata) void load(metadata.today, metadata.today, '');
   }, [metadata, load]);
 
-  const applyPreset = (value: Exclude<ExtendedPreset, 'custom'>) => {
+  const applyPreset = useCallback((value: Exclude<ExtendedPreset, 'custom'>) => {
     if (!metadata) return;
     setActivePreset(value);
     const range =
@@ -229,7 +231,7 @@ export default function SellerScreen() {
     setFrom(range.from);
     setTo(range.to);
     void load(range.from, range.to, branch);
-  };
+  }, [metadata, branch, load]);
 
   const handleOpenSaleDetail = useCallback(async (saleItem: RecentSaleItem) => {
     setSelectedSaleItem(saleItem);
@@ -367,7 +369,7 @@ export default function SellerScreen() {
     return { salesCount, totalNet, totalGross, totalRefunds, avgTicket, participation };
   }, [report]);
 
-  const renderHeader = () => (
+  const headerElement = useMemo(() => (
     <View style={{ gap: 16 }}>
       <Text style={styles.title}>Mis ventas</Text>
       <Text style={styles.subtitle}>
@@ -515,6 +517,19 @@ export default function SellerScreen() {
         </>
       )}
     </View>
+  ), [metadata, activePreset, applyPreset, branch, from, to, busy, error, load, report, summaryStats]);
+
+  const saleKeyExtractor = useCallback((sale: RecentSaleItem) => sale.id, []);
+
+  const renderSaleItem = useCallback(
+    ({ item }: { item: RecentSaleItem }) => (
+      <SellerSaleRow
+        sale={item}
+        branchName={item.branchId ? branchNameMap.get(item.branchId) : undefined}
+        onPress={handleOpenSaleDetail}
+      />
+    ),
+    [branchNameMap, handleOpenSaleDetail]
   );
 
   return (
@@ -530,21 +545,11 @@ export default function SellerScreen() {
         </TouchableOpacity>
       </View>
       <FlashList
-        data={report?.recentSales || []}
-        keyExtractor={(sale) => sale.id}
+        data={report?.recentSales || EMPTY_SALES}
+        keyExtractor={saleKeyExtractor}
         estimatedItemSize={96}
-        renderItem={({ item }) => (
-          <SellerSaleRow
-            sale={item as RecentSaleItem}
-            branchName={
-              (item as RecentSaleItem).branchId
-                ? branchNameMap.get((item as RecentSaleItem).branchId!)
-                : undefined
-            }
-            onPress={(saleItem) => void handleOpenSaleDetail(saleItem)}
-          />
-        )}
-        ListHeaderComponent={renderHeader}
+        renderItem={renderSaleItem}
+        ListHeaderComponent={headerElement}
         contentContainerStyle={styles.content}
         keyboardShouldPersistTaps="handled"
       />

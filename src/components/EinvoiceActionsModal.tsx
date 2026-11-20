@@ -114,7 +114,7 @@ export const EinvoiceActionsModal: React.FC<EinvoiceActionsModalProps> = React.m
       setRepAddress(einvoice.receiptCustomer?.address || '');
     }, [visible, einvoice, eligibleCreditNotes]);
 
-    if (!einvoice) return null;
+    if (!visible || !einvoice) return null;
 
     const isOriginalDoc = einvoice.documentType === '01' || einvoice.documentType === '03';
     const isNoteDoc = einvoice.documentType === '07' || einvoice.documentType === '08';

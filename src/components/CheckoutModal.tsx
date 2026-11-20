@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import {
+  AppState,
   View,
   Text,
   TextInput,
@@ -16,7 +17,6 @@ import {
 import { Image } from 'expo-image';
 import * as Linking from 'expo-linking';
 import * as Haptics from 'expo-haptics';
-import NetInfo from '@react-native-community/netinfo';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   X,
@@ -43,6 +43,8 @@ import {
 import { useAuth } from '@/context/AuthContext';
 import { useCart } from '@/context/CartContext';
 import { useSettings } from '@/context/SettingsContext';
+import { useDebouncedValue } from '@/hooks/use-debounced-value';
+import { sharedRequestCache } from '@/lib/request-cache';
 import { formatPEN, formatDatePE, ui } from '@/lib/theme';
 import { ScreenHeading, SectionHeading } from '@/components/ui';
 import { ReceiptTicketPreview } from '@/components/ReceiptTicketPreview';
@@ -77,10 +79,10 @@ type CheckoutDocType = 'nota_venta' | 'boleta' | 'factura' | 'cotizacion';
 type ActivePaymentCategory = 'cash' | 'yape' | 'plin' | 'card' | 'transfer' | 'mixed' | 'fiado' | 'credits';
 
 const PAYMENT_LOGOS: Record<string, any> = {
-  yape: require('../assets/payment/yape.jpeg'),
-  plin: require('../assets/payment/plin.png'),
-  culqi: require('../assets/payment/culqi.jpeg'),
-  mastercard: require('../assets/payment/mastercard.webp'),
+  yape: require('../../assets/payment/yape.jpeg'),
+  plin: require('../../assets/payment/plin.png'),
+  culqi: require('../../assets/payment/culqi.jpeg'),
+  mastercard: require('../../assets/payment/mastercard.webp'),
 };
 
 const getMethodLogo = (method: { id?: string; name?: string; kind?: string; provider?: string }) => {
@@ -115,7 +117,7 @@ interface CheckoutCustomerInputsProps {
   setCustomerAddress: (val: string) => void;
   customerPhone: string;
   setCustomerPhone: (val: string) => void;
-  syncCustomerToCart: (data: Partial<Customer>) => void;
+  onBlurSync: () => void;
   isSearchingDoc: boolean;
   safeTotal: number;
   docSearchSuccess: string | null;
@@ -134,7 +136,7 @@ const CheckoutCustomerInputs = React.memo<CheckoutCustomerInputsProps>(({
   setCustomerAddress,
   customerPhone,
   setCustomerPhone,
-  syncCustomerToCart,
+  onBlurSync,
   isSearchingDoc,
   safeTotal,
   docSearchSuccess,
@@ -153,10 +155,8 @@ const CheckoutCustomerInputs = React.memo<CheckoutCustomerInputsProps>(({
               style={[styles.inputCompact, styles.inputFlex]}
               accessibilityLabel="RUC, 11 dígitos"
               value={customerRuc}
-              onChangeText={(t) => {
-                setCustomerRuc(t);
-                syncCustomerToCart({ ruc: t });
-              }}
+              onChangeText={setCustomerRuc}
+              onBlur={onBlurSync}
               placeholder="20XXXXXXXXX"
               keyboardType="numeric"
               maxLength={11}
@@ -173,10 +173,8 @@ const CheckoutCustomerInputs = React.memo<CheckoutCustomerInputsProps>(({
             style={styles.inputCompact}
             accessibilityLabel="Razón social SUNAT"
             value={customerName}
-            onChangeText={(t) => {
-              setCustomerName(t);
-              syncCustomerToCart({ name: t });
-            }}
+            onChangeText={setCustomerName}
+            onBlur={onBlurSync}
             placeholder="Nombre o Razón Social"
             placeholderTextColor={ui.textMuted}
           />
@@ -186,10 +184,8 @@ const CheckoutCustomerInputs = React.memo<CheckoutCustomerInputsProps>(({
               <TextInput
                 style={styles.inputCompact}
                 value={customerAddress}
-                onChangeText={(t) => {
-                  setCustomerAddress(t);
-                  syncCustomerToCart({ address: t });
-                }}
+                onChangeText={setCustomerAddress}
+                onBlur={onBlurSync}
                 placeholder="Dirección fiscal"
                 placeholderTextColor={ui.textMuted}
               />
@@ -199,10 +195,8 @@ const CheckoutCustomerInputs = React.memo<CheckoutCustomerInputsProps>(({
               <TextInput
                 style={styles.inputCompact}
                 value={customerPhone}
-                onChangeText={(t) => {
-                  setCustomerPhone(t);
-                  syncCustomerToCart({ phone: t });
-                }}
+                onChangeText={setCustomerPhone}
+                onBlur={onBlurSync}
                 placeholder="9XXXXXXXX"
                 keyboardType="phone-pad"
                 placeholderTextColor={ui.textMuted}
@@ -220,10 +214,8 @@ const CheckoutCustomerInputs = React.memo<CheckoutCustomerInputsProps>(({
             <TextInput
               style={[styles.inputCompact, styles.inputFlex]}
               value={customerDni}
-              onChangeText={(t) => {
-                setCustomerDni(t);
-                syncCustomerToCart({ dni: t });
-              }}
+              onChangeText={setCustomerDni}
+              onBlur={onBlurSync}
               placeholder="8 dígitos"
               keyboardType="numeric"
               maxLength={8}
@@ -241,10 +233,8 @@ const CheckoutCustomerInputs = React.memo<CheckoutCustomerInputsProps>(({
               <TextInput
                 style={styles.inputCompact}
                 value={customerName}
-                onChangeText={(t) => {
-                  setCustomerName(t);
-                  syncCustomerToCart({ name: t });
-                }}
+                onChangeText={setCustomerName}
+                onBlur={onBlurSync}
                 placeholder="Público General"
                 placeholderTextColor={ui.textMuted}
               />
@@ -254,10 +244,8 @@ const CheckoutCustomerInputs = React.memo<CheckoutCustomerInputsProps>(({
               <TextInput
                 style={styles.inputCompact}
                 value={customerPhone}
-                onChangeText={(t) => {
-                  setCustomerPhone(t);
-                  syncCustomerToCart({ phone: t });
-                }}
+                onChangeText={setCustomerPhone}
+                onBlur={onBlurSync}
                 placeholder="9XXXXXXXX"
                 keyboardType="phone-pad"
                 placeholderTextColor={ui.textMuted}
@@ -272,10 +260,8 @@ const CheckoutCustomerInputs = React.memo<CheckoutCustomerInputsProps>(({
           <TextInput
             style={styles.inputCompact}
             value={customerName}
-            onChangeText={(t) => {
-              setCustomerName(t);
-              syncCustomerToCart({ name: t });
-            }}
+            onChangeText={setCustomerName}
+            onBlur={onBlurSync}
             placeholder="Público General"
             placeholderTextColor={ui.textMuted}
           />
@@ -285,10 +271,8 @@ const CheckoutCustomerInputs = React.memo<CheckoutCustomerInputsProps>(({
               <TextInput
                 style={styles.inputCompact}
                 value={customerDni}
-                onChangeText={(t) => {
-                  setCustomerDni(t);
-                  syncCustomerToCart({ dni: t });
-                }}
+                onChangeText={setCustomerDni}
+                onBlur={onBlurSync}
                 placeholder="8 dígitos"
                 keyboardType="numeric"
                 maxLength={8}
@@ -300,10 +284,8 @@ const CheckoutCustomerInputs = React.memo<CheckoutCustomerInputsProps>(({
               <TextInput
                 style={styles.inputCompact}
                 value={customerPhone}
-                onChangeText={(t) => {
-                  setCustomerPhone(t);
-                  syncCustomerToCart({ phone: t });
-                }}
+                onChangeText={setCustomerPhone}
+                onBlur={onBlurSync}
                 placeholder="9XXXXXXXX"
                 keyboardType="phone-pad"
                 placeholderTextColor={ui.textMuted}
@@ -511,6 +493,20 @@ const normalizeInitialDocType = (raw?: string | null): CheckoutDocType | null =>
   return null;
 };
 
+const resolveCategoryFromMethod = (method: any): ActivePaymentCategory => {
+  const id = String(method?.id || '').toLowerCase();
+  const kind = String(method?.kind || '').toLowerCase();
+  const prov = String(method?.provider || '').toLowerCase();
+  if (kind === 'cash' || id === 'efectivo') return 'cash';
+  if (id === 'fiado') return 'fiado';
+  if (kind === 'credit' || id === 'creditos' || id === 'credits') return 'credits';
+  if (kind === 'mixed' || id === 'mixto') return 'mixed';
+  if (`${id} ${String(method?.name || '').toLowerCase()} ${prov}`.includes('yape')) return 'yape';
+  if (`${id} ${String(method?.name || '').toLowerCase()} ${prov}`.includes('plin')) return 'plin';
+  if (kind === 'digital' || id === 'transferencia' || id.includes('transfer')) return 'transfer';
+  return 'card';
+};
+
 export const CheckoutModal: React.FC<CheckoutModalProps> = React.memo(({
   visible,
   onClose,
@@ -552,6 +548,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = React.memo(({
     configurationReady,
     configurationError,
     refreshConfiguration,
+    refreshOfflineCount,
   } = useSettings();
 
   const resolvedBranch = branch || activeBranch || null;
@@ -610,26 +607,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = React.memo(({
     });
   }, [configuredMethods]);
 
-  const resolveCategoryFromMethod = (method: any): ActivePaymentCategory => {
-    const id = String(method?.id || '').toLowerCase();
-    const kind = String(method?.kind || '').toLowerCase();
-    const prov = String(method?.provider || '').toLowerCase();
-    if (kind === 'cash' || id === 'efectivo') return 'cash';
-    if (id === 'fiado') return 'fiado';
-    if (kind === 'credit' || id === 'creditos' || id === 'credits') return 'credits';
-    if (kind === 'mixed' || id === 'mixto') return 'mixed';
-    if (`${id} ${String(method?.name || '').toLowerCase()} ${prov}`.includes('yape')) return 'yape';
-    if (`${id} ${String(method?.name || '').toLowerCase()} ${prov}`.includes('plin')) return 'plin';
-    if (kind === 'digital' || id === 'transferencia' || id.includes('transfer')) return 'transfer';
-    return 'card';
-  };
-
-  const paymentOptions = useMemo(() => {
-    if (!configuredMethods.some((method: any) => method.kind === 'credit') || configuredMethods.some((method: any) => String(method.id).toLowerCase() === 'fiado')) {
-      return configuredMethods;
-    }
-    return [...configuredMethods, { id: 'fiado', name: 'Fiado', kind: 'credit', enabled: true, order: 999 }];
-  }, [configuredMethods]);
+  const paymentOptions = configuredMethods;
 
   const [selectedMethodId, setSelectedMethodId] = useState<string>('efectivo');
 
@@ -671,40 +649,79 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = React.memo(({
   const [selectedCustomer, setSelectedCustomer] = useState<Customer | null>(null);
   const [customersList, setCustomersList] = useState<Customer[]>([]);
   const [showCustomerPicker, setShowCustomerPicker] = useState(false);
+  const [customerSearchQuery, setCustomerSearchQuery] = useState('');
+  const debouncedCustomerSearch = useDebouncedValue(customerSearchQuery, 150);
+  const skipNextLookupDocRef = useRef<string | null>(null);
+
+  const customerFormRef = useRef({
+    name: customerName,
+    dni: customerDni,
+    ruc: customerRuc,
+    phone: customerPhone,
+    address: customerAddress,
+    selectedCustomer,
+  });
+  customerFormRef.current = {
+    name: customerName,
+    dni: customerDni,
+    ruc: customerRuc,
+    phone: customerPhone,
+    address: customerAddress,
+    selectedCustomer,
+  };
+
+  const filteredPickerCustomers = useMemo(() => {
+    const q = debouncedCustomerSearch.trim().toLowerCase();
+    if (!q) return customersList.slice(0, 6);
+    return customersList
+      .filter((c) => {
+        const name = (c.name || '').toLowerCase();
+        const dni = (c.dni || '').toLowerCase();
+        const ruc = (c.ruc || '').toLowerCase();
+        const phone = (c.phone || '').toLowerCase();
+        return name.includes(q) || dni.includes(q) || ruc.includes(q) || phone.includes(q);
+      })
+      .slice(0, 12);
+  }, [customersList, debouncedCustomerSearch]);
   const [isSearchingDoc, setIsSearchingDoc] = useState(false);
   const [docSearchSuccess, setDocSearchSuccess] = useState<string | null>(null);
   const [docError, setDocError] = useState<string | null>(null);
 
-  // Sincronizar datos de cliente con CartContext en tiempo real (para ventas pausadas y reanudadas)
-  const syncCustomerToCart = (patch: {
+  // Sincronizar datos de cliente con CartContext en onBlur/cierre/pausa/confirmación
+  const syncCustomerToCart = useCallback((patch?: {
     name?: string;
     dni?: string;
     ruc?: string;
     phone?: string;
     address?: string;
   }) => {
-    const updatedName = (patch.name !== undefined ? patch.name : customerName).trim();
-    const updatedDni = (patch.dni !== undefined ? patch.dni : customerDni).trim();
-    const updatedRuc = (patch.ruc !== undefined ? patch.ruc : customerRuc).trim();
-    const updatedPhone = (patch.phone !== undefined ? patch.phone : customerPhone).trim();
-    const updatedAddress = (patch.address !== undefined ? patch.address : customerAddress).trim();
+    const curr = customerFormRef.current;
+    const updatedName = (patch?.name !== undefined ? patch.name : curr.name).trim();
+    const updatedDni = (patch?.dni !== undefined ? patch.dni : curr.dni).trim();
+    const updatedRuc = (patch?.ruc !== undefined ? patch.ruc : curr.ruc).trim();
+    const updatedPhone = (patch?.phone !== undefined ? patch.phone : curr.phone).trim();
+    const updatedAddress = (patch?.address !== undefined ? patch.address : curr.address).trim();
 
     if (updatedName || updatedDni || updatedRuc) {
       setCartCustomer({
-        id: selectedCustomer?.id || `cust_${Date.now()}`,
+        id: curr.selectedCustomer?.id || `cust_${Date.now()}`,
         name: updatedName || 'Cliente General',
         dni: updatedDni || undefined,
         ruc: updatedRuc || undefined,
         phone: updatedPhone || undefined,
         address: updatedAddress || undefined,
         accountId: accountId || '',
-        totalPurchases: selectedCustomer?.totalPurchases || 0,
-        totalSpent: selectedCustomer?.totalSpent || 0,
+        totalPurchases: curr.selectedCustomer?.totalPurchases || 0,
+        totalSpent: curr.selectedCustomer?.totalSpent || 0,
       });
     } else {
       setCartCustomer(null);
     }
-  };
+  }, [accountId, setCartCustomer]);
+
+  const handleBlurCustomerSync = useCallback(() => {
+    syncCustomerToCart();
+  }, [syncCustomerToCart]);
 
   // 3. Método de Pago y Parámetros
   const [paymentCategory, setPaymentCategory] = useState<ActivePaymentCategory>('cash');
@@ -712,6 +729,22 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = React.memo(({
   const [operationReference, setOperationReference] = useState('');
   const [creditDays, setCreditDays] = useState('30');
   const [notes, setNotes] = useState('');
+  const [qrZoomVisible, setQrZoomVisible] = useState(false);
+
+  const selectedMethodConfig = useMemo(
+    () =>
+      paymentOptions.find((m: any) => m.id === selectedMethodId) ||
+      paymentOptions.find((m: any) => resolveCategoryFromMethod(m) === paymentCategory) ||
+      null,
+    [paymentOptions, selectedMethodId, paymentCategory]
+  );
+  const selectedMethodQrUrl = String(selectedMethodConfig?.qrUrl || '').trim();
+  const selectedMethodPhone = String(selectedMethodConfig?.qrLabel || posSettings?.digitalPhone || '').trim();
+  const digitalHolder = String(posSettings?.digitalName || businessSettings?.businessName || '').trim();
+
+  useEffect(() => {
+    setQrZoomVisible(false);
+  }, [visible, selectedMethodId]);
 
   // 4. Pago Mixto dinámico (N filas configurables)
   const [mixedSplits, setMixedSplits] = useState<MixedSplitRow[]>([
@@ -719,13 +752,13 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = React.memo(({
     { id: 'split_2', category: 'digital', digitalProvider: 'yape', amountStr: '' },
   ]);
 
-  const handleChangeMixedSplit = (id: string, patch: Partial<MixedSplitRow>) => {
+  const handleChangeMixedSplit = useCallback((id: string, patch: Partial<MixedSplitRow>) => {
     setMixedSplits((prev) =>
       prev.map((row) => (row.id === id ? { ...row, ...patch } : row))
     );
-  };
+  }, []);
 
-  const handleAddMixedSplit = () => {
+  const handleAddMixedSplit = useCallback(() => {
     setMixedSplits((prev) => {
       if (prev.length >= 5) return prev;
       return [
@@ -733,13 +766,13 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = React.memo(({
         { id: `split_${Date.now()}_${prev.length + 1}`, category: 'card', amountStr: '' },
       ];
     });
-  };
+  }, []);
 
-  const handleRemoveMixedSplit = (id: string) => {
+  const handleRemoveMixedSplit = useCallback((id: string) => {
     setMixedSplits((prev) => (prev.length > 1 ? prev.filter((r) => r.id !== id) : prev));
-  };
+  }, []);
 
-  const handleFillMixedRemaining = (id: string) => {
+  const handleFillMixedRemaining = useCallback((id: string) => {
     setMixedSplits((prev) => {
       const currentRow = prev.find((r) => r.id === id);
       if (!currentRow) return prev;
@@ -750,7 +783,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = React.memo(({
       const remaining = Math.max(0, Math.round((safeTotal - otherTotal) * 100) / 100);
       return prev.map((r) => (r.id === id ? { ...r, amountStr: remaining > 0 ? remaining.toFixed(2) : '' } : r));
     });
-  };
+  }, [safeTotal]);
 
   // 5. Estados de Envío y Pantalla de Éxito
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -768,6 +801,16 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = React.memo(({
   const sellerAttributionEnabled = posSettings?.enableSellerAttribution === true;
   const sellerSelectionRequired = sellerAttributionEnabled && posSettings?.requireSellerSelection === true;
   const selectedSeller = saleSellers.find((seller) => seller.id === selectedSellerId);
+
+  useEffect(() => {
+    if (!visible || isSuccessView || typeof AppState?.addEventListener !== 'function') return;
+    const sub = AppState.addEventListener('change', (nextState) => {
+      if (nextState !== 'active') {
+        syncCustomerToCart();
+      }
+    });
+    return () => sub.remove();
+  }, [visible, isSuccessView, syncCustomerToCart]);
 
   useEffect(() => {
     let active = true;
@@ -791,14 +834,22 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = React.memo(({
     return () => { active = false; };
   }, [visible, sellerAttributionEnabled, branchId, user?.uid]);
 
-  // Cargar clientes existentes al abrir
+  // Cargar clientes existentes solo al abrir buscador o elegir fiado/créditos (con caché TTL)
+  const shouldLoadCustomers =
+    visible && Boolean(accountId) && (showCustomerPicker || paymentCategory === 'fiado' || paymentCategory === 'credits');
   useEffect(() => {
-    if (visible && accountId) {
-      getCustomers(accountId)
-        .then((list) => setCustomersList(list || []))
-        .catch(() => {});
-    }
-  }, [visible, accountId]);
+    if (!shouldLoadCustomers || !accountId) return;
+    let active = true;
+    sharedRequestCache
+      .getOrLoad(`customers:${accountId}`, 180_000, () => getCustomers(accountId))
+      .then((list) => {
+        if (active) setCustomersList(list || []);
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [shouldLoadCustomers, accountId]);
 
   // Inicializar únicamente en la transición closed -> open para que limpiar el carrito no borre la vista del comprobante
   useEffect(() => {
@@ -848,15 +899,20 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = React.memo(({
         setSelectedCustomer(cartCustomer);
         setCustomerName(cartCustomer.name || '');
         if (cartCustomer.ruc) {
+          const cleanR = cartCustomer.ruc.trim().replace(/\D/g, '');
+          if (cleanR.length === 11) skipNextLookupDocRef.current = cleanR;
           setCustomerRuc(cartCustomer.ruc);
           if (invoicingEnabled) nextDoc = 'factura';
         } else if (cartCustomer.dni) {
+          const cleanD = cartCustomer.dni.trim().replace(/\D/g, '');
+          if (cleanD.length === 8) skipNextLookupDocRef.current = cleanD;
           setCustomerDni(cartCustomer.dni);
           if (invoicingEnabled) nextDoc = 'boleta';
         }
         setCustomerAddress(cartCustomer.address || '');
         setCustomerPhone(cartCustomer.phone || '');
       } else {
+        skipNextLookupDocRef.current = null;
         setSelectedCustomer(null);
         setCustomerDni('');
         setCustomerRuc('');
@@ -874,6 +930,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = React.memo(({
       setDocType(nextDoc);
     } else if (!visible) {
       wasVisibleRef.current = false;
+      setQrZoomVisible(false);
       lookupAbortRef.current?.abort();
       lookupAbortRef.current = null;
     }
@@ -904,9 +961,9 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = React.memo(({
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
         syncCustomerToCart({
           name: res.name,
-          address: res.address || customerAddress,
-          dni: type === 'dni' ? number : customerDni,
-          ruc: type === 'ruc' ? number : customerRuc,
+          address: res.address || customerFormRef.current.address,
+          dni: type === 'dni' ? number : customerFormRef.current.dni,
+          ruc: type === 'ruc' ? number : customerFormRef.current.ruc,
         });
         if (
           invoicingEnabled &&
@@ -928,13 +985,17 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = React.memo(({
         setIsSearchingDoc(false);
       }
     }
-  }, [invoicingEnabled, docType, customerAddress, customerDni, customerRuc]);
+  }, [invoicingEnabled, docType, syncCustomerToCart]);
 
   // Consulta automática de DNI con debounce (>= 450ms) y cancelación de obsoletas
   useEffect(() => {
     if (!visible) return;
     const cleanDni = customerDni.trim().replace(/\D/g, '');
     if (cleanDni.length !== 8 || !isValidDNI(cleanDni)) return;
+    if (skipNextLookupDocRef.current === cleanDni) {
+      skipNextLookupDocRef.current = null;
+      return;
+    }
     const timer = setTimeout(() => {
       void handleLookup('dni', cleanDni);
     }, 500);
@@ -942,13 +1003,17 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = React.memo(({
       clearTimeout(timer);
       lookupAbortRef.current?.abort();
     };
-  }, [visible, customerDni]);
+  }, [visible, customerDni, handleLookup]);
 
   // Consulta automática de RUC con debounce (>= 450ms) y cancelación de obsoletas
   useEffect(() => {
     if (!visible) return;
     const cleanRuc = customerRuc.trim().replace(/\D/g, '');
     if (cleanRuc.length !== 11 || !isValidRUC(cleanRuc)) return;
+    if (skipNextLookupDocRef.current === cleanRuc) {
+      skipNextLookupDocRef.current = null;
+      return;
+    }
     const timer = setTimeout(() => {
       void handleLookup('ruc', cleanRuc);
     }, 500);
@@ -956,17 +1021,21 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = React.memo(({
       clearTimeout(timer);
       lookupAbortRef.current?.abort();
     };
-  }, [visible, customerRuc]);
+  }, [visible, customerRuc, handleLookup]);
 
   const handleSelectExistingCustomer = (c: Customer) => {
     setSelectedCustomer(c);
     setCustomerName(c.name || '');
     if (c.ruc) {
+      const cleanR = c.ruc.trim().replace(/\D/g, '');
+      if (cleanR.length === 11) skipNextLookupDocRef.current = cleanR;
       setCustomerRuc(c.ruc);
       if (invoicingEnabled && !documentSelectionLockedRef.current && docType !== 'cotizacion') {
         setDocType('factura');
       }
     } else if (c.dni) {
+      const cleanD = c.dni.trim().replace(/\D/g, '');
+      if (cleanD.length === 8) skipNextLookupDocRef.current = cleanD;
       setCustomerDni(c.dni);
       if (invoicingEnabled && !documentSelectionLockedRef.current && docType !== 'cotizacion') {
         setDocType('boleta');
@@ -1154,9 +1223,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = React.memo(({
       const saleToken = checkoutOperationId.current;
       activeSaleTokenRef.current = saleToken;
 
-      const netInfo = await NetInfo.fetch();
-      const isOnline =
-        settingsIsOnline && Boolean(netInfo.isConnected && netInfo.isInternetReachable !== false);
+      const isOnline = settingsIsOnline;
       const cartItemsSnapshot = items.map((i) => ({ ...i }));
       const saleTimestamp = Date.now();
       const cleanRuc = customerRuc.trim().replace(/\D/g, '');
@@ -1388,6 +1455,8 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = React.memo(({
         sessionId: activeCashSession?.sessionId || activeCashSession?.id,
         saleDate: saleTimestamp,
         offlineId: saleToken,
+        skipOfflineDedup: isOnline,
+        enableSellerAttribution: sellerAttributionEnabled,
         sourceSaleRequestId: saleRequestId || undefined,
         sourceQuoteId: sourceQuoteId || undefined,
         ...(sellerAttributionEnabled && selectedSeller
@@ -1449,6 +1518,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = React.memo(({
           throw new Error('Conéctate a internet para confirmar la conversión de forma segura.');
         }
         const queuedItem = await enqueueOfflineSale(salePayload);
+        void refreshOfflineCount();
         const offId = typeof queuedItem === 'string' ? queuedItem : queuedItem.offlineId;
         result = {
           saleId: offId,
@@ -1665,10 +1735,54 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = React.memo(({
     onClose();
   };
 
+  const handleClose = useCallback(() => {
+    if (!isSuccessView) {
+      syncCustomerToCart();
+    }
+    onClose();
+  }, [isSuccessView, syncCustomerToCart, onClose]);
+
   if (!visible) return null;
 
+  const renderPaymentQrCard = (includeHeader: boolean) => {
+    if (!selectedMethodQrUrl) return null;
+    return (
+      <View style={styles.paymentQrCard}>
+        {includeHeader ? (
+          <View style={styles.paymentQrHeader}>
+            <Text style={styles.digitalInfoTitle}>
+              {`QR ${selectedMethodConfig?.name || ''}`.trim()}
+            </Text>
+            {selectedMethodPhone ? (
+              <Text style={styles.digitalInfoPhone}>{selectedMethodPhone}</Text>
+            ) : null}
+            {digitalHolder ? (
+              <Text style={styles.digitalInfoHolder}>
+                Titular: <Text style={styles.boldText}>{digitalHolder}</Text>
+              </Text>
+            ) : null}
+          </View>
+        ) : null}
+        <TouchableOpacity
+          activeOpacity={0.85}
+          onPress={() => setQrZoomVisible(true)}
+          accessibilityRole="button"
+          accessibilityLabel="Ampliar código QR"
+        >
+          <Image
+            source={{ uri: selectedMethodQrUrl }}
+            style={styles.paymentQrImage}
+            contentFit="contain"
+            cachePolicy="memory-disk"
+          />
+        </TouchableOpacity>
+        <Text style={styles.paymentQrHint}>Toca el QR para ampliar</Text>
+      </View>
+    );
+  };
+
   return (
-    <Modal visible={visible} animationType="slide" transparent={false} onRequestClose={onClose}>
+    <Modal visible={visible} animationType="slide" transparent={false} onRequestClose={handleClose}>
       <KeyboardAvoidingView
         style={styles.container}
         behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
@@ -1685,7 +1799,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = React.memo(({
             </View>
           </View>
           <TouchableOpacity
-            onPress={onClose}
+            onPress={handleClose}
             style={styles.compactCloseBtn}
             activeOpacity={0.7}
             accessibilityRole="button"
@@ -2009,27 +2123,64 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = React.memo(({
                 </View>
                 <TouchableOpacity
                   style={styles.customerDirectoryBtn}
-                  onPress={() => setShowCustomerPicker((prev) => !prev)}
+                  onPress={() => {
+                    setShowCustomerPicker((prev) => {
+                      if (prev) setCustomerSearchQuery('');
+                      return !prev;
+                    });
+                  }}
                   accessibilityRole="button"
-                  accessibilityLabel={showCustomerPicker ? 'Cerrar directorio de clientes' : 'Abrir directorio de clientes'}
+                  accessibilityLabel={showCustomerPicker ? 'Cerrar búsqueda de clientes' : 'Buscar cliente'}
                   accessibilityState={{ expanded: showCustomerPicker }}
                 >
-                  <Search size={12} color={ui.primary} />
-                  <Text style={styles.customerDirectoryBtnText}>Directorio</Text>
+                  {showCustomerPicker ? (
+                    <X size={12} color={ui.primary} />
+                  ) : (
+                    <Search size={12} color={ui.primary} />
+                  )}
+                  <Text style={styles.customerDirectoryBtnText}>
+                    {showCustomerPicker ? 'Cerrar' : 'Buscar'}
+                  </Text>
                 </TouchableOpacity>
               </View>
 
-              {/* Selector de Cliente Existente */}
+              {/* Selector de Cliente Existente (oculta el formulario manual mientras está abierto) */}
               {showCustomerPicker ? (
                 <View style={styles.customerPickerDropdown}>
-                  <Text style={styles.pickerHeading}>Clientes Frecuentes:</Text>
-                  {customersList.length === 0 ? (
-                    <Text style={styles.pickerEmptyText}>No hay clientes guardados todavía.</Text>
-                  ) : customersList.slice(0, 5).map((c) => (
+                  <View style={styles.customerSearchInputRow}>
+                    <Search size={14} color={ui.textMuted} />
+                    <TextInput
+                      style={styles.customerSearchInput}
+                      value={customerSearchQuery}
+                      onChangeText={setCustomerSearchQuery}
+                      placeholder="Buscar por nombre, DNI, RUC o teléfono..."
+                      placeholderTextColor={ui.textMuted}
+                      autoCapitalize="none"
+                      autoCorrect={false}
+                    />
+                    {customerSearchQuery.length > 0 ? (
+                      <TouchableOpacity onPress={() => setCustomerSearchQuery('')} hitSlop={6}>
+                        <X size={14} color={ui.textMuted} />
+                      </TouchableOpacity>
+                    ) : null}
+                  </View>
+                  <Text style={styles.pickerHeading}>
+                    {customerSearchQuery.trim() ? 'Resultados:' : 'Clientes Frecuentes:'}
+                  </Text>
+                  {filteredPickerCustomers.length === 0 ? (
+                    <Text style={styles.pickerEmptyText}>
+                      {customersList.length === 0
+                        ? 'No hay clientes guardados todavía.'
+                        : 'No se encontraron clientes con esa búsqueda.'}
+                    </Text>
+                  ) : filteredPickerCustomers.map((c) => (
                     <TouchableOpacity
                       key={c.id}
                       style={styles.pickerItem}
-                      onPress={() => handleSelectExistingCustomer(c)}
+                      onPress={() => {
+                        setCustomerSearchQuery('');
+                        handleSelectExistingCustomer(c);
+                      }}
                       accessibilityRole="button"
                       accessibilityLabel={`Seleccionar cliente ${c.name}${c.ruc ? `, RUC ${c.ruc}` : c.dni ? `, DNI ${c.dni}` : ''}`}
                     >
@@ -2040,27 +2191,27 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = React.memo(({
                     </TouchableOpacity>
                   ))}
                 </View>
-              ) : null}
-
-              {/* Formulario Dinámico de Cliente según Tipo de Comprobante */}
-              <CheckoutCustomerInputs
-                docType={docType}
-                customerRuc={customerRuc}
-                setCustomerRuc={setCustomerRuc}
-                customerDni={customerDni}
-                setCustomerDni={setCustomerDni}
-                customerName={customerName}
-                setCustomerName={setCustomerName}
-                customerAddress={customerAddress}
-                setCustomerAddress={setCustomerAddress}
-                customerPhone={customerPhone}
-                setCustomerPhone={setCustomerPhone}
-                syncCustomerToCart={syncCustomerToCart}
-                isSearchingDoc={isSearchingDoc}
-                safeTotal={safeTotal}
-                docSearchSuccess={docSearchSuccess}
-                docError={docError}
-              />
+              ) : (
+                /* Formulario Dinámico de Cliente según Tipo de Comprobante */
+                <CheckoutCustomerInputs
+                  docType={docType}
+                  customerRuc={customerRuc}
+                  setCustomerRuc={setCustomerRuc}
+                  customerDni={customerDni}
+                  setCustomerDni={setCustomerDni}
+                  customerName={customerName}
+                  setCustomerName={setCustomerName}
+                  customerAddress={customerAddress}
+                  setCustomerAddress={setCustomerAddress}
+                  customerPhone={customerPhone}
+                  setCustomerPhone={setCustomerPhone}
+                  onBlurSync={handleBlurCustomerSync}
+                  isSearchingDoc={isSearchingDoc}
+                  safeTotal={safeTotal}
+                  docSearchSuccess={docSearchSuccess}
+                  docError={docError}
+                />
+              )}
             </View>
 
             {/* 3. MÉTODOS DE PAGO DEL DUEÑO O AVISO DE COTIZACIÓN */}
@@ -2111,7 +2262,12 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = React.memo(({
                   >
                     {logo ? (
                       <View style={styles.methodLogoWrapper}>
-                        <Image source={logo} style={styles.methodLogoImg} contentFit="contain" />
+                        <Image
+                          source={logo}
+                          style={styles.methodLogoImg}
+                          contentFit="contain"
+                          cachePolicy="memory-disk"
+                        />
                       </View>
                     ) : cat === 'cash' ? (
                       <Banknote size={18} color={isSelected ? ui.primary : ui.textSecondary} />
@@ -2150,7 +2306,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = React.memo(({
                   placeholderTextColor={ui.textMuted}
                 />
 
-                {/* Chips de billetes rápidos + incrementos Web parity */}
+                {/* Chips de billetes rápidos */}
                 <View style={styles.quickBillsRow}>
                   <TouchableOpacity
                     style={[styles.quickBillChip, Math.abs(cashReceived - amountToCollect) < 0.01 && styles.quickBillChipActive]}
@@ -2162,7 +2318,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = React.memo(({
                       Exacto
                     </Text>
                   </TouchableOpacity>
-                  {[10, 20, 50, 100, 200].map((bill) => (
+                  {[20, 50, 100].map((bill) => (
                     <TouchableOpacity
                       key={bill}
                       style={[styles.quickBillChip, cashReceived === bill && styles.quickBillChipActive]}
@@ -2173,20 +2329,6 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = React.memo(({
                       <Text style={[styles.quickBillText, cashReceived === bill && styles.quickBillTextActive]}>
                         S/ {bill}
                       </Text>
-                    </TouchableOpacity>
-                  ))}
-                </View>
-
-                <View style={styles.quickBillsRowSecondary}>
-                  {[10, 20, 50].map((inc) => (
-                    <TouchableOpacity
-                      key={`inc-${inc}`}
-                      style={styles.quickBillChip}
-                      onPress={() => setCashReceived((prev) => Math.round(((Number(prev) || 0) + inc) * 100) / 100)}
-                      accessibilityRole="button"
-                      accessibilityLabel={`Sumar ${formatPEN(inc)}`}
-                    >
-                      <Text style={styles.quickBillText}>+S/ {inc}</Text>
                     </TouchableOpacity>
                   ))}
                   <TouchableOpacity
@@ -2230,16 +2372,17 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = React.memo(({
                   <Text style={styles.digitalInfoPhone}>
                     Número:{' '}
                     <Text style={styles.boldText}>
-                      {posSettings?.digitalPhone || '987 654 321'}
+                      {selectedMethodPhone || '987 654 321'}
                     </Text>
                   </Text>
                   <Text style={styles.digitalInfoHolder}>
                     Titular:{' '}
                     <Text style={styles.boldText}>
-                      {posSettings?.digitalName || businessSettings?.businessName || 'Ventify POS'}
+                      {digitalHolder || 'Ventify POS'}
                     </Text>
                   </Text>
                 </View>
+                {renderPaymentQrCard(false)}
                 <Text style={styles.inputLabel}>Número de Operación / Referencia (Opcional)</Text>
                 <TextInput
                   style={styles.input}
@@ -2255,6 +2398,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = React.memo(({
 
             {paymentCategory === 'card' || paymentCategory === 'transfer' ? (
               <View style={styles.paymentDetailBox}>
+                {renderPaymentQrCard(true)}
                 <Text style={styles.inputLabel}>
                   {paymentCategory === 'card' ? 'Lote / Referencia POS' : 'Número de Operación Bancaria'}
                 </Text>
@@ -2420,6 +2564,57 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = React.memo(({
           </View>
         ) : null}
       </KeyboardAvoidingView>
+      {qrZoomVisible && Boolean(selectedMethodQrUrl) && (
+        <Modal
+          visible
+          transparent
+          animationType="fade"
+          onRequestClose={() => setQrZoomVisible(false)}
+        >
+          <View style={styles.qrZoomBackdrop}>
+            <View style={styles.qrZoomCard}>
+              <View style={styles.qrZoomHeader}>
+                <Text style={styles.qrZoomTitle} numberOfLines={1}>
+                  {selectedMethodConfig?.name || paymentCategory.toUpperCase()}
+                </Text>
+                <TouchableOpacity
+                  onPress={() => setQrZoomVisible(false)}
+                  style={styles.compactCloseBtn}
+                  activeOpacity={0.7}
+                  accessibilityRole="button"
+                  accessibilityLabel="Cerrar QR ampliado"
+                >
+                  <X size={18} color={ui.textSecondary} />
+                </TouchableOpacity>
+              </View>
+              <Text style={styles.qrZoomAmount}>
+                Total: {formatPEN(amountToCollect)}
+              </Text>
+              <Image
+                source={{ uri: selectedMethodQrUrl }}
+                style={styles.qrZoomImage}
+                contentFit="contain"
+                cachePolicy="memory-disk"
+              />
+              {selectedMethodPhone ? (
+                <Text style={styles.qrZoomMeta}>{selectedMethodPhone}</Text>
+              ) : null}
+              {digitalHolder ? (
+                <Text style={styles.qrZoomMeta}>{digitalHolder}</Text>
+              ) : null}
+              <TouchableOpacity
+                style={styles.qrZoomCloseBtn}
+                onPress={() => setQrZoomVisible(false)}
+                activeOpacity={0.8}
+                accessibilityRole="button"
+                accessibilityLabel="Cerrar"
+              >
+                <Text style={styles.qrZoomCloseText}>Cerrar</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </Modal>
+      )}
     </Modal>
   );
 });
@@ -2588,12 +2783,32 @@ const styles = StyleSheet.create({
     color: ui.primary,
   },
   customerPickerDropdown: {
+    marginTop: 8,
+    marginBottom: 4,
+    padding: 10,
+    borderRadius: 10,
     backgroundColor: ui.background,
-    borderRadius: 8,
     borderWidth: 1,
     borderColor: ui.border,
-    padding: 10,
-    marginBottom: 12,
+    gap: 6,
+  },
+  customerSearchInputRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: ui.surface,
+    borderWidth: 1,
+    borderColor: ui.border,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    height: 38,
+    marginBottom: 4,
+  },
+  customerSearchInput: {
+    flex: 1,
+    fontSize: 13,
+    color: ui.text,
+    paddingVertical: 0,
   },
   pickerHeading: {
     fontSize: 11,
@@ -3467,6 +3682,95 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '600',
     color: ui.textSecondary,
+  },
+  paymentQrCard: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: ui.border,
+    borderRadius: 14,
+    padding: 14,
+    marginBottom: 12,
+  },
+  paymentQrHeader: {
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  paymentQrImage: {
+    width: 196,
+    height: 196,
+    borderRadius: 8,
+    backgroundColor: '#FFFFFF',
+  },
+  paymentQrHint: {
+    marginTop: 8,
+    fontSize: 12,
+    fontWeight: '600',
+    color: ui.textMuted,
+  },
+  qrZoomBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(15, 23, 42, 0.72)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 20,
+  },
+  qrZoomCard: {
+    width: '100%',
+    maxWidth: 360,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 20,
+    padding: 20,
+    alignItems: 'center',
+  },
+  qrZoomHeader: {
+    width: '100%',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 6,
+  },
+  qrZoomTitle: {
+    flex: 1,
+    fontSize: 17,
+    fontWeight: '800',
+    color: ui.text,
+    marginRight: 8,
+  },
+  qrZoomAmount: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: ui.primary,
+    marginBottom: 14,
+    fontVariant: ['tabular-nums'],
+  },
+  qrZoomImage: {
+    width: 280,
+    height: 280,
+    borderRadius: 12,
+    backgroundColor: '#FFFFFF',
+    marginBottom: 12,
+  },
+  qrZoomMeta: {
+    fontSize: 13,
+    color: ui.textSecondary,
+    textAlign: 'center',
+    marginBottom: 4,
+  },
+  qrZoomCloseBtn: {
+    marginTop: 12,
+    width: '100%',
+    minHeight: 46,
+    borderRadius: 12,
+    backgroundColor: ui.primary,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  qrZoomCloseText: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: ui.onPrimary,
   },
 });
 

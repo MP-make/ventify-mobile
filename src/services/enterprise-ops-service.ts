@@ -11,15 +11,6 @@
  */
 
 import { db, auth } from '@/lib/firebase';
-
-const getAppState = (): { currentState?: string } | null => {
-  try {
-    const rn = (typeof require !== 'undefined' ? require : () => null)('react-native');
-    return rn?.AppState || null;
-  } catch {
-    return null;
-  }
-};
 import {
   collection,
   doc,
@@ -48,6 +39,102 @@ import {
   type CustomPermissions,
   type Permission,
 } from '@/lib/role-permissions';
+
+type AppStateSubscription = { remove?: () => void } | null | undefined;
+type AppStateLike = {
+  currentState?: string;
+  addEventListener?: (type: 'change', listener: (nextState: string) => void) => AppStateSubscription;
+};
+
+const ENTERPRISE_POLL_INTERVAL_MS = 60_000;
+const ENTERPRISE_QUERY_LIMIT = 200;
+
+const getAppState = (): AppStateLike | null => {
+  try {
+    const rn = (typeof require !== 'undefined' ? require : () => null)('react-native');
+    return rn?.AppState || null;
+  } catch {
+    return null;
+  }
+};
+
+const createActivePollingSubscription = (
+  pollTask: (isActive: () => boolean) => Promise<void>,
+  intervalMs = ENTERPRISE_POLL_INTERVAL_MS
+): (() => void) => {
+  let active = true;
+  let inFlight = false;
+  let timer: ReturnType<typeof setInterval> | null = null;
+
+  const AppState = getAppState();
+  const hasAppStateListener = typeof AppState?.addEventListener === 'function';
+  let listenerTriggered = false;
+  let isPaused = Boolean(AppState?.currentState && AppState.currentState !== 'active');
+  let appStateSubscription: AppStateSubscription = null;
+
+  const isAppActive = () => {
+    if (listenerTriggered) return !isPaused;
+    return !isPaused && (!AppState?.currentState || AppState.currentState === 'active');
+  };
+
+  const runPoll = async () => {
+    if (!active || inFlight || !isAppActive()) return;
+    inFlight = true;
+    try {
+      await pollTask(() => active);
+    } finally {
+      inFlight = false;
+    }
+  };
+
+  const stopInterval = () => {
+    if (timer) {
+      clearInterval(timer);
+      timer = null;
+    }
+  };
+
+  const startInterval = () => {
+    if (!active || timer) return;
+    timer = setInterval(() => {
+      if (active && isAppActive()) {
+        void runPoll();
+      }
+    }, intervalMs);
+  };
+
+  if (hasAppStateListener) {
+    appStateSubscription = AppState!.addEventListener!('change', (nextState: string) => {
+      if (!active) return;
+      listenerTriggered = true;
+      if (nextState === 'active') {
+        const wasPaused = isPaused;
+        isPaused = false;
+        if (wasPaused) {
+          void runPoll();
+          startInterval();
+        }
+      } else {
+        isPaused = true;
+        stopInterval();
+      }
+    });
+  }
+
+  if (!hasAppStateListener || isAppActive()) {
+    void runPoll();
+    startInterval();
+  }
+
+  return () => {
+    active = false;
+    stopInterval();
+    if (appStateSubscription && typeof appStateSubscription.remove === 'function') {
+      appStateSubscription.remove();
+    }
+    appStateSubscription = null;
+  };
+};
 
 // ============================================================================
 // CONSTANTES DE COLECCIONES OFICIALES
@@ -831,6 +918,12 @@ export const getSaleRequests = async (
 ): Promise<SaleRequest[]> => {
   if (!accountId) return [];
   const params = new URLSearchParams({ accountId, limit: '300' });
+  if (branchId && branchId !== 'all' && branchId !== 'main') {
+    params.set('branchId', branchId);
+  }
+  if (status && status !== 'all') {
+    params.set('status', status);
+  }
   const response = await apiRequest<{ success: boolean; data: any[] }>(`/api/admin/sale-requests?${params.toString()}`);
   return (response.data || [])
     .map((item) => normalizeSaleRequest(item))
@@ -893,27 +986,19 @@ const normalizeSaleRequest = (data: any): SaleRequest => ({
 export const subscribeToSaleRequests = (
   accountId: string,
   callback: (requests: SaleRequest[]) => void,
-  branchId?: string
+  branchId?: string,
+  status?: SaleRequestStatus | 'all'
 ): (() => void) => {
   if (!accountId) { callback([]); return () => {}; }
-  let active = true;
-  const refresh = async () => {
+  return createActivePollingSubscription(async (isActive) => {
     try {
-      const requests = await getSaleRequests(accountId, branchId);
-      if (active) callback(requests);
+      const requests = await getSaleRequests(accountId, branchId, status);
+      if (isActive()) callback(requests);
     } catch (error) {
       console.warn('[EnterpriseOps] No se pudieron consultar las solicitudes:', error);
-      if (active) callback([]);
+      if (isActive()) callback([]);
     }
-  };
-  void refresh();
-  const timer = setInterval(() => {
-    const appState = getAppState();
-    if (active && (!appState || appState.currentState === 'active')) {
-      void refresh();
-    }
-  }, 30_000);
-  return () => { active = false; clearInterval(timer); };
+  });
 };
 
 export const resolveSaleRequest = async (
@@ -1140,7 +1225,9 @@ export const updateTeamUser = async (userId: string, params: UpdateTeamUserParam
 /** Lista sucursales de la cuenta ordenadas por estado activo y nombre. */
 export const getBranchesList = async (accountId: string): Promise<BranchItem[]> => {
   if (!accountId) return [];
-  const snap = await getDocs(query(collection(db, BRANCHES_COLLECTION), where('accountId', '==', accountId)));
+  const snap = await getDocs(
+    query(collection(db, BRANCHES_COLLECTION), where('accountId', '==', accountId), limit(ENTERPRISE_QUERY_LIMIT))
+  );
   const items: BranchItem[] = snap.docs.map((d) => {
     const data = d.data() || {};
     return {
@@ -1229,7 +1316,11 @@ export const getTeamMembers = async (accountId: string): Promise<TeamMember[]> =
   if (!accountId) return [];
 
   try {
-    const qUsers = query(collection(db, USERS_COLLECTION), where('accountId', '==', accountId));
+    const qUsers = query(
+      collection(db, USERS_COLLECTION),
+      where('accountId', '==', accountId),
+      limit(ENTERPRISE_QUERY_LIMIT)
+    );
     const snapshot = await getDocs(qUsers);
     const members = snapshot.docs.map((docSnap) => mapTeamMemberDoc(docSnap.id, docSnap.data(), accountId));
     return sortTeamMembers(members);
@@ -1252,7 +1343,11 @@ export const subscribeToTeamMembers = (
   }
 
   try {
-    const qUsers = query(collection(db, USERS_COLLECTION), where('accountId', '==', accountId));
+    const qUsers = query(
+      collection(db, USERS_COLLECTION),
+      where('accountId', '==', accountId),
+      limit(ENTERPRISE_QUERY_LIMIT)
+    );
     return onSnapshot(
       qUsers,
       (snapshot) => {
@@ -1283,17 +1378,27 @@ export const getPayrollMovements = async (
 
   try {
     const movements: PayrollMovement[] = [];
+    const branchConstraints =
+      branchId && branchId !== 'all' && branchId !== 'main'
+        ? [where('branchId', '==', branchId)]
+        : [];
 
-    // 1. Consultar cash_register_movements (adelantos y egresos de caja chica)
-    const coll = collection(db, CASH_MOVEMENTS_COLLECTION);
-    let q = query(coll, where('accountId', '==', accountId));
+    const cashQ = query(
+      collection(db, CASH_MOVEMENTS_COLLECTION),
+      where('accountId', '==', accountId),
+      ...branchConstraints,
+      limit(100)
+    );
+    const setQ = query(
+      collection(db, PAYROLL_SETTLEMENTS_COLLECTION),
+      where('accountId', '==', accountId),
+      ...branchConstraints,
+      limit(100)
+    );
 
-    if (branchId && branchId !== 'all' && branchId !== 'main') {
-      q = query(q, where('branchId', '==', branchId));
-    }
-    q = query(q, limit(100));
+    // Consultar cash_register_movements y payroll_settlements en paralelo
+    const [snapshot, setSnap] = await Promise.all([getDocs(cashQ), getDocs(setQ)]);
 
-    const snapshot = await getDocs(q);
     snapshot.docs.forEach((docSnap) => {
         const data = docSnap.data();
         const isAdvance = data.isEmployeeAdvance === true ||
@@ -1328,16 +1433,6 @@ export const getPayrollMovements = async (
         });
     });
 
-    // 2. Consultar payroll_settlements (liquidaciones y pagos no deducidos de caja)
-    const setColl = collection(db, PAYROLL_SETTLEMENTS_COLLECTION);
-    let setQ = query(setColl, where('accountId', '==', accountId));
-
-    if (branchId && branchId !== 'all' && branchId !== 'main') {
-      setQ = query(setQ, where('branchId', '==', branchId));
-    }
-    setQ = query(setQ, limit(100));
-
-    const setSnap = await getDocs(setQ);
     setSnap.docs.forEach((docSnap) => {
         const data = docSnap.data();
         const rawConcept: PayrollConceptType = (data.conceptType as PayrollConceptType) || 'salary';
@@ -1390,24 +1485,15 @@ export const subscribeToPayrollMovements = (
     return () => {};
   }
 
-  let active = true;
-  const refresh = async () => {
+  return createActivePollingSubscription(async (isActive) => {
     try {
       const movements = await getPayrollMovements(accountId, branchId);
-      if (active) callback(movements);
+      if (isActive()) callback(movements);
     } catch (error) {
       console.error('[EnterpriseOps] Error al consultar historial de planilla:', error);
-      if (active) onError?.(error);
+      if (isActive()) onError?.(error);
     }
-  };
-  void refresh();
-  const timer = setInterval(() => {
-    const appState = getAppState();
-    if (active && (!appState || appState.currentState === 'active')) {
-      void refresh();
-    }
-  }, 30_000);
-  return () => { active = false; clearInterval(timer); };
+  });
 };
 
 /** Construye una liquidación compatible con `/payroll` web para evitar crashes al renderizar fechas o desgloses. */

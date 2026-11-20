@@ -760,10 +760,14 @@ export async function fetchPeriodComparison(
 
 export async function fetchInventoryIntelligence(
   accountId: string,
-  branchId?: string
+  branchId?: string,
+  options?: { signal?: AbortSignal }
 ): Promise<InventoryIntelligenceResponse> {
   if (!accountId) {
     throw new ApiError('accountId es requerido.', 400);
+  }
+  if (options?.signal?.aborted) {
+    throw new ApiError('Operación cancelada.', 499, 'ABORTED');
   }
   const params = new URLSearchParams({ accountId });
   const scopedBranch = normalizeBranchScope(branchId);
@@ -773,6 +777,9 @@ export async function fetchInventoryIntelligence(
   const prepared = await getApiRequestInit(path, { method: 'GET' });
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 60000);
+  const externalSignal = options?.signal;
+  const onExternalAbort = () => controller.abort();
+  externalSignal?.addEventListener?.('abort', onExternalAbort, { once: true });
 
   try {
     const response = await fetch(prepared.url, {
@@ -801,12 +808,16 @@ export async function fetchInventoryIntelligence(
     }
     return data as InventoryIntelligenceResult;
   } catch (err) {
+    if (externalSignal?.aborted) {
+      throw new ApiError('Operación cancelada.', 499, 'ABORTED');
+    }
     if (controller.signal.aborted) {
       throw new ApiError('El análisis tardó demasiado. Intenta nuevamente.', 408);
     }
     throw err;
   } finally {
     clearTimeout(timeout);
+    externalSignal?.removeEventListener?.('abort', onExternalAbort);
   }
 }
 
@@ -1023,6 +1034,33 @@ export async function fetchDashboardOperationalSummary(
   };
 }
 
+export async function fetchPeriodSalesSummaryOnly(
+  accountId: string,
+  branchId: string | undefined,
+  fromMs: number,
+  toMs: number,
+  productsMap?: Map<string, Record<string, any>>
+): Promise<{ salesSummary: DashboardSalesBreakdown; rawSalesCount: number }> {
+  if (!accountId) {
+    throw new Error('accountId requerido para resumen de ventas.');
+  }
+  const effectiveBranch = normalizeBranchScope(branchId);
+  const salesQuery = query(
+    collection(db, 'sales'),
+    where('accountId', '==', accountId),
+    ...(effectiveBranch ? [where('branchId', '==', effectiveBranch)] : []),
+    where('date', '>=', fromMs),
+    where('date', '<=', toMs),
+    orderBy('date', 'desc')
+  );
+  const salesSnap = await getDocs(salesQuery);
+  const salesDocs = salesSnap.docs.map((d) => ({ id: d.id, ...(d.data() as Record<string, any>) }));
+  return {
+    salesSummary: aggregatePeriodSalesSummary(salesDocs, productsMap),
+    rawSalesCount: salesDocs.length,
+  };
+}
+
 export async function fetchCanonicalPnlReport(params: GeneratePnlReportParams): Promise<PnlReportResult> {
   const { generatePnlReport } = await import('./pnl-report-service');
   return generatePnlReport(params);
@@ -1219,7 +1257,8 @@ export async function fetchExpensesReport(
     ...(effectiveBranch ? [where('branchId', '==', effectiveBranch)] : []),
     where('createdAt', '>=', Timestamp.fromMillis(fromMs)),
     where('createdAt', '<=', Timestamp.fromMillis(toMs)),
-    orderBy('createdAt', 'asc')
+    orderBy('createdAt', 'asc'),
+    limit(500)
   );
 
   const snap = await getDocs(q);

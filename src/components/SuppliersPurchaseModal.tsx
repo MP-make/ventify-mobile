@@ -124,13 +124,24 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
     visible: boolean;
     editingSupplier: Supplier | null;
   }>({ visible: false, editingSupplier: null });
+  const [modalReady, setModalReady] = useState<boolean>(false);
 
-  // Sincronizar pestaña inicial si cambia desde props
+  // Sincronizar pestaña inicial si cambia desde props y forzar re-sync de layout en Android Fabric
   useEffect(() => {
-    if (visible) {
-      setActiveTab(initialTab);
+    if (!visible) {
+      setModalReady(false);
+      return;
     }
+    setActiveTab(initialTab);
+    const frame = requestAnimationFrame(() => {
+      setModalReady(true);
+    });
+    return () => cancelAnimationFrame(frame);
   }, [visible, initialTab]);
+
+  const handleModalShow = useCallback(() => {
+    setModalReady(true);
+  }, []);
 
   // --------------------------------------------------------------------------
   // CARGA Y SUSCRIPCIÓN EN TIEMPO REAL
@@ -420,7 +431,14 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
   if (!visible) return null;
 
   return (
-    <Modal visible={visible} animationType="slide" transparent={false} onRequestClose={onClose}>
+    <Modal
+      visible={visible}
+      animationType="slide"
+      transparent
+      statusBarTranslucent
+      onShow={handleModalShow}
+      onRequestClose={onClose}
+    >
       <View style={[styles.safeArea, { paddingTop: insets.top, paddingBottom: insets.bottom }]}>
         {/* ENCABEZADO PRINCIPAL */}
         <View style={styles.header}>
@@ -565,7 +583,7 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
               </View>
 
               {/* LISTADO VIRTUALIZADO DE ÓRDENES */}
-              {ordersLoading && purchaseOrders.length === 0 ? (
+              {!modalReady || (ordersLoading && purchaseOrders.length === 0) ? (
                 <View style={styles.centerContainer}>
                   <ActivityIndicator size="large" color={ui.primary} />
                   <Text style={styles.loadingText}>Cargando órdenes de compra...</Text>
@@ -629,7 +647,7 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
               </View>
 
               {/* LISTADO VIRTUALIZADO DE PROVEEDORES */}
-              {suppliersLoading && suppliers.length === 0 ? (
+              {!modalReady || (suppliersLoading && suppliers.length === 0) ? (
                 <View style={styles.centerContainer}>
                   <ActivityIndicator size="large" color={ui.primary} />
                   <Text style={styles.loadingText}>Cargando proveedores...</Text>

@@ -118,7 +118,7 @@ export default function LoginScreen() {
         showsVerticalScrollIndicator={false}
       >
         <View style={styles.body}>
-          {/* Header Centrado: Logo Circular Grande + Nombre + Slogan */}
+          {/* Header Compacto: Logo Circular + Nombre + Slogan al lado y descripción debajo */}
           <View style={styles.compactHeader}>
             <View style={styles.logoCircleContainer}>
               <Image
@@ -128,13 +128,17 @@ export default function LoginScreen() {
                 accessibilityIgnoresInvertColors
               />
             </View>
-            <Text style={styles.brandWordmark}>
-              ventify<Text style={styles.brandDot}>.</Text>
-            </Text>
-            <Text style={styles.headerSloganInline}>Tu negocio, siempre contigo</Text>
-            <Text style={styles.headerSubtitle}>
-              Vende, controla tu inventario y lleva tu negocio desde un solo lugar.
-            </Text>
+            <View style={styles.headerTextGroup}>
+              <View style={styles.headerTopRow}>
+                <Text style={styles.brandWordmark}>
+                  ventify<Text style={styles.brandDot}>.</Text>
+                </Text>
+                <Text style={styles.headerSloganInline}>· Tu negocio, siempre contigo</Text>
+              </View>
+              <Text style={styles.headerSubtitle}>
+                Vende, controla tu inventario y lleva tu negocio desde un solo lugar.
+              </Text>
+            </View>
           </View>
 
           <View style={styles.form}>
@@ -322,56 +326,63 @@ const styles = StyleSheet.create({
   scroll: { flexGrow: 1, justifyContent: 'center', paddingHorizontal: 24 },
   body: { width: '100%', maxWidth: 460, alignSelf: 'center' },
   compactHeader: {
+    flexDirection: 'row',
     alignItems: 'center',
-    marginBottom: 20,
-    paddingHorizontal: 8,
+    gap: 12,
+    marginBottom: 16,
+    paddingHorizontal: 2,
   },
   logoCircleContainer: {
-    width: 74,
-    height: 74,
-    borderRadius: 37,
+    width: 44,
+    height: 44,
+    borderRadius: 22,
     overflow: 'hidden',
     backgroundColor: '#FFFFFF',
     borderWidth: 1.5,
     borderColor: ui.border,
     alignItems: 'center',
     justifyContent: 'center',
-    marginBottom: 10,
-    elevation: 3,
+    elevation: 2,
     shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.12,
-    shadowRadius: 4,
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.1,
+    shadowRadius: 2,
   },
   logoCircularImage: {
-    width: 66,
-    height: 66,
-    borderRadius: 33,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+  },
+  headerTextGroup: {
+    flex: 1,
+    justifyContent: 'center',
+  },
+  headerTopRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: 6,
   },
   brandWordmark: {
-    fontSize: 32,
+    fontSize: 22,
     fontWeight: '800',
-    letterSpacing: -1,
+    letterSpacing: -0.8,
     color: ui.text,
-    textAlign: 'center',
   },
   brandDot: {
     color: ui.primary,
   },
   headerSloganInline: {
-    fontSize: 13.5,
+    fontSize: 13,
     fontWeight: '600',
     color: ui.textSecondary,
     letterSpacing: -0.2,
-    textAlign: 'center',
-    marginTop: 2,
   },
   headerSubtitle: {
-    fontSize: 12,
-    lineHeight: 17,
+    fontSize: 11.5,
+    lineHeight: 16,
     color: ui.textMuted,
-    textAlign: 'center',
-    marginTop: 4,
+    marginTop: 2,
   },
   form: { backgroundColor: ui.surface, borderRadius: 16, padding: 24 },
   formTitle: {

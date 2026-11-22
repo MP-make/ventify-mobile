@@ -25,7 +25,6 @@ import {
   AlertCircle,
   WifiOff,
   Check,
-  Sparkles,
 } from 'lucide-react-native';
 import * as Haptics from 'expo-haptics';
 import { useAuth } from '@/context/AuthContext';
@@ -182,7 +181,7 @@ export default function SignupScreen() {
 
           <View style={styles.form}>
             <View style={styles.trialBadge}>
-              <Sparkles size={13} color={ui.primary} />
+              <Check size={13} color={ui.primary} />
               <Text style={styles.trialBadgeText}>14 días gratis del Plan Profesional</Text>
             </View>
 

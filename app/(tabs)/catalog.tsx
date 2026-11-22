@@ -63,9 +63,6 @@ import { BarcodeScannerModal } from '@/components/BarcodeScannerModal';
 import { QuickStockAdjustModal } from '@/components/catalog/QuickStockAdjustModal';
 import { NewTransferModal } from '@/components/catalog/NewTransferModal';
 import {
-  DEFAULT_CATALOG_BRANDS,
-  DEFAULT_CATALOG_SIZES,
-  mergeCatalogOptions,
   filterCatalogIndex,
   getCatalogCategoryCounts,
 } from '@/lib/catalog-filters';
@@ -554,7 +551,7 @@ export default function CatalogInventoryScreen() {
       return availableBrandsCacheRef.current;
     }
     if (!isFocused) return EMPTY_OPTIONS;
-    const next = ['Todas', ...mergeCatalogOptions(DEFAULT_CATALOG_BRANDS, catalogIndex.brands)];
+    const next = ['Todas', ...catalogIndex.brands];
     availableBrandsCacheRef.current = next;
     return next;
   }, [isFocused, catalogIndex]);
@@ -565,7 +562,7 @@ export default function CatalogInventoryScreen() {
       return availableSizesCacheRef.current;
     }
     if (!isFocused) return EMPTY_OPTIONS;
-    const next = ['Todas', ...mergeCatalogOptions(DEFAULT_CATALOG_SIZES, catalogIndex.sizes)];
+    const next = ['Todas', ...catalogIndex.sizes];
     availableSizesCacheRef.current = next;
     return next;
   }, [isFocused, catalogIndex]);

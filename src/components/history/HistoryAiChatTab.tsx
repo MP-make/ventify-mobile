@@ -10,7 +10,7 @@ import {
 } from 'react-native';
 import { FlashList } from '@shopify/flash-list';
 import { Image } from 'expo-image';
-import { Send, Sparkles, Trash2 } from 'lucide-react-native';
+import { Send, Trash2 } from 'lucide-react-native';
 
 import { ui } from '@/lib/theme';
 import { askVentyAI } from '@/services/crm-operations-service';
@@ -244,7 +244,11 @@ export const HistoryAiChatTab = React.memo<HistoryAiChatTabProps>(
           <View style={styles.quickQuestionsContainer}>
             <View style={styles.quickQuestionsHeaderRow}>
               <View style={styles.quickQuestionsTitleRow}>
-                <Sparkles size={16} color={ui.primary} />
+                <Image
+                  source={VENTY_ICON}
+                  style={{ width: 18, height: 18, borderRadius: 9 }}
+                  contentFit="cover"
+                />
                 <Text style={styles.quickQuestionsTitle}>Consultas rápidas:</Text>
               </View>
               {hasConversation ? (

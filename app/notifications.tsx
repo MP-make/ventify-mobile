@@ -9,6 +9,7 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { FlashList } from '@shopify/flash-list';
+import { Image } from 'expo-image';
 import { useRouter, type Href } from 'expo-router';
 import * as Haptics from 'expo-haptics';
 import {
@@ -19,7 +20,6 @@ import {
   FileText,
   Package,
   ReceiptText,
-  Sparkles,
   Wallet,
 } from 'lucide-react-native';
 import { useAuthSession } from '@/context/AuthContext';
@@ -67,7 +67,13 @@ function NotificationTypeIcon({ type }: { type: string }) {
     case 'quote':
       return <FileText size={18} color={ui.primary} />;
     case 'ai_insight':
-      return <Sparkles size={18} color={ui.accent} />;
+      return (
+        <Image
+          source={require('../assets/venty-icon.webp')}
+          style={{ width: 20, height: 20, borderRadius: 10 }}
+          contentFit="cover"
+        />
+      );
     case 'sunat':
     case 'invoicing':
       return <ReceiptText size={18} color={ui.primary} />;

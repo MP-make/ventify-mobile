@@ -482,49 +482,53 @@ export const BusinessSettingsTab = React.memo<BusinessSettingsTabProps>(
             />
           </View>
 
-          <View style={styles.switchRow}>
-            <View style={styles.flex1}>
-              <Text style={styles.switchTitle}>Exonerado Amazonía (Ley 27037)</Text>
-              <Text style={styles.switchSubtitle}>
-                Emite comprobantes con código tributario 20 (0% IGV)
-              </Text>
-            </View>
-            <Switch
-              value={isAmazonExempt}
-              onValueChange={setIsAmazonExempt}
-              disabled={!canManageSettings}
-              trackColor={{ false: ui.border, true: ui.primary }}
-            />
-          </View>
-
-          {!isAmazonExempt ? (
-            <View style={styles.settingRow}>
-              <Text style={styles.settingLabel}>Tasa de IGV</Text>
-              <View style={styles.segmentControl}>
-                <TouchableOpacity
-                  style={[styles.segmentBtn, taxRateChoice === 18 && styles.segmentBtnActive]}
-                  onPress={() => canManageSettings && setTaxRateChoice(18)}
-                  disabled={!canManageSettings}
-                >
-                  <Text
-                    style={[styles.segmentText, taxRateChoice === 18 && styles.segmentTextActive]}
-                  >
-                    18% General
+          {invoicingEnabled ? (
+            <>
+              <View style={styles.switchRow}>
+                <View style={styles.flex1}>
+                  <Text style={styles.switchTitle}>Exonerado Amazonía (Ley 27037)</Text>
+                  <Text style={styles.switchSubtitle}>
+                    Emite comprobantes con código tributario 20 (0% IGV)
                   </Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={[styles.segmentBtn, taxRateChoice === 10 && styles.segmentBtnActive]}
-                  onPress={() => canManageSettings && setTaxRateChoice(10)}
+                </View>
+                <Switch
+                  value={isAmazonExempt}
+                  onValueChange={setIsAmazonExempt}
                   disabled={!canManageSettings}
-                >
-                  <Text
-                    style={[styles.segmentText, taxRateChoice === 10 && styles.segmentTextActive]}
-                  >
-                    10% MYPE
-                  </Text>
-                </TouchableOpacity>
+                  trackColor={{ false: ui.border, true: ui.primary }}
+                />
               </View>
-            </View>
+
+              {!isAmazonExempt ? (
+                <View style={styles.settingRow}>
+                  <Text style={styles.settingLabel}>Tasa de IGV</Text>
+                  <View style={styles.segmentControl}>
+                    <TouchableOpacity
+                      style={[styles.segmentBtn, taxRateChoice === 18 && styles.segmentBtnActive]}
+                      onPress={() => canManageSettings && setTaxRateChoice(18)}
+                      disabled={!canManageSettings}
+                    >
+                      <Text
+                        style={[styles.segmentText, taxRateChoice === 18 && styles.segmentTextActive]}
+                      >
+                        18% General
+                      </Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={[styles.segmentBtn, taxRateChoice === 10 && styles.segmentBtnActive]}
+                      onPress={() => canManageSettings && setTaxRateChoice(10)}
+                      disabled={!canManageSettings}
+                    >
+                      <Text
+                        style={[styles.segmentText, taxRateChoice === 10 && styles.segmentTextActive]}
+                      >
+                        10% MYPE
+                      </Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              ) : null}
+            </>
           ) : null}
 
           <View style={styles.switchRow}>

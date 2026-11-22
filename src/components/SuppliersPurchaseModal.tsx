@@ -31,7 +31,7 @@ import {
   ClipboardList,
   Contact,
 } from 'lucide-react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { useAuthSession } from '@/context/AuthContext';
 import { useDebouncedValue } from '@/hooks/use-debounced-value';
@@ -88,6 +88,7 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
   onStockUpdated,
   initialTab = 'orders',
 }) => {
+  const insets = useSafeAreaInsets();
   const { accountId, userProfile } = useAuthSession();
 
   // --------------------------------------------------------------------------
@@ -420,7 +421,7 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
 
   return (
     <Modal visible={visible} animationType="slide" transparent={false} onRequestClose={onClose}>
-      <SafeAreaView style={styles.safeArea}>
+      <View style={[styles.safeArea, { paddingTop: insets.top, paddingBottom: insets.bottom }]}>
         {/* ENCABEZADO PRINCIPAL */}
         <View style={styles.header}>
           <View style={styles.headerTitleRow}>
@@ -704,7 +705,7 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
             onApplied={handleAppliedPriceSuggestions}
           />
         )}
-      </SafeAreaView>
+      </View>
     </Modal>
   );
 });

@@ -17,7 +17,6 @@ import {
   X,
   Gift,
   Tag,
-  Sparkles,
   Pause,
   CalendarClock,
   Zap,
@@ -413,7 +412,7 @@ export const PosCartDrawerModal: React.FC<PosCartDrawerModalProps> = React.memo(
                       onPress={onOpenPromos}
                       activeOpacity={0.8}
                     >
-                      <Sparkles size={13} color={ui.primary} />
+                      <Tag size={13} color={ui.primary} />
                       <Text style={styles.promoHintBannerText} numberOfLines={1}>
                         {promoSuggestions[0].name}: {promoSuggestions[0].description}
                       </Text>

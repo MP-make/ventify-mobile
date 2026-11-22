@@ -47,9 +47,6 @@ import { PosReservationModal } from '@/components/pos/PosReservationModal';
 import { PosQuickConceptModal } from '@/components/pos/PosQuickConceptModal';
 import type { QuickSaleBannerPayload } from '@/components/pos/useQuickSaleAction';
 import {
-  DEFAULT_CATALOG_BRANDS,
-  DEFAULT_CATALOG_SIZES,
-  mergeCatalogOptions,
   filterCatalogIndex,
   getCatalogCategoryCounts,
 } from '@/lib/catalog-filters';
@@ -408,7 +405,7 @@ export default function PosCounterScreen() {
       return availableBrandsCacheRef.current;
     }
     if (!isFocused) return EMPTY_OPTIONS;
-    const next = ['Todas', ...mergeCatalogOptions(DEFAULT_CATALOG_BRANDS, catalogIndex.brands)];
+    const next = ['Todas', ...catalogIndex.brands];
     availableBrandsCacheRef.current = next;
     return next;
   }, [isFocused, catalogIndex]);
@@ -419,7 +416,7 @@ export default function PosCounterScreen() {
       return availableSizesCacheRef.current;
     }
     if (!isFocused) return EMPTY_OPTIONS;
-    const next = ['Todas', ...mergeCatalogOptions(DEFAULT_CATALOG_SIZES, catalogIndex.sizes)];
+    const next = ['Todas', ...catalogIndex.sizes];
     availableSizesCacheRef.current = next;
     return next;
   }, [isFocused, catalogIndex]);

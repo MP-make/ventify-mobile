@@ -11,7 +11,8 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { FlashList } from '@shopify/flash-list';
-import { AlertCircle, AlertTriangle, Send, Sparkles, X } from 'lucide-react-native';
+import { Image } from 'expo-image';
+import { AlertCircle, AlertTriangle, Send, X } from 'lucide-react-native';
 import { ui } from '@/lib/theme';
 import { askVentyAI } from '@/services/crm-operations-service';
 import { operationsStyles as styles } from './operationsStyles';
@@ -338,7 +339,11 @@ export const VentyAiModal = React.memo<VentyAiModalProps>(({
       <SafeAreaView edges={['top', 'bottom']} style={styles.fullSheetContainer}>
         <View style={styles.fullSheetHeader}>
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, flex: 1 }}>
-            <Sparkles size={20} color={ui.primary} />
+            <Image
+              source={require('../../../assets/venty-icon.webp')}
+              style={{ width: 28, height: 28, borderRadius: 14 }}
+              contentFit="cover"
+            />
             <View>
               <Text style={styles.modalTitle}>Venty IA</Text>
               <Text style={styles.modalSub}>Asistente operativo en tiempo real</Text>

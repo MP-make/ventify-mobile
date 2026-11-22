@@ -66,6 +66,7 @@ import {
   PRINTER_CONFIG_STORAGE_KEY,
   getPrinterConfig,
   savePrinterConfig,
+  resetPrinterConfigCache,
   scanBluetoothPrinters,
   printRawEscPos,
   testPrinterConnection,
@@ -76,6 +77,7 @@ describe('thermal-printer-service (permissions, fallback safety, HTML escaping, 
   beforeEach(() => {
     vi.clearAllMocks();
     mockAsyncStorage.clear();
+    resetPrinterConfigCache();
     mockPlatform.OS = 'android';
     mockPlatform.Version = 34;
     delete mockNativeModules.ThermalPrinter;
@@ -258,14 +260,24 @@ describe('thermal-printer-service (permissions, fallback safety, HTML escaping, 
   });
 
   describe('printer config persistence', () => {
-    it('saves and retrieves merged PrinterConfig', async () => {
+    it('saves and retrieves merged PrinterConfig using in-memory cache', async () => {
       const saved = await savePrinterConfig({ paperWidth: 58, openCashDrawer: true });
       expect(saved.paperWidth).toBe(58);
       expect(saved.openCashDrawer).toBe(true);
       expect(mockAsyncStorage.has(PRINTER_CONFIG_STORAGE_KEY)).toBe(true);
 
-      const loaded = await getPrinterConfig();
-      expect(loaded).toEqual(saved);
+      const AsyncStorageMock = (await import('@react-native-async-storage/async-storage')).default;
+      const callsBefore = (AsyncStorageMock.getItem as ReturnType<typeof vi.fn>).mock.calls.length;
+      const loaded1 = await getPrinterConfig();
+      const loaded2 = await getPrinterConfig();
+      expect(loaded1).toEqual(saved);
+      expect(loaded2).toEqual(saved);
+      expect((AsyncStorageMock.getItem as ReturnType<typeof vi.fn>).mock.calls.length).toBe(callsBefore);
+
+      resetPrinterConfigCache();
+      const loadedFromStorage = await getPrinterConfig();
+      expect(loadedFromStorage).toEqual(saved);
+      expect((AsyncStorageMock.getItem as ReturnType<typeof vi.fn>).mock.calls.length).toBe(callsBefore + 1);
     });
   });
 });

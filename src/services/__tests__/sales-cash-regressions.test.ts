@@ -63,10 +63,14 @@ vi.mock('firebase/firestore', () => {
     },
     getDoc: async (document: { path: string }) => snapshot(document.path),
     limit: (count: number) => ({ count }),
+    orderBy: vi.fn(),
+    onSnapshot: vi.fn(),
+    addDoc: vi.fn(),
     Timestamp: class Timestamp {},
   };
 });
 
+import { clearRequestCache } from '@/lib/request-cache';
 import { buildAttributedSalePayload, cancelSaleWithReversal, createSaleTransaction } from '../sale-service';
 import { calculateCashAudit, cashAuditSnapshotMatches, clearActiveCashSessionPointer } from '../cash-register-service';
 import { offlineSaleBelongsToIdentity, resolveOfflineSyncAccountId } from '../offline-sync-service';
@@ -79,6 +83,7 @@ const seed = (collectionName: string, id: string, data: Record<string, unknown>)
 
 describe('sales and cash transaction regressions', () => {
   beforeEach(() => {
+    clearRequestCache();
     mocks.collections.clear();
     mocks.writes = [];
     mocks.txReads = [];
@@ -86,7 +91,7 @@ describe('sales and cash transaction regressions', () => {
     mocks.id = 0;
   });
 
-  it('reads session and active pointers before writing a cash sale', async () => {
+  it('reads session and user pointer before writing a cash sale without reading legacy active pointer when sessionId and userId are supplied', async () => {
     seed('products', 'p1', { stock: { b1: 4 }, reservedStock: {}, costPrice: 2 });
     seed('cash_register_sessions', 's1', { status: 'open', activeSessionId: 's1', cashSalesTotal: 0, totalSales: 0, transactionCount: 0 });
     seed('cash_register_sessions', 'active_b1', { status: 'open', activeSessionId: 's1', cashSalesTotal: 0, totalSales: 0, transactionCount: 0 });
@@ -101,10 +106,29 @@ describe('sales and cash transaction regressions', () => {
 
     expect(result.status).toBe('completed');
     expect(mocks.txReads).toContain('cash_register_sessions/s1');
-    expect(mocks.txReads).toContain('cash_register_sessions/active_b1');
     expect(mocks.txReads).toContain('cash_register_sessions/active_a1_b1_u1');
+    expect(mocks.txReads).not.toContain('cash_register_sessions/active_b1');
     expect(mocks.writes.filter((write) => write.path.startsWith('inventory_movements/'))).toHaveLength(1);
     expect(mocks.writes.find((write) => write.path === 'products/p1')?.value).toMatchObject({ stock: { b1: 3 } });
+  });
+
+  it('reads legacy active_b1 and user pointers before writing when sessionId is omitted', async () => {
+    seed('products', 'p1', { stock: { b1: 4 }, reservedStock: {}, costPrice: 2 });
+    seed('cash_register_sessions', 's1', { status: 'open', cashSalesTotal: 0, totalSales: 0, transactionCount: 0 });
+    seed('cash_register_sessions', 'active_b1', { status: 'open', activeSessionId: 's1' });
+    seed('cash_register_sessions', 'active_a1_b1_u1', { status: 'open', activeSessionId: 's1' });
+
+    const result = await createSaleTransaction({
+      accountId: 'a1', branchId: 'b1', userId: 'u1', userName: 'Cashier',
+      items: [{ productId: 'p1', name: 'Product', price: 10, quantity: 1 }],
+      paymentMethod: 'cash', documentType: 'nota_venta', total: 10,
+      payments: [{ category: 'cash', amount: 10 } as any],
+    });
+
+    expect(result.status).toBe('completed');
+    expect(mocks.txReads).toContain('cash_register_sessions/s1');
+    expect(mocks.txReads).toContain('cash_register_sessions/active_b1');
+    expect(mocks.txReads).toContain('cash_register_sessions/active_a1_b1_u1');
   });
 
   it('reads the customer before the counter is updated for a credit sale', async () => {

@@ -1,0 +1,683 @@
+import React, { useCallback, useEffect, useState } from 'react';
+import {
+  ActivityIndicator,
+  Alert,
+  Linking,
+  Modal,
+  ScrollView,
+  Switch,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
+} from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import {
+  Building2,
+  Check,
+  Crown,
+  ExternalLink,
+  RefreshCw,
+  Save,
+  Smartphone,
+  Store,
+  X,
+} from 'lucide-react-native';
+
+import { SectionHeading } from '@/components/ui';
+import type { PlanLimits, PlanSubscription } from '@/context/AuthContext';
+import { APP_URL } from '@/lib/firebase';
+import type { AccountTaxProfile } from '@/lib/invoicing/receipt-amounts';
+import { ui } from '@/lib/theme';
+import type { Branch, BusinessSettings, PosSettings } from '@/types';
+
+import { settingsStyles as styles } from './settingsStyles';
+
+const SUBSCRIPTION_BADGE_MAP: Record<string, { label: string; bg: string; color: string }> = {
+  active: { label: 'Activa', bg: ui.successSoft, color: ui.success },
+  trialing: { label: 'Prueba Gratuita', bg: ui.primarySoft, color: ui.primary },
+  paused: { label: 'Pausada', bg: ui.warningSoft, color: ui.warning },
+  expired: { label: 'Vencida', bg: ui.dangerSoft, color: ui.danger },
+  canceled: { label: 'Cancelada', bg: ui.dangerSoft, color: ui.danger },
+  cancelled: { label: 'Cancelada', bg: ui.dangerSoft, color: ui.danger },
+};
+
+export interface BusinessSettingsTabProps {
+  canManageSettings: boolean;
+  hasAllBranchesAccess: boolean;
+  branchId: string;
+  branches: Branch[];
+  activeBranchName: string;
+  activeBranch: Branch | null;
+  businessSettings: BusinessSettings;
+  businessData: BusinessSettings;
+  posSettings: PosSettings;
+  taxProfile: AccountTaxProfile;
+  invoicingEnabled: boolean;
+  emitterInfo: {
+    ruc?: string;
+    razonSocial?: string;
+    nombreComercial?: string;
+    printedFormatResolution?: string | null;
+  } | null;
+  planLoading: boolean;
+  planError: string | null;
+  subscription: PlanSubscription | null;
+  limits: PlanLimits | null;
+  onRefreshPlan: () => void;
+  onSelectBranch: (branchId: string) => void;
+  updateBusinessData: (patch: Partial<BusinessSettings>) => Promise<void>;
+  updatePosSettings: (patch: Partial<PosSettings>) => Promise<void>;
+}
+
+export const BusinessSettingsTab = React.memo<BusinessSettingsTabProps>(
+  ({
+    canManageSettings,
+    hasAllBranchesAccess,
+    branchId,
+    branches,
+    activeBranchName,
+    activeBranch,
+    businessSettings,
+    businessData,
+    posSettings,
+    taxProfile,
+    invoicingEnabled,
+    emitterInfo,
+    planLoading,
+    planError,
+    subscription,
+    limits,
+    onRefreshPlan,
+    onSelectBranch,
+    updateBusinessData,
+    updatePosSettings,
+  }) => {
+    const [bizName, setBizName] = useState('');
+    const [bizRuc, setBizRuc] = useState('');
+    const [bizAddress, setBizAddress] = useState('');
+    const [bizPhone, setBizPhone] = useState('');
+    const [bizEmail, setBizEmail] = useState('');
+    const [bizDescription, setBizDescription] = useState('');
+    const [ticketFooter, setTicketFooter] = useState('');
+    const [isAmazonExempt, setIsAmazonExempt] = useState(false);
+    const [taxRateChoice, setTaxRateChoice] = useState<18 | 10>(18);
+    const [enableMinSalePrice, setEnableMinSalePrice] = useState(true);
+    const [enableQuickSale, setEnableQuickSale] = useState(true);
+    const [enableSellerAttribution, setEnableSellerAttribution] = useState(false);
+    const [requireSellerSelection, setRequireSellerSelection] = useState(false);
+    const [ticketTemplate, setTicketTemplate] = useState<'standard' | 'compact'>('standard');
+    const [isSavingBiz, setIsSavingBiz] = useState(false);
+    const [branchModalVisible, setBranchModalVisible] = useState(false);
+
+    useEffect(() => {
+      const biz = businessData || businessSettings;
+      if (biz) {
+        setBizName(biz.businessName || '');
+        setBizRuc(biz.ruc || '');
+        setBizAddress(biz.address || '');
+        setBizPhone(biz.phone || '');
+        setBizEmail(biz.email || '');
+        setBizDescription(biz.description || '');
+        setEnableMinSalePrice(biz.enableMinSalePrice !== false);
+        setIsAmazonExempt(Boolean(biz.isAmazonExempt ?? taxProfile.isAmazonExempt));
+        setTaxRateChoice(Number(biz.taxRate ?? taxProfile.taxRate) === 10 ? 10 : 18);
+      }
+
+      if (posSettings) {
+        setTicketFooter(
+          posSettings.ticketFooterMessage ||
+            biz?.receiptFooter ||
+            activeBranch?.receiptFooter ||
+            ''
+        );
+        setEnableQuickSale(posSettings.enableQuickSale !== false);
+        setEnableSellerAttribution(posSettings.enableSellerAttribution === true);
+        setRequireSellerSelection(posSettings.requireSellerSelection === true);
+        setTicketTemplate(posSettings.ticketTemplate === 'compact' ? 'compact' : 'standard');
+      } else if (activeBranch?.receiptFooter) {
+        setTicketFooter(activeBranch.receiptFooter);
+      }
+    }, [businessData, businessSettings, posSettings, activeBranch, taxProfile]);
+
+    const openWebUrl = useCallback(async (path: string) => {
+      const target = path.startsWith('http')
+        ? path
+        : `${APP_URL.replace(/\/$/, '')}${path}`;
+      try {
+        await Linking.openURL(target);
+      } catch {
+        Alert.alert('Error', 'No se pudo abrir el enlace externo.');
+      }
+    }, []);
+
+    const handleSaveBusinessData = async () => {
+      if (!canManageSettings) {
+        Alert.alert(
+          'Acceso Denegado',
+          'Solo administradores o propietarios pueden modificar los datos fiscales y del POS.'
+        );
+        return;
+      }
+
+      if (!bizName.trim()) {
+        Alert.alert('Nombre Requerido', 'La razón social no puede estar vacía.');
+        return;
+      }
+      if (bizRuc.trim() && !/^\d{11}$/.test(bizRuc.trim())) {
+        Alert.alert('RUC Inválido', 'El RUC debe tener exactamente 11 dígitos numéricos.');
+        return;
+      }
+
+      setIsSavingBiz(true);
+      try {
+        await Promise.all([
+          updateBusinessData({
+            businessName: bizName.trim(),
+            ruc: bizRuc.trim(),
+            address: bizAddress.trim(),
+            phone: bizPhone.trim(),
+            email: bizEmail.trim(),
+            description: bizDescription.trim(),
+            receiptFooter: ticketFooter.trim(),
+            enableMinSalePrice,
+            isAmazonExempt,
+            taxExemptionCode: isAmazonExempt ? '20' : '10',
+            taxRate: isAmazonExempt ? 0 : taxRateChoice,
+          }),
+          updatePosSettings({
+            ticketFooterMessage: ticketFooter.trim(),
+            enableQuickSale,
+            allowMixedPayment: posSettings?.allowMixedPayment !== false,
+            enableSellerAttribution,
+            requireSellerSelection: enableSellerAttribution ? requireSellerSelection : false,
+            ticketTemplate,
+          }),
+        ]);
+
+        Alert.alert(
+          'Ajustes Guardados',
+          'La información del negocio, pie de ticket y preferencias del POS han sido actualizados.'
+        );
+      } catch (err: any) {
+        Alert.alert(
+          'Error al Guardar',
+          err?.message || 'No se pudieron actualizar los ajustes.'
+        );
+      } finally {
+        setIsSavingBiz(false);
+      }
+    };
+
+    const subStatusKey = String(subscription?.status || '').toLowerCase();
+    const subBadge = SUBSCRIPTION_BADGE_MAP[subStatusKey] || {
+      label: subscription?.status || 'Activo',
+      bg: ui.primarySoft,
+      color: ui.primary,
+    };
+
+    return (
+      <>
+        <SectionHeading title="Plan y Suscripción" subtitle="Estado de tu cuenta Ventify" />
+        <View style={styles.card}>
+          <View style={styles.cardHeader}>
+            <View style={[styles.iconBadge, { backgroundColor: ui.accentSoft }]}>
+              <Crown size={22} color={ui.accent} />
+            </View>
+            <View style={styles.cardHeaderText}>
+              <View style={styles.inlineRow}>
+                <Text style={styles.cardTitle}>
+                  {subscription?.planName || 'Plan Ventify POS'}
+                </Text>
+                <View style={[styles.pillBadge, { backgroundColor: subBadge.bg }]}>
+                  <Text style={[styles.pillBadgeText, { color: subBadge.color }]}>
+                    {subBadge.label}
+                  </Text>
+                </View>
+              </View>
+              <Text style={styles.cardSubtitle}>
+                {planLoading
+                  ? 'Consultando estado de suscripción...'
+                  : subscription?.daysRemaining === -1
+                    ? 'Suscripción sin límite de vigencia'
+                    : typeof subscription?.daysRemaining === 'number'
+                      ? `${subscription.daysRemaining} días restantes en el ciclo`
+                      : planError || 'Sincronizado con Ventify Cloud'}
+              </Text>
+            </View>
+            <TouchableOpacity
+              onPress={onRefreshPlan}
+              style={styles.iconActionBtn}
+              accessibilityRole="button"
+              accessibilityLabel="Actualizar estado del plan"
+            >
+              <RefreshCw size={18} color={ui.primary} />
+            </TouchableOpacity>
+          </View>
+
+          {limits ? (
+            <View style={styles.limitsGrid}>
+              {limits.branches ? (
+                <View style={styles.limitChip}>
+                  <Text style={styles.limitLabel}>Sucursales</Text>
+                  <Text style={styles.limitValue}>
+                    {limits.branches.current} /{' '}
+                    {limits.branches.max < 0 ? '∞' : limits.branches.max}
+                  </Text>
+                </View>
+              ) : null}
+              {limits.users ? (
+                <View style={styles.limitChip}>
+                  <Text style={styles.limitLabel}>Usuarios</Text>
+                  <Text style={styles.limitValue}>
+                    {limits.users.current} / {limits.users.max < 0 ? '∞' : limits.users.max}
+                  </Text>
+                </View>
+              ) : null}
+              {limits.products ? (
+                <View style={styles.limitChip}>
+                  <Text style={styles.limitLabel}>Productos</Text>
+                  <Text style={styles.limitValue}>
+                    {limits.products.current} /{' '}
+                    {limits.products.max < 0 ? '∞' : limits.products.max}
+                  </Text>
+                </View>
+              ) : null}
+            </View>
+          ) : null}
+
+          <View style={styles.quickLinksRow}>
+            <TouchableOpacity
+              style={styles.quickLinkBtn}
+              onPress={() => void openWebUrl('/settings')}
+              accessibilityRole="button"
+            >
+              <ExternalLink size={15} color={ui.primary} />
+              <Text style={styles.quickLinkText}>Panel Web</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.quickLinkBtn}
+              onPress={() => void openWebUrl('/pricing')}
+              accessibilityRole="button"
+            >
+              <Crown size={15} color={ui.primary} />
+              <Text style={styles.quickLinkText}>Planes</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.quickLinkBtn}
+              onPress={() => void openWebUrl('https://wa.me/51983495868')}
+              accessibilityRole="button"
+            >
+              <Smartphone size={15} color={ui.success} />
+              <Text style={[styles.quickLinkText, { color: ui.success }]}>Soporte</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+
+        <SectionHeading title="Sucursal" subtitle="Sede operativa del terminal" />
+        <View style={styles.card}>
+          <View style={styles.settingRow}>
+            <View style={styles.flex1}>
+              <Text style={styles.settingLabel}>Sucursal Activa</Text>
+              <Text style={styles.settingSubtext}>{activeBranchName || 'Tienda Principal'}</Text>
+            </View>
+            {hasAllBranchesAccess && branches.length > 1 ? (
+              <TouchableOpacity
+                style={styles.secondaryOutlineBtn}
+                onPress={() => setBranchModalVisible(true)}
+                accessibilityRole="button"
+              >
+                <Store size={16} color={ui.primary} />
+                <Text style={styles.secondaryOutlineBtnText}>Cambiar</Text>
+              </TouchableOpacity>
+            ) : (
+              <Store size={20} color={ui.textSecondary} />
+            )}
+          </View>
+        </View>
+
+        <SectionHeading
+          title="Empresa e Impuestos"
+          subtitle={
+            canManageSettings
+              ? 'Información tributaria, IGV y comprobantes'
+              : 'Solo administradores pueden editar estos datos'
+          }
+        />
+        <View style={styles.card}>
+          <View style={styles.cardHeader}>
+            <View style={[styles.iconBadge, { backgroundColor: ui.primarySoft }]}>
+              <Building2 size={22} color={ui.primary} />
+            </View>
+            <View style={styles.cardHeaderText}>
+              <View style={styles.inlineRow}>
+                <Text style={styles.cardTitle}>Datos Fiscales & Tickets</Text>
+                {!canManageSettings ? (
+                  <View style={[styles.pillBadge, { backgroundColor: ui.warningSoft }]}>
+                    <Text style={[styles.pillBadgeText, { color: ui.warning }]}>Solo Lectura</Text>
+                  </View>
+                ) : null}
+              </View>
+              <Text style={styles.cardSubtitle}>
+                {invoicingEnabled
+                  ? `SUNAT Electrónica Activa${emitterInfo?.ruc ? ` · RUC Emisor ${emitterInfo.ruc}` : ''}`
+                  : 'Modo Notas de Venta y Cotizaciones'}
+              </Text>
+            </View>
+          </View>
+
+          <View style={styles.taxSummaryBox}>
+            <Text style={styles.statusBoxLabel}>RÉGIMEN IGV ACTIVO</Text>
+            <Text style={styles.statusBoxValue}>
+              {taxProfile.isAmazonExempt
+                ? 'Amazonía Exonerada (Ley 27037 · IGV 0%)'
+                : `Régimen General Gravado · IGV ${taxProfile.taxRate}%`}
+            </Text>
+          </View>
+
+          <View style={styles.inputGroup}>
+            <Text style={styles.inputLabel}>Razón Social / Nombre Comercial *</Text>
+            <TextInput
+              style={[styles.textInput, !canManageSettings && styles.inputReadOnly]}
+              placeholder="Ej. Comercial Los Andes S.A.C."
+              placeholderTextColor={ui.textMuted}
+              value={bizName}
+              onChangeText={setBizName}
+              editable={canManageSettings}
+            />
+          </View>
+
+          <View style={styles.inputGroup}>
+            <Text style={styles.inputLabel}>RUC (11 Dígitos)</Text>
+            <TextInput
+              style={[styles.textInput, !canManageSettings && styles.inputReadOnly]}
+              placeholder="20601234567"
+              placeholderTextColor={ui.textMuted}
+              keyboardType="numeric"
+              maxLength={11}
+              value={bizRuc}
+              onChangeText={setBizRuc}
+              editable={canManageSettings}
+            />
+          </View>
+
+          <View style={styles.inputGroup}>
+            <Text style={styles.inputLabel}>Dirección Fiscal</Text>
+            <TextInput
+              style={[styles.textInput, !canManageSettings && styles.inputReadOnly]}
+              placeholder="Av. Aviación 1234, La Victoria"
+              placeholderTextColor={ui.textMuted}
+              value={bizAddress}
+              onChangeText={setBizAddress}
+              editable={canManageSettings}
+            />
+          </View>
+
+          <View style={styles.inputGroup}>
+            <Text style={styles.inputLabel}>Teléfono / WhatsApp de Contacto</Text>
+            <TextInput
+              style={[styles.textInput, !canManageSettings && styles.inputReadOnly]}
+              placeholder="987654321"
+              placeholderTextColor={ui.textMuted}
+              keyboardType="phone-pad"
+              value={bizPhone}
+              onChangeText={setBizPhone}
+              editable={canManageSettings}
+            />
+          </View>
+
+          <View style={styles.inputGroup}>
+            <Text style={styles.inputLabel}>Correo Electrónico</Text>
+            <TextInput
+              style={[styles.textInput, !canManageSettings && styles.inputReadOnly]}
+              placeholder="contacto@minegocio.com"
+              placeholderTextColor={ui.textMuted}
+              keyboardType="email-address"
+              autoCapitalize="none"
+              value={bizEmail}
+              onChangeText={setBizEmail}
+              editable={canManageSettings}
+            />
+          </View>
+
+          <View style={styles.inputGroup}>
+            <Text style={styles.inputLabel}>Descripción / Lema en Ticket (Opcional)</Text>
+            <TextInput
+              style={[styles.textInput, !canManageSettings && styles.inputReadOnly]}
+              placeholder="Productos frescos todos los días"
+              placeholderTextColor={ui.textMuted}
+              value={bizDescription}
+              onChangeText={setBizDescription}
+              editable={canManageSettings}
+            />
+          </View>
+
+          <View style={styles.inputGroup}>
+            <Text style={styles.inputLabel}>Mensaje de Pie de Ticket</Text>
+            <TextInput
+              style={[
+                styles.textInput,
+                styles.textInputMultiline,
+                !canManageSettings && styles.inputReadOnly,
+              ]}
+              placeholder="¡Gracias por su compra! Cambios dentro de 7 días con comprobante."
+              placeholderTextColor={ui.textMuted}
+              value={ticketFooter}
+              onChangeText={setTicketFooter}
+              multiline
+              numberOfLines={2}
+              editable={canManageSettings}
+              accessibilityLabel="Mensaje de pie de ticket"
+            />
+          </View>
+
+          <View style={styles.switchRow}>
+            <View style={styles.flex1}>
+              <Text style={styles.switchTitle}>Exonerado Amazonía (Ley 27037)</Text>
+              <Text style={styles.switchSubtitle}>
+                Emite comprobantes con código tributario 20 (0% IGV)
+              </Text>
+            </View>
+            <Switch
+              value={isAmazonExempt}
+              onValueChange={setIsAmazonExempt}
+              disabled={!canManageSettings}
+              trackColor={{ false: ui.border, true: ui.primary }}
+            />
+          </View>
+
+          {!isAmazonExempt ? (
+            <View style={styles.settingRow}>
+              <Text style={styles.settingLabel}>Tasa de IGV</Text>
+              <View style={styles.segmentControl}>
+                <TouchableOpacity
+                  style={[styles.segmentBtn, taxRateChoice === 18 && styles.segmentBtnActive]}
+                  onPress={() => canManageSettings && setTaxRateChoice(18)}
+                  disabled={!canManageSettings}
+                >
+                  <Text
+                    style={[styles.segmentText, taxRateChoice === 18 && styles.segmentTextActive]}
+                  >
+                    18% General
+                  </Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.segmentBtn, taxRateChoice === 10 && styles.segmentBtnActive]}
+                  onPress={() => canManageSettings && setTaxRateChoice(10)}
+                  disabled={!canManageSettings}
+                >
+                  <Text
+                    style={[styles.segmentText, taxRateChoice === 10 && styles.segmentTextActive]}
+                  >
+                    10% MYPE
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          ) : null}
+
+          <View style={styles.switchRow}>
+            <View style={styles.flex1}>
+              <Text style={styles.switchTitle}>Precio Mínimo Personalizado</Text>
+              <Text style={styles.switchSubtitle}>
+                Protege márgenes evitando ventas debajo del mínimo
+              </Text>
+            </View>
+            <Switch
+              value={enableMinSalePrice}
+              onValueChange={setEnableMinSalePrice}
+              disabled={!canManageSettings}
+              trackColor={{ false: ui.border, true: ui.primary }}
+            />
+          </View>
+
+          <View style={styles.switchRow}>
+            <View style={styles.flex1}>
+              <Text style={styles.switchTitle}>Venta Rápida en Efectivo</Text>
+              <Text style={styles.switchSubtitle}>Permite cobrar monto exacto en un toque</Text>
+            </View>
+            <Switch
+              value={enableQuickSale}
+              onValueChange={setEnableQuickSale}
+              disabled={!canManageSettings}
+              trackColor={{ false: ui.border, true: ui.primary }}
+            />
+          </View>
+
+          <View style={styles.switchRow}>
+            <View style={styles.flex1}>
+              <Text style={styles.switchTitle}>Asignar Vendedor al Cobrar</Text>
+              <Text style={styles.switchSubtitle}>Muestra selector de asesor en el Checkout</Text>
+            </View>
+            <Switch
+              value={enableSellerAttribution}
+              onValueChange={(v) => {
+                setEnableSellerAttribution(v);
+                if (!v) setRequireSellerSelection(false);
+              }}
+              disabled={!canManageSettings}
+              trackColor={{ false: ui.border, true: ui.primary }}
+            />
+          </View>
+
+          {enableSellerAttribution ? (
+            <View style={styles.switchRow}>
+              <View style={styles.flex1}>
+                <Text style={styles.switchTitle}>Vendedor Obligatorio</Text>
+                <Text style={styles.switchSubtitle}>
+                  Exige elegir un vendedor antes de completar la venta
+                </Text>
+              </View>
+              <Switch
+                value={requireSellerSelection}
+                onValueChange={setRequireSellerSelection}
+                disabled={!canManageSettings}
+                trackColor={{ false: ui.border, true: ui.primary }}
+              />
+            </View>
+          ) : null}
+
+          <View style={styles.settingRow}>
+            <Text style={styles.settingLabel}>Plantilla de Ticket</Text>
+            <View style={styles.segmentControl}>
+              <TouchableOpacity
+                style={[styles.segmentBtn, ticketTemplate === 'standard' && styles.segmentBtnActive]}
+                onPress={() => canManageSettings && setTicketTemplate('standard')}
+                disabled={!canManageSettings}
+              >
+                <Text
+                  style={[
+                    styles.segmentText,
+                    ticketTemplate === 'standard' && styles.segmentTextActive,
+                  ]}
+                >
+                  Estándar
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.segmentBtn, ticketTemplate === 'compact' && styles.segmentBtnActive]}
+                onPress={() => canManageSettings && setTicketTemplate('compact')}
+                disabled={!canManageSettings}
+              >
+                <Text
+                  style={[
+                    styles.segmentText,
+                    ticketTemplate === 'compact' && styles.segmentTextActive,
+                  ]}
+                >
+                  Compacto
+                </Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+
+          {canManageSettings ? (
+            <TouchableOpacity
+              style={[styles.saveButton, isSavingBiz && styles.buttonDisabled]}
+              onPress={handleSaveBusinessData}
+              disabled={isSavingBiz}
+            >
+              {isSavingBiz ? (
+                <ActivityIndicator color={ui.onPrimary} />
+              ) : (
+                <>
+                  <Save size={18} color={ui.onPrimary} />
+                  <Text style={styles.saveButtonText}>Guardar Negocio y Tickets</Text>
+                </>
+              )}
+            </TouchableOpacity>
+          ) : null}
+        </View>
+
+        {branchModalVisible && (
+          <Modal
+            visible={branchModalVisible}
+            transparent
+            animationType="fade"
+            onRequestClose={() => setBranchModalVisible(false)}
+          >
+            <View style={styles.modalOverlay}>
+              <SafeAreaView style={styles.modalContent}>
+                <View style={styles.modalHeader}>
+                  <Text style={styles.modalTitle}>Cambiar Sucursal</Text>
+                  <TouchableOpacity
+                    onPress={() => setBranchModalVisible(false)}
+                    style={styles.modalCloseButton}
+                    accessibilityRole="button"
+                  >
+                    <X size={20} color={ui.textSecondary} />
+                  </TouchableOpacity>
+                </View>
+                <ScrollView style={{ maxHeight: 300 }}>
+                  {branches.map((b) => {
+                    const selected = b.id === branchId;
+                    return (
+                      <TouchableOpacity
+                        key={b.id || b.name}
+                        style={[styles.deviceItem, selected && styles.deviceItemSelected]}
+                        onPress={() => {
+                          if (b.id) {
+                            onSelectBranch(b.id);
+                          }
+                          setBranchModalVisible(false);
+                        }}
+                      >
+                        <View style={styles.flex1}>
+                          <Text style={[styles.deviceName, selected && { color: ui.primary }]}>
+                            {b.name}
+                          </Text>
+                          {b.address ? <Text style={styles.deviceAddress}>{b.address}</Text> : null}
+                        </View>
+                        {selected ? <Check size={18} color={ui.primary} /> : null}
+                      </TouchableOpacity>
+                    );
+                  })}
+                </ScrollView>
+              </SafeAreaView>
+            </View>
+          </Modal>
+        )}
+      </>
+    );
+  }
+);

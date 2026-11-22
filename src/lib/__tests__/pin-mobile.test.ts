@@ -21,11 +21,21 @@ import {
 } from '../pin-mobile';
 
 describe('pin-mobile security & lockout', () => {
-  it('computes standard SHA-256 matching Node crypto', () => {
-    for (const input of ['', '1234', 'abc', 'salt:56789012', 'ventify-pin-v1-check-utf8-ñ']) {
+  it('computes standard SHA-256 matching Node crypto including multi-block >512B inputs', () => {
+    const longInput = 'ventify-long-utf8-ñ-'.repeat(40);
+    for (const input of ['', '1234', 'abc', 'salt:56789012', 'ventify-pin-v1-check-utf8-ñ', longInput]) {
       const expected = createHash('sha256').update(input, 'utf8').digest('hex');
       expect(sha256Hex(input)).toBe(expected);
     }
+  });
+
+  it('produces exact 1000-iteration stretched PIN digests matching Node crypto', () => {
+    const salt = '00112233445566778899aabbccddeeff';
+    let expected = createHash('sha256').update(`${salt}:1357`, 'utf8').digest('hex');
+    for (let i = 1; i < 1000; i += 1) {
+      expected = createHash('sha256').update(`${salt}:${expected}`, 'utf8').digest('hex');
+    }
+    expect(hashPin('1357', salt, 1000)).toBe(`v1$1000$${salt}$${expected}`);
   });
 
   it('validates 4-to-8 numeric digits strictly', () => {

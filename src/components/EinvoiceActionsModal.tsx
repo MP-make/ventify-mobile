@@ -53,7 +53,9 @@ export interface EinvoiceActionsModalProps {
 
 type ActionTab = 'details' | 'credit_note' | 'debit_note' | 'replacement';
 
-export const EinvoiceActionsModal: React.FC<EinvoiceActionsModalProps> = React.memo(
+const EinvoiceActionsModalContent: React.FC<
+  Omit<EinvoiceActionsModalProps, 'einvoice'> & { einvoice: PublicEinvoice }
+> = React.memo(
   ({
     visible,
     einvoice,
@@ -85,7 +87,11 @@ export const EinvoiceActionsModal: React.FC<EinvoiceActionsModalProps> = React.m
     const [repAddress, setRepAddress] = useState('');
 
     const eligibleCreditNotes = useMemo(() => {
-      if (!einvoice || (einvoice.documentType !== '01' && einvoice.documentType !== '03')) {
+      if (
+        !visible ||
+        activeTab !== 'replacement' ||
+        (einvoice.documentType !== '01' && einvoice.documentType !== '03')
+      ) {
         return [];
       }
       return allEinvoices.filter(
@@ -99,22 +105,29 @@ export const EinvoiceActionsModal: React.FC<EinvoiceActionsModalProps> = React.m
           Math.round(Number(note.amount || 0) * 100) ===
             Math.round(Number(einvoice.amount || 0) * 100)
       );
-    }, [allEinvoices, einvoice]);
+    }, [visible, activeTab, allEinvoices, einvoice]);
+
+    const resolvedRepNoteId = useMemo(
+      () =>
+        eligibleCreditNotes.some((note) => note.id === repNoteId)
+          ? repNoteId
+          : eligibleCreditNotes[0]?.id || '',
+      [eligibleCreditNotes, repNoteId]
+    );
 
     useEffect(() => {
-      if (!visible || !einvoice) return;
+      if (!visible) return;
       setActiveTab('details');
       setNcReasonCode('01');
       setNcReasonDesc('Anulación de la operación');
       setNdReasonCode('01');
       setNdReasonDesc('Intereses por mora');
-      setRepNoteId(eligibleCreditNotes[0]?.id || '');
+      setRepNoteId('');
       setRepDocNumber(einvoice.receiptCustomer?.identityNumber || '');
       setRepName(einvoice.receiptCustomer?.name || '');
       setRepAddress(einvoice.receiptCustomer?.address || '');
-    }, [visible, einvoice, eligibleCreditNotes]);
-
-    if (!visible || !einvoice) return null;
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [visible, einvoice.id]);
 
     const isOriginalDoc = einvoice.documentType === '01' || einvoice.documentType === '03';
     const isNoteDoc = einvoice.documentType === '07' || einvoice.documentType === '08';
@@ -217,7 +230,7 @@ export const EinvoiceActionsModal: React.FC<EinvoiceActionsModalProps> = React.m
       const customerName = repName.trim();
       const expectedType = einvoice.documentType as '01' | '03';
 
-      if (!repNoteId) {
+      if (!resolvedRepNoteId) {
         Alert.alert('Nota requerida', 'Selecciona una Nota de Crédito total aceptada.');
         return;
       }
@@ -248,7 +261,7 @@ export const EinvoiceActionsModal: React.FC<EinvoiceActionsModalProps> = React.m
           saleId: einvoice.saleId,
           documentType: expectedType,
           replacesInvoiceId: einvoice.id,
-          creditNoteId: repNoteId,
+          creditNoteId: resolvedRepNoteId,
           customer: {
             identityType: docNum.length === 11 ? '6' : '1',
             identityNumber: docNum,
@@ -653,7 +666,7 @@ export const EinvoiceActionsModal: React.FC<EinvoiceActionsModalProps> = React.m
                       <Text style={styles.fieldLabel}>Nota de Crédito Aceptada</Text>
                       <View style={styles.reasonList}>
                         {eligibleCreditNotes.map((note) => {
-                          const selected = repNoteId === note.id;
+                          const selected = resolvedRepNoteId === note.id;
                           return (
                             <TouchableOpacity
                               key={note.id}
@@ -733,6 +746,11 @@ export const EinvoiceActionsModal: React.FC<EinvoiceActionsModalProps> = React.m
     );
   }
 );
+
+export const EinvoiceActionsModal: React.FC<EinvoiceActionsModalProps> = React.memo((props) => {
+  if (!props.visible || !props.einvoice) return null;
+  return <EinvoiceActionsModalContent {...props} einvoice={props.einvoice} />;
+});
 
 const styles = StyleSheet.create({
   overlay: {

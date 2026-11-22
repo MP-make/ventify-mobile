@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import {
   Modal,
   View,
@@ -14,7 +14,7 @@ import * as Print from 'expo-print';
 import * as Haptics from 'expo-haptics';
 import * as Linking from 'expo-linking';
 import { X, Printer, Share2, CheckCircle2, Clock, Calendar, Phone, AlertCircle, FileText } from 'lucide-react-native';
-import { useSettings } from '@/context/SettingsContext';
+import { useBusinessSettings } from '@/context/SettingsContext';
 import { formatPEN, formatDatePE, ui } from '@/lib/theme';
 import { buildReservationReceiptHtml } from '@/lib/printing/escpos-builder';
 
@@ -25,18 +25,16 @@ interface ReservationReceiptModalProps {
   business?: any;
 }
 
-export const ReservationReceiptModal: React.FC<ReservationReceiptModalProps> = React.memo(({
+const ReservationReceiptModalContent: React.FC<ReservationReceiptModalProps> = React.memo(({
   visible,
   onClose,
   reservation,
   business: propBusiness,
 }) => {
-  const { businessData, businessSettings, activeBranchName } = useSettings();
+  const { businessData, businessSettings, activeBranchName } = useBusinessSettings();
   const effectiveBusiness = propBusiness || businessSettings || businessData;
   const [isPrinting, setIsPrinting] = useState(false);
   const [isSharing, setIsSharing] = useState(false);
-
-  if (!visible || !reservation) return null;
 
   const isDelivered = reservation.status === 'completed' || reservation.status === 'delivered';
   const isCancelled = reservation.status === 'cancelled';
@@ -54,20 +52,31 @@ export const ReservationReceiptModal: React.FC<ReservationReceiptModalProps> = R
   const customerPhone = reservation.customer?.phone || reservation.customerPhone || '';
   const customerDoc = reservation.customer?.documentNumber || reservation.customer?.dni || reservation.customerDni || '';
 
-  const createdDate = reservation.createdAt
-    ? (typeof reservation.createdAt?.toDate === 'function' ? reservation.createdAt.toDate() : new Date(reservation.createdAt))
-    : (reservation.date ? new Date(reservation.date) : new Date());
+  const createdDate = useMemo(
+    () =>
+      reservation.createdAt
+        ? (typeof reservation.createdAt?.toDate === 'function' ? reservation.createdAt.toDate() : new Date(reservation.createdAt))
+        : (reservation.date ? new Date(reservation.date) : new Date()),
+    [reservation.createdAt, reservation.date]
+  );
 
-  const expiryDate = reservation.expiryDate
-    ? (typeof reservation.expiryDate?.toDate === 'function' ? reservation.expiryDate.toDate() : new Date(reservation.expiryDate))
-    : (reservation.pickupDate ? new Date(reservation.pickupDate) : null);
+  const expiryDate = useMemo(
+    () =>
+      reservation.expiryDate
+        ? (typeof reservation.expiryDate?.toDate === 'function' ? reservation.expiryDate.toDate() : new Date(reservation.expiryDate))
+        : (reservation.pickupDate ? new Date(reservation.pickupDate) : null),
+    [reservation.expiryDate, reservation.pickupDate]
+  );
 
-  const businessInfo = {
-    businessName: effectiveBusiness?.businessName || effectiveBusiness?.name || businessData?.businessName || 'Ventify POS',
-    ruc: effectiveBusiness?.ruc || businessData?.ruc || '20123456789',
-    address: effectiveBusiness?.address || effectiveBusiness?.commercialAddress || businessData?.address || activeBranchName || '',
-    phone: effectiveBusiness?.phone || businessData?.phone || '',
-  };
+  const businessInfo = useMemo(
+    () => ({
+      businessName: effectiveBusiness?.businessName || effectiveBusiness?.name || businessData?.businessName || 'Ventify POS',
+      ruc: effectiveBusiness?.ruc || businessData?.ruc || '20123456789',
+      address: effectiveBusiness?.address || effectiveBusiness?.commercialAddress || businessData?.address || activeBranchName || '',
+      phone: effectiveBusiness?.phone || businessData?.phone || '',
+    }),
+    [effectiveBusiness, businessData, activeBranchName]
+  );
 
   const handlePrint = async () => {
     try {
@@ -312,6 +321,11 @@ export const ReservationReceiptModal: React.FC<ReservationReceiptModalProps> = R
       </View>
     </Modal>
   );
+});
+
+export const ReservationReceiptModal: React.FC<ReservationReceiptModalProps> = React.memo((props) => {
+  if (!props.visible || !props.reservation) return null;
+  return <ReservationReceiptModalContent {...props} />;
 });
 
 const styles = StyleSheet.create({

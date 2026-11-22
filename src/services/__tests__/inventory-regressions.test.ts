@@ -30,6 +30,26 @@ vi.mock('firebase/firestore', () => {
       fake.writes.push({ kind: 'setDoc', ref, data });
       fake.documents.set(keyFor(ref), { ...data });
     }),
+    writeBatch: vi.fn(() => {
+      const ops: Array<() => void> = [];
+      return {
+        set: (ref: any, data: any) => {
+          ops.push(() => {
+            fake.writes.push({ kind: 'batch.set', ref, data });
+            fake.documents.set(keyFor(ref), { ...data });
+          });
+        },
+        update: (ref: any, data: any) => {
+          ops.push(() => {
+            fake.writes.push({ kind: 'batch.update', ref, data });
+            fake.documents.set(keyFor(ref), { ...(fake.documents.get(keyFor(ref)) || {}), ...data });
+          });
+        },
+        commit: async () => {
+          ops.forEach((op) => op());
+        },
+      };
+    }),
     updateDoc: vi.fn(async (ref: any, data: any) => {
       fake.writes.push({ kind: 'updateDoc', ref, data });
       fake.documents.set(keyFor(ref), { ...(fake.documents.get(keyFor(ref)) || {}), ...data });
@@ -39,9 +59,17 @@ vi.mock('firebase/firestore', () => {
       return { exists: () => !!data, data: () => data };
     }),
     getDocs: vi.fn(async (q: any) => {
-      const accountId = q.constraints?.find((constraint: any) => constraint.type === 'where')?.args?.[2];
+      const wheres = (q.constraints || []).filter((constraint: any) => constraint?.type === 'where');
       const docs = [...fake.documents.entries()]
-        .filter(([key, data]) => key.startsWith('products/') && data.accountId === accountId)
+        .filter(([key, data]) => {
+          if (!key.startsWith('products/')) return false;
+          return wheres.every(({ args }: any) => {
+            const [field, op, val] = args;
+            if (op === '==') return data[field] === val;
+            if (op === 'array-contains') return Array.isArray(data[field]) && data[field].includes(val);
+            return true;
+          });
+        })
         .map(([key, data]) => {
           const id = key.slice('products/'.length);
           return { id, data: () => data };
@@ -72,6 +100,7 @@ vi.mock('firebase/firestore', () => {
   };
 });
 
+import { clearRequestCache } from '@/lib/request-cache';
 import {
   approveStockTransfer,
   cancelStockTransfer,
@@ -87,6 +116,7 @@ const actor = { uid: 'manager-1', displayName: 'Manager', role: 'manager' };
 
 describe('inventory parity regressions', () => {
   beforeEach(() => {
+    clearRequestCache();
     fake.documents.clear();
     fake.writes.length = 0;
     fake.generatedId = 0;
@@ -204,5 +234,41 @@ describe('inventory parity regressions', () => {
     expect(fake.documents.get('transfers/t1').status).toBe('completed');
     const kardexWrites = fake.writes.filter((write) => write.kind === 'tx.set' && write.ref.collectionName === 'inventory_movements');
     expect(kardexWrites).toHaveLength(2);
+  });
+
+  it('caches findByBarcodeRemote negative misses for 30s and invalidates cache on saveProduct', async () => {
+    const firestoreMod = await import('firebase/firestore');
+    const getDocsSpy = firestoreMod.getDocs as ReturnType<typeof vi.fn>;
+    getDocsSpy.mockClear();
+
+    const first = await findByBarcodeRemote('a1', '7750001112223');
+    const callsAfterFirst = getDocsSpy.mock.calls.length;
+    const second = await findByBarcodeRemote('a1', '7750001112223');
+    expect(first).toBeNull();
+    expect(second).toBeNull();
+    expect(callsAfterFirst).toBe(3);
+    expect(getDocsSpy.mock.calls.length).toBe(callsAfterFirst);
+
+    // saveProduct creates product with that barcode and invalidates barcode cache
+    await saveProduct(
+      {
+        accountId: 'a1',
+        name: 'Gaseosa',
+        sku: 'GAS-1',
+        barcode: '7750001112223',
+        price: 5,
+        costPrice: 3,
+        category: 'Bebidas',
+        stock: { north: 10 },
+        branchId: 'north',
+        trackStock: true,
+      } as any,
+      true,
+      actor
+    );
+
+    const afterSave = await findByBarcodeRemote('a1', '7750001112223');
+    expect(afterSave).not.toBeNull();
+    expect(afterSave?.product.barcode).toBe('7750001112223');
   });
 });

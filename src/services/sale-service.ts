@@ -72,6 +72,13 @@ export const getAvailableSaleSellers = async (branchId: string): Promise<SaleSel
   });
 };
 
+const getEnableSellerAttributionCached = async (accountId: string): Promise<boolean> => {
+  return sharedRequestCache.getOrLoad(`settings_pos:${accountId}`, 120_000, async () => {
+    const posSettingsSnap = await getDoc(doc(db, 'settings', `${accountId}_pos`));
+    return posSettingsSnap.exists() && posSettingsSnap.data()?.enableSellerAttribution === true;
+  });
+};
+
 // ============================================================================
 // TIPOS E INTERFACES
 // ============================================================================
@@ -553,10 +560,11 @@ export const buildAttributedSalePayload = (
  */
 export const finalizeAttributedSaleViaServer = async (
   params: CreateSaleTransactionParams,
-  resolvedSessionId?: string
+  resolvedSessionId?: string,
+  prefetchedToken?: string
 ): Promise<CreateSaleTransactionResult> => {
   const currentUser = auth.currentUser;
-  const token = await currentUser?.getIdToken();
+  const token = prefetchedToken || (await currentUser?.getIdToken());
   if (!token) {
     throw new Error('Inicia sesión para registrar la venta.');
   }
@@ -767,10 +775,7 @@ export const createSaleTransaction = async (
         : false;
     if (typeof params.enableSellerAttribution !== 'boolean') {
       try {
-        const posSettingsSnap = await getDoc(doc(db, 'settings', `${accountId}_pos`));
-        if (posSettingsSnap.exists()) {
-          enableSellerAttribution = posSettingsSnap.data()?.enableSellerAttribution === true;
-        }
+        enableSellerAttribution = await getEnableSellerAttributionCached(accountId);
       } catch (e) {
         console.warn('[SaleService] Error checking settings for seller attribution:', e);
       }
@@ -778,53 +783,102 @@ export const createSaleTransaction = async (
 
     if (enableSellerAttribution || params.sourceSaleRequestId || params.sourceQuoteId) {
       let resolvedSession = params.sessionId;
+      let prefetchedToken: string | undefined;
       if (!resolvedSession) {
         try {
-          if (userId) {
-            const uSnap = await getDoc(doc(db, CASH_SESSIONS_COLLECTION, `active_${accountId}_${branchId}_${userId}`));
-            if (uSnap.exists() && uSnap.data()?.status === 'open') {
-              resolvedSession = uSnap.data()?.activeSessionId;
-            }
+          const [uSnap, aSnap, token] = await Promise.all([
+            userId
+              ? getDoc(doc(db, CASH_SESSIONS_COLLECTION, `active_${accountId}_${branchId}_${userId}`))
+              : Promise.resolve(null),
+            getDoc(doc(db, CASH_SESSIONS_COLLECTION, `active_${branchId}`)),
+            auth.currentUser?.getIdToken().catch(() => undefined) ?? Promise.resolve(undefined),
+          ]);
+          prefetchedToken = token;
+          if (uSnap?.exists() && uSnap.data()?.status === 'open') {
+            resolvedSession = uSnap.data()?.activeSessionId;
           }
-          if (!resolvedSession) {
-            const aSnap = await getDoc(doc(db, CASH_SESSIONS_COLLECTION, `active_${branchId}`));
-            if (aSnap.exists() && aSnap.data()?.status === 'open') {
-              resolvedSession = aSnap.data()?.activeSessionId;
-            }
+          if (!resolvedSession && aSnap?.exists() && aSnap.data()?.status === 'open') {
+            resolvedSession = aSnap.data()?.activeSessionId;
           }
         } catch (err) {
           console.warn('[SaleService] Error resolving active cash session for server checkout:', err);
         }
       }
-      return await finalizeAttributedSaleViaServer(params, resolvedSession);
+      return await finalizeAttributedSaleViaServer(params, resolvedSession, prefetchedToken);
     }
   }
 
   // 2. EJECUCIÓN TRANSACCIONAL ATÓMICA
   const transactionResult = await runTransaction(db, async (tx) => {
-    // A. Validar Sesión de Caja si no es cotización
+    // Validar que todos los ítems tengan productId antes de emitir lecturas transaccionales
+    for (const item of items) {
+      if (!item.productId) {
+        throw new Error(`Ítem inválido en la venta: falta productId (${item.name || 'desconocido'})`);
+      }
+    }
+
+    const isPrepaidCredits = isPrepaidCreditMethod(paymentMethod) || effectivePrepaidCredits > 0;
+    const isFiado = !isPrepaidCredits && (paymentMethod === 'fiado' || paymentMethod === 'credit' || effectiveCredit > 0);
+    let customerRef: any = null;
+
+    if (!isQuote && (isFiado || isPrepaidCredits)) {
+      if (!customerId) {
+        throw new Error(isFiado
+          ? 'Para ventas al fiado es obligatorio seleccionar o registrar un cliente.'
+          : 'Para usar créditos prepagados debes seleccionar un cliente.');
+      }
+      customerRef = doc(db, CUSTOMERS_COLLECTION, customerId);
+    }
+
+    const normalizedDocType: SaleDocumentType = isQuote
+      ? 'cotizacion'
+      : (documentType as SaleDocumentType) || 'nota_venta';
+    const series = resolveDocumentSeries(normalizedDocType);
+    const counterRef = doc(db, NOTA_COUNTERS_COLLECTION, branchId);
+
     let resolvedSessionId = params.sessionId;
-    const activePointerRef = doc(db, CASH_SESSIONS_COLLECTION, `active_${branchId}`);
-    const userPointerRef = userId ? doc(db, CASH_SESSIONS_COLLECTION, `active_${accountId}_${branchId}_${userId}`) : null;
-    let cachedActivePointerSnap: any = undefined;
-    let cachedUserPointerSnap: any = undefined;
+    const userPointerRef =
+      !isQuote && userId
+        ? doc(db, CASH_SESSIONS_COLLECTION, `active_${accountId}_${branchId}_${userId}`)
+        : null;
+    // Evitar lectura/contención en puntero legado active_${branchId} cuando sessionId y userId están presentes
+    const needLegacyActivePointer = !isQuote && (!resolvedSessionId || !userPointerRef);
+    const activePointerRef = needLegacyActivePointer
+      ? doc(db, CASH_SESSIONS_COLLECTION, `active_${branchId}`)
+      : null;
+    const initialSessionRef = resolvedSessionId
+      ? doc(db, CASH_SESSIONS_COLLECTION, resolvedSessionId)
+      : null;
+
+    const uniqueProductIds = Array.from(new Set(items.map((it) => it.productId)));
+
+    // Firestore requiere que todas las lecturas ocurran antes de la primera escritura.
+    // Unificamos Paso B (productos) y Paso C/D (correlativo, cliente, sesión y punteros) en un solo Promise.all.
+    const [
+      initialProductSnaps,
+      counterSnap,
+      customerSnap,
+      initialSessionSnap,
+      userPointerSnap,
+      activePointerSnap,
+    ] = await Promise.all([
+      Promise.all(uniqueProductIds.map((pId) => tx.get(doc(db, PRODUCTS_COLLECTION, pId)))),
+      tx.get(counterRef),
+      customerRef ? tx.get(customerRef) : Promise.resolve(null),
+      initialSessionRef ? tx.get(initialSessionRef) : Promise.resolve(null),
+      userPointerRef ? tx.get(userPointerRef) : Promise.resolve(null),
+      activePointerRef ? tx.get(activePointerRef) : Promise.resolve(null),
+    ]);
 
     if (!isQuote && !resolvedSessionId) {
-      const [userPtrSnap, activePtrSnap] = await Promise.all([
-        userPointerRef ? tx.get(userPointerRef) : Promise.resolve(null),
-        tx.get(activePointerRef),
-      ]);
-      cachedUserPointerSnap = userPtrSnap;
-      cachedActivePointerSnap = activePtrSnap;
-
-      if (userPtrSnap?.exists()) {
-        const uData = userPtrSnap.data();
+      if (userPointerSnap?.exists()) {
+        const uData = userPointerSnap.data();
         if (uData.status === 'open' && uData.activeSessionId) {
           resolvedSessionId = uData.activeSessionId;
         }
       }
-      if (!resolvedSessionId && activePtrSnap?.exists()) {
-        const pointerData = activePtrSnap.data();
+      if (!resolvedSessionId && activePointerSnap?.exists()) {
+        const pointerData = activePointerSnap.data();
         if (pointerData.status === 'open' && pointerData.activeSessionId) {
           resolvedSessionId = pointerData.activeSessionId;
         }
@@ -836,34 +890,6 @@ export const createSaleTransaction = async (
         'No se encontró una sesión de caja abierta en esta sucursal. Abre tu caja antes de registrar ventas en efectivo.'
       );
     }
-
-    // B. Leer y validar todos los productos involucrados
-    interface ValidatedItemData {
-      item: SaleItemInput;
-      productRef: any;
-      productData: any;
-      effectiveStockBranchKey: string;
-      baseUnitsToDeduct: number;
-      previousStock: number;
-      newStock: number;
-      costPrice: number;
-      margin: number;
-    }
-
-    const validatedItems: ValidatedItemData[] = [];
-
-    // Validar que todos los ítems tengan productId
-    for (const item of items) {
-      if (!item.productId) {
-        throw new Error(`Ítem inválido en la venta: falta productId (${item.name || 'desconocido'})`);
-      }
-    }
-
-    // Deduplicar productIds y leer en paralelo
-    const uniqueProductIds = Array.from(new Set(items.map((it) => it.productId)));
-    const initialProductSnaps = await Promise.all(
-      uniqueProductIds.map((pId) => tx.get(doc(db, PRODUCTS_COLLECTION, pId)))
-    );
 
     const productDocMap = new Map<string, { ref: any; snap: any }>();
     uniqueProductIds.forEach((pId, idx) => {
@@ -881,14 +907,43 @@ export const createSaleTransaction = async (
       )
     ).filter((base) => !productDocMap.has(base));
 
-    if (missingCandidateBases.length > 0) {
-      const fallbackSnaps = await Promise.all(
-        missingCandidateBases.map((base) => tx.get(doc(db, PRODUCTS_COLLECTION, base)))
-      );
+    const resolvedSessionRef = resolvedSessionId
+      ? initialSessionRef || doc(db, CASH_SESSIONS_COLLECTION, resolvedSessionId)
+      : null;
+    const needResolvedSessionRead = Boolean(resolvedSessionRef && !initialSessionRef);
+
+    let sessionSnap = initialSessionSnap;
+    if (missingCandidateBases.length > 0 || needResolvedSessionRead) {
+      const [fallbackSnaps, resolvedSessSnap] = await Promise.all([
+        missingCandidateBases.length > 0
+          ? Promise.all(missingCandidateBases.map((base) => tx.get(doc(db, PRODUCTS_COLLECTION, base))))
+          : Promise.resolve([]),
+        needResolvedSessionRead ? tx.get(resolvedSessionRef!) : Promise.resolve(initialSessionSnap),
+      ]);
       missingCandidateBases.forEach((base, idx) => {
         productDocMap.set(base, { ref: doc(db, PRODUCTS_COLLECTION, base), snap: fallbackSnaps[idx] });
       });
+      if (needResolvedSessionRead) {
+        sessionSnap = resolvedSessSnap;
+      }
     }
+
+    const sessionRef = resolvedSessionRef;
+
+    // B. Validar todos los productos involucrados
+    interface ValidatedItemData {
+      item: SaleItemInput;
+      productRef: any;
+      productData: any;
+      effectiveStockBranchKey: string;
+      baseUnitsToDeduct: number;
+      previousStock: number;
+      newStock: number;
+      costPrice: number;
+      margin: number;
+    }
+
+    const validatedItems: ValidatedItemData[] = [];
 
     for (const item of items) {
       let pId = item.productId;
@@ -1069,56 +1124,8 @@ export const createSaleTransaction = async (
       productStockPlans.set(path, { productRef: first.productRef, update, entries: group });
     }
 
-    // C. Obtener correlativo secuencial atómico oficial desde nota-counters/{branchId}
-    const normalizedDocType: SaleDocumentType = isQuote
-      ? 'cotizacion'
-      : (documentType as SaleDocumentType) || 'nota_venta';
-
-    const series = resolveDocumentSeries(normalizedDocType);
-    const counterRef = doc(db, NOTA_COUNTERS_COLLECTION, branchId);
-
-    // D. Preparar referencias independientes para lectura paralela (cuenta por cobrar, sesión y punteros)
-    let customerRef: any = null;
+    // C. Resolver correlativo, cliente y validación de sesión desde el snapshot ya leído
     let newCustomerDebt: number | null = null;
-    const isPrepaidCredits = isPrepaidCreditMethod(paymentMethod) || effectivePrepaidCredits > 0;
-    const isFiado = !isPrepaidCredits && (paymentMethod === 'fiado' || paymentMethod === 'credit' || effectiveCredit > 0);
-
-    if (!isQuote && (isFiado || isPrepaidCredits)) {
-      if (!customerId) {
-        throw new Error(isFiado
-          ? 'Para ventas al fiado es obligatorio seleccionar o registrar un cliente.'
-          : 'Para usar créditos prepagados debes seleccionar un cliente.');
-      }
-      customerRef = doc(db, CUSTOMERS_COLLECTION, customerId);
-    }
-
-    // Firestore requires every transactional read to finish before the first write.
-    const sessionRef = resolvedSessionId
-      ? doc(db, CASH_SESSIONS_COLLECTION, resolvedSessionId)
-      : null;
-    const needActivePointerRead = Boolean(resolvedSessionId) && cachedActivePointerSnap === undefined;
-    const needUserPointerRead = Boolean(resolvedSessionId && userPointerRef) && cachedUserPointerSnap === undefined;
-
-    const [
-      counterSnap,
-      customerSnap,
-      sessionSnap,
-      fetchedActivePointerSnap,
-      fetchedUserPointerSnap,
-    ] = await Promise.all([
-      tx.get(counterRef),
-      customerRef ? tx.get(customerRef) : Promise.resolve(null),
-      sessionRef ? tx.get(sessionRef) : Promise.resolve(null),
-      needActivePointerRead
-        ? tx.get(activePointerRef)
-        : Promise.resolve(cachedActivePointerSnap ?? null),
-      needUserPointerRead
-        ? tx.get(userPointerRef!)
-        : Promise.resolve(cachedUserPointerSnap ?? null),
-    ]);
-
-    const activePointerSnap = resolvedSessionId ? fetchedActivePointerSnap : null;
-    const userPointerSnap = resolvedSessionId && userPointerRef ? fetchedUserPointerSnap : null;
 
     let nextNumber = 1;
     if (counterSnap.exists()) {
@@ -1349,8 +1356,16 @@ export const createSaleTransaction = async (
           });
         }
 
-        // Actualizar acumuladores en el puntero de sesión activa
-        if (activePointerSnap?.exists() && activePointerSnap.data()?.activeSessionId === resolvedSessionId) {
+        const userPointerMatches =
+          Boolean(userPointerRef && userPointerSnap?.exists() && userPointerSnap.data()?.activeSessionId === resolvedSessionId);
+
+        // Actualizar acumuladores en el puntero legado solo si no hay puntero de usuario identificando la caja
+        if (
+          !userPointerMatches &&
+          activePointerRef &&
+          activePointerSnap?.exists() &&
+          activePointerSnap.data()?.activeSessionId === resolvedSessionId
+        ) {
           const pData = activePointerSnap.data();
           tx.update(activePointerRef, {
             cashSalesTotal: (pData.cashSalesTotal || 0) + effectiveCash,
@@ -1360,14 +1375,14 @@ export const createSaleTransaction = async (
           });
         }
 
-        if (userPointerSnap?.exists() && userPointerSnap.data()?.activeSessionId === resolvedSessionId) {
-            const uData = userPointerSnap.data();
+        if (userPointerMatches && userPointerSnap) {
+          const uData = userPointerSnap.data() || {};
           tx.update(userPointerRef!, {
-              cashSalesTotal: (uData.cashSalesTotal || 0) + effectiveCash,
-              totalSales: (uData.totalSales || 0) + (params.chargedAmount ?? total),
-              transactionCount: (uData.transactionCount || 0) + 1,
-              lastSaleAt: serverTimestamp(),
-            });
+            cashSalesTotal: (uData.cashSalesTotal || 0) + effectiveCash,
+            totalSales: (uData.totalSales || 0) + (params.chargedAmount ?? total),
+            transactionCount: (uData.transactionCount || 0) + 1,
+            lastSaleAt: serverTimestamp(),
+          });
         }
       }
 
@@ -1594,14 +1609,16 @@ export const emitToSunatAsync = async (
       const nextStatus: SunatEmitResult['status'] =
         response.status >= 500 || response.status === 429 ? 'error' : 'rejected';
       console.error(`[SaleService] Error en emisión SUNAT (${response.status}):`, errMsg);
-      try {
-        await updateDoc(doc(db, SALES_COLLECTION, saleId), {
-          sunatStatus: nextStatus,
-          sunatError: String(errMsg).slice(0, 200),
-          cdrDescription: String(errMsg).slice(0, 200),
-          sunatUpdatedAt: serverTimestamp(),
-        });
-      } catch (_) {}
+      if (!data?.einvoice?.status && data?.persisted !== true) {
+        try {
+          await updateDoc(doc(db, SALES_COLLECTION, saleId), {
+            sunatStatus: nextStatus,
+            sunatError: String(errMsg).slice(0, 200),
+            cdrDescription: String(errMsg).slice(0, 200),
+            sunatUpdatedAt: serverTimestamp(),
+          });
+        } catch (_) {}
+      }
       return {
         success: false,
         status: nextStatus,
@@ -1620,24 +1637,8 @@ export const emitToSunatAsync = async (
     const sunatHash: string | null =
       einvoice?.digestValue || einvoice?.hash || data?.hash || null;
 
-    try {
-      await updateDoc(doc(db, SALES_COLLECTION, saleId), {
-        sunatStatus: resolvedStatus,
-        ...(resolvedDocNumber ? { documentNumber: resolvedDocNumber } : {}),
-        ...(einvoice?.id ? { einvoiceId: einvoice.id } : {}),
-        ...(einvoice?.receiptAmounts ? { fiscalAmounts: einvoice.receiptAmounts } : {}),
-        ...(einvoice?.receiptCustomer ? { receiptCustomer: einvoice.receiptCustomer } : {}),
-        cdrDescription,
-        hash: sunatHash,
-        sunatHash,
-        xmlUrl: einvoice?.xmlUrl || data?.xmlUrl || null,
-        pdfUrl: einvoice?.pdfUrl || data?.pdfUrl || null,
-        sunatResponseDate: serverTimestamp(),
-      });
-    } catch (persistErr) {
-      // El backend Admin SDK ya actualiza el documento; un cashier puede no tener permisos de updateDoc en sales
-      console.warn('[SaleService] Client post-emit update skipped:', persistErr);
-    }
+    // El backend Admin SDK ya persiste el estado SUNAT en sales/{saleId} cuando response.ok;
+    // omitimos updateDoc redundante en cliente.
 
     return {
       success: Boolean(data?.success),
@@ -1724,10 +1725,7 @@ export const cancelSaleWithReversal = async (
         typeof providedSellerAttribution === 'boolean' ? providedSellerAttribution : false;
       if (typeof providedSellerAttribution !== 'boolean') {
         try {
-          const posSnap = await getDoc(doc(db, 'settings', `${legacyAccountId}_pos`));
-          if (posSnap.exists()) {
-            enableSellerAttribution = posSnap.data()?.enableSellerAttribution === true;
-          }
+          enableSellerAttribution = await getEnableSellerAttributionCached(legacyAccountId);
         } catch {
           // continuar con verificación de attributionVersion y rol
         }
@@ -1807,11 +1805,47 @@ export const cancelSaleWithReversal = async (
     }
   }
 
-  const legacyMovements = legacyAccountId ? await getDocs(query(
-    collection(db, INVENTORY_MOVEMENTS_COLLECTION),
-    where('saleId', '==', saleId),
-    where('accountId', '==', legacyAccountId),
-  )) : { docs: [] };
+  const legacyCreditParts = Array.isArray(legacySaleData?.payments)
+    ? legacySaleData.payments.filter((part: PaymentSplit) => part.category === 'credit')
+    : [];
+  const legacyIsPrepaid =
+    legacySaleData?.creditMode === 'prepaid' ||
+    (legacySaleData?.creditMode !== 'receivable' &&
+      (isPrepaidCreditMethod(String(legacySaleData?.paymentMethod || '')) ||
+        isPrepaidCreditMethod(String(legacySaleData?.paymentMethodId || ''))));
+  const isLegacyFiadoSale =
+    Boolean(legacySaleData) &&
+    !legacyIsPrepaid &&
+    (legacySaleData?.creditMode === 'receivable' ||
+      legacyCreditParts.length > 0 ||
+      legacySaleData?.paymentMethod === 'fiado' ||
+      legacySaleData?.paymentMethod === 'credit' ||
+      legacySaleData?.paymentCategory === 'credit' ||
+      Number(legacySaleData?.creditAmount || 0) > 0);
+
+  const [legacyMovements, linkedFiadoReservations] = await Promise.all([
+    legacyAccountId
+      ? getDocs(
+          query(
+            collection(db, INVENTORY_MOVEMENTS_COLLECTION),
+            where('saleId', '==', saleId),
+            where('accountId', '==', legacyAccountId),
+            limit(100)
+          )
+        )
+      : Promise.resolve({ docs: [] }),
+    legacyAccountId && isLegacyFiadoSale
+      ? getDocs(
+          query(
+            collection(db, RESERVATIONS_COLLECTION),
+            where('accountId', '==', legacyAccountId),
+            where('saleId', '==', saleId),
+            limit(10)
+          )
+        )
+      : Promise.resolve({ docs: [] }),
+  ]);
+
   const legacyStockBranchByProduct = new Map<string, string>();
   for (const movement of legacyMovements.docs) {
     const data = movement.data();
@@ -1819,12 +1853,6 @@ export const cancelSaleWithReversal = async (
       legacyStockBranchByProduct.set(data.productId, data.branchId);
     }
   }
-
-  const linkedFiadoReservations = legacyAccountId ? await getDocs(query(
-    collection(db, RESERVATIONS_COLLECTION),
-    where('accountId', '==', legacyAccountId),
-    where('saleId', '==', saleId),
-  )) : { docs: [] };
 
   const result = await runTransaction(db, async (tx) => {
     const saleRef = doc(db, SALES_COLLECTION, saleId);

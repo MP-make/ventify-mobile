@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import {
   Modal,
   View,
@@ -18,7 +18,7 @@ import {
   X,
 } from 'lucide-react-native';
 import * as Haptics from 'expo-haptics';
-import { useAuth } from '@/context/AuthContext';
+import { useAuthSession, usePinLock } from '@/context/AuthContext';
 import { ui } from '@/lib/theme';
 import { BrandLogo } from '@/components/ui';
 import {
@@ -28,8 +28,43 @@ import {
   normalizePinLength,
 } from '@/lib/pin-mobile';
 
-export const PinLockModal: React.FC = React.memo(() => {
+const NOOP = () => {};
+const KEYPAD_ROWS = [
+  ['1', '2', '3'],
+  ['4', '5', '6'],
+  ['7', '8', '9'],
+] as const;
+
+interface KeypadDigitButtonProps {
+  digit: string;
+  disabled: boolean;
+  onPressDigit: (digit: string) => void;
+}
+
+const KeypadDigitButton = React.memo<KeypadDigitButtonProps>(
+  ({ digit, disabled, onPressDigit }) => {
+    const handlePress = useCallback(() => {
+      onPressDigit(digit);
+    }, [onPressDigit, digit]);
+
+    return (
+      <TouchableOpacity
+        onPress={handlePress}
+        disabled={disabled}
+        style={[styles.keyButton, disabled && styles.keyDisabled]}
+        accessibilityRole="button"
+        accessibilityLabel={`Dígito ${digit}`}
+        activeOpacity={0.6}
+      >
+        <Text style={styles.keyText}>{digit}</Text>
+      </TouchableOpacity>
+    );
+  }
+);
+
+const PinLockModalContent: React.FC = React.memo(() => {
   const insets = useSafeAreaInsets();
+  const { userProfile } = useAuthSession();
   const {
     isPinLocked,
     isPinSetupOpen,
@@ -40,8 +75,7 @@ export const PinLockModal: React.FC = React.memo(() => {
     unlockWithPin,
     updatePinCode,
     lockTerminal,
-    userProfile,
-  } = useAuth();
+  } = usePinLock();
 
   const effectiveLength = normalizePinLength(pinLength);
   const isSetupMode = !isPinLocked && isPinSetupOpen;
@@ -196,26 +230,53 @@ export const PinLockModal: React.FC = React.memo(() => {
 
   const maxAllowedDigits = isSetupMode ? PIN_MAX_LENGTH : effectiveLength;
 
-  const handleDigit = (digit: string) => {
-    if (isCoolingDown || savingSetup) return;
-    if (pin.length >= maxAllowedDigits) return;
+  const handleDigit = useCallback(
+    (digit: string) => {
+      if (isCoolingDown || savingSetup) return;
+      if (pin.length >= maxAllowedDigits) return;
 
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
-    const nextPin = pin + digit;
-    setPin(nextPin);
-    setErrorMsg(null);
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
+      const nextPin = pin + digit;
+      setPin(nextPin);
+      setErrorMsg(null);
 
-    if (!isSetupMode && nextPin.length === effectiveLength) {
-      submitUnlock(nextPin);
-    }
-  };
+      if (!isSetupMode && nextPin.length === effectiveLength) {
+        submitUnlock(nextPin);
+      }
+    },
+    [isCoolingDown, savingSetup, pin, maxAllowedDigits, isSetupMode, effectiveLength, submitUnlock]
+  );
 
-  const handleDelete = () => {
+  const handleDelete = useCallback(() => {
     if (isCoolingDown || savingSetup || pin.length === 0) return;
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
     setPin((prev) => prev.slice(0, -1));
     setErrorMsg(null);
-  };
+  }, [isCoolingDown, savingSetup, pin.length]);
+
+  const handleConfirmPress = useCallback(() => {
+    if (isSetupMode) {
+      void submitSetupStep();
+    } else {
+      submitUnlock(pin);
+    }
+  }, [isSetupMode, submitSetupStep, submitUnlock, pin]);
+
+  const containerStyle = useMemo(
+    () => [
+      styles.container,
+      {
+        paddingTop: Math.max(insets.top, Platform.OS === 'ios' ? 44 : 24) + 12,
+        paddingBottom: Math.max(insets.bottom, 24),
+      },
+    ],
+    [insets.top, insets.bottom]
+  );
+
+  const shakeTransformStyle = useMemo(
+    () => ({ transform: [{ translateX: shakeAnim }] }),
+    [shakeAnim]
+  );
 
   if (!visible) return null;
 
@@ -232,17 +293,9 @@ export const PinLockModal: React.FC = React.memo(() => {
       animationType="fade"
       transparent={false}
       statusBarTranslucent
-      onRequestClose={isSetupMode ? closePinSetup : () => {}}
+      onRequestClose={isSetupMode ? closePinSetup : NOOP}
     >
-      <View
-        style={[
-          styles.container,
-          {
-            paddingTop: Math.max(insets.top, Platform.OS === 'ios' ? 44 : 24) + 12,
-            paddingBottom: Math.max(insets.bottom, 24),
-          },
-        ]}
-      >
+      <View style={containerStyle}>
         {/* Cabecera de Seguridad */}
         <View style={styles.header}>
           {isSetupMode ? (
@@ -284,7 +337,7 @@ export const PinLockModal: React.FC = React.memo(() => {
               styles.dotsContainer,
               dotCompact && styles.dotsContainerCompact,
               dotMedium && styles.dotsContainerMedium,
-              { transform: [{ translateX: shakeAnim }] },
+              shakeTransformStyle,
             ]}
           >
             {Array.from({ length: dotCount }, (_, index) => {
@@ -332,13 +385,7 @@ export const PinLockModal: React.FC = React.memo(() => {
         <View style={styles.keypadContainer}>
           {showExplicitConfirm ? (
             <TouchableOpacity
-              onPress={() => {
-                if (isSetupMode) {
-                  void submitSetupStep();
-                } else {
-                  submitUnlock(pin);
-                }
-              }}
+              onPress={handleConfirmPress}
               disabled={!canSubmitExplicit}
               style={[
                 styles.confirmButton,
@@ -366,69 +413,29 @@ export const PinLockModal: React.FC = React.memo(() => {
             </TouchableOpacity>
           ) : null}
 
-          <View style={styles.row}>
-            {['1', '2', '3'].map((digit) => (
-              <TouchableOpacity
-                key={digit}
-                onPress={() => handleDigit(digit)}
-                disabled={isCoolingDown}
-                style={[styles.keyButton, isCoolingDown && styles.keyDisabled]}
-                accessibilityRole="button"
-                accessibilityLabel={`Dígito ${digit}`}
-                activeOpacity={0.6}
-              >
-                <Text style={styles.keyText}>{digit}</Text>
-              </TouchableOpacity>
-            ))}
-          </View>
-
-          <View style={styles.row}>
-            {['4', '5', '6'].map((digit) => (
-              <TouchableOpacity
-                key={digit}
-                onPress={() => handleDigit(digit)}
-                disabled={isCoolingDown}
-                style={[styles.keyButton, isCoolingDown && styles.keyDisabled]}
-                accessibilityRole="button"
-                accessibilityLabel={`Dígito ${digit}`}
-                activeOpacity={0.6}
-              >
-                <Text style={styles.keyText}>{digit}</Text>
-              </TouchableOpacity>
-            ))}
-          </View>
-
-          <View style={styles.row}>
-            {['7', '8', '9'].map((digit) => (
-              <TouchableOpacity
-                key={digit}
-                onPress={() => handleDigit(digit)}
-                disabled={isCoolingDown}
-                style={[styles.keyButton, isCoolingDown && styles.keyDisabled]}
-                accessibilityRole="button"
-                accessibilityLabel={`Dígito ${digit}`}
-                activeOpacity={0.6}
-              >
-                <Text style={styles.keyText}>{digit}</Text>
-              </TouchableOpacity>
-            ))}
-          </View>
+          {KEYPAD_ROWS.map((rowDigits, rowIdx) => (
+            <View key={rowIdx} style={styles.row}>
+              {rowDigits.map((digit) => (
+                <KeypadDigitButton
+                  key={digit}
+                  digit={digit}
+                  disabled={isCoolingDown}
+                  onPressDigit={handleDigit}
+                />
+              ))}
+            </View>
+          ))}
 
           <View style={styles.row}>
             <View style={styles.keyEmpty}>
               <ShieldCheck size={22} color={ui.textMuted} />
             </View>
 
-            <TouchableOpacity
-              onPress={() => handleDigit('0')}
+            <KeypadDigitButton
+              digit="0"
               disabled={isCoolingDown}
-              style={[styles.keyButton, isCoolingDown && styles.keyDisabled]}
-              accessibilityRole="button"
-              accessibilityLabel="Dígito 0"
-              activeOpacity={0.6}
-            >
-              <Text style={styles.keyText}>0</Text>
-            </TouchableOpacity>
+              onPressDigit={handleDigit}
+            />
 
             <TouchableOpacity
               onPress={handleDelete}
@@ -449,6 +456,12 @@ export const PinLockModal: React.FC = React.memo(() => {
       </View>
     </Modal>
   );
+});
+
+export const PinLockModal: React.FC = React.memo(() => {
+  const { isPinLocked, isPinSetupOpen } = usePinLock();
+  if (!isPinLocked && !isPinSetupOpen) return null;
+  return <PinLockModalContent />;
 });
 
 const styles = StyleSheet.create({

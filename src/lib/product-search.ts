@@ -19,6 +19,11 @@ import {
 // 1. TEXT & CODE NORMALIZATION
 // ============================================================================
 
+const NON_ASCII_RE = /[^\x00-\x7F]/;
+const COMBINING_MARKS_RE = /[\u0300-\u036f]/g;
+const COLLAPSE_WS_TEST_RE = /[^\S ]|\s{2,}/;
+const WHITESPACE_RUN_RE = /\s+/g;
+
 /**
  * Normalizes text for search comparison:
  * lowercase, removes accents/diacritics, strips extra whitespace
@@ -26,12 +31,15 @@ import {
  */
 export function normalizeSearchText(value: string | undefined | null): string {
   if (!value) return '';
-  return value
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .trim()
-    .replace(/\s+/g, ' ');
+  let str = value.trim();
+  if (!str) return '';
+  if (NON_ASCII_RE.test(str)) {
+    str = str.normalize('NFD').replace(COMBINING_MARKS_RE, '');
+  }
+  if (COLLAPSE_WS_TEST_RE.test(str)) {
+    str = str.replace(WHITESPACE_RUN_RE, ' ');
+  }
+  return str.toLowerCase();
 }
 
 /**
@@ -127,7 +135,9 @@ export function findProductByBarcode(
   const normalized = normalizeCode(code);
   if (!normalized) return undefined;
 
-  for (const product of products) {
+  for (let i = 0; i < products.length; i += 1) {
+    const product = products[i];
+
     // 1. Direct barcode
     if (product.barcode && normalizeCode(product.barcode) === normalized) {
       return { product };
@@ -140,29 +150,47 @@ export function findProductByBarcode(
 
     // 3. Secondary barcode aliases
     if (Array.isArray(product.barcodes)) {
-      if (product.barcodes.some((b) => normalizeCode(b) === normalized)) {
-        return { product };
+      for (let j = 0; j < product.barcodes.length; j += 1) {
+        if (normalizeCode(product.barcodes[j]) === normalized) {
+          return { product };
+        }
       }
     }
 
-    // 4. Presentation barcodes
-    const presentations = getAllPresentations(product);
-    const matchedPresentation = presentations.find(
-      (p) => p.barcode && normalizeCode(p.barcode) === normalized
-    );
-    if (matchedPresentation) {
-      return { product, matchedPresentation };
+    // 4. Presentation barcodes (base + branch overrides without full array allocation)
+    if (Array.isArray(product.presentations)) {
+      for (let j = 0; j < product.presentations.length; j += 1) {
+        const p = product.presentations[j];
+        if (p?.barcode && normalizeCode(p.barcode) === normalized) {
+          return { product, matchedPresentation: normalizePresentation(p) };
+        }
+      }
+    }
+    const branchPrices = product.branchPrices;
+    if (branchPrices) {
+      for (const branchKey in branchPrices) {
+        if (!Object.prototype.hasOwnProperty.call(branchPrices, branchKey)) continue;
+        const bpPresentations = branchPrices[branchKey]?.presentations;
+        if (Array.isArray(bpPresentations)) {
+          for (let j = 0; j < bpPresentations.length; j += 1) {
+            const p = bpPresentations[j];
+            if (p?.barcode && normalizeCode(p.barcode) === normalized) {
+              return { product, matchedPresentation: normalizePresentation(p) };
+            }
+          }
+        }
+      }
     }
 
     // 5. Variant barcodes & variant SKUs
     if (Array.isArray(product.variants)) {
-      const matchedVariant = product.variants.find((v) => {
+      for (let j = 0; j < product.variants.length; j += 1) {
+        const v = product.variants[j];
         const vBarcode = v.barcode ? normalizeCode(v.barcode) : '';
         const vSku = v.sku ? normalizeCode(v.sku) : '';
-        return vBarcode === normalized || vSku === normalized;
-      });
-      if (matchedVariant) {
-        return { product, matchedVariant };
+        if (vBarcode === normalized || vSku === normalized) {
+          return { product, matchedVariant: v };
+        }
       }
     }
   }
@@ -185,6 +213,7 @@ export function filterProducts(
   branchId?: string
 ): Product[] {
   const normQuery = normalizeSearchText(query);
+  const compactQuery = normQuery ? normQuery.replace(/\s+/g, '') : '';
   const normCategory = normalizeSearchText(category);
   const isAllCategories = !normCategory || normCategory === 'all' || normCategory === 'todos';
 
@@ -220,12 +249,14 @@ export function filterProducts(
 
       // Check name, SKU, barcode
       if (normalizeSearchText(product.name).includes(normQuery)) return true;
-      if (normalizeCode(product.sku).includes(normQuery.replace(/\s+/g, ''))) return true;
-      if (product.barcode && normalizeCode(product.barcode).includes(normQuery.replace(/\s+/g, ''))) return true;
+      if (normalizeCode(product.sku).includes(compactQuery)) return true;
+      if (product.barcode && normalizeCode(product.barcode).includes(compactQuery)) return true;
 
       // Check secondary barcodes
       if (Array.isArray(product.barcodes)) {
-        if (product.barcodes.some((b) => normalizeCode(b).includes(normQuery.replace(/\s+/g, '')))) return true;
+        for (let i = 0; i < product.barcodes.length; i += 1) {
+          if (normalizeCode(product.barcodes[i]).includes(compactQuery)) return true;
+        }
       }
 
       // Check brand and supplier
@@ -234,12 +265,16 @@ export function filterProducts(
 
       // Check presentations
       if (Array.isArray(product.presentations)) {
-        if (product.presentations.some((p) => normalizeSearchText(p.name).includes(normQuery))) return true;
+        for (let i = 0; i < product.presentations.length; i += 1) {
+          if (normalizeSearchText(product.presentations[i].name).includes(normQuery)) return true;
+        }
       }
 
       // Check variants
       if (Array.isArray(product.variants)) {
-        if (product.variants.some((v) => normalizeSearchText(v.name).includes(normQuery))) return true;
+        for (let i = 0; i < product.variants.length; i += 1) {
+          if (normalizeSearchText(product.variants[i].name).includes(normQuery)) return true;
+        }
       }
 
       return false;
@@ -467,11 +502,16 @@ export function resolveProductBranchStock(product: Product, branchId: string = '
   const stockMap = product.stock;
   if (typeof stockMap === 'number') return Number(stockMap) || 0;
   if (!stockMap || typeof stockMap !== 'object') return 0;
-  if (typeof stockMap[branchId] === 'number') return Number(stockMap[branchId]) || 0;
-  const fallbackKey = Object.keys(stockMap).find(
-    (k) => k.toLowerCase().includes('principal') || k.toLowerCase().includes('main')
-  );
-  return fallbackKey ? Number(stockMap[fallbackKey] || 0) : 0;
+  const direct = stockMap[branchId];
+  if (typeof direct === 'number') return direct || 0;
+  for (const key in stockMap) {
+    if (!Object.prototype.hasOwnProperty.call(stockMap, key)) continue;
+    const lower = key.toLowerCase();
+    if (lower.includes('principal') || lower.includes('main')) {
+      return Number(stockMap[key] || 0);
+    }
+  }
+  return 0;
 }
 
 /**

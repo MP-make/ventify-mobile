@@ -10,6 +10,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo, { NetInfoState } from '@react-native-community/netinfo';
 import { db, auth } from '@/lib/firebase';
+import { sharedRequestCache } from '@/lib/request-cache';
 import { collection, query, where, limit, getDocs, getDoc, doc } from 'firebase/firestore';
 import {
   createSaleTransaction,
@@ -75,6 +76,8 @@ export interface SyncProcessResult {
 export interface OfflineQueueChangeEvent {
   type: 'enqueued' | 'synced' | 'updated' | 'quarantined_changed';
   queueCount: number;
+  count?: number;
+  items?: PendingOfflineSale[];
   successful?: number;
   quarantined?: number;
 }
@@ -272,12 +275,48 @@ const deduplicateAndCapQuarantine = (
 };
 
 class OfflineSyncService {
+  private static readonly REACHABILITY_BACKOFF_STEPS_MS = [5_000, 15_000, 30_000, 60_000] as const;
+
   private isProcessingInMemory = false;
   private netInfoUnsubscribe: (() => void) | null = null;
   private networkSyncTimer: ReturnType<typeof setTimeout> | null = null;
   private retryWakeupTimer: ReturnType<typeof setTimeout> | null = null;
   private queueMutex: Promise<void> = Promise.resolve();
+  private queueCache: PendingOfflineSale[] | null = null;
+  private reachabilityBackoffIndex = 0;
   private listeners = new Set<(event: OfflineQueueChangeEvent) => void>();
+
+  public resetQueueCache(): void {
+    this.queueCache = null;
+    this.reachabilityBackoffIndex = 0;
+  }
+
+  private async loadQueueLocked(): Promise<PendingOfflineSale[]> {
+    if (this.queueCache !== null) {
+      return [...this.queueCache];
+    }
+    try {
+      const raw = await AsyncStorage.getItem(OFFLINE_QUEUE_STORAGE_KEY);
+      if (!raw) {
+        this.queueCache = [];
+        return [];
+      }
+      const parsed = JSON.parse(raw);
+      const normalized = Array.isArray(parsed) ? parsed : [];
+      this.queueCache = normalized;
+      return [...normalized];
+    } catch (err) {
+      console.error('[OfflineSync] Error al leer cola offline:', err);
+      return [];
+    }
+  }
+
+  private async writeQueueLocked(nextQueue: PendingOfflineSale[]): Promise<PendingOfflineSale[]> {
+    const snapshot = [...nextQueue];
+    await AsyncStorage.setItem(OFFLINE_QUEUE_STORAGE_KEY, JSON.stringify(snapshot));
+    this.queueCache = snapshot;
+    return [...snapshot];
+  }
 
   public subscribeQueueChanges(
     listener: (event: OfflineQueueChangeEvent) => void
@@ -340,16 +379,20 @@ class OfflineSyncService {
     };
 
     try {
-      const queueCount = await this.runWithQueueMutex(async () => {
-        const currentQueue = await this.getOfflineQueue();
+      const updatedQueue = await this.runWithQueueMutex(async () => {
+        const currentQueue = await this.loadQueueLocked();
         // Evitar duplicados por offlineId
         const filtered = currentQueue.filter((q) => q.offlineId !== offlineId);
         filtered.push(pendingItem);
 
-        await AsyncStorage.setItem(OFFLINE_QUEUE_STORAGE_KEY, JSON.stringify(filtered));
-        return filtered.length;
+        return await this.writeQueueLocked(filtered);
       });
-      this.emitQueueChange({ type: 'enqueued', queueCount });
+      this.emitQueueChange({
+        type: 'enqueued',
+        queueCount: updatedQueue.length,
+        count: updatedQueue.length,
+        items: updatedQueue,
+      });
       console.log(`[OfflineSync] Venta encolada exitosamente: ${offlineId}`);
       return pendingItem;
     } catch (err) {
@@ -362,15 +405,10 @@ class OfflineSyncService {
    * Obtiene la cola de ventas pendientes de sincronización
    */
   public async getOfflineQueue(): Promise<PendingOfflineSale[]> {
-    try {
-      const raw = await AsyncStorage.getItem(OFFLINE_QUEUE_STORAGE_KEY);
-      if (!raw) return [];
-      const parsed = JSON.parse(raw);
-      return Array.isArray(parsed) ? parsed : [];
-    } catch (err) {
-      console.error('[OfflineSync] Error al leer cola offline:', err);
-      return [];
+    if (this.queueCache !== null) {
+      return [...this.queueCache];
     }
+    return this.runWithQueueMutex(() => this.loadQueueLocked());
   }
 
   /**
@@ -399,7 +437,7 @@ class OfflineSyncService {
 
         if (!target) {
           console.warn(`[OfflineSync] No se encontró la venta ${offlineId} en cuarentena.`);
-          return { moved: false, queueCount: 0 };
+          return { moved: false, items: [] as PendingOfflineSale[] };
         }
 
         // Remover de cuarentena
@@ -419,16 +457,21 @@ class OfflineSyncService {
           failureCategory: undefined,
         };
 
-        const queue = await this.getOfflineQueue();
+        const queue = await this.loadQueueLocked();
         const filteredQueue = queue.filter((q) => q.offlineId !== offlineId);
         filteredQueue.push(resetItem);
-        await AsyncStorage.setItem(OFFLINE_QUEUE_STORAGE_KEY, JSON.stringify(filteredQueue));
-        return { moved: true, queueCount: filteredQueue.length };
+        const persisted = await this.writeQueueLocked(filteredQueue);
+        return { moved: true, items: persisted };
       });
 
       if (!result.moved) return false;
 
-      this.emitQueueChange({ type: 'quarantined_changed', queueCount: result.queueCount });
+      this.emitQueueChange({
+        type: 'quarantined_changed',
+        queueCount: result.items.length,
+        count: result.items.length,
+        items: result.items,
+      });
 
       // Disparar procesamiento si hay internet
       const net = await NetInfo.fetch();
@@ -450,14 +493,18 @@ class OfflineSyncService {
    */
   public async removeQuarantinedSale(offlineId: string): Promise<boolean> {
     try {
-      const queueCount = await this.runWithQueueMutex(async () => {
+      const queueItems = await this.runWithQueueMutex(async () => {
         const quarantined = await this.getQuarantinedSales();
         const filtered = quarantined.filter((q) => q.offlineId !== offlineId);
         await AsyncStorage.setItem(QUARANTINED_STORAGE_KEY, JSON.stringify(filtered));
-        const queue = await this.getOfflineQueue();
-        return queue.length;
+        return await this.loadQueueLocked();
       });
-      this.emitQueueChange({ type: 'quarantined_changed', queueCount });
+      this.emitQueueChange({
+        type: 'quarantined_changed',
+        queueCount: queueItems.length,
+        count: queueItems.length,
+        items: queueItems,
+      });
       return true;
     } catch (err) {
       console.error('[OfflineSync] Error eliminando venta en cuarentena:', err);
@@ -486,6 +533,7 @@ class OfflineSyncService {
     // 0. Verificar cola local PRIMERO antes de consultar NetInfo, claims o Firestore
     const initialQueue = await this.getOfflineQueue();
     if (initialQueue.length === 0) {
+      this.reachabilityBackoffIndex = 0;
       this.clearRetryWakeupTimer();
       return summary;
     }
@@ -494,11 +542,18 @@ class OfflineSyncService {
     const netState = await NetInfo.fetch();
     if (!netState.isConnected || netState.isInternetReachable === false) {
       if (netState.isConnected && netState.isInternetReachable === false) {
-        this.scheduleRetryWakeup(2_500, accountIdOverride);
+        const steps = OfflineSyncService.REACHABILITY_BACKOFF_STEPS_MS;
+        const delay = steps[Math.min(this.reachabilityBackoffIndex, steps.length - 1)];
+        this.reachabilityBackoffIndex = Math.min(this.reachabilityBackoffIndex + 1, steps.length - 1);
+        this.scheduleRetryWakeup(delay, accountIdOverride);
+      } else {
+        this.reachabilityBackoffIndex = 0;
+        this.clearRetryWakeupTimer();
       }
       console.log('[OfflineSync] Sin conexión a internet. Omitiendo sincronización.');
       return summary;
     }
+    this.reachabilityBackoffIndex = 0;
 
     // 2. Control de concurrencia con Mutex Lock exclusivo en memoria
     const lockAcquired = await this.acquireLock();
@@ -510,7 +565,7 @@ class OfflineSyncService {
     let emittedEvent: OfflineQueueChangeEvent | null = null;
 
     try {
-      const queue = await this.runWithQueueMutex(() => this.getOfflineQueue());
+      const queue = await this.runWithQueueMutex(() => this.loadQueueLocked());
       summary.total = queue.length;
 
       if (queue.length === 0) {
@@ -549,11 +604,21 @@ class OfflineSyncService {
         } catch {
           // Match AuthContext: an unavailable claims read may still resolve from profile/ownership.
         }
-        const userSnapshot = await getDoc(doc(db, 'users', currentUser.uid));
-        if (auth.currentUser?.uid !== currentUser.uid) return summary;
-        const profileAccountId = userSnapshot.exists() && typeof userSnapshot.data()?.accountId === 'string'
-          ? userSnapshot.data()?.accountId
-          : null;
+        let profileAccountId: string | null = null;
+        if (!claimAccountId) {
+          profileAccountId = await sharedRequestCache.getOrLoad(
+            `user_account:${currentUser.uid}`,
+            120_000,
+            async () => {
+              const userSnapshot = await getDoc(doc(db, 'users', currentUser.uid));
+              return userSnapshot.exists() && typeof userSnapshot.data()?.accountId === 'string'
+                ? String(userSnapshot.data()?.accountId)
+                : null;
+            },
+            { cacheNullish: false }
+          );
+          if (auth.currentUser?.uid !== currentUser.uid) return summary;
+        }
         let ownedAccountId: string | null = null;
         if (!profileAccountId && !claimAccountId) {
           const ownedAccounts = await getDocs(query(
@@ -587,6 +652,7 @@ class OfflineSyncService {
           // A. DEDUPLICACIÓN EN FIRESTORE
           // Verifica si la venta ya fue registrada previamente en el servidor
           let alreadySynced = false;
+          let dedupConfirmedNoDuplicate = false;
           try {
             const existingQ = query(
               collection(db, 'sales'),
@@ -603,6 +669,8 @@ class OfflineSyncService {
               completedTimestamps.set(item.offlineId, item.timestamp);
               summary.successful++;
               alreadySynced = true;
+            } else {
+              dedupConfirmedNoDuplicate = true;
             }
           } catch (dedupErr) {
             console.warn(
@@ -615,18 +683,22 @@ class OfflineSyncService {
             continue; // Se descarta de la cola activa
           }
 
-          // B. EJECUTAR TRANSACCIÓN ATÓMICA DE VENTA (mantener offlineId deduplication activo)
-          const payloadToSync =
-            item.salePayload &&
-            'skipOfflineDedup' in (item.salePayload as unknown as Record<string, unknown>)
-              ? (() => {
-                  const { skipOfflineDedup: _omit, ...rest } =
-                    item.salePayload as CreateSaleTransactionParams & {
-                      skipOfflineDedup?: unknown;
-                    };
-                  return rest as CreateSaleTransactionParams;
-                })()
-              : item.salePayload;
+          // B. EJECUTAR TRANSACCIÓN ATÓMICA DE VENTA (omitir dedup duplicada cuando pre-check ya la confirmó)
+          const rawPayload = item.salePayload as CreateSaleTransactionParams & {
+            skipOfflineDedup?: unknown;
+          };
+          let payloadToSync: CreateSaleTransactionParams;
+          if (dedupConfirmedNoDuplicate) {
+            payloadToSync = {
+              ...(rawPayload as CreateSaleTransactionParams),
+              skipOfflineDedup: true,
+            };
+          } else if ('skipOfflineDedup' in rawPayload) {
+            const { skipOfflineDedup: _omit, ...rest } = rawPayload;
+            payloadToSync = rest as CreateSaleTransactionParams;
+          } else {
+            payloadToSync = item.salePayload;
+          }
           await createSaleTransaction(payloadToSync);
 
           console.log(`[OfflineSync] Venta sincronizada con éxito: ${item.offlineId}`);
@@ -685,7 +757,7 @@ class OfflineSyncService {
       let nextQueueSnapshot: PendingOfflineSale[] = queue;
       if (summary.processed > 0) {
         nextQueueSnapshot = await this.runWithQueueMutex(async () => {
-          const latestQueue = await this.getOfflineQueue();
+          const latestQueue = await this.loadQueueLocked();
           const nextQueue: PendingOfflineSale[] = [];
 
           for (const latestItem of latestQueue) {
@@ -703,8 +775,8 @@ class OfflineSyncService {
             nextQueue.push(latestItem);
           }
 
-          // Guardar cola activa actualizada
-          await AsyncStorage.setItem(OFFLINE_QUEUE_STORAGE_KEY, JSON.stringify(nextQueue));
+          // Guardar cola activa actualizada y refrescar cache en memoria
+          const persisted = await this.writeQueueLocked(nextQueue);
 
           // Guardar cuarentena acumulada (deduplicada y acotada a 100 entradas)
           if (quarantinedToAdd.length > 0) {
@@ -716,7 +788,7 @@ class OfflineSyncService {
             await AsyncStorage.setItem(QUARANTINED_STORAGE_KEY, JSON.stringify(combined));
           }
 
-          return nextQueue;
+          return persisted;
         });
         remainingCount = nextQueueSnapshot.length;
       }
@@ -742,6 +814,8 @@ class OfflineSyncService {
               ? 'quarantined_changed'
               : 'updated',
           queueCount: remainingCount,
+          count: remainingCount,
+          items: nextQueueSnapshot,
           successful: summary.successful,
           quarantined: summary.quarantined,
         };
@@ -811,6 +885,7 @@ class OfflineSyncService {
 
       if (wasOffline) {
         wasOffline = false;
+        this.reachabilityBackoffIndex = 0;
         this.clearNetworkSyncTimer();
         this.networkSyncTimer = setTimeout(() => {
           this.networkSyncTimer = null;
@@ -819,6 +894,8 @@ class OfflineSyncService {
             console.warn('[OfflineSync] Error en sincronización por evento de red:', err)
           );
         }, NETWORK_RECONNECT_DEBOUNCE_MS);
+      } else {
+        this.reachabilityBackoffIndex = 0;
       }
     });
 

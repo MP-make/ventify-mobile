@@ -280,7 +280,7 @@ describe('companion-scanner-service (/api/scanner/reader strict protocol)', () =
       });
       expect(onUpdate.mock.calls[0][0].scan?.result).toBe('added');
 
-      await vi.advanceTimersByTimeAsync(1600);
+      await vi.advanceTimersByTimeAsync(2600);
       await vi.waitFor(() => {
         expect(onUpdate).toHaveBeenCalledTimes(2);
       });
@@ -301,6 +301,60 @@ describe('companion-scanner-service (/api/scanner/reader strict protocol)', () =
       });
       const directStatus = await getScannerSessionStatus(VALID_SESSION_ID, 'https://ventify.com.pe');
       expect(directStatus.purpose).toBe('inventory');
+    });
+
+    it('uses adaptive polling (2500ms active -> 5000ms idle) and aborts in-flight requests on unsubscribe', async () => {
+      vi.useFakeTimers();
+      try {
+        const signals: AbortSignal[] = [];
+        const idlePayload = { purpose: 'pos', expiresAt: 1999999999000, scan: null };
+        let holdPollInFlight = false;
+        const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+          if (init?.signal) signals.push(init.signal);
+          if (holdPollInFlight) {
+            return new Promise(() => {});
+          }
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: async () => idlePayload,
+          });
+        });
+        vi.stubGlobal('fetch', fetchMock);
+
+        const onUpdate = vi.fn();
+        const unsub = subscribeToScannerSession(
+          VALID_SESSION_ID,
+          onUpdate,
+          undefined,
+          'https://ventify.com.pe'
+        );
+
+        // Initial poll immediately -> unchanged #0
+        await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+        // 2500ms -> poll #2 (idle unchanged count becomes 1)
+        await vi.advanceTimersByTimeAsync(2500);
+        await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+        // 2500ms -> poll #3 (idle unchanged count becomes 2 -> switches next interval to 5000ms)
+        await vi.advanceTimersByTimeAsync(2500);
+        await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+
+        // Advancing 2500ms should NOT trigger poll #4 yet when backed off to 5000ms
+        await vi.advanceTimersByTimeAsync(2500);
+        expect(fetchMock).toHaveBeenCalledTimes(3);
+
+        // Make poll #4 remain in-flight so unsub() aborts its active controller
+        holdPollInFlight = true;
+        await vi.advanceTimersByTimeAsync(2500);
+        await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+
+        unsub();
+        expect(signals).toHaveLength(4);
+        expect(signals.slice(0, 3).every((s) => !s.aborted)).toBe(true);
+        expect(signals[3].aborted).toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 });

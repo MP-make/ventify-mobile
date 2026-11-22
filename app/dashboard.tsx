@@ -26,8 +26,8 @@ import {
   Users,
   Wallet,
 } from 'lucide-react-native';
-import { useAuth } from '@/context/AuthContext';
-import { useSettings } from '@/context/SettingsContext';
+import { useAuthSession } from '@/context/AuthContext';
+import { useBusinessSettings } from '@/context/SettingsContext';
 import { useProducts } from '@/context/ProductsContext';
 import { usePermissions } from '@/hooks/usePermissions';
 import { formatPEN, ui } from '@/lib/theme';
@@ -64,9 +64,9 @@ const WEEKDAY_SHORT = ['Dom', 'Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb'];
 
 export default function DashboardScreen() {
   const router = useRouter();
-  const { accountId, branchId } = useAuth();
-  const { activeBranchName } = useSettings();
-  const { products } = useProducts();
+  const { accountId, branchId } = useAuthSession();
+  const { activeBranchName } = useBusinessSettings();
+  const { productsById } = useProducts();
   const { canAccessDashboard, canViewMargins, hasAllBranchesAccess } = usePermissions();
 
   const [preset, setPreset] = useState<DateRangePreset>('7d');
@@ -85,6 +85,8 @@ export default function DashboardScreen() {
 
   const intelTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const intelAbortRef = useRef<AbortController | null>(null);
+  const dashboardAbortRef = useRef<AbortController | null>(null);
+  const dashboardReqIdRef = useRef(0);
   const isMountedRef = useRef(true);
 
   const effectiveBranch = useMemo(() => {
@@ -94,15 +96,8 @@ export default function DashboardScreen() {
 
   const bounds = useMemo(() => getDateRangeBounds(preset), [preset]);
 
-  const productsMap = useMemo(() => {
-    const map = new Map<string, Record<string, any>>();
-    for (const p of products) {
-      if (p?.id) map.set(p.id, p as unknown as Record<string, any>);
-    }
-    return map;
-  }, [products]);
-  const productsMapRef = useRef(productsMap);
-  productsMapRef.current = productsMap;
+  const productsMapRef = useRef(productsById);
+  productsMapRef.current = productsById;
 
   const loadIntelligence = useCallback(async () => {
     if (!accountId || !canAccessDashboard) return;
@@ -140,26 +135,45 @@ export default function DashboardScreen() {
 
   const loadDashboard = useCallback(
     async (isRefresh = false) => {
+      dashboardAbortRef.current?.abort();
       if (!accountId || !canAccessDashboard) {
+        dashboardAbortRef.current = null;
         setLoading(false);
+        setRefreshing(false);
         return;
       }
+      const controller = new AbortController();
+      dashboardAbortRef.current = controller;
+      const reqId = ++dashboardReqIdRef.current;
+
       if (isRefresh) setRefreshing(true);
       else setLoading(true);
       setError(null);
       setSelectedTrendIndex(null);
 
       try {
+        const requestOptions = { forceRefresh: isRefresh, signal: controller.signal };
         const [compResult, opsResult] = await Promise.allSettled([
-          fetchPeriodComparison(accountId, bounds.fromMs, bounds.toMs, effectiveBranch),
+          fetchPeriodComparison(
+            accountId,
+            bounds.fromMs,
+            bounds.toMs,
+            effectiveBranch,
+            requestOptions
+          ),
           fetchDashboardOperationalSummary(
             accountId,
             effectiveBranch,
             bounds.fromMs,
             bounds.toMs,
-            productsMapRef.current
+            productsMapRef.current as unknown as Map<string, Record<string, any>>,
+            requestOptions
           ),
         ]);
+
+        if (!isMountedRef.current || controller.signal.aborted || reqId !== dashboardReqIdRef.current) {
+          return;
+        }
 
         if (opsResult.status === 'fulfilled') {
           setSummary(opsResult.value);
@@ -173,24 +187,55 @@ export default function DashboardScreen() {
           setComparison(null);
         }
       } catch (err: any) {
+        if (
+          !isMountedRef.current ||
+          controller.signal.aborted ||
+          reqId !== dashboardReqIdRef.current ||
+          err?.code === 'ABORTED' ||
+          err?.name === 'AbortError'
+        ) {
+          return;
+        }
         setError(err?.message || 'No se pudieron cargar las métricas del dashboard.');
       } finally {
-        setLoading(false);
-        setRefreshing(false);
+        if (isMountedRef.current && reqId === dashboardReqIdRef.current) {
+          setLoading(false);
+          setRefreshing(false);
+        }
+        if (dashboardAbortRef.current === controller) {
+          dashboardAbortRef.current = null;
+        }
       }
     },
     [accountId, canAccessDashboard, bounds.fromMs, bounds.toMs, effectiveBranch]
   );
 
   useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      dashboardReqIdRef.current += 1;
+      dashboardAbortRef.current?.abort();
+      dashboardAbortRef.current = null;
+      intelAbortRef.current?.abort();
+      intelAbortRef.current = null;
+      if (intelTimerRef.current) {
+        clearTimeout(intelTimerRef.current);
+        intelTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
     void loadDashboard();
+    return () => {
+      dashboardAbortRef.current?.abort();
+    };
   }, [loadDashboard]);
 
   useEffect(() => {
-    isMountedRef.current = true;
     void loadIntelligence();
     return () => {
-      isMountedRef.current = false;
       intelAbortRef.current?.abort();
       intelAbortRef.current = null;
       if (intelTimerRef.current) {

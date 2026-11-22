@@ -29,11 +29,13 @@ import {
   runTransaction,
   serverTimestamp,
   DocumentData,
+  Query,
   QueryDocumentSnapshot,
   QuerySnapshot,
 } from 'firebase/firestore';
 import { cleanFirestoreData } from '@/lib/firebase-utils';
 import { apiRequest } from '@/lib/api-client';
+import { sharedRequestCache } from '@/lib/request-cache';
 import {
   ROLE_PERMISSIONS,
   type CustomPermissions,
@@ -48,6 +50,37 @@ type AppStateLike = {
 
 const ENTERPRISE_POLL_INTERVAL_MS = 60_000;
 const ENTERPRISE_QUERY_LIMIT = 200;
+const FIRESTORE_BACKGROUND_PAUSE_MS = 15_000;
+const missingEnterpriseIndexes = new Set<string>();
+
+const isMissingEnterpriseIndexError = (err: any): boolean => {
+  const code = String(err?.code || '').toLowerCase();
+  const msg = String(err?.message || '').toLowerCase();
+  return (
+    code === 'failed-precondition' ||
+    msg.includes('requires an index') ||
+    msg.includes('failed-precondition')
+  );
+};
+
+async function getDocsEnterpriseWithFallback(
+  indexKey: string,
+  buildIndexed: () => Query<DocumentData>,
+  buildFallback: () => Query<DocumentData>
+): Promise<QuerySnapshot<DocumentData>> {
+  if (missingEnterpriseIndexes.has(indexKey)) {
+    return getDocs(buildFallback());
+  }
+  try {
+    return await getDocs(buildIndexed());
+  } catch (err: any) {
+    if (isMissingEnterpriseIndexError(err)) {
+      missingEnterpriseIndexes.add(indexKey);
+      return getDocs(buildFallback());
+    }
+    throw err;
+  }
+}
 
 const getAppState = (): AppStateLike | null => {
   try {
@@ -58,13 +91,71 @@ const getAppState = (): AppStateLike | null => {
   }
 };
 
+const createAppStateManagedFirestoreSubscription = (
+  attach: () => () => void
+): (() => void) => {
+  const AppState = getAppState();
+  let disposed = false;
+  let activeUnsub: (() => void) | null = null;
+  let backgroundPauseTimer: ReturnType<typeof setTimeout> | null = null;
+  let appStateSubscription: AppStateSubscription = null;
+
+  const ensureAttached = () => {
+    if (disposed || activeUnsub) return;
+    activeUnsub = attach();
+  };
+
+  const clearPauseTimer = () => {
+    if (backgroundPauseTimer) {
+      clearTimeout(backgroundPauseTimer);
+      backgroundPauseTimer = null;
+    }
+  };
+
+  if (typeof AppState?.addEventListener === 'function') {
+    appStateSubscription = AppState.addEventListener('change', (nextState: string) => {
+      if (disposed) return;
+      if (nextState === 'active') {
+        clearPauseTimer();
+        ensureAttached();
+      } else if (nextState === 'background' || nextState === 'inactive') {
+        if (!backgroundPauseTimer && activeUnsub) {
+          backgroundPauseTimer = setTimeout(() => {
+            backgroundPauseTimer = null;
+            if (!disposed && AppState?.currentState !== 'active' && activeUnsub) {
+              activeUnsub();
+              activeUnsub = null;
+            }
+          }, FIRESTORE_BACKGROUND_PAUSE_MS);
+        }
+      }
+    });
+  }
+
+  if (typeof AppState?.currentState !== 'string' || AppState.currentState === 'active') {
+    ensureAttached();
+  }
+
+  return () => {
+    disposed = true;
+    clearPauseTimer();
+    if (appStateSubscription && typeof appStateSubscription.remove === 'function') {
+      appStateSubscription.remove();
+    }
+    appStateSubscription = null;
+    activeUnsub?.();
+    activeUnsub = null;
+  };
+};
+
 const createActivePollingSubscription = (
-  pollTask: (isActive: () => boolean) => Promise<void>,
+  pollTask: (isActive: () => boolean, signal: AbortSignal) => Promise<void>,
   intervalMs = ENTERPRISE_POLL_INTERVAL_MS
 ): (() => void) => {
   let active = true;
   let inFlight = false;
   let timer: ReturnType<typeof setInterval> | null = null;
+  let activeController: AbortController | null = null;
 
   const AppState = getAppState();
   const hasAppStateListener = typeof AppState?.addEventListener === 'function';
@@ -77,12 +168,24 @@ const createActivePollingSubscription = (
     return !isPaused && (!AppState?.currentState || AppState.currentState === 'active');
   };
 
+  const abortInFlight = () => {
+    if (activeController) {
+      activeController.abort();
+      activeController = null;
+    }
+  };
+
   const runPoll = async () => {
     if (!active || inFlight || !isAppActive()) return;
     inFlight = true;
+    const controller = new AbortController();
+    activeController = controller;
     try {
-      await pollTask(() => active);
+      await pollTask(() => active && !controller.signal.aborted, controller.signal);
     } finally {
+      if (activeController === controller) {
+        activeController = null;
+      }
       inFlight = false;
     }
   };
@@ -117,6 +220,7 @@ const createActivePollingSubscription = (
       } else {
         isPaused = true;
         stopInterval();
+        abortInFlight();
       }
     });
   }
@@ -129,6 +233,7 @@ const createActivePollingSubscription = (
   return () => {
     active = false;
     stopInterval();
+    abortInFlight();
     if (appStateSubscription && typeof appStateSubscription.remove === 'function') {
       appStateSubscription.remove();
     }
@@ -758,35 +863,37 @@ export const subscribeToQuotes = (
     return () => {};
   }
 
-  try {
-    const coll = collection(db, QUOTES_COLLECTION);
-    let q = query(coll, where('accountId', '==', accountId));
+  return createAppStateManagedFirestoreSubscription(() => {
+    try {
+      const coll = collection(db, QUOTES_COLLECTION);
+      let q = query(coll, where('accountId', '==', accountId));
 
-    if (branchId && branchId !== 'all' && branchId !== 'main') {
-      q = query(q, where('branchId', '==', branchId));
-    }
-
-    q = query(q, orderBy('createdAt', 'desc'), limit(150));
-
-    return onSnapshot(
-      q,
-      (snapshot: QuerySnapshot<DocumentData>) => {
-        const quotes = snapshot.docs
-          .filter((d) => !d.data()?.isSaleRequest)
-          .map(quoteFromDoc);
-        quotes.sort((a, b) => b.date - a.date);
-        callback(quotes);
-      },
-      (error) => {
-        console.warn('[EnterpriseOps] Error en suscripción a cotizaciones:', error);
-        onError?.(error);
-        callback([]);
+      if (branchId && branchId !== 'all' && branchId !== 'main') {
+        q = query(q, where('branchId', '==', branchId));
       }
-    );
-  } catch (error) {
-    console.error('[EnterpriseOps] Error configurando suscripción a cotizaciones:', error);
-    return () => {};
-  }
+
+      q = query(q, orderBy('createdAt', 'desc'), limit(150));
+
+      return onSnapshot(
+        q,
+        (snapshot: QuerySnapshot<DocumentData>) => {
+          const quotes = snapshot.docs
+            .filter((d) => !d.data()?.isSaleRequest)
+            .map(quoteFromDoc);
+          quotes.sort((a, b) => b.date - a.date);
+          callback(quotes);
+        },
+        (error) => {
+          console.warn('[EnterpriseOps] Error en suscripción a cotizaciones:', error);
+          onError?.(error);
+          callback([]);
+        }
+      );
+    } catch (error) {
+      console.error('[EnterpriseOps] Error configurando suscripción a cotizaciones:', error);
+      return () => {};
+    }
+  });
 };
 
 /**
@@ -914,17 +1021,22 @@ export const convertQuoteToSale = async (quoteId: string, saleId: string): Promi
 export const getSaleRequests = async (
   accountId: string,
   branchId?: string,
-  status?: SaleRequestStatus | 'all'
+  status?: SaleRequestStatus | 'all',
+  options?: { limit?: number; signal?: AbortSignal }
 ): Promise<SaleRequest[]> => {
   if (!accountId) return [];
-  const params = new URLSearchParams({ accountId, limit: '300' });
+  const limitCount = Math.max(1, Math.min(options?.limit ?? 100, 300));
+  const params = new URLSearchParams({ accountId, limit: String(limitCount) });
   if (branchId && branchId !== 'all' && branchId !== 'main') {
     params.set('branchId', branchId);
   }
   if (status && status !== 'all') {
     params.set('status', status);
   }
-  const response = await apiRequest<{ success: boolean; data: any[] }>(`/api/admin/sale-requests?${params.toString()}`);
+  const response = await apiRequest<{ success: boolean; data: any[] }>(
+    `/api/admin/sale-requests?${params.toString()}`,
+    { signal: options?.signal }
+  );
   return (response.data || [])
     .map((item) => normalizeSaleRequest(item))
     .filter((request) => (!branchId || branchId === 'all' || branchId === 'main' || !request.branchId || request.branchId === branchId)
@@ -982,6 +1094,13 @@ const normalizeSaleRequest = (data: any): SaleRequest => ({
   convertedAt: data.convertedAt ? toMillis(data.convertedAt) : undefined,
 });
 
+const buildSaleRequestsSignature = (requests: SaleRequest[]): string => {
+  if (requests.length === 0) return '0';
+  return requests
+    .map((r) => `${r.id}:${r.status}:${r.reviewedAt ?? ''}:${r.convertedSaleId ?? ''}:${r.total}`)
+    .join('|');
+};
+
 /** Poll the canonical server resource because saleRequests is restricted to the Admin SDK. */
 export const subscribeToSaleRequests = (
   accountId: string,
@@ -990,13 +1109,26 @@ export const subscribeToSaleRequests = (
   status?: SaleRequestStatus | 'all'
 ): (() => void) => {
   if (!accountId) { callback([]); return () => {}; }
-  return createActivePollingSubscription(async (isActive) => {
+  let hasEmittedFirst = false;
+  let lastSignature = '';
+  return createActivePollingSubscription(async (isActive, signal) => {
     try {
-      const requests = await getSaleRequests(accountId, branchId, status);
-      if (isActive()) callback(requests);
-    } catch (error) {
+      const requests = await getSaleRequests(accountId, branchId, status, { limit: 100, signal });
+      if (!isActive()) return;
+      const signature = buildSaleRequestsSignature(requests);
+      if (!hasEmittedFirst || signature !== lastSignature) {
+        hasEmittedFirst = true;
+        lastSignature = signature;
+        callback(requests);
+      }
+    } catch (error: any) {
+      if (!isActive() || signal.aborted || error?.code === 'ABORTED') return;
       console.warn('[EnterpriseOps] No se pudieron consultar las solicitudes:', error);
-      if (isActive()) callback([]);
+      if (!hasEmittedFirst) {
+        hasEmittedFirst = true;
+        lastSignature = '0';
+        callback([]);
+      }
     }
   });
 };
@@ -1158,7 +1290,7 @@ export const createTeamUser = async (
     throw new Error('Selecciona una sucursal o habilita acceso multisede.');
   }
 
-  return apiRequest('/api/users', {
+  const res = await apiRequest<{ id?: string; resetLink?: string; message?: string }>('/api/users', {
     method: 'POST',
     body: {
       accountId,
@@ -1173,6 +1305,8 @@ export const createTeamUser = async (
       ...(customPermissions ? { customPermissions } : {}),
     },
   });
+  sharedRequestCache.invalidate(`team_members:${accountId}`);
+  return res;
 };
 
 /** Actualiza rol, sucursal, estado activo o permisos personalizados de un miembro existente. */
@@ -1220,40 +1354,51 @@ export const updateTeamUser = async (userId: string, params: UpdateTeamUserParam
   }
 
   await setDoc(doc(db, USERS_COLLECTION, userId), payload, { merge: true });
+  sharedRequestCache.invalidate(`team_members:${params.accountId}`);
 };
 
 /** Lista sucursales de la cuenta ordenadas por estado activo y nombre. */
-export const getBranchesList = async (accountId: string): Promise<BranchItem[]> => {
+export const getBranchesList = async (
+  accountId: string,
+  options?: { forceRefresh?: boolean }
+): Promise<BranchItem[]> => {
   if (!accountId) return [];
-  const snap = await getDocs(
-    query(collection(db, BRANCHES_COLLECTION), where('accountId', '==', accountId), limit(ENTERPRISE_QUERY_LIMIT))
+  return sharedRequestCache.getOrLoad(
+    `branches:${accountId}`,
+    120_000,
+    async () => {
+      const snap = await getDocs(
+        query(collection(db, BRANCHES_COLLECTION), where('accountId', '==', accountId), limit(ENTERPRISE_QUERY_LIMIT))
+      );
+      const items: BranchItem[] = snap.docs.map((d) => {
+        const data = d.data() || {};
+        return {
+          id: d.id,
+          accountId: data.accountId || accountId,
+          name: data.name || 'Sucursal',
+          address: data.address || '',
+          phone: data.phone || '',
+          email: data.email || '',
+          manager: data.manager || '',
+          isActive: data.isActive !== false,
+          businessName: data.businessName || '',
+          ruc: data.ruc || '',
+          commercialAddress: data.commercialAddress || '',
+          fiscalAddress: data.fiscalAddress || '',
+          commercialPhone: data.commercialPhone || '',
+          receiptFooter: data.receiptFooter || '',
+          createdAt: toMillis(data.createdAt),
+          updatedAt: toMillis(data.updatedAt),
+        };
+      });
+      items.sort((a, b) => {
+        if (a.isActive !== b.isActive) return a.isActive ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      });
+      return items;
+    },
+    { forceRefresh: options?.forceRefresh }
   );
-  const items: BranchItem[] = snap.docs.map((d) => {
-    const data = d.data() || {};
-    return {
-      id: d.id,
-      accountId: data.accountId || accountId,
-      name: data.name || 'Sucursal',
-      address: data.address || '',
-      phone: data.phone || '',
-      email: data.email || '',
-      manager: data.manager || '',
-      isActive: data.isActive !== false,
-      businessName: data.businessName || '',
-      ruc: data.ruc || '',
-      commercialAddress: data.commercialAddress || '',
-      fiscalAddress: data.fiscalAddress || '',
-      commercialPhone: data.commercialPhone || '',
-      receiptFooter: data.receiptFooter || '',
-      createdAt: toMillis(data.createdAt),
-      updatedAt: toMillis(data.updatedAt),
-    };
-  });
-  items.sort((a, b) => {
-    if (a.isActive !== b.isActive) return a.isActive ? -1 : 1;
-    return a.name.localeCompare(b.name);
-  });
-  return items;
 };
 
 /** Crea o edita una sucursal validando límite del plan al crear. */
@@ -1282,6 +1427,7 @@ export const saveBranchRecord = async (params: SaveBranchParams): Promise<string
 
   if (params.id) {
     await setDoc(doc(db, BRANCHES_COLLECTION, params.id), body, { merge: true });
+    sharedRequestCache.invalidate(`branches:${params.accountId}`);
     return params.id;
   }
 
@@ -1297,6 +1443,7 @@ export const saveBranchRecord = async (params: SaveBranchParams): Promise<string
     ...body,
     createdAt: now,
   });
+  sharedRequestCache.invalidate(`branches:${params.accountId}`);
   return createdRef.id;
 };
 
@@ -1306,24 +1453,35 @@ export const toggleBranchActive = async (branchId: string, isActive: boolean): P
     isActive,
     updatedAt: Date.now(),
   });
+  sharedRequestCache.invalidatePrefix('branches:');
 };
 
 /**
  * Obtiene la lista completa de colaboradores/usuarios del negocio desde la colección oficial `users`.
  * NO consulta la colección inexistente `employees`.
  */
-export const getTeamMembers = async (accountId: string): Promise<TeamMember[]> => {
+export const getTeamMembers = async (
+  accountId: string,
+  options?: { forceRefresh?: boolean }
+): Promise<TeamMember[]> => {
   if (!accountId) return [];
 
   try {
-    const qUsers = query(
-      collection(db, USERS_COLLECTION),
-      where('accountId', '==', accountId),
-      limit(ENTERPRISE_QUERY_LIMIT)
+    return await sharedRequestCache.getOrLoad(
+      `team_members:${accountId}`,
+      60_000,
+      async () => {
+        const qUsers = query(
+          collection(db, USERS_COLLECTION),
+          where('accountId', '==', accountId),
+          limit(ENTERPRISE_QUERY_LIMIT)
+        );
+        const snapshot = await getDocs(qUsers);
+        const members = snapshot.docs.map((docSnap) => mapTeamMemberDoc(docSnap.id, docSnap.data(), accountId));
+        return sortTeamMembers(members);
+      },
+      { forceRefresh: options?.forceRefresh }
     );
-    const snapshot = await getDocs(qUsers);
-    const members = snapshot.docs.map((docSnap) => mapTeamMemberDoc(docSnap.id, docSnap.data(), accountId));
-    return sortTeamMembers(members);
   } catch (error) {
     console.error('[EnterpriseOps] Error al obtener colaboradores:', error);
     return [];
@@ -1342,27 +1500,29 @@ export const subscribeToTeamMembers = (
     return () => {};
   }
 
-  try {
-    const qUsers = query(
-      collection(db, USERS_COLLECTION),
-      where('accountId', '==', accountId),
-      limit(ENTERPRISE_QUERY_LIMIT)
-    );
-    return onSnapshot(
-      qUsers,
-      (snapshot) => {
-        const members = snapshot.docs.map((docSnap) => mapTeamMemberDoc(docSnap.id, docSnap.data(), accountId));
-        callback(sortTeamMembers(members));
-      },
-      (err) => {
-        console.warn('[EnterpriseOps] Error en subscribeToTeamMembers:', err);
-        callback([]);
-      }
-    );
-  } catch (error) {
-    console.error('[EnterpriseOps] Error configurando subscribeToTeamMembers:', error);
-    return () => {};
-  }
+  return createAppStateManagedFirestoreSubscription(() => {
+    try {
+      const qUsers = query(
+        collection(db, USERS_COLLECTION),
+        where('accountId', '==', accountId),
+        limit(ENTERPRISE_QUERY_LIMIT)
+      );
+      return onSnapshot(
+        qUsers,
+        (snapshot) => {
+          const members = snapshot.docs.map((docSnap) => mapTeamMemberDoc(docSnap.id, docSnap.data(), accountId));
+          callback(sortTeamMembers(members));
+        },
+        (err) => {
+          console.warn('[EnterpriseOps] Error en subscribeToTeamMembers:', err);
+          callback([]);
+        }
+      );
+    } catch (error) {
+      console.error('[EnterpriseOps] Error configurando subscribeToTeamMembers:', error);
+      return () => {};
+    }
+  });
 };
 
 /**
@@ -1378,26 +1538,54 @@ export const getPayrollMovements = async (
 
   try {
     const movements: PayrollMovement[] = [];
-    const branchConstraints =
-      branchId && branchId !== 'all' && branchId !== 'main'
-        ? [where('branchId', '==', branchId)]
-        : [];
+    const scopedBranch =
+      branchId && branchId !== 'all' && branchId !== 'main' ? branchId : undefined;
+    const branchConstraints = scopedBranch ? [where('branchId', '==', scopedBranch)] : [];
 
-    const cashQ = query(
-      collection(db, CASH_MOVEMENTS_COLLECTION),
-      where('accountId', '==', accountId),
-      ...branchConstraints,
-      limit(100)
-    );
-    const setQ = query(
-      collection(db, PAYROLL_SETTLEMENTS_COLLECTION),
-      where('accountId', '==', accountId),
-      ...branchConstraints,
-      limit(100)
-    );
+    const cashKey = scopedBranch ? 'payroll_cash_branch' : 'payroll_cash_all';
+    const setKey = scopedBranch ? 'payroll_set_branch' : 'payroll_set_all';
 
-    // Consultar cash_register_movements y payroll_settlements en paralelo
-    const [snapshot, setSnap] = await Promise.all([getDocs(cashQ), getDocs(setQ)]);
+    // Consultar cash_register_movements (filtrado por isEmployeeAdvance) y payroll_settlements en paralelo
+    const [snapshot, setSnap] = await Promise.all([
+      getDocsEnterpriseWithFallback(
+        cashKey,
+        () =>
+          query(
+            collection(db, CASH_MOVEMENTS_COLLECTION),
+            where('accountId', '==', accountId),
+            ...branchConstraints,
+            where('isEmployeeAdvance', '==', true),
+            orderBy('createdAt', 'desc'),
+            limit(50)
+          ),
+        () =>
+          query(
+            collection(db, CASH_MOVEMENTS_COLLECTION),
+            where('accountId', '==', accountId),
+            ...branchConstraints,
+            where('isEmployeeAdvance', '==', true),
+            limit(50)
+          )
+      ),
+      getDocsEnterpriseWithFallback(
+        setKey,
+        () =>
+          query(
+            collection(db, PAYROLL_SETTLEMENTS_COLLECTION),
+            where('accountId', '==', accountId),
+            ...branchConstraints,
+            orderBy('createdAt', 'desc'),
+            limit(50)
+          ),
+        () =>
+          query(
+            collection(db, PAYROLL_SETTLEMENTS_COLLECTION),
+            where('accountId', '==', accountId),
+            ...branchConstraints,
+            limit(50)
+          )
+      ),
+    ]);
 
     snapshot.docs.forEach((docSnap) => {
         const data = docSnap.data();

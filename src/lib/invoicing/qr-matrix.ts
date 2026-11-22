@@ -88,20 +88,8 @@ const VERSION_SPECS_M: readonly VersionSpecM[] = [
 
 // BCH(15,5) format bits for Level M (00) + mask pattern 0..7, pre-masked with 0x5412
 const FORMAT_BITS_M: readonly number[] = [
-  0x5412 ^ 0x0000, // placeholder replaced below via runtime BCH computation for 100% accuracy
+  0x5412, 0x5125, 0x5e7c, 0x5b4b, 0x45f9, 0x40ce, 0x4f97, 0x4aa0,
 ];
-
-function computeBchFormatInfo(ecLevelBits: number, maskPattern: number): number {
-  const data = (ecLevelBits << 3) | maskPattern;
-  let rem = data << 10;
-  const gen = 0x537;
-  for (let bit = 14; bit >= 10; bit--) {
-    if ((rem >> bit) & 1) {
-      rem ^= gen << (bit - 10);
-    }
-  }
-  return ((data << 10) | rem) ^ 0x5412;
-}
 
 function computeBchVersionInfo(version: number): number {
   let rem = version << 12;
@@ -114,11 +102,11 @@ function computeBchVersionInfo(version: number): number {
   return (version << 12) | rem;
 }
 
-void FORMAT_BITS_M;
+const utf8Encoder = typeof TextEncoder !== 'undefined' ? new TextEncoder() : null;
 
 function utf8Encode(text: string): Uint8Array {
-  if (typeof TextEncoder !== 'undefined') {
-    return new TextEncoder().encode(text);
+  if (utf8Encoder) {
+    return utf8Encoder.encode(text);
   }
   const bytes: number[] = [];
   for (let i = 0; i < text.length; i++) {
@@ -303,8 +291,8 @@ function placeFunctionPatterns(spec: VersionSpecM): {
 }
 
 function writeFormatInfo(modules: Uint8Array, n: number, mask: number): void {
-  // EC level M is 0b00
-  const fmt = computeBchFormatInfo(0b00, mask);
+  // EC level M is 0b00; lookup precomputed BCH(15,5) bits masked with 0x5412
+  const fmt = FORMAT_BITS_M[mask] ?? 0;
 
   // Copy 1 (top-left): LSB at (0, 8), MSB at (8, 0)
   for (let i = 0; i <= 5; i++) modules[i * n + 8] = (fmt >> i) & 1;
@@ -371,23 +359,28 @@ function penaltyScore(modules: Uint8Array, n: number): number {
     }
   }
 
-  // Rule 3: finder-like 1:1:3:1:1 patterns
-  const evalFinderLike = (isRow: boolean) => {
-    for (let i = 0; i < n; i++) {
-      for (let j = 0; j <= n - 11; j++) {
-        let bits = 0;
-        for (let k = 0; k < 11; k++) {
-          const val = isRow ? modules[i * n + (j + k)] : modules[(j + k) * n + i];
-          bits = (bits << 1) | val;
-        }
-        if (bits === 0b10111010000 || bits === 0b00001011101) {
-          score += 40;
-        }
+  // Rule 3: finder-like 1:1:3:1:1 patterns (O(N^2) rolling 11-bit bitmask)
+  for (let r = 0; r < n; r++) {
+    const rowOffset = r * n;
+    let bits = 0;
+    for (let c = 0; c < n; c++) {
+      bits = ((bits << 1) | modules[rowOffset + c]) & 0x7ff;
+      if (c >= 10 && (bits === 0b10111010000 || bits === 0b00001011101)) {
+        score += 40;
       }
     }
-  };
-  evalFinderLike(true);
-  evalFinderLike(false);
+  }
+  for (let c = 0; c < n; c++) {
+    let bits = 0;
+    let idx = c;
+    for (let r = 0; r < n; r++) {
+      bits = ((bits << 1) | modules[idx]) & 0x7ff;
+      if (r >= 10 && (bits === 0b10111010000 || bits === 0b00001011101)) {
+        score += 40;
+      }
+      idx += n;
+    }
+  }
 
   // Rule 4: dark ratio balance
   let darkCount = 0;
@@ -414,6 +407,19 @@ interface QrCoreResult {
 
 const QR_CORE_CACHE_LIMIT = 20;
 const QR_CORE_CACHE = new Map<string, QrCoreResult>();
+
+// Reused across the 8 mask evaluations (max Version 10 = 57x57 = 3249 modules) to avoid 8x allocations.
+let MASK_SCRATCH_A = new Uint8Array(57 * 57);
+let MASK_SCRATCH_B = new Uint8Array(57 * 57);
+
+function ensureMaskScratchCapacity(len: number): void {
+  if (MASK_SCRATCH_A.length < len) {
+    MASK_SCRATCH_A = new Uint8Array(len);
+  }
+  if (MASK_SCRATCH_B.length < len) {
+    MASK_SCRATCH_B = new Uint8Array(len);
+  }
+}
 
 /**
  * Computes and caches QR modules + merged horizontal-run SVG path without allocating `boolean[][]`.
@@ -465,15 +471,20 @@ function computeQrCore(text: string): QrCoreResult {
     }
   }
 
+  const moduleCount = n * n;
+  ensureMaskScratchCapacity(moduleCount);
+  let candidate = MASK_SCRATCH_A.subarray(0, moduleCount);
+  let best = MASK_SCRATCH_B.subarray(0, moduleCount);
   let bestScore = Infinity;
-  let bestModules = baseModules;
 
   for (let mask = 0; mask < 8; mask++) {
-    const candidate = new Uint8Array(baseModules);
+    candidate.set(baseModules);
     for (let r = 0; r < n; r++) {
+      const rowOffset = r * n;
       for (let c = 0; c < n; c++) {
-        if (!isFunction[r * n + c] && maskCondition(mask, r, c)) {
-          candidate[r * n + c] ^= 1;
+        const idx = rowOffset + c;
+        if (!isFunction[idx] && maskCondition(mask, r, c)) {
+          candidate[idx] ^= 1;
         }
       }
     }
@@ -481,9 +492,15 @@ function computeQrCore(text: string): QrCoreResult {
     const score = penaltyScore(candidate, n);
     if (score < bestScore) {
       bestScore = score;
-      bestModules = candidate;
+      const tmp = best;
+      best = candidate;
+      candidate = tmp;
     }
   }
+
+  // Copy winning masked grid into baseModules so cached entry owns an isolated Uint8Array.
+  baseModules.set(best);
+  const bestModules = baseModules;
 
   const pathParts: string[] = [];
   for (let r = 0; r < n; r++) {
@@ -519,6 +536,19 @@ function computeQrCore(text: string): QrCoreResult {
   }
   QR_CORE_CACHE.set(cacheKey, core);
   return core;
+}
+
+/**
+ * Codifica texto en tamaño de matriz y path SVG unificado usando `QR_CORE_CACHE`
+ * sin asignar la matriz `boolean[][]`.
+ */
+export function generateQrSvgData(content: string): { size: number; pathData: string } | null {
+  if (!content) return null;
+  const core = computeQrCore(content);
+  return {
+    size: core.size,
+    pathData: core.pathData,
+  };
 }
 
 /**

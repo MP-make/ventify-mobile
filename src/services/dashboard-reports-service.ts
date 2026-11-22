@@ -19,9 +19,13 @@ import {
   query,
   Timestamp,
   where,
+  type DocumentData,
+  type Query,
+  type QuerySnapshot,
 } from 'firebase/firestore';
 import { auth, db } from '@/lib/firebase';
 import { ApiError, apiRequest, getApiRequestInit } from '@/lib/api-client';
+import { sharedRequestCache } from '@/lib/request-cache';
 import { classifyMovementForPnl, expenseCategoryLabel } from './cash-register-service';
 import type { GeneratePnlReportParams, PnlReportResult } from './pnl-report-service';
 
@@ -731,6 +735,40 @@ export function summarizeEinvoices(
 // DASHBOARD EXECUTIVO & REPORTES API / FIRESTORE
 // ============================================================================
 
+const REPORT_CACHE_TTL_MS = 60_000;
+const EXPORT_DOWNLOAD_TIMEOUT_MS = 60_000;
+const missingReportIndexes = new Set<string>();
+let lastExportTempUri: string | null = null;
+
+const isMissingFirestoreIndexError = (err: any): boolean => {
+  const code = String(err?.code || '').toLowerCase();
+  const msg = String(err?.message || '').toLowerCase();
+  return (
+    code === 'failed-precondition' ||
+    msg.includes('requires an index') ||
+    msg.includes('failed-precondition')
+  );
+};
+
+async function getDocsWithMemoizedIndexFallback(
+  indexKey: string,
+  buildIndexedQuery: () => Query<DocumentData>,
+  buildFallbackQuery: () => Query<DocumentData>
+): Promise<QuerySnapshot<DocumentData>> {
+  if (missingReportIndexes.has(indexKey)) {
+    return getDocs(buildFallbackQuery());
+  }
+  try {
+    return await getDocs(buildIndexedQuery());
+  } catch (err: any) {
+    if (isMissingFirestoreIndexError(err)) {
+      missingReportIndexes.add(indexKey);
+      return getDocs(buildFallbackQuery());
+    }
+    throw err;
+  }
+}
+
 const normalizeBranchScope = (branchId?: string | null): string | undefined => {
   if (!branchId || branchId === 'all') return undefined;
   return branchId;
@@ -740,10 +778,14 @@ export async function fetchPeriodComparison(
   accountId: string,
   fromMs: number,
   toMs: number,
-  branchId?: string
+  branchId?: string,
+  options?: { forceRefresh?: boolean; signal?: AbortSignal }
 ): Promise<PeriodComparisonResult> {
   if (!accountId || !Number.isFinite(fromMs) || !Number.isFinite(toMs) || toMs < fromMs) {
     throw new ApiError('Parámetros de período inválidos.', 400);
+  }
+  if (options?.signal?.aborted) {
+    throw new ApiError('Operación cancelada.', 499, 'ABORTED');
   }
   const params = new URLSearchParams({
     accountId,
@@ -753,15 +795,23 @@ export async function fetchPeriodComparison(
   const scopedBranch = normalizeBranchScope(branchId);
   if (scopedBranch) params.set('branchId', scopedBranch);
 
-  return apiRequest<PeriodComparisonResult>(`/api/dashboard/period-comparison?${params.toString()}`, {
-    timeoutMs: 30000,
-  });
+  const cacheKey = `dash_period_cmp:${accountId}:${scopedBranch || 'all'}:${Math.trunc(fromMs)}:${Math.trunc(toMs)}`;
+  return sharedRequestCache.getOrLoad(
+    cacheKey,
+    REPORT_CACHE_TTL_MS,
+    () =>
+      apiRequest<PeriodComparisonResult>(`/api/dashboard/period-comparison?${params.toString()}`, {
+        timeoutMs: 30000,
+        signal: options?.signal,
+      }),
+    { forceRefresh: options?.forceRefresh }
+  );
 }
 
 export async function fetchInventoryIntelligence(
   accountId: string,
   branchId?: string,
-  options?: { signal?: AbortSignal }
+  options?: { signal?: AbortSignal; forceRefresh?: boolean }
 ): Promise<InventoryIntelligenceResponse> {
   if (!accountId) {
     throw new ApiError('accountId es requerido.', 400);
@@ -773,52 +823,65 @@ export async function fetchInventoryIntelligence(
   const scopedBranch = normalizeBranchScope(branchId);
   if (scopedBranch) params.set('branchId', scopedBranch);
 
-  const path = `/api/dashboard/inventory-intelligence?${params.toString()}`;
-  const prepared = await getApiRequestInit(path, { method: 'GET' });
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 60000);
-  const externalSignal = options?.signal;
-  const onExternalAbort = () => controller.abort();
-  externalSignal?.addEventListener?.('abort', onExternalAbort, { once: true });
+  const cacheKey = `dash_inv_intel:${accountId}:${scopedBranch || 'all'}`;
+  const res = await sharedRequestCache.getOrLoad(
+    cacheKey,
+    REPORT_CACHE_TTL_MS,
+    async () => {
+      const path = `/api/dashboard/inventory-intelligence?${params.toString()}`;
+      const prepared = await getApiRequestInit(path, { method: 'GET' });
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 60000);
+      const externalSignal = options?.signal;
+      const onExternalAbort = () => controller.abort();
+      externalSignal?.addEventListener?.('abort', onExternalAbort, { once: true });
 
-  try {
-    const response = await fetch(prepared.url, {
-      ...prepared.init,
-      signal: controller.signal,
-    });
-    if (auth.currentUser?.uid !== prepared.uid) {
-      throw new ApiError('La sesión cambió. Repite la operación.', 409);
-    }
-    if (response.status === 503) {
-      const retryRaw = Number(response.headers?.get?.('Retry-After'));
-      const retryAfter = Number.isFinite(retryRaw) && retryRaw > 0 ? retryRaw : 5;
-      return { building: true, retryAfter };
-    }
-    if (!response.ok) {
-      const body = await response.json().catch(() => null);
-      throw new ApiError(
-        body?.error || body?.message || 'No se pudo consultar inteligencia de inventario.',
-        response.status,
-        body?.code
-      );
-    }
-    const data = await response.json().catch(() => null);
-    if (!data) {
-      throw new ApiError('Respuesta inválida del servidor.', 502);
-    }
-    return data as InventoryIntelligenceResult;
-  } catch (err) {
-    if (externalSignal?.aborted) {
-      throw new ApiError('Operación cancelada.', 499, 'ABORTED');
-    }
-    if (controller.signal.aborted) {
-      throw new ApiError('El análisis tardó demasiado. Intenta nuevamente.', 408);
-    }
-    throw err;
-  } finally {
-    clearTimeout(timeout);
-    externalSignal?.removeEventListener?.('abort', onExternalAbort);
+      try {
+        const response = await fetch(prepared.url, {
+          ...prepared.init,
+          signal: controller.signal,
+        });
+        if (auth.currentUser?.uid !== prepared.uid) {
+          throw new ApiError('La sesión cambió. Repite la operación.', 409);
+        }
+        if (response.status === 503) {
+          const retryRaw = Number(response.headers?.get?.('Retry-After'));
+          const retryAfter = Number.isFinite(retryRaw) && retryRaw > 0 ? retryRaw : 5;
+          return { building: true, retryAfter } as InventoryIntelligenceResponse;
+        }
+        if (!response.ok) {
+          const body = await response.json().catch(() => null);
+          throw new ApiError(
+            body?.error || body?.message || 'No se pudo consultar inteligencia de inventario.',
+            response.status,
+            body?.code
+          );
+        }
+        const data = await response.json().catch(() => null);
+        if (!data) {
+          throw new ApiError('Respuesta inválida del servidor.', 502);
+        }
+        return data as InventoryIntelligenceResult;
+      } catch (err) {
+        if (externalSignal?.aborted) {
+          throw new ApiError('Operación cancelada.', 499, 'ABORTED');
+        }
+        if (controller.signal.aborted) {
+          throw new ApiError('El análisis tardó demasiado. Intenta nuevamente.', 408);
+        }
+        throw err;
+      } finally {
+        clearTimeout(timeout);
+        externalSignal?.removeEventListener?.('abort', onExternalAbort);
+      }
+    },
+    { forceRefresh: options?.forceRefresh }
+  );
+
+  if ('building' in res && res.building) {
+    sharedRequestCache.invalidate(cacheKey);
   }
+  return res;
 }
 
 export async function fetchDashboardOperationalSummary(
@@ -826,212 +889,249 @@ export async function fetchDashboardOperationalSummary(
   branchId: string | undefined,
   fromMs: number,
   toMs: number,
-  productsMap?: Map<string, Record<string, any>>
+  productsMap?: Map<string, Record<string, any>>,
+  options?: { forceRefresh?: boolean; signal?: AbortSignal }
 ): Promise<DashboardOperationalSummary> {
   if (!accountId) {
     throw new Error('accountId requerido para resumen operativo.');
   }
+  if (options?.signal?.aborted) {
+    throw new ApiError('Operación cancelada.', 499, 'ABORTED');
+  }
   const effectiveBranch = normalizeBranchScope(branchId);
+  const cacheKey = `dash_ops:${accountId}:${effectiveBranch || 'all'}:${fromMs}:${toMs}:${productsMap ? 'pm' : 'nopm'}`;
 
-  const salesQuery = query(
-    collection(db, 'sales'),
-    where('accountId', '==', accountId),
-    ...(effectiveBranch ? [where('branchId', '==', effectiveBranch)] : []),
-    where('date', '>=', fromMs),
-    where('date', '<=', toMs),
-    orderBy('date', 'desc')
-  );
-
-  const sessionsQuery = query(
-    collection(db, 'cash_register_sessions'),
-    where('accountId', '==', accountId),
-    ...(effectiveBranch ? [where('branchId', '==', effectiveBranch)] : []),
-    where('status', '==', 'open'),
-    orderBy('openTime', 'desc'),
-    limit(20)
-  );
-
-  const transfersQuery = query(
-    collection(db, 'transfers'),
-    where('accountId', '==', accountId),
-    orderBy('createdAt', 'desc'),
-    limit(100)
-  );
-
-  const lowStockQuery = query(
-    collection(db, 'products'),
-    where('accountId', '==', accountId),
-    where('lowStockBranches', 'array-contains', effectiveBranch || '__any__'),
-    limit(100)
-  );
-
-  const reservationsQuery = query(
-    collection(db, 'reservations'),
-    where('accountId', '==', accountId),
-    ...(effectiveBranch ? [where('branchId', '==', effectiveBranch)] : []),
-    where('status', '==', 'pending'),
-    orderBy('date', 'desc'),
-    limit(200)
-  );
-
-  const [salesRes, sessionsRes, transfersRes, lowStockRes, reservationsRes] = await Promise.allSettled([
-    getDocs(salesQuery),
-    getDocs(sessionsQuery),
-    getDocs(transfersQuery),
-    getDocs(lowStockQuery),
-    getDocs(reservationsQuery),
-  ]);
-
-  if (salesRes.status === 'rejected') {
-    throw salesRes.reason;
-  }
-
-  const salesDocs = salesRes.value.docs.map((d) => ({ id: d.id, ...(d.data() as Record<string, any>) }));
-  const salesSummary = aggregatePeriodSalesSummary(salesDocs, productsMap);
-
-  const openSessions: OpenCashSessionSummary[] =
-    sessionsRes.status === 'fulfilled'
-      ? sessionsRes.value.docs
-          .filter((d) => !d.id.startsWith('active_'))
-          .map((d) => {
-            const data = d.data() || {};
-            return {
-              id: d.id,
-              branchId: String(data.branchId || ''),
-              registerName: data.registerName ? String(data.registerName) : undefined,
-              startedByName: data.startedByName ? String(data.startedByName) : undefined,
-              openTime: toEpochMs(data.openTime || data.openedAt),
-              initialAmount: Number(data.initialAmount ?? data.openingBalance) || 0,
-              totalSales: Number(data.totalSales) || 0,
-            };
-          })
-      : [];
-
-  const totalOpeningBalance = round2(openSessions.reduce((s, c) => s + c.initialAmount, 0));
-  const totalSalesInOpenShifts = round2(openSessions.reduce((s, c) => s + c.totalSales, 0));
-
-  let pendingTransfersCount = 0;
-  let inTransitTransfersCount = 0;
-  if (transfersRes.status === 'fulfilled') {
-    for (const d of transfersRes.value.docs) {
-      const data = d.data() || {};
-      const src = String(data.sourceBranchId || data.fromBranchId || '');
-      const dest = String(data.destinationBranchId || data.toBranchId || '');
-      if (effectiveBranch && src !== effectiveBranch && dest !== effectiveBranch) continue;
-      if (data.status === 'pending' || data.status === 'approved') pendingTransfersCount += 1;
-      else if (data.status === 'in_transit') inTransitTransfersCount += 1;
-    }
-  }
-
-  const lowStockProducts: LowStockAlertProduct[] = [];
-  if (lowStockRes.status === 'fulfilled') {
-    for (const d of lowStockRes.value.docs) {
-      const data = d.data() || {};
-      if (data.active === false) continue;
-      const stockMap: Record<string, number> = data.stock || {};
-      const reservedMap: Record<string, number> = data.reservedStock || {};
-      const available = effectiveBranch
-        ? (Number(stockMap[effectiveBranch]) || 0) - (Number(reservedMap[effectiveBranch]) || 0)
-        : Object.keys(stockMap).reduce(
-            (acc, bId) => acc + ((Number(stockMap[bId]) || 0) - (Number(reservedMap[bId]) || 0)),
-            0
-          );
-      lowStockProducts.push({
-        id: d.id,
-        name: String(data.name || 'Producto'),
-        stock: available,
-        minStock: Number(data.minStock) || 5,
-      });
-    }
-  }
-
-  const nowMs = Date.now();
-  let overdueFiadosCount = 0;
-  let overdueFiadosTotal = 0;
-  let activeFiadosCount = 0;
-  let activeFiadosTotal = 0;
-
-  if (reservationsRes.status === 'fulfilled') {
-    for (const d of reservationsRes.value.docs) {
-      const data = d.data() || {};
-      const isFiado = data.type === 'fiado' || data.isCreditSale === true;
-      if (!isFiado) continue;
-      const remaining = Math.max(
-        0,
-        (Number(data.total) || 0) - (Number(data.paidAmount) || 0) - (Number(data.returnedAmount) || 0)
+  return sharedRequestCache.getOrLoad(
+    cacheKey,
+    REPORT_CACHE_TTL_MS,
+    async () => {
+      const salesQuery = query(
+        collection(db, 'sales'),
+        where('accountId', '==', accountId),
+        ...(effectiveBranch ? [where('branchId', '==', effectiveBranch)] : []),
+        where('date', '>=', fromMs),
+        where('date', '<=', toMs),
+        orderBy('date', 'desc'),
+        limit(1500)
       );
-      if (remaining <= 0) continue;
-      activeFiadosCount += 1;
-      activeFiadosTotal = round2(activeFiadosTotal + remaining);
-      const dueMs = toEpochMs(data.dueDate);
-      if (dueMs > 0 && dueMs < nowMs) {
-        overdueFiadosCount += 1;
-        overdueFiadosTotal = round2(overdueFiadosTotal + remaining);
+
+      const sessionsQuery = query(
+        collection(db, 'cash_register_sessions'),
+        where('accountId', '==', accountId),
+        ...(effectiveBranch ? [where('branchId', '==', effectiveBranch)] : []),
+        where('status', '==', 'open'),
+        orderBy('openTime', 'desc'),
+        limit(20)
+      );
+
+      const activeTransferStatuses = ['pending', 'approved', 'in_transit'];
+
+      const lowStockQuery = query(
+        collection(db, 'products'),
+        where('accountId', '==', accountId),
+        where('lowStockBranches', 'array-contains', effectiveBranch || '__any__'),
+        limit(100)
+      );
+
+      const [salesRes, sessionsRes, transfersRes, lowStockRes, reservationsRes] = await Promise.allSettled([
+        getDocs(salesQuery),
+        getDocs(sessionsQuery),
+        getDocsWithMemoizedIndexFallback(
+          'dash_transfers_active',
+          () =>
+            query(
+              collection(db, 'transfers'),
+              where('accountId', '==', accountId),
+              where('status', 'in', activeTransferStatuses),
+              orderBy('createdAt', 'desc'),
+              limit(100)
+            ),
+          () =>
+            query(
+              collection(db, 'transfers'),
+              where('accountId', '==', accountId),
+              where('status', 'in', activeTransferStatuses),
+              limit(100)
+            )
+        ),
+        getDocs(lowStockQuery),
+        getDocsWithMemoizedIndexFallback(
+          effectiveBranch ? 'dash_fiados_branch' : 'dash_fiados_all',
+          () =>
+            query(
+              collection(db, 'reservations'),
+              where('accountId', '==', accountId),
+              ...(effectiveBranch ? [where('branchId', '==', effectiveBranch)] : []),
+              where('status', '==', 'pending'),
+              where('type', '==', 'fiado'),
+              orderBy('date', 'desc'),
+              limit(200)
+            ),
+          () =>
+            query(
+              collection(db, 'reservations'),
+              where('accountId', '==', accountId),
+              ...(effectiveBranch ? [where('branchId', '==', effectiveBranch)] : []),
+              where('status', '==', 'pending'),
+              orderBy('date', 'desc'),
+              limit(200)
+            )
+        ),
+      ]);
+
+      if (salesRes.status === 'rejected') {
+        throw salesRes.reason;
       }
-    }
-  }
 
-  const alerts: OperationalAlert[] = [];
-  if (openSessions.length === 0) {
-    alerts.push({
-      id: 'no-open-cash',
-      severity: 'warning',
-      title: 'Sin caja abierta en este alcance',
-      description: 'Abre un turno de caja para registrar cobros y arqueos.',
-      route: '/(tabs)/operations',
-      actionLabel: 'Ir a Caja',
-    });
-  }
-  if (overdueFiadosCount > 0) {
-    alerts.push({
-      id: 'overdue-fiados',
-      severity: 'danger',
-      title: `${overdueFiadosCount} fiado${overdueFiadosCount === 1 ? '' : 's'} vencido${overdueFiadosCount === 1 ? '' : 's'}`,
-      description: `Saldo vencido por cobrar: S/ ${overdueFiadosTotal.toFixed(2)}.`,
-      route: '/(tabs)/operations',
-      actionLabel: 'Cobrar',
-    });
-  }
-  if (lowStockProducts.length > 0) {
-    alerts.push({
-      id: 'low-stock',
-      severity: 'warning',
-      title: `${lowStockProducts.length} producto${lowStockProducts.length === 1 ? '' : 's'} con stock bajo`,
-      description: `Revisa reposición para evitar quiebres de inventario.`,
-      route: '/(tabs)/catalog',
-      actionLabel: 'Ver Catálogo',
-    });
-  }
-  if (pendingTransfersCount + inTransitTransfersCount > 0) {
-    alerts.push({
-      id: 'pending-transfers',
-      severity: 'info',
-      title: `${pendingTransfersCount + inTransitTransfersCount} traslado${pendingTransfersCount + inTransitTransfersCount === 1 ? '' : 's'} en curso`,
-      description: `${pendingTransfersCount} por aprobar/enviar · ${inTransitTransfersCount} en tránsito.`,
-      route: '/(tabs)/catalog',
-      actionLabel: 'Traslados',
-    });
-  }
+      const salesDocs = salesRes.value.docs.map((d) => ({ id: d.id, ...(d.data() as Record<string, any>) }));
+      const salesSummary = aggregatePeriodSalesSummary(salesDocs, productsMap);
 
-  return {
-    salesSummary,
-    rawSalesCount: salesDocs.length,
-    openCashSessions: {
-      count: openSessions.length,
-      totalOpeningBalance,
-      totalSalesInOpenShifts,
-      sessions: openSessions,
+      const openSessions: OpenCashSessionSummary[] =
+        sessionsRes.status === 'fulfilled'
+          ? sessionsRes.value.docs
+              .filter((d) => !d.id.startsWith('active_'))
+              .map((d) => {
+                const data = d.data() || {};
+                return {
+                  id: d.id,
+                  branchId: String(data.branchId || ''),
+                  registerName: data.registerName ? String(data.registerName) : undefined,
+                  startedByName: data.startedByName ? String(data.startedByName) : undefined,
+                  openTime: toEpochMs(data.openTime || data.openedAt),
+                  initialAmount: Number(data.initialAmount ?? data.openingBalance) || 0,
+                  totalSales: Number(data.totalSales) || 0,
+                };
+              })
+          : [];
+
+      const totalOpeningBalance = round2(openSessions.reduce((s, c) => s + c.initialAmount, 0));
+      const totalSalesInOpenShifts = round2(openSessions.reduce((s, c) => s + c.totalSales, 0));
+
+      let pendingTransfersCount = 0;
+      let inTransitTransfersCount = 0;
+      if (transfersRes.status === 'fulfilled') {
+        for (const d of transfersRes.value.docs) {
+          const data = d.data() || {};
+          const src = String(data.sourceBranchId || data.fromBranchId || '');
+          const dest = String(data.destinationBranchId || data.toBranchId || '');
+          if (effectiveBranch && src !== effectiveBranch && dest !== effectiveBranch) continue;
+          if (data.status === 'pending' || data.status === 'approved') pendingTransfersCount += 1;
+          else if (data.status === 'in_transit') inTransitTransfersCount += 1;
+        }
+      }
+
+      const lowStockProducts: LowStockAlertProduct[] = [];
+      if (lowStockRes.status === 'fulfilled') {
+        for (const d of lowStockRes.value.docs) {
+          const data = d.data() || {};
+          if (data.active === false) continue;
+          const stockMap: Record<string, number> = data.stock || {};
+          const reservedMap: Record<string, number> = data.reservedStock || {};
+          const available = effectiveBranch
+            ? (Number(stockMap[effectiveBranch]) || 0) - (Number(reservedMap[effectiveBranch]) || 0)
+            : Object.keys(stockMap).reduce(
+                (acc, bId) => acc + ((Number(stockMap[bId]) || 0) - (Number(reservedMap[bId]) || 0)),
+                0
+              );
+          lowStockProducts.push({
+            id: d.id,
+            name: String(data.name || 'Producto'),
+            stock: available,
+            minStock: Number(data.minStock) || 5,
+          });
+        }
+      }
+
+      const nowMs = Date.now();
+      let overdueFiadosCount = 0;
+      let overdueFiadosTotal = 0;
+      let activeFiadosCount = 0;
+      let activeFiadosTotal = 0;
+
+      if (reservationsRes.status === 'fulfilled') {
+        for (const d of reservationsRes.value.docs) {
+          const data = d.data() || {};
+          const isFiado = data.type === 'fiado' || data.isCreditSale === true;
+          if (!isFiado) continue;
+          const remaining = Math.max(
+            0,
+            (Number(data.total) || 0) - (Number(data.paidAmount) || 0) - (Number(data.returnedAmount) || 0)
+          );
+          if (remaining <= 0) continue;
+          activeFiadosCount += 1;
+          activeFiadosTotal = round2(activeFiadosTotal + remaining);
+          const dueMs = toEpochMs(data.dueDate);
+          if (dueMs > 0 && dueMs < nowMs) {
+            overdueFiadosCount += 1;
+            overdueFiadosTotal = round2(overdueFiadosTotal + remaining);
+          }
+        }
+      }
+
+      const alerts: OperationalAlert[] = [];
+      if (openSessions.length === 0) {
+        alerts.push({
+          id: 'no-open-cash',
+          severity: 'warning',
+          title: 'Sin caja abierta en este alcance',
+          description: 'Abre un turno de caja para registrar cobros y arqueos.',
+          route: '/(tabs)/operations',
+          actionLabel: 'Ir a Caja',
+        });
+      }
+      if (overdueFiadosCount > 0) {
+        alerts.push({
+          id: 'overdue-fiados',
+          severity: 'danger',
+          title: `${overdueFiadosCount} fiado${overdueFiadosCount === 1 ? '' : 's'} vencido${overdueFiadosCount === 1 ? '' : 's'}`,
+          description: `Saldo vencido por cobrar: S/ ${overdueFiadosTotal.toFixed(2)}.`,
+          route: '/(tabs)/operations',
+          actionLabel: 'Cobrar',
+        });
+      }
+      if (lowStockProducts.length > 0) {
+        alerts.push({
+          id: 'low-stock',
+          severity: 'warning',
+          title: `${lowStockProducts.length} producto${lowStockProducts.length === 1 ? '' : 's'} con stock bajo`,
+          description: `Revisa reposición para evitar quiebres de inventario.`,
+          route: '/(tabs)/catalog',
+          actionLabel: 'Ver Catálogo',
+        });
+      }
+      if (pendingTransfersCount + inTransitTransfersCount > 0) {
+        alerts.push({
+          id: 'pending-transfers',
+          severity: 'info',
+          title: `${pendingTransfersCount + inTransitTransfersCount} traslado${pendingTransfersCount + inTransitTransfersCount === 1 ? '' : 's'} en curso`,
+          description: `${pendingTransfersCount} por aprobar/enviar · ${inTransitTransfersCount} en tránsito.`,
+          route: '/(tabs)/catalog',
+          actionLabel: 'Traslados',
+        });
+      }
+
+      return {
+        salesSummary,
+        rawSalesCount: salesDocs.length,
+        openCashSessions: {
+          count: openSessions.length,
+          totalOpeningBalance,
+          totalSalesInOpenShifts,
+          sessions: openSessions,
+        },
+        pendingTransfersCount,
+        inTransitTransfersCount,
+        lowStockCount: lowStockProducts.length,
+        lowStockProducts: lowStockProducts.slice(0, 10),
+        overdueFiadosCount,
+        overdueFiadosTotal,
+        activeFiadosCount,
+        activeFiadosTotal,
+        alerts,
+      };
     },
-    pendingTransfersCount,
-    inTransitTransfersCount,
-    lowStockCount: lowStockProducts.length,
-    lowStockProducts: lowStockProducts.slice(0, 10),
-    overdueFiadosCount,
-    overdueFiadosTotal,
-    activeFiadosCount,
-    activeFiadosTotal,
-    alerts,
-  };
+    { forceRefresh: options?.forceRefresh }
+  );
 }
 
 export async function fetchPeriodSalesSummaryOnly(
@@ -1039,26 +1139,40 @@ export async function fetchPeriodSalesSummaryOnly(
   branchId: string | undefined,
   fromMs: number,
   toMs: number,
-  productsMap?: Map<string, Record<string, any>>
+  productsMap?: Map<string, Record<string, any>>,
+  options?: { forceRefresh?: boolean; signal?: AbortSignal }
 ): Promise<{ salesSummary: DashboardSalesBreakdown; rawSalesCount: number }> {
   if (!accountId) {
     throw new Error('accountId requerido para resumen de ventas.');
   }
+  if (options?.signal?.aborted) {
+    throw new ApiError('Operación cancelada.', 499, 'ABORTED');
+  }
   const effectiveBranch = normalizeBranchScope(branchId);
-  const salesQuery = query(
-    collection(db, 'sales'),
-    where('accountId', '==', accountId),
-    ...(effectiveBranch ? [where('branchId', '==', effectiveBranch)] : []),
-    where('date', '>=', fromMs),
-    where('date', '<=', toMs),
-    orderBy('date', 'desc')
+  const cacheKey = `dash_sales_only:${accountId}:${effectiveBranch || 'all'}:${fromMs}:${toMs}:${productsMap ? 'pm' : 'nopm'}`;
+
+  return sharedRequestCache.getOrLoad(
+    cacheKey,
+    REPORT_CACHE_TTL_MS,
+    async () => {
+      const salesQuery = query(
+        collection(db, 'sales'),
+        where('accountId', '==', accountId),
+        ...(effectiveBranch ? [where('branchId', '==', effectiveBranch)] : []),
+        where('date', '>=', fromMs),
+        where('date', '<=', toMs),
+        orderBy('date', 'desc'),
+        limit(1500)
+      );
+      const salesSnap = await getDocs(salesQuery);
+      const salesDocs = salesSnap.docs.map((d) => ({ id: d.id, ...(d.data() as Record<string, any>) }));
+      return {
+        salesSummary: aggregatePeriodSalesSummary(salesDocs, productsMap),
+        rawSalesCount: salesDocs.length,
+      };
+    },
+    { forceRefresh: options?.forceRefresh }
   );
-  const salesSnap = await getDocs(salesQuery);
-  const salesDocs = salesSnap.docs.map((d) => ({ id: d.id, ...(d.data() as Record<string, any>) }));
-  return {
-    salesSummary: aggregatePeriodSalesSummary(salesDocs, productsMap),
-    rawSalesCount: salesDocs.length,
-  };
 }
 
 export async function fetchCanonicalPnlReport(params: GeneratePnlReportParams): Promise<PnlReportResult> {
@@ -1070,19 +1184,31 @@ export async function fetchSellerPerformanceReport(
   accountId: string,
   fromDay: string,
   toDay: string,
-  branchId?: string
+  branchId?: string,
+  options?: { forceRefresh?: boolean; signal?: AbortSignal }
 ): Promise<SellerPerformanceApiResponse> {
   if (!accountId) throw new ApiError('accountId es requerido.', 400);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(fromDay) || !/^\d{4}-\d{2}-\d{2}$/.test(toDay) || toDay < fromDay) {
     throw new ApiError('Rango de fechas inválido (AAAA-MM-DD).', 400);
   }
+  if (options?.signal?.aborted) {
+    throw new ApiError('Operación cancelada.', 499, 'ABORTED');
+  }
   const params = new URLSearchParams({ fromDay, toDay });
   const scopedBranch = normalizeBranchScope(branchId);
   if (scopedBranch) params.set('branchId', scopedBranch);
 
-  return apiRequest<SellerPerformanceApiResponse>(`/api/reports/sellers?${params.toString()}`, {
-    timeoutMs: 30000,
-  });
+  const cacheKey = `dash_sellers:${accountId}:${scopedBranch || 'all'}:${fromDay}:${toDay}`;
+  return sharedRequestCache.getOrLoad(
+    cacheKey,
+    REPORT_CACHE_TTL_MS,
+    () =>
+      apiRequest<SellerPerformanceApiResponse>(`/api/reports/sellers?${params.toString()}`, {
+        timeoutMs: 30000,
+        signal: options?.signal,
+      }),
+    { forceRefresh: options?.forceRefresh }
+  );
 }
 
 export async function fetchCashClosureReports(
@@ -1090,49 +1216,95 @@ export async function fetchCashClosureReports(
   branchId?: string,
   fromMs?: number,
   toMs?: number,
-  maxItems: number = 60
+  maxItems: number = 30,
+  options?: { forceRefresh?: boolean; signal?: AbortSignal }
 ): Promise<CashClosureReportItem[]> {
   if (!accountId) return [];
-  const effectiveBranch = normalizeBranchScope(branchId);
-  const q = query(
-    collection(db, 'cash_register_reports'),
-    where('accountId', '==', accountId),
-    ...(effectiveBranch ? [where('branchId', '==', effectiveBranch)] : []),
-    orderBy('createdAt', 'desc'),
-    limit(maxItems)
-  );
-  const snap = await getDocs(q);
-  const rows: CashClosureReportItem[] = [];
-  for (const d of snap.docs) {
-    const data = d.data() || {};
-    const createdMs = toEpochMs(data.createdAt || data.closedAt || data.closeTime);
-    const closeMs = toEpochMs(data.closeTime || data.closedAt || data.createdAt);
-    const refMs = closeMs || createdMs;
-    if (fromMs && refMs && refMs < fromMs) continue;
-    if (toMs && refMs && refMs > toMs) continue;
-
-    rows.push({
-      id: d.id,
-      sessionId: String(data.sessionId || ''),
-      branchId: String(data.branchId || data.sessionSnapshot?.branchId || ''),
-      branchName: data.branchName || data.sessionSnapshot?.branchName || undefined,
-      startedByName: data.startedByName || data.sessionSnapshot?.startedByName || undefined,
-      closedByName: data.closedByName || undefined,
-      createdAt: createdMs,
-      closeTime: closeMs,
-      expectedAmount: Number(data.expectedAmount) || 0,
-      countedAmount: Number(data.countedAmount) || 0,
-      difference: Number(data.difference) || 0,
-      notes: data.notes ? String(data.notes) : undefined,
-      computed: data.computed || undefined,
-    });
+  if (options?.signal?.aborted) {
+    throw new ApiError('Operación cancelada.', 499, 'ABORTED');
   }
-  return rows;
+  const effectiveBranch = normalizeBranchScope(branchId);
+  const boundedLimit = Math.max(1, Math.min(maxItems || 30, 30));
+  const cacheKey = `dash_closures:${accountId}:${effectiveBranch || 'all'}:${fromMs || 0}:${toMs || 0}:${boundedLimit}`;
+
+  return sharedRequestCache.getOrLoad(
+    cacheKey,
+    REPORT_CACHE_TTL_MS,
+    async () => {
+      const dateConstraints: any[] = [];
+      if (typeof fromMs === 'number' && Number.isFinite(fromMs) && fromMs > 0) {
+        dateConstraints.push(where('createdAt', '>=', Timestamp.fromMillis(fromMs)));
+      }
+      if (typeof toMs === 'number' && Number.isFinite(toMs) && toMs > 0) {
+        dateConstraints.push(where('createdAt', '<=', Timestamp.fromMillis(toMs)));
+      }
+
+      const snap = dateConstraints.length > 0
+        ? await getDocsWithMemoizedIndexFallback(
+            effectiveBranch ? 'cash_closures_dated_branch' : 'cash_closures_dated_all',
+            () =>
+              query(
+                collection(db, 'cash_register_reports'),
+                where('accountId', '==', accountId),
+                ...(effectiveBranch ? [where('branchId', '==', effectiveBranch)] : []),
+                ...dateConstraints,
+                orderBy('createdAt', 'desc'),
+                limit(boundedLimit)
+              ),
+            () =>
+              query(
+                collection(db, 'cash_register_reports'),
+                where('accountId', '==', accountId),
+                ...(effectiveBranch ? [where('branchId', '==', effectiveBranch)] : []),
+                orderBy('createdAt', 'desc'),
+                limit(boundedLimit)
+              )
+          )
+        : await getDocs(
+            query(
+              collection(db, 'cash_register_reports'),
+              where('accountId', '==', accountId),
+              ...(effectiveBranch ? [where('branchId', '==', effectiveBranch)] : []),
+              orderBy('createdAt', 'desc'),
+              limit(boundedLimit)
+            )
+          );
+
+      const rows: CashClosureReportItem[] = [];
+      for (const d of snap.docs) {
+        const data = d.data() || {};
+        const createdMs = toEpochMs(data.createdAt || data.closedAt || data.closeTime);
+        const closeMs = toEpochMs(data.closeTime || data.closedAt || data.createdAt);
+        const refMs = closeMs || createdMs;
+        if (fromMs && refMs && refMs < fromMs) continue;
+        if (toMs && refMs && refMs > toMs) continue;
+
+        rows.push({
+          id: d.id,
+          sessionId: String(data.sessionId || ''),
+          branchId: String(data.branchId || data.sessionSnapshot?.branchId || ''),
+          branchName: data.branchName || data.sessionSnapshot?.branchName || undefined,
+          startedByName: data.startedByName || data.sessionSnapshot?.startedByName || undefined,
+          closedByName: data.closedByName || undefined,
+          createdAt: createdMs,
+          closeTime: closeMs,
+          expectedAmount: Number(data.expectedAmount) || 0,
+          countedAmount: Number(data.countedAmount) || 0,
+          difference: Number(data.difference) || 0,
+          notes: data.notes ? String(data.notes) : undefined,
+          computed: data.computed || undefined,
+        });
+      }
+      return rows;
+    },
+    { forceRefresh: options?.forceRefresh }
+  );
 }
 
 export async function fetchReceivablesReport(
   accountId: string,
-  branchId?: string
+  branchId?: string,
+  options?: { forceRefresh?: boolean; signal?: AbortSignal }
 ): Promise<ReceivablesSummary> {
   if (!accountId) {
     return {
@@ -1145,100 +1317,133 @@ export async function fetchReceivablesReport(
       topCustomers: [],
     };
   }
+  if (options?.signal?.aborted) {
+    throw new ApiError('Operación cancelada.', 499, 'ABORTED');
+  }
   const effectiveBranch = normalizeBranchScope(branchId);
+  const cacheKey = `dash_receivables:${accountId}:${effectiveBranch || 'all'}`;
 
-  const fiadosQuery = query(
-    collection(db, 'reservations'),
-    where('accountId', '==', accountId),
-    ...(effectiveBranch ? [where('branchId', '==', effectiveBranch)] : []),
-    where('status', '==', 'pending'),
-    orderBy('date', 'desc'),
-    limit(200)
+  return sharedRequestCache.getOrLoad(
+    cacheKey,
+    REPORT_CACHE_TTL_MS,
+    async () => {
+      const [fiadosSnap, customersSnap] = await Promise.all([
+        getDocsWithMemoizedIndexFallback(
+          effectiveBranch ? 'receivables_fiados_branch' : 'receivables_fiados_all',
+          () =>
+            query(
+              collection(db, 'reservations'),
+              where('accountId', '==', accountId),
+              ...(effectiveBranch ? [where('branchId', '==', effectiveBranch)] : []),
+              where('status', '==', 'pending'),
+              where('type', '==', 'fiado'),
+              orderBy('date', 'desc'),
+              limit(200)
+            ),
+          () =>
+            query(
+              collection(db, 'reservations'),
+              where('accountId', '==', accountId),
+              ...(effectiveBranch ? [where('branchId', '==', effectiveBranch)] : []),
+              where('status', '==', 'pending'),
+              orderBy('date', 'desc'),
+              limit(200)
+            )
+        ),
+        getDocsWithMemoizedIndexFallback(
+          'receivables_customers_debt',
+          () =>
+            query(
+              collection(db, 'customers'),
+              where('accountId', '==', accountId),
+              orderBy('currentDebt', 'desc'),
+              limit(50)
+            ),
+          () =>
+            query(
+              collection(db, 'customers'),
+              where('accountId', '==', accountId),
+              limit(300)
+            )
+        ),
+      ]);
+
+      const nowMs = Date.now();
+      const fiados: ReceivablesFiadoItem[] = [];
+      let totalDebt = 0;
+      let overdueDebt = 0;
+      let overdueFiadosCount = 0;
+
+      for (const d of fiadosSnap.docs) {
+        const data = d.data() || {};
+        if (data.type !== 'fiado' && data.isCreditSale !== true) continue;
+        const total = Number(data.total) || 0;
+        const paidAmount = Number(data.paidAmount) || 0;
+        const returnedAmount = Number(data.returnedAmount) || 0;
+        const remainingAmount = round2(Math.max(0, total - paidAmount - returnedAmount));
+        if (remainingAmount <= 0) continue;
+
+        const dueMs = toEpochMs(data.dueDate);
+        const isOverdue = dueMs > 0 && dueMs < nowMs;
+        totalDebt = round2(totalDebt + remainingAmount);
+        if (isOverdue) {
+          overdueFiadosCount += 1;
+          overdueDebt = round2(overdueDebt + remainingAmount);
+        }
+        fiados.push({
+          id: d.id,
+          customerId: data.customerId ? String(data.customerId) : undefined,
+          customerName: String(data.customerName || 'Cliente sin nombre'),
+          branchId: data.branchId ? String(data.branchId) : undefined,
+          total,
+          paidAmount,
+          remainingAmount,
+          date: toEpochMs(data.date),
+          dueDate: dueMs || undefined,
+          isOverdue,
+        });
+      }
+
+      let totalCreditsInFavor = 0;
+      const customers: ReceivablesCustomerSummary[] = [];
+      for (const d of customersSnap.docs) {
+        const data = d.data() || {};
+        const credits = Number(data.credits) || 0;
+        const currentDebt = Number(data.currentDebt) || 0;
+        totalCreditsInFavor = round2(totalCreditsInFavor + Math.max(0, credits));
+        customers.push({
+          id: d.id,
+          name: String(data.name || 'Cliente'),
+          phone: data.phone ? String(data.phone) : undefined,
+          currentDebt,
+          credits,
+          totalSpent: Number(data.totalSpent) || 0,
+          totalPurchases: Number(data.totalPurchases) || 0,
+        });
+      }
+
+      customers.sort((a, b) => (b.currentDebt - a.currentDebt) || (b.totalSpent - a.totalSpent));
+
+      return {
+        totalDebt,
+        overdueDebt,
+        activeFiadosCount: fiados.length,
+        overdueFiadosCount,
+        totalCreditsInFavor,
+        fiados,
+        topCustomers: customers.slice(0, 20),
+      };
+    },
+    { forceRefresh: options?.forceRefresh }
   );
-
-  const customersQuery = query(
-    collection(db, 'customers'),
-    where('accountId', '==', accountId),
-    limit(300)
-  );
-
-  const [fiadosSnap, customersSnap] = await Promise.all([
-    getDocs(fiadosQuery),
-    getDocs(customersQuery),
-  ]);
-
-  const nowMs = Date.now();
-  const fiados: ReceivablesFiadoItem[] = [];
-  let totalDebt = 0;
-  let overdueDebt = 0;
-  let overdueFiadosCount = 0;
-
-  for (const d of fiadosSnap.docs) {
-    const data = d.data() || {};
-    if (data.type !== 'fiado' && data.isCreditSale !== true) continue;
-    const total = Number(data.total) || 0;
-    const paidAmount = Number(data.paidAmount) || 0;
-    const returnedAmount = Number(data.returnedAmount) || 0;
-    const remainingAmount = round2(Math.max(0, total - paidAmount - returnedAmount));
-    if (remainingAmount <= 0) continue;
-
-    const dueMs = toEpochMs(data.dueDate);
-    const isOverdue = dueMs > 0 && dueMs < nowMs;
-    totalDebt = round2(totalDebt + remainingAmount);
-    if (isOverdue) {
-      overdueFiadosCount += 1;
-      overdueDebt = round2(overdueDebt + remainingAmount);
-    }
-    fiados.push({
-      id: d.id,
-      customerId: data.customerId ? String(data.customerId) : undefined,
-      customerName: String(data.customerName || 'Cliente sin nombre'),
-      branchId: data.branchId ? String(data.branchId) : undefined,
-      total,
-      paidAmount,
-      remainingAmount,
-      date: toEpochMs(data.date),
-      dueDate: dueMs || undefined,
-      isOverdue,
-    });
-  }
-
-  let totalCreditsInFavor = 0;
-  const customers: ReceivablesCustomerSummary[] = [];
-  for (const d of customersSnap.docs) {
-    const data = d.data() || {};
-    const credits = Number(data.credits) || 0;
-    const currentDebt = Number(data.currentDebt) || 0;
-    totalCreditsInFavor = round2(totalCreditsInFavor + Math.max(0, credits));
-    customers.push({
-      id: d.id,
-      name: String(data.name || 'Cliente'),
-      phone: data.phone ? String(data.phone) : undefined,
-      currentDebt,
-      credits,
-      totalSpent: Number(data.totalSpent) || 0,
-      totalPurchases: Number(data.totalPurchases) || 0,
-    });
-  }
-
-  customers.sort((a, b) => (b.currentDebt - a.currentDebt) || (b.totalSpent - a.totalSpent));
-
-  return {
-    totalDebt,
-    overdueDebt,
-    activeFiadosCount: fiados.length,
-    overdueFiadosCount,
-    totalCreditsInFavor,
-    fiados,
-    topCustomers: customers.slice(0, 20),
-  };
 }
 
 export async function fetchExpensesReport(
   accountId: string,
   branchId: string | undefined,
   fromMs: number,
-  toMs: number
+  toMs: number,
+  options?: { forceRefresh?: boolean; signal?: AbortSignal }
 ): Promise<ExpensesReportSummary> {
   if (!accountId) {
     return {
@@ -1250,86 +1455,112 @@ export async function fetchExpensesReport(
       recentExpenses: [],
     };
   }
-  const effectiveBranch = normalizeBranchScope(branchId);
-  const q = query(
-    collection(db, 'cash_register_movements'),
-    where('accountId', '==', accountId),
-    ...(effectiveBranch ? [where('branchId', '==', effectiveBranch)] : []),
-    where('createdAt', '>=', Timestamp.fromMillis(fromMs)),
-    where('createdAt', '<=', Timestamp.fromMillis(toMs)),
-    orderBy('createdAt', 'asc'),
-    limit(500)
-  );
-
-  const snap = await getDocs(q);
-  let totalOperatingExpenses = 0;
-  let totalEmployeeAdvances = 0;
-  let totalRefunds = 0;
-
-  const byCategory = new Map<string, { label: string; amount: number; count: number }>();
-  const recentExpenses: ExpensesReportSummary['recentExpenses'] = [];
-
-  for (const d of snap.docs) {
-    const data = d.data() || {};
-    const rawAmount = Number(data.amount) || 0;
-    if (rawAmount === 0) continue;
-
-    const pnlClass = classifyMovementForPnl({
-      type: data.type,
-      amount: rawAmount,
-      category: data.category,
-      expenseCategoryId: data.expenseCategoryId,
-      isEmployeeAdvance: data.isEmployeeAdvance,
-    });
-
-    const absAmt = round2(Math.abs(rawAmount));
-    if (pnlClass === 'operating_expense') {
-      totalOperatingExpenses = round2(totalOperatingExpenses + absAmt);
-      const catKey = String(data.expenseCategoryId || data.category || 'other').toLowerCase();
-      const label = expenseCategoryLabel(data.expenseCategoryId, data.category);
-      const entry = byCategory.get(catKey) || { label, amount: 0, count: 0 };
-      entry.amount = round2(entry.amount + absAmt);
-      entry.count += 1;
-      byCategory.set(catKey, entry);
-
-      recentExpenses.push({
-        id: d.id,
-        label,
-        reason: String(data.reason || 'Gasto operativo'),
-        amount: absAmt,
-        createdAt: toEpochMs(data.createdAt),
-        createdByName: data.createdByName ? String(data.createdByName) : undefined,
-      });
-    } else if (pnlClass === 'employee_advance') {
-      totalEmployeeAdvances = round2(totalEmployeeAdvances + absAmt);
-    } else if (pnlClass === 'refund') {
-      totalRefunds = round2(totalRefunds + absAmt);
-    }
+  if (options?.signal?.aborted) {
+    throw new ApiError('Operación cancelada.', 499, 'ABORTED');
   }
+  const effectiveBranch = normalizeBranchScope(branchId);
+  const cacheKey = `dash_expenses:${accountId}:${effectiveBranch || 'all'}:${fromMs}:${toMs}`;
 
-  const categories: ExpenseCategorySummaryItem[] = [...byCategory.entries()]
-    .map(([category, info]) => ({
-      category,
-      label: info.label,
-      amount: info.amount,
-      count: info.count,
-      percentage:
-        totalOperatingExpenses > 0
-          ? Math.round((info.amount / totalOperatingExpenses) * 1000) / 10
-          : 0,
-    }))
-    .sort((a, b) => b.amount - a.amount);
+  return sharedRequestCache.getOrLoad(
+    cacheKey,
+    REPORT_CACHE_TTL_MS,
+    async () => {
+      const snap = await getDocsWithMemoizedIndexFallback(
+        effectiveBranch ? 'expenses_type_branch' : 'expenses_type_all',
+        () =>
+          query(
+            collection(db, 'cash_register_movements'),
+            where('accountId', '==', accountId),
+            ...(effectiveBranch ? [where('branchId', '==', effectiveBranch)] : []),
+            where('type', '==', 'expense'),
+            where('createdAt', '>=', Timestamp.fromMillis(fromMs)),
+            where('createdAt', '<=', Timestamp.fromMillis(toMs)),
+            orderBy('createdAt', 'desc'),
+            limit(200)
+          ),
+        () =>
+          query(
+            collection(db, 'cash_register_movements'),
+            where('accountId', '==', accountId),
+            ...(effectiveBranch ? [where('branchId', '==', effectiveBranch)] : []),
+            where('createdAt', '>=', Timestamp.fromMillis(fromMs)),
+            where('createdAt', '<=', Timestamp.fromMillis(toMs)),
+            orderBy('createdAt', 'asc'),
+            limit(500)
+          )
+      );
 
-  recentExpenses.sort((a, b) => b.createdAt - a.createdAt);
+      let totalOperatingExpenses = 0;
+      let totalEmployeeAdvances = 0;
+      let totalRefunds = 0;
 
-  return {
-    totalOperatingExpenses,
-    totalEmployeeAdvances,
-    totalRefunds,
-    movementsCount: snap.size,
-    categories,
-    recentExpenses: recentExpenses.slice(0, 30),
-  };
+      const byCategory = new Map<string, { label: string; amount: number; count: number }>();
+      const recentExpenses: ExpensesReportSummary['recentExpenses'] = [];
+
+      for (const d of snap.docs) {
+        const data = d.data() || {};
+        const rawAmount = Number(data.amount) || 0;
+        if (rawAmount === 0) continue;
+
+        const pnlClass = classifyMovementForPnl({
+          type: data.type,
+          amount: rawAmount,
+          category: data.category,
+          expenseCategoryId: data.expenseCategoryId,
+          isEmployeeAdvance: data.isEmployeeAdvance,
+        });
+
+        const absAmt = round2(Math.abs(rawAmount));
+        if (pnlClass === 'operating_expense') {
+          totalOperatingExpenses = round2(totalOperatingExpenses + absAmt);
+          const catKey = String(data.expenseCategoryId || data.category || 'other').toLowerCase();
+          const label = expenseCategoryLabel(data.expenseCategoryId, data.category);
+          const entry = byCategory.get(catKey) || { label, amount: 0, count: 0 };
+          entry.amount = round2(entry.amount + absAmt);
+          entry.count += 1;
+          byCategory.set(catKey, entry);
+
+          recentExpenses.push({
+            id: d.id,
+            label,
+            reason: String(data.reason || 'Gasto operativo'),
+            amount: absAmt,
+            createdAt: toEpochMs(data.createdAt),
+            createdByName: data.createdByName ? String(data.createdByName) : undefined,
+          });
+        } else if (pnlClass === 'employee_advance') {
+          totalEmployeeAdvances = round2(totalEmployeeAdvances + absAmt);
+        } else if (pnlClass === 'refund') {
+          totalRefunds = round2(totalRefunds + absAmt);
+        }
+      }
+
+      const categories: ExpenseCategorySummaryItem[] = [...byCategory.entries()]
+        .map(([category, info]) => ({
+          category,
+          label: info.label,
+          amount: info.amount,
+          count: info.count,
+          percentage:
+            totalOperatingExpenses > 0
+              ? Math.round((info.amount / totalOperatingExpenses) * 1000) / 10
+              : 0,
+        }))
+        .sort((a, b) => b.amount - a.amount);
+
+      recentExpenses.sort((a, b) => b.createdAt - a.createdAt);
+
+      return {
+        totalOperatingExpenses,
+        totalEmployeeAdvances,
+        totalRefunds,
+        movementsCount: snap.size,
+        categories,
+        recentExpenses: recentExpenses.slice(0, 30),
+      };
+    },
+    { forceRefresh: options?.forceRefresh }
+  );
 }
 
 // ============================================================================
@@ -1338,26 +1569,40 @@ export async function fetchExpensesReport(
 
 export async function fetchEinvoices(
   accountId: string,
-  options?: { branchId?: string; from?: string; to?: string }
+  options?: { branchId?: string; from?: string; to?: string; forceRefresh?: boolean; signal?: AbortSignal }
 ): Promise<PublicEinvoice[]> {
   if (!accountId) {
     throw new ApiError('accountId es requerido.', 400);
+  }
+  if (options?.signal?.aborted) {
+    throw new ApiError('Operación cancelada.', 499, 'ABORTED');
   }
   const params = new URLSearchParams({ accountId });
   if (options?.from && options?.to) {
     params.set('from', options.from);
     params.set('to', options.to);
   }
-
-  const data = await apiRequest<{ success: boolean; einvoices: PublicEinvoice[] }>(
-    `/api/invoicing/status?${params.toString()}`,
-    { timeoutMs: 60000 }
-  );
-
-  const list = Array.isArray(data?.einvoices) ? data.einvoices : [];
   const scopedBranch = normalizeBranchScope(options?.branchId);
-  if (!scopedBranch) return list;
-  return list.filter((doc) => !doc.branchId || doc.branchId === scopedBranch);
+  if (scopedBranch) {
+    params.set('branchId', scopedBranch);
+  }
+
+  const cacheKey = `einvoices:${accountId}:${scopedBranch || 'all'}:${options?.from || ''}:${options?.to || ''}`;
+  return sharedRequestCache.getOrLoad(
+    cacheKey,
+    REPORT_CACHE_TTL_MS,
+    async () => {
+      const data = await apiRequest<{ success: boolean; einvoices: PublicEinvoice[] }>(
+        `/api/invoicing/status?${params.toString()}`,
+        { timeoutMs: 60000, signal: options?.signal }
+      );
+
+      const list = Array.isArray(data?.einvoices) ? data.einvoices : [];
+      if (!scopedBranch) return list;
+      return list.filter((doc) => !doc.branchId || doc.branchId === scopedBranch);
+    },
+    { forceRefresh: options?.forceRefresh }
+  );
 }
 
 export async function retryEinvoiceDocument(
@@ -1378,6 +1623,7 @@ export async function retryEinvoiceDocument(
   if (!data?.einvoice) {
     throw new ApiError('El servidor no devolvió el comprobante actualizado.', 502);
   }
+  sharedRequestCache.invalidatePrefix(`einvoices:${accountId}:`);
   return data.einvoice;
 }
 
@@ -1396,6 +1642,7 @@ export async function emitEinvoiceDocument(payload: EmitEinvoicePayload): Promis
   if (!data?.einvoice) {
     throw new ApiError('El servidor no devolvió el comprobante emitido.', 502);
   }
+  sharedRequestCache.invalidatePrefix(`einvoices:${payload.accountId}:`);
   return data.einvoice;
 }
 
@@ -1431,7 +1678,26 @@ export async function downloadAndShareExportFile(
     }
   }
 
-  const downloadResult = await FileSystem.downloadAsync(prepared.url, targetUri, { headers });
+  const prevUri = lastExportTempUri;
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutHandle = setTimeout(() => {
+      reject(new ApiError('La descarga tardó demasiado.', 408));
+    }, EXPORT_DOWNLOAD_TIMEOUT_MS);
+  });
+
+  let downloadResult: FileSystem.FileSystemDownloadResult;
+  try {
+    downloadResult = await Promise.race([
+      FileSystem.downloadAsync(prepared.url, targetUri, { headers }),
+      timeoutPromise,
+    ]);
+  } finally {
+    if (timeoutHandle !== undefined) {
+      clearTimeout(timeoutHandle);
+    }
+  }
+
   if (downloadResult.status < 200 || downloadResult.status >= 300) {
     let errorMessage = 'No se pudo descargar el archivo.';
     try {
@@ -1445,6 +1711,11 @@ export async function downloadAndShareExportFile(
     }
     await FileSystem.deleteAsync(downloadResult.uri, { idempotent: true }).catch(() => {});
     throw new ApiError(errorMessage, downloadResult.status);
+  }
+
+  lastExportTempUri = downloadResult.uri || null;
+  if (prevUri && prevUri !== downloadResult.uri) {
+    await FileSystem.deleteAsync(prevUri, { idempotent: true }).catch(() => {});
   }
 
   const canShare = await Sharing.isAvailableAsync();

@@ -70,8 +70,11 @@ const is58PaperWidth = (width?: EscPosOptions['paperWidth']): boolean =>
 // 2. ESC/POS BINARY BUILDER CLASS
 // ============================================================================
 
+const PRINTABLE_ASCII_RE = /^[\x20-\x7E\r\n]*$/;
+
 export class EscPosBuilder {
-  private buffer: number[] = [];
+  private buffer: Uint8Array = new Uint8Array(2048);
+  private length: number = 0;
   public readonly cols: number;
 
   constructor(public readonly options: EscPosOptions = {}) {
@@ -79,28 +82,62 @@ export class EscPosBuilder {
     this.init();
   }
 
+  private ensureCapacity(extra: number): void {
+    const needed = this.length + extra;
+    if (needed <= this.buffer.length) return;
+    let nextCapacity = this.buffer.length * 2;
+    while (nextCapacity < needed) {
+      nextCapacity *= 2;
+    }
+    const next = new Uint8Array(nextCapacity);
+    next.set(this.buffer.subarray(0, this.length));
+    this.buffer = next;
+  }
+
   /** ESC @ - Initialize printer to default state */
   init(): this {
-    this.buffer.push(0x1b, 0x40);
+    this.ensureCapacity(2);
+    this.buffer[this.length++] = 0x1b;
+    this.buffer[this.length++] = 0x40;
     return this;
   }
 
   /** ESC p - Open cash drawer (pin 2 pulse 50ms) */
   openCashDrawer(): this {
-    this.buffer.push(0x1b, 0x70, 0x00, 0x19, 0xfa);
+    this.ensureCapacity(5);
+    const buf = this.buffer;
+    let offset = this.length;
+    buf[offset++] = 0x1b;
+    buf[offset++] = 0x70;
+    buf[offset++] = 0x00;
+    buf[offset++] = 0x19;
+    buf[offset++] = 0xfa;
+    this.length = offset;
     return this;
   }
 
   /** ESC a - Alignment (0: Left, 1: Center, 2: Right) */
   align(alignment: 'left' | 'center' | 'right'): this {
     const code = alignment === 'center' ? 0x01 : alignment === 'right' ? 0x02 : 0x00;
-    this.buffer.push(0x1b, 0x61, code);
+    this.ensureCapacity(3);
+    const buf = this.buffer;
+    let offset = this.length;
+    buf[offset++] = 0x1b;
+    buf[offset++] = 0x61;
+    buf[offset++] = code;
+    this.length = offset;
     return this;
   }
 
   /** ESC E - Bold emphasis toggle */
   bold(enable: boolean = true): this {
-    this.buffer.push(0x1b, 0x45, enable ? 0x01 : 0x00);
+    this.ensureCapacity(3);
+    const buf = this.buffer;
+    let offset = this.length;
+    buf[offset++] = 0x1b;
+    buf[offset++] = 0x45;
+    buf[offset++] = enable ? 0x01 : 0x00;
+    this.length = offset;
     return this;
   }
 
@@ -110,13 +147,20 @@ export class EscPosBuilder {
     if (mode === 'double-height') n = 0x01;
     else if (mode === 'double-width') n = 0x10;
     else if (mode === 'double') n = 0x11;
-    this.buffer.push(0x1d, 0x21, n);
+    this.ensureCapacity(3);
+    const buf = this.buffer;
+    let offset = this.length;
+    buf[offset++] = 0x1d;
+    buf[offset++] = 0x21;
+    buf[offset++] = n;
+    this.length = offset;
     return this;
   }
 
   /** Strips diacritics and converts to printer-safe ASCII / CP437 */
   private sanitizeText(text: string): string {
     if (!text) return '';
+    if (PRINTABLE_ASCII_RE.test(text)) return text;
     return text
       .normalize('NFD')
       .replace(/[\u0300-\u036f]/g, '') // remove accent marks
@@ -129,15 +173,28 @@ export class EscPosBuilder {
 
   /** Push already-sanitized ASCII characters directly into buffer */
   private pushRawAscii(ascii: string): void {
-    for (let i = 0; i < ascii.length; i++) {
-      this.buffer.push(ascii.charCodeAt(i));
+    const len = ascii.length;
+    if (len === 0) return;
+    this.ensureCapacity(len);
+    const buf = this.buffer;
+    let offset = this.length;
+    for (let i = 0; i < len; i++) {
+      buf[offset++] = ascii.charCodeAt(i);
     }
+    this.length = offset;
   }
 
   /** Push already-sanitized ASCII line + LF without re-running sanitizeText */
   private rawSanitizedLine(sanitized: string): this {
-    this.pushRawAscii(sanitized);
-    this.buffer.push(0x0a);
+    const len = sanitized.length;
+    this.ensureCapacity(len + 1);
+    const buf = this.buffer;
+    let offset = this.length;
+    for (let i = 0; i < len; i++) {
+      buf[offset++] = sanitized.charCodeAt(i);
+    }
+    buf[offset++] = 0x0a;
+    this.length = offset;
     return this;
   }
 
@@ -154,7 +211,13 @@ export class EscPosBuilder {
 
   /** ESC d - Feed N lines */
   feed(lines: number = 1): this {
-    this.buffer.push(0x1b, 0x64, Math.max(1, lines));
+    this.ensureCapacity(3);
+    const buf = this.buffer;
+    let offset = this.length;
+    buf[offset++] = 0x1b;
+    buf[offset++] = 0x64;
+    buf[offset++] = Math.max(1, lines);
+    this.length = offset;
     return this;
   }
 
@@ -168,7 +231,21 @@ export class EscPosBuilder {
     const cleanLeft = this.sanitizeText(left);
     const cleanRight = this.sanitizeText(right);
     const spaceCount = Math.max(1, this.cols - cleanLeft.length - cleanRight.length);
-    return this.rawSanitizedLine(`${cleanLeft}${' '.repeat(spaceCount)}${cleanRight}`);
+    const totalLen = cleanLeft.length + spaceCount + cleanRight.length + 1;
+    this.ensureCapacity(totalLen);
+    const buf = this.buffer;
+    let offset = this.length;
+    for (let i = 0; i < cleanLeft.length; i++) {
+      buf[offset++] = cleanLeft.charCodeAt(i);
+    }
+    buf.fill(0x20, offset, offset + spaceCount);
+    offset += spaceCount;
+    for (let i = 0; i < cleanRight.length; i++) {
+      buf[offset++] = cleanRight.charCodeAt(i);
+    }
+    buf[offset++] = 0x0a;
+    this.length = offset;
+    return this;
   }
 
   /** Three columns: quantity/sku, name, total */
@@ -195,32 +272,54 @@ export class EscPosBuilder {
     const pL = len % 256;
     const pH = Math.floor(len / 256);
 
+    this.ensureCapacity(41 + cleanData.length);
+    const buf = this.buffer;
+    let offset = this.length;
+
     // 1. Model 2
-    this.buffer.push(0x1d, 0x28, 0x6b, 0x04, 0x00, 0x31, 0x41, 0x32, 0x00);
+    buf[offset++] = 0x1d; buf[offset++] = 0x28; buf[offset++] = 0x6b;
+    buf[offset++] = 0x04; buf[offset++] = 0x00; buf[offset++] = 0x31;
+    buf[offset++] = 0x41; buf[offset++] = 0x32; buf[offset++] = 0x00;
     // 2. Module size (3..8)
-    this.buffer.push(0x1d, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x43, Math.min(8, Math.max(3, size)));
+    buf[offset++] = 0x1d; buf[offset++] = 0x28; buf[offset++] = 0x6b;
+    buf[offset++] = 0x03; buf[offset++] = 0x00; buf[offset++] = 0x31;
+    buf[offset++] = 0x43; buf[offset++] = Math.min(8, Math.max(3, size));
     // 3. Error correction level (M: 49)
-    this.buffer.push(0x1d, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x45, 0x31);
+    buf[offset++] = 0x1d; buf[offset++] = 0x28; buf[offset++] = 0x6b;
+    buf[offset++] = 0x03; buf[offset++] = 0x00; buf[offset++] = 0x31;
+    buf[offset++] = 0x45; buf[offset++] = 0x31;
     // 4. Store data
-    this.buffer.push(0x1d, 0x28, 0x6b, pL, pH, 0x31, 0x50, 0x30);
+    buf[offset++] = 0x1d; buf[offset++] = 0x28; buf[offset++] = 0x6b;
+    buf[offset++] = pL;   buf[offset++] = pH;   buf[offset++] = 0x31;
+    buf[offset++] = 0x50; buf[offset++] = 0x30;
     for (let i = 0; i < cleanData.length; i++) {
-      this.buffer.push(cleanData.charCodeAt(i));
+      buf[offset++] = cleanData.charCodeAt(i);
     }
     // 5. Print stored QR
-    this.buffer.push(0x1d, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x51, 0x30);
+    buf[offset++] = 0x1d; buf[offset++] = 0x28; buf[offset++] = 0x6b;
+    buf[offset++] = 0x03; buf[offset++] = 0x00; buf[offset++] = 0x31;
+    buf[offset++] = 0x51; buf[offset++] = 0x30;
+    this.length = offset;
     return this;
   }
 
   /** GS V - Paper Cut (partial cut) */
   cut(partial: boolean = true, feedLines: number = 3): this {
     this.feed(Math.max(1, feedLines));
-    this.buffer.push(0x1d, 0x56, partial ? 0x42 : 0x41, 0x00);
+    this.ensureCapacity(4);
+    const buf = this.buffer;
+    let offset = this.length;
+    buf[offset++] = 0x1d;
+    buf[offset++] = 0x56;
+    buf[offset++] = partial ? 0x42 : 0x41;
+    buf[offset++] = 0x00;
+    this.length = offset;
     return this;
   }
 
   /** Returns raw binary buffer */
   build(): Uint8Array {
-    return new Uint8Array(this.buffer);
+    return this.buffer.subarray(0, this.length);
   }
 }
 
@@ -631,6 +730,7 @@ export function buildSaleReceiptEscPos(
       emitterRuc: merged.ruc,
       consultUrl,
       taxProfile: options.taxProfile,
+      precomputedAmounts: amounts,
     }
   );
 
@@ -835,6 +935,7 @@ export function buildReceiptHtml(
       emitterRuc: merged.ruc,
       consultUrl,
       taxProfile: options.taxProfile,
+      precomputedAmounts: amounts,
     }
   );
   const qrSvg = qrData ? buildQrSvgMarkup(qrData, is58 ? 96 : 112, 2) : '';
@@ -1064,7 +1165,9 @@ export function buildReservationReceiptHtml(
     : (reservation.date ? new Date(reservation.date) : new Date());
 
   const formattedDate = formatDatePE(createdDate);
-  const formattedTime = createdDate.toLocaleTimeString('es-PE', { hour: '2-digit', minute: '2-digit' });
+  const formattedTime = Number.isNaN(createdDate.getTime())
+    ? ''
+    : `${String(createdDate.getHours()).padStart(2, '0')}:${String(createdDate.getMinutes()).padStart(2, '0')}`;
   const expiryDate = reservation.expiryDate
     ? (typeof reservation.expiryDate?.toDate === 'function' ? reservation.expiryDate.toDate() : new Date(reservation.expiryDate))
     : (reservation.pickupDate ? new Date(reservation.pickupDate) : null);

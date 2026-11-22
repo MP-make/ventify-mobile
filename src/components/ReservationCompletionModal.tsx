@@ -13,10 +13,10 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { useAuth } from '@/context/AuthContext';
-import { useSettings } from '@/context/SettingsContext';
+import { useAuthSession } from '@/context/AuthContext';
+import { useBusinessSettings, useCashSession } from '@/context/SettingsContext';
 import { ui, formatPEN } from '@/lib/theme';
-import { resolveCheckoutPayment } from '@/lib/checkout-payment';
+import { tryResolveCheckoutPayment } from '@/lib/checkout-payment';
 import { getAvailableSaleSellers, type SaleSellerOption } from '@/services/sale-service';
 import { completeOrCancelReservation, type ReservationOrder } from '@/services/crm-operations-service';
 
@@ -28,9 +28,14 @@ const DOC_TYPE_OPTIONS: Array<{ key: CompletionDocType; label: string }> = [
   { key: 'factura', label: 'Factura' },
 ];
 
-/** Delivery collects only the remaining balance while retaining the full commercial sale. */
-export const ReservationCompletionModal: React.FC<{
+interface ReservationCompletionModalProps {
   item: ReservationOrder | null;
+  onClose: () => void;
+  onCompleted: (item: ReservationOrder) => void;
+}
+
+const ReservationCompletionModalContent: React.FC<{
+  item: ReservationOrder;
   onClose: () => void;
   onCompleted: (item: ReservationOrder) => void;
 }> = React.memo(({
@@ -38,16 +43,15 @@ export const ReservationCompletionModal: React.FC<{
   onClose,
   onCompleted,
 }) => {
-  const { user, userProfile, branchId, role } = useAuth();
+  const { user, userProfile, branchId, role } = useAuthSession();
   const {
     paymentMethods,
     posSettings,
-    activeCashSession,
-    isCashOpen,
     configurationReady,
     configurationError,
     refreshConfiguration,
-  } = useSettings();
+  } = useBusinessSettings();
+  const { activeCashSession, isCashOpen } = useCashSession();
   const methods = useMemo(
     () => paymentMethods.filter((method) => method.enabled && method.kind !== 'credit' && method.kind !== 'mixed'),
     [paymentMethods]
@@ -63,7 +67,6 @@ export const ReservationCompletionModal: React.FC<{
   const [error, setError] = useState('');
 
   useEffect(() => {
-    if (!item) return;
     let alive = true;
     setMethodId('');
     setDocumentType('nota_venta');
@@ -92,18 +95,28 @@ export const ReservationCompletionModal: React.FC<{
     return () => {
       alive = false;
     };
-  }, [item?.id, item?.branchId, posSettings.enableSellerAttribution]);
+  }, [item.id, item.branchId, item.sellerId, posSettings.enableSellerAttribution]);
 
-  const method = methods.find((entry) => entry.id === methodId) || methods.find((entry) => entry.kind === 'cash') || methods[0];
-  const remaining = Math.max(0, Number(item?.remainingAmount) || 0);
-  const paymentPreview = method
-    ? resolveCheckoutPayment({
-        methods,
-        selectedMethodId: method.id,
-        total: remaining,
-        category: method.kind === 'cash' ? 'cash' : method.kind === 'digital' ? 'transfer' : 'card',
-      })
-    : null;
+  const method = useMemo(
+    () =>
+      methods.find((entry) => entry.id === methodId) ||
+      methods.find((entry) => entry.kind === 'cash') ||
+      methods[0],
+    [methods, methodId]
+  );
+  const remaining = Math.max(0, Number(item.remainingAmount) || 0);
+  const paymentPreview = useMemo(() => {
+    if (!method) return null;
+    const category =
+      method.kind === 'cash' ? 'cash' : method.kind === 'digital' ? 'transfer' : 'card';
+    const result = tryResolveCheckoutPayment({
+      methods,
+      selectedMethodId: method.id,
+      total: remaining,
+      category,
+    });
+    return result.ok ? result.value : null;
+  }, [methods, method, remaining]);
 
   const submit = async () => {
     if (!item || !user || busy) return;
@@ -350,6 +363,22 @@ export const ReservationCompletionModal: React.FC<{
         </KeyboardAvoidingView>
       </SafeAreaView>
     </Modal>
+  );
+});
+
+/** Delivery collects only the remaining balance while retaining the full commercial sale. */
+export const ReservationCompletionModal: React.FC<ReservationCompletionModalProps> = React.memo(({
+  item,
+  onClose,
+  onCompleted,
+}) => {
+  if (!item) return null;
+  return (
+    <ReservationCompletionModalContent
+      item={item}
+      onClose={onClose}
+      onCompleted={onCompleted}
+    />
   );
 });
 

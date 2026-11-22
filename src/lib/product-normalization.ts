@@ -21,6 +21,12 @@ export const isLocalFileUri = (uri?: string | null): boolean => {
 /** Filtra galería conservando únicamente URLs remotas válidas. */
 export const sanitizeRemoteImageUrls = (urls?: string[] | null): string[] => {
   if (!Array.isArray(urls) || urls.length === 0) return [];
+  if (urls.length === 1) {
+    const raw = urls[0];
+    if (typeof raw !== 'string') return [];
+    const trimmed = raw.trim();
+    return trimmed && !isLocalFileUri(trimmed) ? [trimmed] : [];
+  }
   const seen = new Set<string>();
   const result: string[] = [];
   for (let i = 0; i < urls.length; i += 1) {

@@ -51,10 +51,15 @@ const SHA256_INIT = new Uint32Array([
   0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ]);
 
-function encodeUtf8(input: string): Uint8Array {
-  if (typeof TextEncoder !== 'undefined') {
-    return new TextEncoder().encode(input);
-  }
+const SHARED_TEXT_ENCODER = typeof TextEncoder !== 'undefined' ? new TextEncoder() : null;
+const SHA256_PAD_CAPACITY = 512;
+const SHA256_PAD_SCRATCH = new Uint8Array(SHA256_PAD_CAPACITY);
+const SHA256_PAD_VIEW = new DataView(SHA256_PAD_SCRATCH.buffer);
+const SHA256_HASH_SCRATCH = new Uint32Array(8);
+const SHA256_W_SCRATCH = new Uint32Array(64);
+const HEX_BYTES = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2, '0'));
+
+function encodeUtf8Fallback(input: string): Uint8Array {
   const bytes: number[] = [];
   for (let i = 0; i < input.length; i += 1) {
     let code = input.charCodeAt(i);
@@ -89,21 +94,49 @@ function rotr(value: number, bits: number): number {
 
 /** Standard FIPS 180-4 SHA-256 digest returned as lowercase 64-char hex. */
 export function sha256Hex(input: string): string {
-  const bytes = encodeUtf8(input);
-  const bitLen = bytes.length * 8;
-  const totalLen = Math.ceil((bytes.length + 9) / 64) * 64;
-  const padded = new Uint8Array(totalLen);
-  padded.set(bytes);
-  padded[bytes.length] = 0x80;
+  let byteLen = 0;
+  let totalLen = 0;
+  let padded: Uint8Array;
+  let view: DataView;
 
-  const view = new DataView(padded.buffer);
+  if (
+    SHARED_TEXT_ENCODER &&
+    typeof SHARED_TEXT_ENCODER.encodeInto === 'function' &&
+    input.length * 3 + 9 <= SHA256_PAD_CAPACITY
+  ) {
+    const { written } = SHARED_TEXT_ENCODER.encodeInto(input, SHA256_PAD_SCRATCH);
+    byteLen = written;
+    totalLen = Math.ceil((byteLen + 9) / 64) * 64;
+    padded = SHA256_PAD_SCRATCH;
+    view = SHA256_PAD_VIEW;
+    padded.fill(0, byteLen, totalLen);
+  } else {
+    const bytes = SHARED_TEXT_ENCODER ? SHARED_TEXT_ENCODER.encode(input) : encodeUtf8Fallback(input);
+    byteLen = bytes.length;
+    totalLen = Math.ceil((byteLen + 9) / 64) * 64;
+    if (totalLen <= SHA256_PAD_CAPACITY) {
+      padded = SHA256_PAD_SCRATCH;
+      view = SHA256_PAD_VIEW;
+      padded.set(bytes);
+      padded.fill(0, byteLen, totalLen);
+    } else {
+      padded = new Uint8Array(totalLen);
+      view = new DataView(padded.buffer);
+      padded.set(bytes);
+    }
+  }
+
+  const bitLen = byteLen * 8;
+  padded[byteLen] = 0x80;
+
   const highBits = Math.floor(bitLen / 0x100000000);
   const lowBits = bitLen >>> 0;
   view.setUint32(totalLen - 8, highBits, false);
   view.setUint32(totalLen - 4, lowBits, false);
 
-  const hash = new Uint32Array(SHA256_INIT);
-  const w = new Uint32Array(64);
+  const hash = SHA256_HASH_SCRATCH;
+  hash.set(SHA256_INIT);
+  const w = SHA256_W_SCRATCH;
 
   for (let offset = 0; offset < totalLen; offset += 64) {
     for (let i = 0; i < 16; i += 1) {
@@ -154,7 +187,12 @@ export function sha256Hex(input: string): string {
 
   let out = '';
   for (let i = 0; i < 8; i += 1) {
-    out += hash[i].toString(16).padStart(8, '0');
+    const word = hash[i];
+    out +=
+      HEX_BYTES[(word >>> 24) & 0xff] +
+      HEX_BYTES[(word >>> 16) & 0xff] +
+      HEX_BYTES[(word >>> 8) & 0xff] +
+      HEX_BYTES[word & 0xff];
   }
   return out;
 }

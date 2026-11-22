@@ -4,10 +4,12 @@ import {
   PRODUCT_CATALOG_WORK_BATCH_SIZE,
   isAuthoritativeCatalogSnapshot,
   processCatalogInBatches,
+  processCatalogRangeInBatches,
   productsForCatalogScope,
   shouldRetainCatalogProduct,
 } from '@/lib/product-catalog-loader';
 import {
+  EMPTY_CRITICAL_ALERTS,
   ProductCatalogIndex,
   ProductCatalogInventoryIndex,
   removeCatalogProduct,
@@ -142,7 +144,7 @@ describe('product catalog loading', () => {
     expect(index.get('duplicate-primary')?.product.id).toBe('z-primary');
   });
 
-  it('updates inventory KPIs and alerts incrementally with branch, inactive, and price rules', () => {
+  it('updates inventory KPIs incrementally with branch, inactive, and price rules and memoizes unchanged snapshots', () => {
     const index = new ProductCatalogInventoryIndex('north');
     index.upsert(product('low', {
       costPrice: 5,
@@ -151,7 +153,8 @@ describe('product catalog loading', () => {
     index.upsert(product('empty', { stock: { north: 0 } }));
     index.upsert(product('inactive', { active: false, stock: { north: 100 }, costPrice: 10 }));
 
-    expect(index.snapshot()).toEqual({
+    const snap1 = index.snapshot();
+    expect(snap1).toEqual({
       stats: {
         totalProducts: 2,
         skuCount: 2,
@@ -160,11 +163,17 @@ describe('product catalog loading', () => {
         lowStockCount: 1,
         outOfStockCount: 1,
       },
-      alerts: [
-        { productId: 'low', name: 'low', currentStock: 2, minStock: 3 },
-        { productId: 'empty', name: 'empty', currentStock: 0, minStock: 3 },
-      ],
+      alerts: [],
     });
+    expect(snap1.alerts).toBe(EMPTY_CRITICAL_ALERTS);
+    expect(Object.isFrozen(snap1.alerts)).toBe(true);
+    expect(index.snapshot()).toBe(snap1);
+
+    // Updating a product without changing numeric KPIs returns the exact same memoized snapshot reference
+    index.upsert(product('empty', { name: 'empty renamed', stock: { north: 0 } }));
+    const snapUnchangedStats = index.snapshot();
+    expect(snapUnchangedStats).toBe(snap1);
+    expect(snapUnchangedStats.stats).toBe(snap1.stats);
 
     index.upsert(product('low', { costPrice: 5, stock: { north: 10 } }));
     index.remove('empty');
@@ -176,5 +185,33 @@ describe('product catalog loading', () => {
       lowStockCount: 0,
       outOfStockCount: 0,
     });
+  });
+
+  it('supports zero-slice index ranges and respects time-slice yield budgets', async () => {
+    const fixture = Array.from({ length: 250 }, (_, index) => product(`r-${index}`));
+    const visited: string[] = [];
+    let yields = 0;
+
+    const metrics = await processCatalogRangeInBatches(
+      fixture,
+      (items, start, end) => {
+        for (let i = start; i < end; i += 1) {
+          visited.push(items[i].id);
+        }
+      },
+      {
+        batchSize: 50,
+        yieldBudgetMs: 1000,
+        yieldControl: async () => {
+          yields += 1;
+        },
+      }
+    );
+
+    expect(metrics).toEqual({ itemCount: 250, batchCount: 5, maxItemsPerBatch: 50 });
+    expect(visited).toHaveLength(250);
+    expect(visited[0]).toBe('r-0');
+    expect(visited.at(-1)).toBe('r-249');
+    expect(yields).toBe(0);
   });
 });

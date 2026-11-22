@@ -1,5 +1,9 @@
 import type { Sale } from '@/types';
-import { receiptAmountsForSale, type TaxProfileInput } from './receipt-amounts';
+import {
+  receiptAmountsForSale,
+  type ReceiptAmountsResult,
+  type TaxProfileInput,
+} from './receipt-amounts';
 
 const LIMA_UTC_OFFSET_MS = 5 * 60 * 60 * 1000;
 
@@ -96,6 +100,8 @@ export function buildSaleQrContent(
     emitterRuc?: string | null;
     consultUrl?: string | null;
     taxProfile?: TaxProfileInput | null;
+    precomputedAmounts?: Pick<ReceiptAmountsResult, 'igv' | 'total'> | null;
+    amounts?: Pick<ReceiptAmountsResult, 'igv' | 'total'> | null;
   }
 ): string | null {
   const rawDocType = String(sale.documentType || '').toLowerCase();
@@ -136,7 +142,10 @@ export function buildSaleQrContent(
       defaultSerie,
       sale.saleNumber
     );
-    const amounts = receiptAmountsForSale(sale, sale.fiscalAmounts, options?.taxProfile);
+    const amounts =
+      options?.precomputedAmounts ??
+      options?.amounts ??
+      receiptAmountsForSale(sale, sale.fiscalAmounts, options?.taxProfile);
 
     const rawDoc = String(
       (sale as { receiptCustomer?: { identityNumber?: string } }).receiptCustomer?.identityNumber ||

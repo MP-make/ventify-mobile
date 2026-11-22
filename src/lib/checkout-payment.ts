@@ -35,6 +35,10 @@ export interface CheckoutPaymentResolution {
   netAmount: number;
 }
 
+export type ResolveCheckoutPaymentResult =
+  | { ok: true; value: CheckoutPaymentResolution }
+  | { ok: false; error: string };
+
 const roundMoney = (value: number): number => Math.round(value * 100) / 100;
 
 const calculateBreakdown = (amount: number, method: PosPaymentMethodConfig) => {
@@ -54,27 +58,44 @@ const calculateBreakdown = (amount: number, method: PosPaymentMethodConfig) => {
 const normalizedMethodText = (method: PosPaymentMethodConfig): string =>
   `${method.id} ${method.name} ${method.provider || ''}`.toLowerCase();
 
-const isTransferMethod = (method: PosPaymentMethodConfig): boolean =>
-  method.kind === 'digital' && /transfer|bcp|banco/.test(normalizedMethodText(method));
+const getNormalizedText = (
+  method: PosPaymentMethodConfig,
+  cache?: Map<PosPaymentMethodConfig, string>
+): string => {
+  if (!cache) return normalizedMethodText(method);
+  let text = cache.get(method);
+  if (text === undefined) {
+    text = normalizedMethodText(method);
+    cache.set(method, text);
+  }
+  return text;
+};
+
+const isTransferMethod = (
+  method: PosPaymentMethodConfig,
+  cache?: Map<PosPaymentMethodConfig, string>
+): boolean =>
+  method.kind === 'digital' && /transfer|bcp|banco/.test(getNormalizedText(method, cache));
 
 const isProviderMethod = (
   method: PosPaymentMethodConfig,
   provider: 'yape' | 'plin',
-): boolean => method.kind === 'digital' && normalizedMethodText(method).includes(provider);
+  cache?: Map<PosPaymentMethodConfig, string>
+): boolean => method.kind === 'digital' && getNormalizedText(method, cache).includes(provider);
 
 const methodForCategory = (
-  methods: readonly PosPaymentMethodConfig[],
+  enabled: readonly PosPaymentMethodConfig[],
   category: CheckoutPaymentCategory,
+  cache?: Map<PosPaymentMethodConfig, string>
 ): PosPaymentMethodConfig | undefined => {
-  const enabled = methods.filter(method => method.enabled);
   switch (category) {
     case 'cash':
       return enabled.find(method => method.kind === 'cash' || method.reportCategory === 'cash');
     case 'yape':
     case 'plin':
-      return enabled.find(method => isProviderMethod(method, category));
+      return enabled.find(method => isProviderMethod(method, category, cache));
     case 'transfer':
-      return enabled.find(isTransferMethod);
+      return enabled.find(method => isTransferMethod(method, cache));
     case 'card':
       return enabled.find(method => method.kind !== 'mixed' && method.kind !== 'credit' && (method.kind === 'terminal' || method.reportCategory === 'card'));
     case 'mixed':
@@ -86,10 +107,10 @@ const methodForCategory = (
 };
 
 const methodForSplit = (
-  methods: readonly PosPaymentMethodConfig[],
+  enabled: readonly PosPaymentMethodConfig[],
   split: CheckoutPaymentSplitInput,
+  cache?: Map<PosPaymentMethodConfig, string>
 ): PosPaymentMethodConfig | undefined => {
-  const enabled = methods.filter(method => method.enabled);
   if (split.methodId) {
     return enabled.find(
       method => method.id === split.methodId && method.kind !== 'mixed' && method.kind !== 'credit'
@@ -103,27 +124,29 @@ const methodForSplit = (
   }
   const digitalProvider = split.digitalProvider;
   if (digitalProvider === 'transferencia') {
-    return enabled.find(isTransferMethod);
+    return enabled.find(method => isTransferMethod(method, cache));
   }
   return enabled.find(method => method.kind === 'digital' && (
-    digitalProvider ? isProviderMethod(method, digitalProvider) : true
+    digitalProvider ? isProviderMethod(method, digitalProvider, cache) : true
   ));
 };
 
 const buildPayment = (
   method: PosPaymentMethodConfig,
   amount: number,
+  cache?: Map<PosPaymentMethodConfig, string>
 ): SalePaymentSplit => {
   const breakdown = calculateBreakdown(amount, method);
+  const roundedAmount = roundMoney(amount);
   const payment: SalePaymentSplit = {
     methodId: method.id,
     methodName: method.name,
     category: method.reportCategory,
-    amount: roundMoney(amount),
+    amount: roundedAmount,
   };
   if (method.kind === 'digital') {
-    if (isProviderMethod(method, 'yape')) payment.digitalProvider = 'yape';
-    else if (isProviderMethod(method, 'plin')) payment.digitalProvider = 'plin';
+    if (isProviderMethod(method, 'yape', cache)) payment.digitalProvider = 'yape';
+    else if (isProviderMethod(method, 'plin', cache)) payment.digitalProvider = 'plin';
   }
   if (breakdown.commissionAmount > 0) {
     payment.commissionAmount = breakdown.commissionAmount;
@@ -131,68 +154,130 @@ const buildPayment = (
     payment.commissionRule = method.commissionRule;
   }
   if (breakdown.surchargeAmount > 0) payment.surchargeAmount = breakdown.surchargeAmount;
-  if (breakdown.chargedAmount !== roundMoney(amount)) payment.chargedAmount = breakdown.chargedAmount;
+  if (breakdown.chargedAmount !== roundedAmount) payment.chargedAmount = breakdown.chargedAmount;
   return payment;
 };
 
-/** Resolves the configured checkout method and applies the POS web payment math. */
-export function resolveCheckoutPayment({
+/** Non-throwing variant of `resolveCheckoutPayment` returning a discriminated result. */
+export function tryResolveCheckoutPayment({
   methods,
   selectedMethodId,
   category,
   total,
   splits,
-}: ResolveCheckoutPaymentInput): CheckoutPaymentResolution {
-  if (!Number.isFinite(total) || total < 0) throw new Error('El total de la venta no es válido.');
+}: ResolveCheckoutPaymentInput): ResolveCheckoutPaymentResult {
+  if (!Number.isFinite(total) || total < 0) {
+    return { ok: false, error: 'El total de la venta no es válido.' };
+  }
+
+  const enabledMethods = methods.filter(method => method.enabled);
 
   let method: PosPaymentMethodConfig | undefined;
   if (category === 'fiado' && selectedMethodId === 'fiado') {
-    method = methodForCategory(methods, 'fiado');
+    method = methodForCategory(enabledMethods, 'fiado');
   } else {
-    method = methods.find(candidate => candidate.enabled && candidate.id === selectedMethodId);
+    method = enabledMethods.find(candidate => candidate.id === selectedMethodId);
     if (!method && selectedMethodId === 'efectivo') {
-      method = methodForCategory(methods, category);
+      method = methodForCategory(enabledMethods, category);
     }
   }
-  if (!method) throw new Error('El método de pago está desactivado o ya no existe.');
+  if (!method) {
+    return { ok: false, error: 'El método de pago está desactivado o ya no existe.' };
+  }
 
   if (splits !== undefined) {
-    if (method.kind !== 'mixed') throw new Error('Los pagos divididos requieren un método mixto.');
-    if (!splits.length) throw new Error('Agrega al menos un método de pago');
-    if (splits.some(split => !Number.isFinite(split.amount) || split.amount < 0)) {
-      throw new Error('Los montos no pueden ser negativos');
+    if (method.kind !== 'mixed') {
+      return { ok: false, error: 'Los pagos divididos requieren un método mixto.' };
     }
-    const totalPaid = splits.reduce((sum, split) => sum + split.amount, 0);
+    if (!splits.length) {
+      return { ok: false, error: 'Agrega al menos un método de pago' };
+    }
+
+    let totalPaid = 0;
+    let hasPositive = false;
+    for (let i = 0; i < splits.length; i++) {
+      const amount = splits[i].amount;
+      if (!Number.isFinite(amount) || amount < 0) {
+        return { ok: false, error: 'Los montos no pueden ser negativos' };
+      }
+      totalPaid += amount;
+      if (amount > 0) hasPositive = true;
+    }
+
     if (Math.abs(total - totalPaid) > 0.01) {
-      throw new Error(`El total de los pagos (${roundMoney(totalPaid).toFixed(2)}) no coincide con el total de la venta (${total.toFixed(2)})`);
+      return {
+        ok: false,
+        error: `El total de los pagos (${roundMoney(totalPaid).toFixed(2)}) no coincide con el total de la venta (${total.toFixed(2)})`,
+      };
     }
-    if (splits.every(split => split.amount <= 0)) {
-      throw new Error('Ingresa un monto mayor a cero en al menos un método');
+    if (!hasPositive) {
+      return { ok: false, error: 'Ingresa un monto mayor a cero en al menos un método' };
     }
-    const payments = splits.filter(split => split.amount > 0).map(split => {
-      const splitMethod = methodForSplit(methods, split);
-      if (!splitMethod) throw new Error('Una parte del pago utiliza un método inválido.');
-      return buildPayment(splitMethod, split.amount);
-    });
-    const chargedAmount = roundMoney(payments.reduce((sum, payment) => sum + (payment.chargedAmount ?? payment.amount), 0));
-    const commissionAmount = roundMoney(payments.reduce((sum, payment) => sum + (payment.commissionAmount || 0), 0));
-    const surchargeAmount = roundMoney(payments.reduce((sum, payment) => sum + (payment.surchargeAmount || 0), 0));
+
+    // Precompute normalized search strings once for enabled digital methods across all splits.
+    const normalizedTextCache = new Map<PosPaymentMethodConfig, string>();
+    for (let i = 0; i < enabledMethods.length; i++) {
+      const candidate = enabledMethods[i];
+      if (candidate.kind === 'digital') {
+        normalizedTextCache.set(candidate, normalizedMethodText(candidate));
+      }
+    }
+
+    const payments: SalePaymentSplit[] = [];
+    let rawCharged = 0;
+    let rawCommission = 0;
+    let rawSurcharge = 0;
+
+    for (let i = 0; i < splits.length; i++) {
+      const split = splits[i];
+      if (split.amount <= 0) continue;
+      const splitMethod = methodForSplit(enabledMethods, split, normalizedTextCache);
+      if (!splitMethod) {
+        return { ok: false, error: 'Una parte del pago utiliza un método inválido.' };
+      }
+      const payment = buildPayment(splitMethod, split.amount, normalizedTextCache);
+      payments.push(payment);
+      rawCharged += payment.chargedAmount ?? payment.amount;
+      rawCommission += payment.commissionAmount || 0;
+      rawSurcharge += payment.surchargeAmount || 0;
+    }
+
+    const chargedAmount = roundMoney(rawCharged);
+    const commissionAmount = roundMoney(rawCommission);
+    const surchargeAmount = roundMoney(rawSurcharge);
     return {
-      paymentMethodId: method.id,
-      paymentMethodName: method.name,
-      payments,
-      chargedAmount,
-      commissionAmount,
-      surchargeAmount,
-      netAmount: roundMoney(chargedAmount - commissionAmount),
+      ok: true,
+      value: {
+        paymentMethodId: method.id,
+        paymentMethodName: method.name,
+        payments,
+        chargedAmount,
+        commissionAmount,
+        surchargeAmount,
+        netAmount: roundMoney(chargedAmount - commissionAmount),
+      },
     };
   }
 
   const breakdown = calculateBreakdown(total, method);
   return {
-    paymentMethodId: method.id,
-    paymentMethodName: method.name,
-    payments: [],
-    ...breakdown,
+    ok: true,
+    value: {
+      paymentMethodId: method.id,
+      paymentMethodName: method.name,
+      payments: [],
+      ...breakdown,
+    },
   };
+}
+
+/** Resolves the configured checkout method and applies the POS web payment math. */
+export function resolveCheckoutPayment(
+  input: ResolveCheckoutPaymentInput
+): CheckoutPaymentResolution {
+  const res = tryResolveCheckoutPayment(input);
+  if (!res.ok) {
+    throw new Error(res.error);
+  }
+  return res.value;
 }

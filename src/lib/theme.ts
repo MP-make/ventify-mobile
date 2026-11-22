@@ -170,8 +170,12 @@ export function formatPEN(amount: number): string {
 
   const isNegative = amount < 0;
   const absAmount = Math.abs(amount);
+  const fixed = absAmount.toFixed(2);
+  if (absAmount < 1000 && fixed.length <= 6) {
+    return `${isNegative ? '-' : ''}S/ ${fixed}`;
+  }
 
-  const parts = absAmount.toFixed(2).split('.');
+  const parts = fixed.split('.');
   const integerPart = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ',');
   const decimalPart = parts[1];
 

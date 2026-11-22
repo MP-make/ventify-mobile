@@ -23,7 +23,9 @@ export const SCAN_DEBOUNCE_COOLDOWN_MS = 1200;         // 1.2s anti-rebote
 export const SCANNER_APP_VERSION = '2.0.1';
 
 const READER_REQUEST_TIMEOUT_MS = 8000;
-const STATUS_POLL_INTERVAL_MS = 1500;
+const STATUS_ACTIVE_POLL_INTERVAL_MS = 2500;
+const STATUS_IDLE_POLL_INTERVAL_MS = 5000;
+const IDLE_POLLS_THRESHOLD = 2;
 const STATUS_ERROR_BACKOFF_MS = 3000;
 const STATUS_MAX_ERROR_BACKOFF_MS = 12000;
 const MAX_SESSION_BASE_URLS = 20;
@@ -146,10 +148,24 @@ async function postReaderAction(
   payload:
     | { sessionId: string; action: 'pair'; token: string }
     | { sessionId: string; action: 'status' }
-    | { sessionId: string; action: 'scan'; id: string; code: string }
+    | { sessionId: string; action: 'scan'; id: string; code: string },
+  externalSignal?: AbortSignal
 ): Promise<ReaderApiResponse> {
+  if (externalSignal?.aborted) {
+    throw new ScannerApiError('Solicitud de escáner cancelada.', 499);
+  }
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), READER_REQUEST_TIMEOUT_MS);
+  let timedOut = false;
+  let externallyAborted = false;
+  const onExternalAbort = () => {
+    externallyAborted = true;
+    controller.abort();
+  };
+  externalSignal?.addEventListener?.('abort', onExternalAbort, { once: true });
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, READER_REQUEST_TIMEOUT_MS);
 
   try {
     const response = await fetch(`${normalizeBaseUrl(baseUrl)}/api/scanner/reader`, {
@@ -178,7 +194,10 @@ async function postReaderAction(
     if (err instanceof ScannerApiError) {
       throw err;
     }
-    if (controller.signal.aborted || err?.name === 'AbortError') {
+    if (externallyAborted && !timedOut) {
+      throw new ScannerApiError('Solicitud de escáner cancelada.', 499);
+    }
+    if (timedOut || controller.signal.aborted || err?.name === 'AbortError') {
       throw new ScannerApiError('La conexión con la computadora tardó demasiado.', 408);
     }
     throw new ScannerApiError(
@@ -187,6 +206,7 @@ async function postReaderAction(
     );
   } finally {
     clearTimeout(timeout);
+    externalSignal?.removeEventListener?.('abort', onExternalAbort);
   }
 }
 
@@ -478,17 +498,22 @@ export async function sendScannedCodeToDesktop(
  */
 export async function getScannerSessionStatus(
   sessionId: string,
-  baseUrl?: string
+  baseUrl?: string,
+  signal?: AbortSignal
 ): Promise<{
   purpose: ScannerPurpose;
   expiresAt: number;
   scan: ScannerScan | null;
 }> {
   const resolvedBaseUrl = resolveSessionBaseUrl(sessionId, baseUrl);
-  const response = await postReaderAction(resolvedBaseUrl, {
-    sessionId,
-    action: 'status',
-  });
+  const response = await postReaderAction(
+    resolvedBaseUrl,
+    {
+      sessionId,
+      action: 'status',
+    },
+    signal
+  );
 
   return {
     purpose: response.purpose || 'sale',
@@ -497,25 +522,51 @@ export async function getScannerSessionStatus(
   };
 }
 
-const buildSessionSignature = (
+interface SessionStateSnapshot {
+  purpose: ScannerPurpose;
+  expiresAt: number;
+  scanId: string | null;
+  scanResult: ScanResult | null;
+  scanCode: string | null;
+  scanMessage: string | null;
+  revoked: boolean;
+}
+
+const createSessionSnapshot = (
   purpose: ScannerPurpose,
   expiresAt: number,
   scan: ScannerScan | null | undefined,
   revoked: boolean
-): string =>
-  JSON.stringify([
-    purpose,
-    expiresAt,
-    scan?.id ?? null,
-    scan?.result ?? null,
-    scan?.code ?? null,
-    scan?.message ?? null,
-    revoked,
-  ]);
+): SessionStateSnapshot => ({
+  purpose,
+  expiresAt,
+  scanId: scan?.id ?? null,
+  scanResult: scan?.result ?? null,
+  scanCode: scan?.code ?? null,
+  scanMessage: scan?.message ?? null,
+  revoked,
+});
+
+const hasSessionSnapshotChanged = (
+  prev: SessionStateSnapshot | null,
+  next: SessionStateSnapshot
+): boolean => {
+  if (!prev) return true;
+  return (
+    prev.purpose !== next.purpose ||
+    prev.expiresAt !== next.expiresAt ||
+    prev.scanId !== next.scanId ||
+    prev.scanResult !== next.scanResult ||
+    prev.scanCode !== next.scanCode ||
+    prev.scanMessage !== next.scanMessage ||
+    prev.revoked !== next.revoked
+  );
+};
 
 /**
  * Sondea el estado de la sesión vinculada contra `/api/scanner/reader` (`action: 'status'`)
- * con control de backpressure, diff real de estado y pausa cuando la app pasa a segundo plano.
+ * con control de backpressure, sondeo adaptativo (2500ms activo -> 5000ms inactivo),
+ * AbortSignal en segundo plano/desuscripción y comparación escalar sin JSON.stringify.
  */
 export function subscribeToScannerSession(
   sessionId: string,
@@ -527,9 +578,11 @@ export function subscribeToScannerSession(
   let isActive = true;
   let isPollingInFlight = false;
   let hasEmittedFirst = false;
-  let lastSignature = '';
+  let lastSnapshot: SessionStateSnapshot | null = null;
+  let unchangedIdlePolls = 0;
   let consecutiveErrors = 0;
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let activePollController: AbortController | null = null;
 
   const hasAppStateListener = typeof AppState?.addEventListener === 'function';
   let listenerTriggered = false;
@@ -540,6 +593,13 @@ export function subscribeToScannerSession(
     if (timer) {
       clearTimeout(timer);
       timer = null;
+    }
+  };
+
+  const abortActivePoll = () => {
+    if (activePollController) {
+      activePollController.abort();
+      activePollController = null;
     }
   };
 
@@ -569,21 +629,25 @@ export function subscribeToScannerSession(
     if (isAppBackgrounded()) {
       isPausedByAppState = true;
       if (!hasAppStateListener) {
-        scheduleNext(STATUS_POLL_INTERVAL_MS);
+        scheduleNext(STATUS_IDLE_POLL_INTERVAL_MS);
       }
       return;
     }
 
     isPollingInFlight = true;
+    const pollController = new AbortController();
+    activePollController = pollController;
     try {
-      const state = await getScannerSessionStatus(sessionId, resolvedBaseUrl);
-      if (!isActive) return;
+      const state = await getScannerSessionStatus(sessionId, resolvedBaseUrl, pollController.signal);
+      if (!isActive || pollController.signal.aborted) return;
 
       consecutiveErrors = 0;
-      const signature = buildSessionSignature(state.purpose, state.expiresAt, state.scan, false);
-      if (!hasEmittedFirst || signature !== lastSignature) {
+      const nextSnapshot = createSessionSnapshot(state.purpose, state.expiresAt, state.scan, false);
+      const changed = !hasEmittedFirst || hasSessionSnapshotChanged(lastSnapshot, nextSnapshot);
+      if (changed) {
         hasEmittedFirst = true;
-        lastSignature = signature;
+        lastSnapshot = nextSnapshot;
+        unchangedIdlePolls = 0;
         onUpdate({
           sessionId,
           baseUrl: resolvedBaseUrl,
@@ -595,11 +659,19 @@ export function subscribeToScannerSession(
           lastHeartbeatAt: Date.now(),
           scan: state.scan,
         });
+      } else if (state.scan?.result === 'pending') {
+        unchangedIdlePolls = 0;
+      } else {
+        unchangedIdlePolls += 1;
       }
 
-      scheduleNext(STATUS_POLL_INTERVAL_MS);
+      const nextIntervalMs =
+        unchangedIdlePolls >= IDLE_POLLS_THRESHOLD
+          ? STATUS_IDLE_POLL_INTERVAL_MS
+          : STATUS_ACTIVE_POLL_INTERVAL_MS;
+      scheduleNext(nextIntervalMs);
     } catch (err: any) {
-      if (!isActive) return;
+      if (!isActive || pollController.signal.aborted) return;
       const status = err instanceof ScannerApiError ? err.status : 0;
 
       if (status === 401 || status === 403 || status === 410) {
@@ -609,7 +681,7 @@ export function subscribeToScannerSession(
         sessionBaseUrlMap.delete(sessionId);
         const revokedExpiresAt = Date.now();
         hasEmittedFirst = true;
-        lastSignature = buildSessionSignature('sale', revokedExpiresAt, null, true);
+        lastSnapshot = createSessionSnapshot('sale', revokedExpiresAt, null, true);
         onUpdate({
           sessionId,
           baseUrl: resolvedBaseUrl,
@@ -633,6 +705,9 @@ export function subscribeToScannerSession(
       consecutiveErrors += 1;
       scheduleNext(backoffMs);
     } finally {
+      if (activePollController === pollController) {
+        activePollController = null;
+      }
       isPollingInFlight = false;
     }
   };
@@ -644,12 +719,14 @@ export function subscribeToScannerSession(
       if (nextState === 'active') {
         if (isPausedByAppState) {
           isPausedByAppState = false;
+          unchangedIdlePolls = 0;
           clearPollTimer();
           void pollOnce();
         }
       } else {
         isPausedByAppState = true;
         clearPollTimer();
+        abortActivePoll();
       }
     });
   }
@@ -660,6 +737,7 @@ export function subscribeToScannerSession(
     isActive = false;
     cleanupAppStateListener();
     clearPollTimer();
+    abortActivePoll();
   };
 }
 

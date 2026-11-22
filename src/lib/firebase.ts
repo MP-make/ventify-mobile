@@ -18,6 +18,7 @@ import {
   type Persistence,
 } from 'firebase/auth';
 import { APP_URL } from './env';
+import { metaKVStorage } from './native-kv-storage';
 
 // 1. Resolve environment variables (supporting EXPO_PUBLIC_* and NEXT_PUBLIC_*)
 const firebaseConfig = {
@@ -62,26 +63,19 @@ function resolveReactNativePersistence(): PersistenceFactory | null {
       return candidate as PersistenceFactory;
     }
   } catch {
-    // Fallback to @firebase/auth directly below
-  }
-
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const rnAuthModule = require('@firebase/auth');
-    const candidate =
-      rnAuthModule?.getReactNativePersistence ??
-      rnAuthModule?.default?.getReactNativePersistence;
-    if (typeof candidate === 'function') {
-      return candidate as PersistenceFactory;
-    }
-  } catch {
     // Expected in pure Node/Vitest or browser environments
   }
 
   return null;
 }
 
-function resolveAsyncStorage(): unknown | null {
+interface FirebaseAuthPersistenceStorage {
+  getItem: (key: string) => Promise<string | null>;
+  setItem: (key: string, value: string) => Promise<void>;
+  removeItem: (key: string) => Promise<void>;
+}
+
+function resolveLegacyAsyncStorage(): FirebaseAuthPersistenceStorage | null {
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const storageModule = require('@react-native-async-storage/async-storage');
@@ -89,9 +83,10 @@ function resolveAsyncStorage(): unknown | null {
     if (
       candidate &&
       typeof candidate.getItem === 'function' &&
-      typeof candidate.setItem === 'function'
+      typeof candidate.setItem === 'function' &&
+      typeof candidate.removeItem === 'function'
     ) {
-      return candidate;
+      return candidate as FirebaseAuthPersistenceStorage;
     }
   } catch {
     // Expected in pure Node/Vitest when RN native modules are unavailable
@@ -99,20 +94,70 @@ function resolveAsyncStorage(): unknown | null {
   return null;
 }
 
+function resolveAuthPersistenceStorage(): FirebaseAuthPersistenceStorage | null {
+  const legacyAsyncStorage = resolveLegacyAsyncStorage();
+  if (!metaKVStorage) {
+    return legacyAsyncStorage;
+  }
+
+  return {
+    getItem: async (key: string): Promise<string | null> => {
+      if (metaKVStorage.isSyncCapable) {
+        const value = metaKVStorage.getItemSync(key);
+        if (value !== null) {
+          return value;
+        }
+        if (legacyAsyncStorage) {
+          try {
+            const legacyValue = await legacyAsyncStorage.getItem(key);
+            if (legacyValue !== null) {
+              metaKVStorage.setItemSync(key, legacyValue);
+              void legacyAsyncStorage.removeItem(key).catch(() => {});
+              return legacyValue;
+            }
+          } catch {
+            // Ignore legacy migration error
+          }
+        }
+        return null;
+      }
+
+      return await metaKVStorage.getItem(key);
+    },
+    setItem: async (key: string, value: string): Promise<void> => {
+      if (metaKVStorage.isSyncCapable) {
+        metaKVStorage.setItemSync(key, value);
+        return;
+      }
+      await metaKVStorage.setItem(key, value);
+    },
+    removeItem: async (key: string): Promise<void> => {
+      if (metaKVStorage.isSyncCapable) {
+        metaKVStorage.removeItemSync(key);
+        if (legacyAsyncStorage) {
+          await legacyAsyncStorage.removeItem(key).catch(() => {});
+        }
+        return;
+      }
+      await metaKVStorage.removeItem(key);
+    },
+  };
+}
+
 // 2. Initialize or get Firebase App
 const app: FirebaseApp = !getApps().length
   ? initializeApp(firebaseConfig)
   : getApp();
 
-// 3. Initialize Firebase Auth with React Native AsyncStorage Persistence
+// 3. Initialize Firebase Auth with MMKV-backed React Native Persistence (+ AsyncStorage migration)
 let authInstance: Auth;
 try {
   const getPersistence = resolveReactNativePersistence();
-  const asyncStorage = getPersistence ? resolveAsyncStorage() : null;
+  const persistenceStorage = getPersistence ? resolveAuthPersistenceStorage() : null;
 
-  if (getPersistence && asyncStorage) {
+  if (getPersistence && persistenceStorage) {
     authInstance = initializeAuth(app, {
-      persistence: getPersistence(asyncStorage),
+      persistence: getPersistence(persistenceStorage),
     });
   } else {
     authInstance = getAuth(app);

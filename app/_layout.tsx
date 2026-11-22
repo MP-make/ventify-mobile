@@ -1,11 +1,17 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { View, ActivityIndicator, StyleSheet, Text } from 'react-native';
 import { Stack, useRouter, useSegments } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider, initialWindowMetrics } from 'react-native-safe-area-context';
 import { enableFreeze } from 'react-native-screens';
 import * as SplashScreen from 'expo-splash-screen';
-import { AuthProvider, useAuth } from '@/context/AuthContext';
+import {
+  AuthProvider,
+  useAuthSession,
+  useNetworkStatus,
+  usePinLock,
+  usePlanAccess,
+} from '@/context/AuthContext';
 import { SettingsProvider } from '@/context/SettingsContext';
 import { ProductsProvider } from '@/context/ProductsContext';
 import { CartProvider } from '@/context/CartContext';
@@ -22,18 +28,19 @@ const STACK_SCREEN_OPTIONS = {
   animation: 'fade' as const,
 };
 
-function GlobalPinLockGate() {
-  const { user, isPinLocked, isPinSetupOpen } = useAuth();
+const GlobalPinLockGate = React.memo(function GlobalPinLockGate() {
+  const { user } = useAuthSession();
+  const { isPinLocked, isPinSetupOpen } = usePinLock();
   if (!user || (!isPinLocked && !isPinSetupOpen)) return null;
   return <PinLockModal />;
-}
+});
 
 /**
  * Componente interno que orquesta la navegación y redirección reactiva
  * según el estado de la sesión de Firebase Auth
  */
-function RootNavigationLayout() {
-  const { user, initialized, loading, role } = useAuth();
+const RootNavigationLayout = React.memo(function RootNavigationLayout() {
+  const { user, initialized, loading, role } = useAuthSession();
   const segments = useSegments();
   const router = useRouter();
 
@@ -81,25 +88,31 @@ function RootNavigationLayout() {
       ) : null}
     </View>
   );
-}
+});
 
 function SessionWorkspace() {
-  const {
-    user,
-    userProfile,
-    accountId,
-    role,
-    initialized,
-    loading,
-    isOnline,
-    subscription,
-    accessChecking,
-    accessError,
-    accessBlocked,
-    refreshAccess,
-    logout,
-  } = useAuth();
+  const { user, userProfile, accountId, role, initialized, loading, logout } = useAuthSession();
+  const { subscription, accessChecking, accessError, accessBlocked, refreshAccess } =
+    usePlanAccess();
+  const { isOnline } = useNetworkStatus();
   const [rechecking, setRechecking] = useState(false);
+
+  const handleRefresh = useCallback(async () => {
+    setRechecking(true);
+    try {
+      await refreshAccess();
+    } finally {
+      setRechecking(false);
+    }
+  }, [refreshAccess]);
+
+  const handleRefreshPress = useCallback(() => {
+    void handleRefresh();
+  }, [handleRefresh]);
+
+  const handleLogoutPress = useCallback(() => {
+    void logout();
+  }, [logout]);
 
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -134,14 +147,6 @@ function SessionWorkspace() {
   if (user && problem) {
     const { AccountProblemScreen } = require('@/components/AccountProblemScreen') as typeof import('@/components/AccountProblemScreen');
     const userLabel = userProfile?.displayName || user.email || 'cliente';
-    const handleRefresh = async () => {
-      setRechecking(true);
-      try {
-        await refreshAccess();
-      } finally {
-        setRechecking(false);
-      }
-    };
 
     return (
       <AccountProblemScreen
@@ -152,8 +157,8 @@ function SessionWorkspace() {
         isOnline={isOnline}
         userLabel={userLabel}
         rechecking={rechecking}
-        onRefresh={() => void handleRefresh()}
-        onLogout={() => void logout()}
+        onRefresh={handleRefreshPress}
+        onLogout={handleLogoutPress}
       />
     );
   }

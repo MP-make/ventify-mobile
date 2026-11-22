@@ -41,6 +41,89 @@ export const DEFAULT_MIN_STOCK_THRESHOLD = 5;
 export const LOW_STOCK_THRESHOLD = DEFAULT_MIN_STOCK_THRESHOLD;
 export const LOW_STOCK_ANY = '__any__';
 
+const PO_BACKGROUND_PAUSE_MS = 15_000;
+const missingPurchaseOrderIndexes = new Set<string>();
+
+const isMissingPoIndexError = (err: any): boolean => {
+  const code = String(err?.code || '').toLowerCase();
+  const msg = String(err?.message || '').toLowerCase();
+  return (
+    code === 'failed-precondition' ||
+    msg.includes('requires an index') ||
+    msg.includes('failed-precondition')
+  );
+};
+
+type AppStateSubscription = { remove?: () => void } | null | undefined;
+type AppStateLike = {
+  currentState?: string;
+  addEventListener?: (type: 'change', listener: (nextState: string) => void) => AppStateSubscription;
+};
+
+const getAppState = (): AppStateLike | null => {
+  try {
+    const rn = (typeof require !== 'undefined' ? require : () => null)('react-native');
+    return rn?.AppState || null;
+  } catch {
+    return null;
+  }
+};
+
+const createAppStateManagedSubscription = (attach: () => () => void): (() => void) => {
+  const AppState = getAppState();
+  let disposed = false;
+  let activeUnsub: (() => void) | null = null;
+  let pauseTimer: ReturnType<typeof setTimeout> | null = null;
+  let appStateSub: AppStateSubscription = null;
+
+  const ensureAttached = () => {
+    if (disposed || activeUnsub) return;
+    activeUnsub = attach();
+  };
+
+  const clearPauseTimer = () => {
+    if (pauseTimer) {
+      clearTimeout(pauseTimer);
+      pauseTimer = null;
+    }
+  };
+
+  if (typeof AppState?.addEventListener === 'function') {
+    appStateSub = AppState.addEventListener('change', (nextState: string) => {
+      if (disposed) return;
+      if (nextState === 'active') {
+        clearPauseTimer();
+        ensureAttached();
+      } else if (nextState === 'background' || nextState === 'inactive') {
+        if (!pauseTimer && activeUnsub) {
+          pauseTimer = setTimeout(() => {
+            pauseTimer = null;
+            if (!disposed && AppState?.currentState !== 'active' && activeUnsub) {
+              activeUnsub();
+              activeUnsub = null;
+            }
+          }, PO_BACKGROUND_PAUSE_MS);
+        }
+      }
+    });
+  }
+
+  if (typeof AppState?.currentState !== 'string' || AppState.currentState === 'active') {
+    ensureAttached();
+  }
+
+  return () => {
+    disposed = true;
+    clearPauseTimer();
+    if (appStateSub && typeof appStateSub.remove === 'function') {
+      appStateSub.remove();
+    }
+    appStateSub = null;
+    activeUnsub?.();
+    activeUnsub = null;
+  };
+};
+
 // ============================================================================
 // TIPOS E INTERFACES
 // ============================================================================
@@ -481,30 +564,30 @@ export const subscribeSuppliers = (
     return () => {};
   }
 
-  const suppliersColl = collection(db, SUPPLIERS_COLLECTION);
-  const constraints: any[] = [where('accountId', '==', accountId)];
+  return createAppStateManagedSubscription(() => {
+    const suppliersColl = collection(db, SUPPLIERS_COLLECTION);
+    const constraints: any[] = [where('accountId', '==', accountId)];
 
-  if (onlyActive) {
-    constraints.push(where('active', '==', true));
-  }
-  constraints.push(firestoreLimit(300));
-
-  const q = query(suppliersColl, ...constraints);
-
-  const unsubscribe = onSnapshot(
-    q,
-    (snapshot) => {
-      const list = snapshot.docs.map(supplierFromDoc);
-      list.sort((a, b) => a.name.localeCompare(b.name, 'es', { sensitivity: 'base' }));
-      callback(list);
-    },
-    (err) => {
-      console.warn('[suppliers-po-service] Error en suscripción a proveedores:', err);
-      callback([]);
+    if (onlyActive) {
+      constraints.push(where('active', '==', true));
     }
-  );
+    constraints.push(firestoreLimit(300));
 
-  return unsubscribe;
+    const q = query(suppliersColl, ...constraints);
+
+    return onSnapshot(
+      q,
+      (snapshot) => {
+        const list = snapshot.docs.map(supplierFromDoc);
+        list.sort((a, b) => a.name.localeCompare(b.name, 'es', { sensitivity: 'base' }));
+        callback(list);
+      },
+      (err) => {
+        console.warn('[suppliers-po-service] Error en suscripción a proveedores:', err);
+        callback([]);
+      }
+    );
+  });
 };
 
 /**
@@ -633,11 +716,43 @@ export const getPurchaseOrdersAsync = async (
 ): Promise<PurchaseOrder[]> => {
   if (!accountId) return [];
 
+  const hasStatusFilter = Boolean(statusFilter && statusFilter !== 'all');
+  const indexKey = hasStatusFilter ? 'po:status' : 'po:all';
+
+  const runFallback = async (): Promise<PurchaseOrder[]> => {
+    const coll = collection(db, PURCHASE_ORDERS_COLLECTION);
+    const fallbackConstraints: any[] = [where('accountId', '==', accountId)];
+    if (hasStatusFilter) {
+      fallbackConstraints.push(where('status', '==', statusFilter));
+    }
+    const q = query(coll, ...fallbackConstraints, firestoreLimit(200));
+    const snap = await getDocs(q);
+    let orders = snap.docs.map(purchaseOrderFromDoc);
+
+    if (hasStatusFilter) {
+      orders = orders.filter((o) => o.status === statusFilter);
+    }
+    if (branchId && branchId !== 'all') {
+      orders = orders.filter((o) => !o.branchId || o.branchId === branchId);
+    }
+
+    orders.sort((a, b) => {
+      const tA = a.createdAt instanceof Date ? a.createdAt.getTime() : Number(a.createdAt) || 0;
+      const tB = b.createdAt instanceof Date ? b.createdAt.getTime() : Number(b.createdAt) || 0;
+      return tB - tA;
+    });
+
+    return orders;
+  };
+
   try {
+    if (missingPurchaseOrderIndexes.has(indexKey)) {
+      return await runFallback();
+    }
     const coll = collection(db, PURCHASE_ORDERS_COLLECTION);
     const constraints: any[] = [where('accountId', '==', accountId)];
 
-    if (statusFilter && statusFilter !== 'all') {
+    if (hasStatusFilter) {
       constraints.push(where('status', '==', statusFilter));
     }
 
@@ -655,27 +770,12 @@ export const getPurchaseOrdersAsync = async (
 
     return orders;
   } catch (err: any) {
+    if (isMissingPoIndexError(err)) {
+      missingPurchaseOrderIndexes.add(indexKey);
+    }
     console.warn('[suppliers-po-service] Error con orderBy en purchase_orders, usando fallback:', err?.message);
     try {
-      const coll = collection(db, PURCHASE_ORDERS_COLLECTION);
-      const q = query(coll, where('accountId', '==', accountId), firestoreLimit(200));
-      const snap = await getDocs(q);
-      let orders = snap.docs.map(purchaseOrderFromDoc);
-
-      if (statusFilter && statusFilter !== 'all') {
-        orders = orders.filter((o) => o.status === statusFilter);
-      }
-      if (branchId && branchId !== 'all') {
-        orders = orders.filter((o) => !o.branchId || o.branchId === branchId);
-      }
-
-      orders.sort((a, b) => {
-        const tA = a.createdAt instanceof Date ? a.createdAt.getTime() : Number(a.createdAt) || 0;
-        const tB = b.createdAt instanceof Date ? b.createdAt.getTime() : Number(b.createdAt) || 0;
-        return tB - tA;
-      });
-
-      return orders;
+      return await runFallback();
     } catch (fallbackErr) {
       console.error('[suppliers-po-service] Fallback getPurchaseOrders falló:', fallbackErr);
       return [];
@@ -699,8 +799,10 @@ export const subscribePurchaseOrders = (
 
   const coll = collection(db, PURCHASE_ORDERS_COLLECTION);
   const constraints: any[] = [where('accountId', '==', accountId)];
+  const hasStatusFilter = Boolean(statusFilter && statusFilter !== 'all');
+  const indexKey = hasStatusFilter ? 'po:status' : 'po:all';
 
-  if (statusFilter && statusFilter !== 'all') {
+  if (hasStatusFilter) {
     constraints.push(where('status', '==', statusFilter));
   }
 
@@ -720,69 +822,63 @@ export const subscribePurchaseOrders = (
     callback(orders);
   };
 
-  const isFirestoreIndexError = (err: any): boolean => {
-    const code = String(err?.code || '').toLowerCase();
-    const msg = String(err?.message || '').toLowerCase();
-    return (
-      code === 'failed-precondition' ||
-      msg.includes('requires an index') ||
-      msg.includes('failed-precondition')
-    );
-  };
+  return createAppStateManagedSubscription(() => {
+    let disposed = false;
+    let activeUnsubscribe: (() => void) | null = null;
+    let listenerGeneration = 0;
 
-  let disposed = false;
-  let activeUnsubscribe: (() => void) | null = null;
-  let listenerGeneration = 0;
-
-  const startListener = (useIndexed: boolean) => {
-    if (disposed) return;
-    const generation = ++listenerGeneration;
-    let q;
-    try {
-      q = useIndexed
-        ? query(coll, ...constraints, orderBy('createdAt', 'desc'), firestoreLimit(200))
-        : query(coll, ...constraints, firestoreLimit(200));
-    } catch (err: any) {
-      if (useIndexed && isFirestoreIndexError(err)) {
-        console.warn('[suppliers-po-service] Índice faltante en purchase_orders, usando fallback sin orderBy:', err?.message || err);
-        startListener(false);
-        return;
-      }
-      console.warn('[suppliers-po-service] Error al construir consulta de purchase_orders:', err);
-      callback([]);
-      return;
-    }
-
-    const unsub = onSnapshot(
-      q,
-      handleSnapshot,
-      (err) => {
-        if (disposed || generation !== listenerGeneration) return;
-        if (useIndexed && isFirestoreIndexError(err)) {
-          console.warn('[suppliers-po-service] Índice faltante en suscripción a purchase_orders, usando fallback sin orderBy:', err?.message || err);
-          unsub?.();
+    const startListener = (useIndexed: boolean) => {
+      if (disposed) return;
+      const generation = ++listenerGeneration;
+      let q;
+      try {
+        q = useIndexed
+          ? query(coll, ...constraints, orderBy('createdAt', 'desc'), firestoreLimit(200))
+          : query(coll, ...constraints, firestoreLimit(200));
+      } catch (err: any) {
+        if (useIndexed && isMissingPoIndexError(err)) {
+          missingPurchaseOrderIndexes.add(indexKey);
+          console.warn('[suppliers-po-service] Índice faltante en purchase_orders, usando fallback sin orderBy:', err?.message || err);
           startListener(false);
           return;
         }
-        console.warn('[suppliers-po-service] Error en suscripción a purchase_orders:', err);
+        console.warn('[suppliers-po-service] Error al construir consulta de purchase_orders:', err);
         callback([]);
+        return;
       }
-    );
 
-    if (disposed || generation !== listenerGeneration) {
-      unsub?.();
-    } else {
-      activeUnsubscribe = unsub;
-    }
-  };
+      const unsub = onSnapshot(
+        q,
+        handleSnapshot,
+        (err) => {
+          if (disposed || generation !== listenerGeneration) return;
+          if (useIndexed && isMissingPoIndexError(err)) {
+            missingPurchaseOrderIndexes.add(indexKey);
+            console.warn('[suppliers-po-service] Índice faltante en suscripción a purchase_orders, usando fallback sin orderBy:', err?.message || err);
+            unsub?.();
+            startListener(false);
+            return;
+          }
+          console.warn('[suppliers-po-service] Error en suscripción a purchase_orders:', err);
+          callback([]);
+        }
+      );
 
-  startListener(true);
+      if (disposed || generation !== listenerGeneration) {
+        unsub?.();
+      } else {
+        activeUnsubscribe = unsub;
+      }
+    };
 
-  return () => {
-    disposed = true;
-    activeUnsubscribe?.();
-    activeUnsubscribe = null;
-  };
+    startListener(!missingPurchaseOrderIndexes.has(indexKey));
+
+    return () => {
+      disposed = true;
+      activeUnsubscribe?.();
+      activeUnsubscribe = null;
+    };
+  });
 };
 
 /**
@@ -1279,25 +1375,11 @@ export const receivePurchaseOrder = async (
   };
 };
 
-/**
- * Aplica los nuevos precios de venta unitario y de presentaciones sugeridos tras una recepción de OC.
- */
-export const applyProductSuggestedPrices = async (
-  productId: string,
+const buildSuggestedPricesUpdatePayload = (
+  data: Record<string, any>,
   suggestedPrice: number,
   presentations?: ReceivedProductCostChangePresentation[]
-): Promise<void> => {
-  if (!productId) {
-    throw new Error('Identificador de producto requerido para actualizar precios.');
-  }
-
-  const productRef = doc(db, PRODUCTS_COLLECTION, productId);
-  const snap = await getDoc(productRef);
-  if (!snap.exists()) {
-    throw new Error('Producto no encontrado al aplicar precios sugeridos.');
-  }
-
-  const data = snap.data() as Record<string, any>;
+): Record<string, any> => {
   const floor = Number(data.minSalePrice ?? 0);
   const safeSuggested = roundToCents(Math.max(floor, Number(suggestedPrice) || 0));
 
@@ -1321,7 +1403,97 @@ export const applyProductSuggestedPrices = async (
     });
   }
 
+  return updatePayload;
+};
+
+/**
+ * Aplica los nuevos precios de venta unitario y de presentaciones sugeridos tras una recepción de OC.
+ */
+export const applyProductSuggestedPrices = async (
+  productId: string,
+  suggestedPrice: number,
+  presentations?: ReceivedProductCostChangePresentation[]
+): Promise<void> => {
+  if (!productId) {
+    throw new Error('Identificador de producto requerido para actualizar precios.');
+  }
+
+  const productRef = doc(db, PRODUCTS_COLLECTION, productId);
+  const snap = await getDoc(productRef);
+  if (!snap.exists()) {
+    throw new Error('Producto no encontrado al aplicar precios sugeridos.');
+  }
+
+  const updatePayload = buildSuggestedPricesUpdatePayload(
+    snap.data() as Record<string, any>,
+    suggestedPrice,
+    presentations
+  );
   await updateDoc(productRef, updatePayload);
+};
+
+export interface BatchProductSuggestedPriceUpdate {
+  productId: string;
+  suggestedPrice: number;
+  presentations?: ReceivedProductCostChangePresentation[];
+}
+
+/**
+ * Aplica en batch (`writeBatch`) los precios sugeridos para múltiples productos tras una recepción de OC.
+ */
+export const applyBatchProductSuggestedPrices = async (
+  updates: BatchProductSuggestedPriceUpdate[]
+): Promise<number> => {
+  const valid = (updates || []).filter((u) => Boolean(u?.productId));
+  if (valid.length === 0) return 0;
+
+  const refs = valid.map((u) => doc(db, PRODUCTS_COLLECTION, u.productId));
+  const snaps = await Promise.all(refs.map((r) => getDoc(r)));
+  let writeBatchFn: ((firestore: typeof db) => any) | null = null;
+  try {
+    const firestoreMod = await import('firebase/firestore');
+    if (typeof firestoreMod.writeBatch === 'function') {
+      writeBatchFn = firestoreMod.writeBatch;
+    }
+  } catch {
+    writeBatchFn = null;
+  }
+
+  if (writeBatchFn) {
+    const batch = writeBatchFn(db);
+    let count = 0;
+    for (let i = 0; i < valid.length; i += 1) {
+      const snap = snaps[i];
+      if (!snap.exists()) continue;
+      const payload = buildSuggestedPricesUpdatePayload(
+        snap.data() as Record<string, any>,
+        valid[i].suggestedPrice,
+        valid[i].presentations
+      );
+      batch.update(refs[i], payload);
+      count += 1;
+    }
+    if (count > 0) {
+      await batch.commit();
+    }
+    return count;
+  }
+
+  let count = 0;
+  await Promise.all(
+    valid.map(async (u, i) => {
+      const snap = snaps[i];
+      if (!snap.exists()) return;
+      const payload = buildSuggestedPricesUpdatePayload(
+        snap.data() as Record<string, any>,
+        u.suggestedPrice,
+        u.presentations
+      );
+      await updateDoc(refs[i], payload);
+      count += 1;
+    })
+  );
+  return count;
 };
 
 // ============================================================================
@@ -1384,6 +1556,7 @@ export const SuppliersPOService = {
   updatePurchaseOrderStatus,
   receivePurchaseOrder,
   applyProductSuggestedPrices,
+  applyBatchProductSuggestedPrices,
   calculateWeightedAverageCost,
   calculatePurchaseOrderStats,
   generateNextOrderNumber,

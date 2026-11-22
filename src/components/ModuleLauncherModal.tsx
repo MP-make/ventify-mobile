@@ -1,4 +1,4 @@
-import React, { useMemo } from 'react';
+import React, { useCallback, useMemo } from 'react';
 import {
   Modal,
   ScrollView,
@@ -12,7 +12,6 @@ import { useRouter, type Href } from 'expo-router';
 import * as Haptics from 'expo-haptics';
 import {
   BarChart3,
-  Bell,
   Building2,
   FileSpreadsheet,
   Lock,
@@ -23,8 +22,8 @@ import {
   UserCheck,
   X,
 } from 'lucide-react-native';
-import { useAuth } from '@/context/AuthContext';
-import { useSettings } from '@/context/SettingsContext';
+import { useAuthSession, usePinLock } from '@/context/AuthContext';
+import { useBusinessSettings } from '@/context/SettingsContext';
 import { usePermissions } from '@/hooks/usePermissions';
 import { ui } from '@/lib/theme';
 
@@ -45,12 +44,58 @@ interface LauncherModuleItem {
   icon: LucideIcon;
 }
 
-export const ModuleLauncherModal: React.FC<ModuleLauncherModalProps> = React.memo(
-  ({ visible, onClose, unreadCount = 0 }) => {
+const stopResponder = () => true;
+
+const LauncherTile = React.memo<{
+  item: LauncherModuleItem;
+  onNavigate: (route: string) => void;
+}>(({ item, onNavigate }) => {
+  const Icon = item.icon;
+  const iconBoxStyle = useMemo(
+    () => [styles.tileIconBox, { backgroundColor: item.tintBg }],
+    [item.tintBg]
+  );
+  const handlePress = useCallback(() => {
+    onNavigate(item.route);
+  }, [onNavigate, item.route]);
+
+  return (
+    <TouchableOpacity
+      onPress={handlePress}
+      style={styles.tile}
+      activeOpacity={0.78}
+      accessibilityRole="button"
+      accessibilityLabel={`${item.title}: ${item.subtitle}`}
+    >
+      <View style={styles.tileTopRow}>
+        <View style={iconBoxStyle}>
+          <Icon size={20} color={item.tintColor} />
+        </View>
+        {item.badgeCount && item.badgeCount > 0 ? (
+          <View style={styles.badgePill}>
+            <Text style={styles.badgePillText}>
+              {item.badgeCount > 99 ? '99+' : item.badgeCount}
+            </Text>
+          </View>
+        ) : null}
+      </View>
+      <Text style={styles.tileTitle} numberOfLines={1}>
+        {item.title}
+      </Text>
+      <Text style={styles.tileSubtitle} numberOfLines={1}>
+        {item.subtitle}
+      </Text>
+    </TouchableOpacity>
+  );
+});
+
+const ModuleLauncherModalContent: React.FC<ModuleLauncherModalProps> = React.memo(
+  ({ visible, onClose }) => {
     const insets = useSafeAreaInsets();
     const router = useRouter();
-    const { accountId, lockTerminal, userProfile } = useAuth();
-    const { businessName, activeBranchName } = useSettings();
+    const { accountId, userProfile } = useAuthSession();
+    const { lockTerminal } = usePinLock();
+    const { businessName, activeBranchName } = useBusinessSettings();
     const {
       role,
       isOwner,
@@ -143,17 +188,29 @@ export const ModuleLauncherModal: React.FC<ModuleLauncherModalProps> = React.mem
       isSeller,
     ]);
 
-    const handleNavigate = (route: string) => {
-      Haptics.selectionAsync().catch(() => {});
-      onClose();
-      router.push(route as Href);
-    };
+    const handleNavigate = useCallback(
+      (route: string) => {
+        Haptics.selectionAsync().catch(() => {});
+        onClose();
+        router.push(route as Href);
+      },
+      [onClose, router]
+    );
 
-    const handleLock = () => {
+    const handleGoSettings = useCallback(() => {
+      handleNavigate('/(tabs)/settings');
+    }, [handleNavigate]);
+
+    const handleLock = useCallback(() => {
       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
       onClose();
       lockTerminal();
-    };
+    }, [onClose, lockTerminal]);
+
+    const sheetStyle = useMemo(
+      () => [styles.sheet, { paddingBottom: Math.max(insets.bottom, 20) }],
+      [insets.bottom]
+    );
 
     const roleLabel =
       role === 'owner'
@@ -179,8 +236,8 @@ export const ModuleLauncherModal: React.FC<ModuleLauncherModalProps> = React.mem
           onPress={onClose}
         >
           <View
-            style={[styles.sheet, { paddingBottom: Math.max(insets.bottom, 20) }]}
-            onStartShouldSetResponder={() => true}
+            style={sheetStyle}
+            onStartShouldSetResponder={stopResponder}
           >
             <View style={styles.sheetHandle} />
             <View style={styles.sheetHeader}>
@@ -211,45 +268,16 @@ export const ModuleLauncherModal: React.FC<ModuleLauncherModalProps> = React.mem
                 </View>
               ) : (
                 <View style={styles.grid}>
-                  {modules.map((item) => {
-                    const Icon = item.icon;
-                    return (
-                      <TouchableOpacity
-                        key={item.id}
-                        onPress={() => handleNavigate(item.route)}
-                        style={styles.tile}
-                        activeOpacity={0.78}
-                        accessibilityRole="button"
-                        accessibilityLabel={`${item.title}: ${item.subtitle}`}
-                      >
-                        <View style={styles.tileTopRow}>
-                          <View style={[styles.tileIconBox, { backgroundColor: item.tintBg }]}>
-                            <Icon size={20} color={item.tintColor} />
-                          </View>
-                          {item.badgeCount && item.badgeCount > 0 ? (
-                            <View style={styles.badgePill}>
-                              <Text style={styles.badgePillText}>
-                                {item.badgeCount > 99 ? '99+' : item.badgeCount}
-                              </Text>
-                            </View>
-                          ) : null}
-                        </View>
-                        <Text style={styles.tileTitle} numberOfLines={1}>
-                          {item.title}
-                        </Text>
-                        <Text style={styles.tileSubtitle} numberOfLines={1}>
-                          {item.subtitle}
-                        </Text>
-                      </TouchableOpacity>
-                    );
-                  })}
+                  {modules.map((item) => (
+                    <LauncherTile key={item.id} item={item} onNavigate={handleNavigate} />
+                  ))}
                 </View>
               )}
 
               {!isSeller && (
                 <View style={styles.quickRow}>
                   <TouchableOpacity
-                    onPress={() => handleNavigate('/(tabs)/settings')}
+                    onPress={handleGoSettings}
                     style={styles.quickBtn}
                     activeOpacity={0.78}
                     accessibilityRole="button"
@@ -267,7 +295,7 @@ export const ModuleLauncherModal: React.FC<ModuleLauncherModalProps> = React.mem
                     accessibilityLabel="Bloquear terminal con PIN"
                   >
                     <Lock size={17} color={ui.primary} />
-                    <Text style={[styles.quickBtnText, { color: ui.primary }]}>
+                    <Text style={[styles.quickBtnText, styles.quickBtnLockText]}>
                       Bloquear PIN
                     </Text>
                   </TouchableOpacity>
@@ -277,6 +305,19 @@ export const ModuleLauncherModal: React.FC<ModuleLauncherModalProps> = React.mem
           </View>
         </TouchableOpacity>
       </Modal>
+    );
+  }
+);
+
+export const ModuleLauncherModal: React.FC<ModuleLauncherModalProps> = React.memo(
+  ({ visible, onClose, unreadCount }) => {
+    if (!visible) return null;
+    return (
+      <ModuleLauncherModalContent
+        visible={visible}
+        onClose={onClose}
+        unreadCount={unreadCount}
+      />
     );
   }
 );
@@ -426,5 +467,8 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '700',
     color: ui.text,
+  },
+  quickBtnLockText: {
+    color: ui.primary,
   },
 });

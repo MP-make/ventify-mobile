@@ -87,6 +87,7 @@ export interface EscPosReceiptData {
 export const PRINTER_CONFIG_STORAGE_KEY = 'ventify_printer_config_v2';
 const BLUETOOTH_PRINT_TIMEOUT_MS = 10_000;
 let lastSharedPdfUri: string | null = null;
+let cachedPrinterConfig: PrinterConfig | null = null;
 
 // ============================================================================
 // TIPOS E INTERFACES
@@ -153,21 +154,37 @@ export const DEFAULT_PRINTER_CONFIG: PrinterConfig = {
 // GESTOR DE CONFIGURACIÓN DE IMPRESORA
 // ============================================================================
 
+const clonePrinterConfig = (cfg: PrinterConfig): PrinterConfig => ({
+  ...cfg,
+  selectedDevice: cfg.selectedDevice ? { ...cfg.selectedDevice } : null,
+});
+
+export const resetPrinterConfigCache = (): void => {
+  cachedPrinterConfig = null;
+};
+
 /**
- * Obtiene la configuración de impresora persistida en AsyncStorage
+ * Obtiene la configuración de impresora persistida en AsyncStorage (con cache en memoria)
  */
 export const getPrinterConfig = async (): Promise<PrinterConfig> => {
+  if (cachedPrinterConfig) {
+    return clonePrinterConfig(cachedPrinterConfig);
+  }
   try {
     const raw = await AsyncStorage.getItem(PRINTER_CONFIG_STORAGE_KEY);
-    if (!raw) return DEFAULT_PRINTER_CONFIG;
+    if (!raw) {
+      cachedPrinterConfig = clonePrinterConfig(DEFAULT_PRINTER_CONFIG);
+      return clonePrinterConfig(cachedPrinterConfig);
+    }
     const parsed = JSON.parse(raw);
-    return {
+    cachedPrinterConfig = clonePrinterConfig({
       ...DEFAULT_PRINTER_CONFIG,
       ...parsed,
-    };
+    });
+    return clonePrinterConfig(cachedPrinterConfig);
   } catch (err) {
     console.error('[ThermalPrinterService] Error leyendo configuración:', err);
-    return DEFAULT_PRINTER_CONFIG;
+    return clonePrinterConfig(DEFAULT_PRINTER_CONFIG);
   }
 };
 
@@ -179,12 +196,13 @@ export const savePrinterConfig = async (
 ): Promise<PrinterConfig> => {
   try {
     const current = await getPrinterConfig();
-    const updated: PrinterConfig = {
+    const updated: PrinterConfig = clonePrinterConfig({
       ...current,
       ...partial,
-    };
+    });
     await AsyncStorage.setItem(PRINTER_CONFIG_STORAGE_KEY, JSON.stringify(updated));
-    return updated;
+    cachedPrinterConfig = updated;
+    return clonePrinterConfig(updated);
   } catch (err) {
     console.error('[ThermalPrinterService] Error guardando configuración:', err);
     throw err;

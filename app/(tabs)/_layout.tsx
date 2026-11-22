@@ -10,8 +10,8 @@ import {
   Settings,
 } from 'lucide-react-native';
 import { Header } from '@/components/Header';
-import { useAuth } from '@/context/AuthContext';
-import { useCart } from '@/context/CartContext';
+import { useAuthSession } from '@/context/AuthContext';
+import { useCartBadgeCount } from '@/context/CartContext';
 import { ui } from '@/lib/theme';
 
 const TabHeader = React.memo(() => <Header />);
@@ -51,29 +51,30 @@ const renderSettingsIcon = ({ color, size, focused }: TabIconProps) => (
 
 const CATALOG_OPTIONS = {
   title: 'Inventario',
+  freezeOnBlur: true,
   tabBarIcon: renderCatalogIcon,
 };
 
 const OPERATIONS_OPTIONS = {
   title: 'Caja',
-  headerShown: false,
+  freezeOnBlur: true,
   tabBarIcon: renderOperationsIcon,
 };
 
 const HISTORY_OPTIONS = {
   title: 'Ventas',
-  headerShown: false,
+  freezeOnBlur: true,
   tabBarIcon: renderHistoryIcon,
 };
 
 const SETTINGS_OPTIONS = {
   title: 'Ajustes',
-  headerShown: false,
+  freezeOnBlur: true,
   tabBarIcon: renderSettingsIcon,
 };
 
 function AuthenticatedTabLayout() {
-  const { totalItemsCount } = useCart();
+  const totalItemsCount = useCartBadgeCount();
   const insets = useSafeAreaInsets();
   const { width } = useWindowDimensions();
   const expanded = width >= 900;
@@ -109,6 +110,7 @@ function AuthenticatedTabLayout() {
   const posOptions = useMemo(
     () => ({
       title: 'Vender',
+      freezeOnBlur: false,
       tabBarIcon: renderPosIcon,
       tabBarBadge: badgeCount,
       tabBarBadgeStyle: styles.cartBadge,
@@ -137,7 +139,7 @@ function AuthenticatedTabLayout() {
 }
 
 export default function TabLayout() {
-  const { user, initialized, role } = useAuth();
+  const { user, initialized, role } = useAuthSession();
   if (!initialized || !user || role === 'seller') {
     return <View style={styles.bootPlaceholder} />;
   }

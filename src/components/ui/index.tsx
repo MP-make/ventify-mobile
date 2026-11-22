@@ -1,9 +1,21 @@
-import React, { useMemo } from 'react';
+import React from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 import { Image } from 'expo-image';
 import { ui } from '@/lib/theme';
 
 const BRAND_LOGO_SOURCE = require('../../../assets/brand/ventify-logo.png');
+const logoSizeStyleCache = new Map<number, { width: number; height: number }>();
+
+function getLogoSizeStyle(size: number): { width: number; height: number } {
+  let cached = logoSizeStyleCache.get(size);
+  if (!cached) {
+    cached = { width: size, height: size };
+    if (logoSizeStyleCache.size < 32) {
+      logoSizeStyleCache.set(size, cached);
+    }
+  }
+  return cached;
+}
 
 /** The original Ventify mark, shared with the web product. */
 export const BrandLogo = React.memo(function BrandLogo({
@@ -13,7 +25,7 @@ export const BrandLogo = React.memo(function BrandLogo({
   size?: number;
   wordmark?: boolean;
 }) {
-  const logoStyle = useMemo(() => ({ width: size, height: size }), [size]);
+  const logoStyle = getLogoSizeStyle(size);
   const isLarge = size > 50;
 
   return (

@@ -12,6 +12,7 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
+import { FlashList } from '@shopify/flash-list';
 import { useRouter } from 'expo-router';
 import {
   ArrowLeft,
@@ -23,9 +24,10 @@ import {
   ShieldAlert,
   X,
 } from 'lucide-react-native';
-import { useAuth } from '@/context/AuthContext';
-import { useSettings } from '@/context/SettingsContext';
+import { useAuthSession } from '@/context/AuthContext';
+import { useBusinessSettings } from '@/context/SettingsContext';
 import { useProducts } from '@/context/ProductsContext';
+import { useDebouncedValue } from '@/hooks/use-debounced-value';
 import { usePermissions } from '@/hooks/usePermissions';
 import { FinancialPnlModal } from '@/components/FinancialPnlModal';
 import { formatDatePE, formatPEN, ui } from '@/lib/theme';
@@ -50,8 +52,10 @@ import {
   getDateRangeBounds,
   type ReceivablesSummary,
   type SellerPerformanceApiResponse,
+  type SellerPerformanceRow,
   toEpochMs,
 } from '@/services/dashboard-reports-service';
+import type { Branch, Product } from '@/types';
 
 type ReportTab =
   | 'sales'
@@ -93,6 +97,512 @@ const KARDEX_FILTERS: Array<{ key: KardexTypeFilter; label: string }> = [
 
 const MIME_CSV = 'text/csv;charset=utf-8';
 const MIME_XLSX = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+const REPORT_TAB_CACHE_TTL_MS = 60_000;
+const MAX_TAB_CACHE_ENTRIES = 40;
+const EMPTY_KARDEX_ITEMS: any[] = [];
+const EMPTY_CLOSURES: CashClosureReportItem[] = [];
+const EMPTY_SELLER_ROWS: SellerPerformanceRow[] = [];
+
+const ListGap12 = () => <View style={styles.listGap12} />;
+
+interface TabCacheEntry {
+  data: unknown;
+  expiresAt: number;
+}
+
+const KardexMovementRow = React.memo<{ item: any }>(({ item: mov }) => {
+  const delta =
+    Number(mov.quantityChanged ?? (mov.type === 'in' ? mov.quantity : -mov.quantity)) || 0;
+  const isPositive = delta >= 0;
+  return (
+    <View style={styles.card}>
+      <View style={styles.lineRow}>
+        <Text style={styles.cardTitle} numberOfLines={1}>
+          {mov.productName || 'Producto'}
+        </Text>
+        <Text
+          style={[
+            styles.lineValue,
+            { color: isPositive ? ui.success : ui.danger },
+          ]}
+        >
+          {isPositive ? '+' : ''}
+          {delta}
+        </Text>
+      </View>
+      <Text style={styles.mutedText}>
+        Stock: {mov.quantityBefore ?? mov.previousStock ?? 0} →{' '}
+        {mov.quantityAfter ?? mov.newStock ?? 0} ·{' '}
+        {mov.reason || mov.movementType || 'Movimiento'}
+      </Text>
+      <Text style={styles.metaSmall}>
+        {formatDatePE(toEpochMs(mov.createdAt || mov.date))}
+        {mov.userName ? ` · ${mov.userName}` : ''}
+      </Text>
+    </View>
+  );
+});
+
+interface KardexReportTabProps {
+  items: any[];
+  loading: boolean;
+  refreshing: boolean;
+  tabError: string | null;
+  hasAllBranchesAccess: boolean;
+  branches: Branch[];
+  kardexBranchId: string;
+  onSelectBranch: (branchId: string) => void;
+  onRefresh: () => void;
+  onRetry: () => void;
+}
+
+const KardexReportTab = React.memo<KardexReportTabProps>(
+  ({
+    items,
+    loading,
+    refreshing,
+    tabError,
+    hasAllBranchesAccess,
+    branches,
+    kardexBranchId,
+    onSelectBranch,
+    onRefresh,
+    onRetry,
+  }) => {
+    const [kardexFilter, setKardexFilter] = useState<KardexTypeFilter>('all');
+
+    const filteredKardex = useMemo(() => {
+      if (kardexFilter === 'all') return items;
+      return items.filter((item) => {
+        const mt = String(item.movementType || '').toLowerCase();
+        const t = String(item.type || '').toLowerCase();
+        if (kardexFilter === 'transfer') return mt.includes('transfer') || t === 'transfer';
+        if (kardexFilter === 'adjustment') {
+          return (
+            mt.includes('adjust') ||
+            mt.includes('audit') ||
+            mt.includes('damage') ||
+            t === 'adjustment'
+          );
+        }
+        if (kardexFilter === 'in') return t === 'in';
+        if (kardexFilter === 'out') return t === 'out';
+        return true;
+      });
+    }, [items, kardexFilter]);
+
+    const keyExtractor = useCallback(
+      (item: any, index: number) => (item?.id ? String(item.id) : `kardex-${index}`),
+      []
+    );
+
+    const renderItem = useCallback(
+      ({ item }: { item: any }) => <KardexMovementRow item={item} />,
+      []
+    );
+
+    const listHeader = useMemo(
+      () => (
+        <View style={styles.listHeaderBlock}>
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={styles.pillsRowEdge}
+          >
+            {KARDEX_FILTERS.map((f) => {
+              const active = kardexFilter === f.key;
+              return (
+                <TouchableOpacity
+                  key={f.key}
+                  onPress={() => setKardexFilter(f.key)}
+                  style={[styles.pill, active && styles.pillActive]}
+                >
+                  <Text style={[styles.pillText, active && styles.pillTextActive]}>{f.label}</Text>
+                </TouchableOpacity>
+              );
+            })}
+          </ScrollView>
+
+          {hasAllBranchesAccess && branches.length > 1 && (
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={styles.pillsRowEdge}
+            >
+              <TouchableOpacity
+                onPress={() => onSelectBranch('all')}
+                style={[styles.pill, kardexBranchId === 'all' && styles.pillActive]}
+              >
+                <Text
+                  style={[styles.pillText, kardexBranchId === 'all' && styles.pillTextActive]}
+                >
+                  Todas las sedes
+                </Text>
+              </TouchableOpacity>
+              {branches.map((b) => {
+                if (!b.id) return null;
+                const active = kardexBranchId === b.id;
+                return (
+                  <TouchableOpacity
+                    key={b.id}
+                    onPress={() => onSelectBranch(b.id!)}
+                    style={[styles.pill, active && styles.pillActive]}
+                  >
+                    <Text style={[styles.pillText, active && styles.pillTextActive]}>
+                      {b.name}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </ScrollView>
+          )}
+
+          {loading ? (
+            <View style={styles.centerBox}>
+              <ActivityIndicator size="large" color={ui.primary} />
+              <Text style={styles.mutedText}>Generando reporte...</Text>
+            </View>
+          ) : tabError ? (
+            <View style={styles.errorCard}>
+              <Text style={styles.errorText}>{tabError}</Text>
+              <TouchableOpacity onPress={onRetry} style={styles.retryBtn}>
+                <Text style={styles.retryBtnText}>Reintentar</Text>
+              </TouchableOpacity>
+            </View>
+          ) : null}
+        </View>
+      ),
+      [kardexFilter, hasAllBranchesAccess, branches, kardexBranchId, onSelectBranch, loading, tabError, onRetry]
+    );
+
+    const listEmpty = useMemo(
+      () =>
+        !loading && !tabError ? (
+          <View style={styles.card}>
+            <Text style={styles.mutedText}>No hay movimientos Kardex en este filtro.</Text>
+          </View>
+        ) : null,
+      [loading, tabError]
+    );
+
+    return (
+      <FlashList
+        data={loading || tabError ? EMPTY_KARDEX_ITEMS : filteredKardex}
+        keyExtractor={keyExtractor}
+        estimatedItemSize={96}
+        renderItem={renderItem}
+        ItemSeparatorComponent={ListGap12}
+        ListHeaderComponent={listHeader}
+        ListEmptyComponent={listEmpty}
+        contentContainerStyle={styles.flashListContent}
+        showsVerticalScrollIndicator={false}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={[ui.primary]} />
+        }
+      />
+    );
+  }
+);
+
+const ClosureReportRow = React.memo<{
+  item: CashClosureReportItem;
+  onSelect: (item: CashClosureReportItem) => void;
+}>(({ item: c, onSelect }) => (
+  <TouchableOpacity onPress={() => onSelect(c)} style={styles.card} activeOpacity={0.78}>
+    <View style={styles.lineRow}>
+      <Text style={styles.cardTitle}>
+        {c.branchName || 'Caja'} · {c.closedByName || c.startedByName || 'Operador'}
+      </Text>
+      <Text
+        style={[
+          styles.lineValue,
+          {
+            color:
+              c.difference === 0
+                ? ui.success
+                : c.difference > 0
+                  ? ui.primary
+                  : ui.danger,
+          },
+        ]}
+      >
+        {c.difference === 0
+          ? 'Cuadrado'
+          : `${c.difference > 0 ? '+' : ''}${formatPEN(c.difference)}`}
+      </Text>
+    </View>
+    <Text style={styles.mutedText}>
+      Esperado: {formatPEN(c.expectedAmount)} · Contado: {formatPEN(c.countedAmount)}
+    </Text>
+    <Text style={styles.metaSmall}>
+      {formatDatePE(c.closeTime || c.createdAt)} · Tocar para detalle
+    </Text>
+  </TouchableOpacity>
+));
+
+interface ClosuresReportTabProps {
+  closures: CashClosureReportItem[];
+  loading: boolean;
+  refreshing: boolean;
+  tabError: string | null;
+  onSelectClosure: (item: CashClosureReportItem) => void;
+  onRefresh: () => void;
+  onRetry: () => void;
+}
+
+const ClosuresReportTab = React.memo<ClosuresReportTabProps>(
+  ({ closures, loading, refreshing, tabError, onSelectClosure, onRefresh, onRetry }) => {
+    const closuresSummary = useMemo(() => {
+      let expectedTotal = 0;
+      let totalDiff = 0;
+      let shortageCount = 0;
+      for (const c of closures) {
+        expectedTotal += c.expectedAmount;
+        totalDiff += c.difference;
+        if (c.difference < 0) shortageCount += 1;
+      }
+      return { expectedTotal, totalDiff, shortageCount };
+    }, [closures]);
+
+    const keyExtractor = useCallback((item: CashClosureReportItem) => item.id, []);
+
+    const renderItem = useCallback(
+      ({ item }: { item: CashClosureReportItem }) => (
+        <ClosureReportRow item={item} onSelect={onSelectClosure} />
+      ),
+      [onSelectClosure]
+    );
+
+    const listHeader = useMemo(
+      () => (
+        <View style={styles.listHeaderBlock}>
+          {loading ? (
+            <View style={styles.centerBox}>
+              <ActivityIndicator size="large" color={ui.primary} />
+              <Text style={styles.mutedText}>Generando reporte...</Text>
+            </View>
+          ) : tabError ? (
+            <View style={styles.errorCard}>
+              <Text style={styles.errorText}>{tabError}</Text>
+              <TouchableOpacity onPress={onRetry} style={styles.retryBtn}>
+                <Text style={styles.retryBtnText}>Reintentar</Text>
+              </TouchableOpacity>
+            </View>
+          ) : (
+            <View style={styles.kpiRow}>
+              <View style={styles.kpiBox}>
+                <Text style={styles.kpiLabel}>Cierres en Período</Text>
+                <Text style={styles.kpiValue}>{closures.length}</Text>
+                <Text style={styles.kpiMeta}>
+                  Esperado: {formatPEN(closuresSummary.expectedTotal)}
+                </Text>
+              </View>
+              <View style={styles.kpiBox}>
+                <Text style={styles.kpiLabel}>Diferencia Acumulada</Text>
+                <Text
+                  style={[
+                    styles.kpiValue,
+                    { color: closuresSummary.totalDiff >= 0 ? ui.success : ui.danger },
+                  ]}
+                >
+                  {closuresSummary.totalDiff >= 0 ? '+' : ''}
+                  {formatPEN(closuresSummary.totalDiff)}
+                </Text>
+                <Text style={styles.kpiMeta}>
+                  {closuresSummary.shortageCount} con faltante
+                </Text>
+              </View>
+            </View>
+          )}
+        </View>
+      ),
+      [loading, tabError, onRetry, closures.length, closuresSummary]
+    );
+
+    const listEmpty = useMemo(
+      () =>
+        !loading && !tabError ? (
+          <View style={styles.card}>
+            <Text style={styles.mutedText}>Sin cierres Z registrados en este rango.</Text>
+          </View>
+        ) : null,
+      [loading, tabError]
+    );
+
+    return (
+      <FlashList
+        data={loading || tabError ? EMPTY_CLOSURES : closures}
+        keyExtractor={keyExtractor}
+        estimatedItemSize={100}
+        renderItem={renderItem}
+        ItemSeparatorComponent={ListGap12}
+        ListHeaderComponent={listHeader}
+        ListEmptyComponent={listEmpty}
+        contentContainerStyle={styles.flashListContent}
+        showsVerticalScrollIndicator={false}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={[ui.primary]} />
+        }
+      />
+    );
+  }
+);
+
+const CommissionCalculatorCard = React.memo<{
+  onCommissionPctChange: (pct: number) => void;
+}>(({ onCommissionPctChange }) => {
+  const [commissionRateInput, setCommissionRateInput] = useState('0');
+  const debouncedInput = useDebouncedValue(commissionRateInput, 150);
+
+  useEffect(() => {
+    const pct = Math.max(0, Math.min(100, Number(debouncedInput) || 0));
+    onCommissionPctChange(pct);
+  }, [debouncedInput, onCommissionPctChange]);
+
+  return (
+    <View style={styles.card}>
+      <View style={styles.commissionRow}>
+        <Text style={styles.lineLabel}>Simular Comisión (% sobre Neto):</Text>
+        <TextInput
+          value={commissionRateInput}
+          onChangeText={setCommissionRateInput}
+          keyboardType="decimal-pad"
+          maxLength={5}
+          style={styles.commissionInput}
+        />
+      </View>
+    </View>
+  );
+});
+
+const SellerPerformanceCard = React.memo<{
+  row: SellerPerformanceRow;
+  rank: number;
+  commissionPct: number;
+}>(({ row, rank, commissionPct }) => {
+  const commissionAmt = Math.round(row.net * (commissionPct / 100) * 100) / 100;
+  return (
+    <View style={styles.card}>
+      <View style={styles.lineRow}>
+        <Text style={styles.cardTitle}>
+          #{rank} {row.sellerName}
+        </Text>
+        <Text style={[styles.lineValue, { color: ui.primary }]}>
+          {formatPEN(row.net)}
+        </Text>
+      </View>
+      <Text style={styles.mutedText}>
+        {row.salesCount} ventas · Bruto {formatPEN(row.gross)} · Dev.{' '}
+        {formatPEN(row.refunds)}
+      </Text>
+      <Text style={styles.metaSmall}>
+        Participación:{' '}
+        {row.participation !== null ? `${row.participation.toFixed(1)}%` : '—'}
+        {commissionPct > 0 ? ` · Comisión est.: ${formatPEN(commissionAmt)}` : ''}
+      </Text>
+    </View>
+  );
+});
+
+interface SellersReportTabProps {
+  sellersData: SellerPerformanceApiResponse | null;
+  loading: boolean;
+  refreshing: boolean;
+  tabError: string | null;
+  onRefresh: () => void;
+  onRetry: () => void;
+}
+
+const SellersReportTab = React.memo<SellersReportTabProps>(
+  ({ sellersData, loading, refreshing, tabError, onRefresh, onRetry }) => {
+    const [commissionPct, setCommissionPct] = useState(0);
+
+    const keyExtractor = useCallback(
+      (row: SellerPerformanceRow, index: number) => row.sellerId || `unassigned-${index}`,
+      []
+    );
+
+    const renderItem = useCallback(
+      ({ item, index }: { item: SellerPerformanceRow; index: number }) => (
+        <SellerPerformanceCard row={item} rank={index + 1} commissionPct={commissionPct} />
+      ),
+      [commissionPct]
+    );
+
+    const listHeader = useMemo(
+      () => (
+        <View style={styles.listHeaderBlock}>
+          {loading ? (
+            <View style={styles.centerBox}>
+              <ActivityIndicator size="large" color={ui.primary} />
+              <Text style={styles.mutedText}>Generando reporte...</Text>
+            </View>
+          ) : tabError ? (
+            <View style={styles.errorCard}>
+              <Text style={styles.errorText}>{tabError}</Text>
+              <TouchableOpacity onPress={onRetry} style={styles.retryBtn}>
+                <Text style={styles.retryBtnText}>Reintentar</Text>
+              </TouchableOpacity>
+            </View>
+          ) : sellersData ? (
+            <>
+              <View style={styles.kpiRow}>
+                <View style={styles.kpiBox}>
+                  <Text style={styles.kpiLabel}>Neto Atribuido</Text>
+                  <Text style={styles.kpiValue}>{formatPEN(sellersData.report.totalNet)}</Text>
+                  <Text style={styles.kpiMeta}>
+                    Bruto: {formatPEN(sellersData.report.totalGross)}
+                  </Text>
+                </View>
+                <View style={styles.kpiBox}>
+                  <Text style={styles.kpiLabel}>Devoluciones</Text>
+                  <Text style={[styles.kpiValue, { color: ui.danger }]}>
+                    {formatPEN(sellersData.report.totalRefunds)}
+                  </Text>
+                  <Text style={styles.kpiMeta}>{sellersData.timeZone}</Text>
+                </View>
+              </View>
+
+              <CommissionCalculatorCard onCommissionPctChange={setCommissionPct} />
+            </>
+          ) : null}
+        </View>
+      ),
+      [loading, tabError, onRetry, sellersData]
+    );
+
+    const listEmpty = useMemo(
+      () =>
+        !loading && !tabError && sellersData ? (
+          <View style={styles.card}>
+            <Text style={styles.mutedText}>
+              No hay ventas comerciales atribuidas en este período.
+            </Text>
+          </View>
+        ) : null,
+      [loading, tabError, sellersData]
+    );
+
+    return (
+      <FlashList
+        data={loading || tabError || !sellersData ? EMPTY_SELLER_ROWS : sellersData.report.rows}
+        extraData={commissionPct}
+        keyExtractor={keyExtractor}
+        estimatedItemSize={96}
+        renderItem={renderItem}
+        ItemSeparatorComponent={ListGap12}
+        ListHeaderComponent={listHeader}
+        ListEmptyComponent={listEmpty}
+        contentContainerStyle={styles.flashListContent}
+        keyboardShouldPersistTaps="handled"
+        showsVerticalScrollIndicator={false}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={[ui.primary]} />
+        }
+      />
+    );
+  }
+);
 
 function mapPresetToPnlPeriod(preset: DateRangePreset): PnlPeriodType {
   switch (preset) {
@@ -110,9 +620,9 @@ function mapPresetToPnlPeriod(preset: DateRangePreset): PnlPeriodType {
 export default function ReportsScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
-  const { accountId, branchId } = useAuth();
-  const { businessName, activeBranchName, branches, posSettings } = useSettings();
-  const { products } = useProducts();
+  const { accountId, branchId } = useAuthSession();
+  const { businessName, activeBranchName, branches, posSettings } = useBusinessSettings();
+  const { products, productsById, stats } = useProducts();
   const {
     canViewReports,
     canViewMargins,
@@ -136,15 +646,17 @@ export default function ReportsScreen() {
   const [pnlReport, setPnlReport] = useState<PnlReportResult | null>(null);
   const [pnlModalVisible, setPnlModalVisible] = useState(false);
   const [kardexItems, setKardexItems] = useState<any[]>([]);
-  const [kardexFilter, setKardexFilter] = useState<KardexTypeFilter>('all');
   const [kardexBranchId, setKardexBranchId] = useState<string>('');
   const [closures, setClosures] = useState<CashClosureReportItem[]>([]);
   const [selectedClosure, setSelectedClosure] = useState<CashClosureReportItem | null>(null);
   const [receivables, setReceivables] = useState<ReceivablesSummary | null>(null);
   const [sellersData, setSellersData] = useState<SellerPerformanceApiResponse | null>(null);
-  const [commissionRateInput, setCommissionRateInput] = useState('0');
   const [expensesData, setExpensesData] = useState<ExpensesReportSummary | null>(null);
+
   const requestIdRef = useRef(0);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const isMountedRef = useRef(true);
+  const tabCacheRef = useRef<Map<string, TabCacheEntry>>(new Map());
 
   const effectiveBranch = useMemo(() => {
     if (hasAllBranchesAccess && scopeAllBranches) return undefined;
@@ -159,15 +671,8 @@ export default function ReportsScreen() {
 
   const bounds = useMemo(() => getDateRangeBounds(preset), [preset]);
 
-  const productsMap = useMemo(() => {
-    const map = new Map<string, any>();
-    for (const p of products) {
-      if (p?.id) map.set(p.id, p);
-    }
-    return map;
-  }, [products]);
-  const productsMapRef = useRef(productsMap);
-  productsMapRef.current = productsMap;
+  const productsMapRef = useRef(productsById);
+  productsMapRef.current = productsById;
 
   const inventorySummary = useMemo(() => {
     if (activeTab !== 'inventory') {
@@ -181,6 +686,7 @@ export default function ReportsScreen() {
         criticalList: [] as Array<{ id: string; name: string; qty: number; minStock: number }>,
       };
     }
+    const isSingleActiveBranch = Boolean(effectiveBranch);
     let activeCount = 0;
     let totalUnits = 0;
     let costValuation = 0;
@@ -191,7 +697,7 @@ export default function ReportsScreen() {
 
     for (const p of products) {
       if (p.active === false) continue;
-      activeCount += 1;
+      if (!isSingleActiveBranch) activeCount += 1;
       const stockMap = p.stock || {};
       const qty = effectiveBranch
         ? Number(stockMap[effectiveBranch]) || 0
@@ -199,17 +705,19 @@ export default function ReportsScreen() {
 
       const safeQty = Math.max(0, qty);
       totalUnits += safeQty;
-      const cost = Number(p.costPrice) || 0;
       const retail = Number(p.suggestedPrice ?? p.price) || 0;
-      costValuation += safeQty * cost;
       retailValuation += safeQty * retail;
+      if (!isSingleActiveBranch) {
+        const cost = Number(p.costPrice) || 0;
+        costValuation += safeQty * cost;
+      }
 
       const minStock = Number(p.minStock) || 5;
       if (qty <= 0) {
-        outOfStockCount += 1;
+        if (!isSingleActiveBranch) outOfStockCount += 1;
         criticalList.push({ id: p.id, name: p.name, qty, minStock });
       } else if (qty <= minStock) {
-        lowStockCount += 1;
+        if (!isSingleActiveBranch) lowStockCount += 1;
         criticalList.push({ id: p.id, name: p.name, qty, minStock });
       }
     }
@@ -217,44 +725,102 @@ export default function ReportsScreen() {
     criticalList.sort((a, b) => a.qty - b.qty);
 
     return {
-      activeCount,
+      activeCount: isSingleActiveBranch ? stats.totalProducts : activeCount,
       totalUnits: Math.round(totalUnits * 100) / 100,
-      costValuation: Math.round(costValuation * 100) / 100,
+      costValuation: isSingleActiveBranch
+        ? stats.totalInventoryValue
+        : Math.round(costValuation * 100) / 100,
       retailValuation: Math.round(retailValuation * 100) / 100,
-      lowStockCount,
-      outOfStockCount,
+      lowStockCount: isSingleActiveBranch ? stats.lowStockCount : lowStockCount,
+      outOfStockCount: isSingleActiveBranch ? stats.outOfStockCount : outOfStockCount,
       criticalList: criticalList.slice(0, 15),
     };
-  }, [activeTab, products, effectiveBranch]);
-
-  const closuresSummary = useMemo(() => {
-    let expectedTotal = 0;
-    let totalDiff = 0;
-    let shortageCount = 0;
-    for (const c of closures) {
-      expectedTotal += c.expectedAmount;
-      totalDiff += c.difference;
-      if (c.difference < 0) shortageCount += 1;
-    }
-    return { expectedTotal, totalDiff, shortageCount };
-  }, [closures]);
+  }, [activeTab, products, effectiveBranch, stats]);
 
   const loadTabData = useCallback(
     async (isRefresh = false) => {
-      if (!accountId || !canViewReports) return;
+      abortControllerRef.current?.abort();
+      if (!accountId || !canViewReports) {
+        abortControllerRef.current = null;
+        setLoading(false);
+        setRefreshing(false);
+        return;
+      }
       const reqId = ++requestIdRef.current;
       if (activeTab === 'inventory') {
+        abortControllerRef.current = null;
         setTabError(null);
         setLoading(false);
         setRefreshing(false);
         return;
       }
 
+      const branchScopeKey =
+        activeTab === 'kardex'
+          ? hasAllBranchesAccess
+            ? activeKardexBranch || 'all'
+            : effectiveBranch || 'all'
+          : effectiveBranch || 'all';
+      const presetScopeKey =
+        activeTab === 'kardex' || activeTab === 'receivables' ? 'all' : preset;
+      const marginScopeKey = activeTab === 'pnl' ? (canViewMargins ? 'm1' : 'm0') : '';
+      const cacheKey = `${accountId}:${activeTab}:${presetScopeKey}:${branchScopeKey}:${marginScopeKey}`;
+
+      if (!isRefresh) {
+        const cached = tabCacheRef.current.get(cacheKey);
+        if (cached && cached.expiresAt > Date.now()) {
+          switch (activeTab) {
+            case 'sales':
+              setSalesData(cached.data as { salesSummary: DashboardSalesBreakdown });
+              break;
+            case 'pnl':
+              setPnlReport(cached.data as PnlReportResult | null);
+              break;
+            case 'kardex':
+              setKardexItems(cached.data as any[]);
+              break;
+            case 'closures':
+              setClosures(cached.data as CashClosureReportItem[]);
+              break;
+            case 'receivables':
+              setReceivables(cached.data as ReceivablesSummary);
+              break;
+            case 'sellers':
+              setSellersData(cached.data as SellerPerformanceApiResponse);
+              break;
+            case 'expenses':
+              setExpensesData(cached.data as ExpensesReportSummary);
+              break;
+          }
+          setTabError(null);
+          setLoading(false);
+          setRefreshing(false);
+          return;
+        }
+        tabCacheRef.current.delete(cacheKey);
+      } else {
+        tabCacheRef.current.delete(cacheKey);
+      }
+
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
+
       if (isRefresh) setRefreshing(true);
       else setLoading(true);
       setTabError(null);
 
+      const writeTabCache = (data: unknown) => {
+        const cache = tabCacheRef.current;
+        if (cache.has(cacheKey)) cache.delete(cacheKey);
+        else if (cache.size >= MAX_TAB_CACHE_ENTRIES) {
+          const oldestKey = cache.keys().next().value;
+          if (oldestKey !== undefined) cache.delete(oldestKey);
+        }
+        cache.set(cacheKey, { data, expiresAt: Date.now() + REPORT_TAB_CACHE_TTL_MS });
+      };
+
       try {
+        const requestOptions = { forceRefresh: isRefresh, signal: controller.signal };
         switch (activeTab) {
           case 'sales': {
             const res = await fetchPeriodSalesSummaryOnly(
@@ -262,14 +828,19 @@ export default function ReportsScreen() {
               effectiveBranch,
               bounds.fromMs,
               bounds.toMs,
-              productsMapRef.current
+              productsMapRef.current as unknown as Map<string, Record<string, any>>,
+              requestOptions
             );
-            if (reqId !== requestIdRef.current) return;
+            if (!isMountedRef.current || controller.signal.aborted || reqId !== requestIdRef.current) {
+              return;
+            }
+            writeTabCache(res);
             setSalesData(res);
             break;
           }
           case 'pnl': {
             if (!canViewMargins) {
+              writeTabCache(null);
               setPnlReport(null);
               break;
             }
@@ -278,17 +849,27 @@ export default function ReportsScreen() {
               branchId: effectiveBranch,
               startDate: bounds.fromMs,
               endDate: bounds.toMs,
-              productsMap: productsMapRef.current,
+              productsMap: productsMapRef.current as Map<string, Product>,
               includeDetails: false,
+              forceRefresh: isRefresh,
+              signal: controller.signal,
             });
-            if (reqId !== requestIdRef.current) return;
+            if (!isMountedRef.current || controller.signal.aborted || reqId !== requestIdRef.current) {
+              return;
+            }
+            writeTabCache(res);
             setPnlReport(res);
             break;
           }
           case 'kardex': {
-            const branchScope = hasAllBranchesAccess ? activeKardexBranch || 'all' : effectiveBranch || 'all';
+            const branchScope = hasAllBranchesAccess
+              ? activeKardexBranch || 'all'
+              : effectiveBranch || 'all';
             const list = await getProductKardex(accountId, branchScope, undefined, 80);
-            if (reqId !== requestIdRef.current) return;
+            if (!isMountedRef.current || controller.signal.aborted || reqId !== requestIdRef.current) {
+              return;
+            }
+            writeTabCache(list);
             setKardexItems(list);
             break;
           }
@@ -297,15 +878,23 @@ export default function ReportsScreen() {
               accountId,
               effectiveBranch,
               bounds.fromMs,
-              bounds.toMs
+              bounds.toMs,
+              30,
+              requestOptions
             );
-            if (reqId !== requestIdRef.current) return;
+            if (!isMountedRef.current || controller.signal.aborted || reqId !== requestIdRef.current) {
+              return;
+            }
+            writeTabCache(list);
             setClosures(list);
             break;
           }
           case 'receivables': {
-            const res = await fetchReceivablesReport(accountId, effectiveBranch);
-            if (reqId !== requestIdRef.current) return;
+            const res = await fetchReceivablesReport(accountId, effectiveBranch, requestOptions);
+            if (!isMountedRef.current || controller.signal.aborted || reqId !== requestIdRef.current) {
+              return;
+            }
+            writeTabCache(res);
             setReceivables(res);
             break;
           }
@@ -314,9 +903,13 @@ export default function ReportsScreen() {
               accountId,
               bounds.fromIso,
               bounds.toIso,
-              effectiveBranch
+              effectiveBranch,
+              requestOptions
             );
-            if (reqId !== requestIdRef.current) return;
+            if (!isMountedRef.current || controller.signal.aborted || reqId !== requestIdRef.current) {
+              return;
+            }
+            writeTabCache(res);
             setSellersData(res);
             break;
           }
@@ -325,20 +918,35 @@ export default function ReportsScreen() {
               accountId,
               effectiveBranch,
               bounds.fromMs,
-              bounds.toMs
+              bounds.toMs,
+              requestOptions
             );
-            if (reqId !== requestIdRef.current) return;
+            if (!isMountedRef.current || controller.signal.aborted || reqId !== requestIdRef.current) {
+              return;
+            }
+            writeTabCache(res);
             setExpensesData(res);
             break;
           }
         }
       } catch (err: any) {
-        if (reqId !== requestIdRef.current) return;
+        if (
+          !isMountedRef.current ||
+          controller.signal.aborted ||
+          reqId !== requestIdRef.current ||
+          err?.code === 'ABORTED' ||
+          err?.name === 'AbortError'
+        ) {
+          return;
+        }
         setTabError(err?.message || 'No se pudo cargar este reporte.');
       } finally {
-        if (reqId === requestIdRef.current) {
+        if (isMountedRef.current && reqId === requestIdRef.current) {
           setLoading(false);
           setRefreshing(false);
+        }
+        if (abortControllerRef.current === controller) {
+          abortControllerRef.current = null;
         }
       }
     },
@@ -346,6 +954,7 @@ export default function ReportsScreen() {
       accountId,
       canViewReports,
       activeTab,
+      preset,
       effectiveBranch,
       bounds.fromMs,
       bounds.toMs,
@@ -358,7 +967,20 @@ export default function ReportsScreen() {
   );
 
   useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      requestIdRef.current += 1;
+      abortControllerRef.current?.abort();
+      abortControllerRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
     void loadTabData();
+    return () => {
+      abortControllerRef.current?.abort();
+    };
   }, [loadTabData]);
 
   const handleServerExport = async (
@@ -399,7 +1021,7 @@ export default function ReportsScreen() {
           branchId: effectiveBranch,
           startDate: bounds.fromMs,
           endDate: bounds.toMs,
-          productsMap: productsMapRef.current,
+          productsMap: productsMapRef.current as Map<string, Product>,
           includeDetails: true,
         });
         setPnlReport(reportToExport);
@@ -417,20 +1039,13 @@ export default function ReportsScreen() {
     }
   };
 
-  const filteredKardex = useMemo(() => {
-    if (kardexFilter === 'all') return kardexItems;
-    return kardexItems.filter((item) => {
-      const mt = String(item.movementType || '').toLowerCase();
-      const t = String(item.type || '').toLowerCase();
-      if (kardexFilter === 'transfer') return mt.includes('transfer') || t === 'transfer';
-      if (kardexFilter === 'adjustment') {
-        return mt.includes('adjust') || mt.includes('audit') || mt.includes('damage') || t === 'adjustment';
-      }
-      if (kardexFilter === 'in') return t === 'in';
-      if (kardexFilter === 'out') return t === 'out';
-      return true;
-    });
-  }, [kardexItems, kardexFilter]);
+  const handleRefreshTab = useCallback(() => {
+    void loadTabData(true);
+  }, [loadTabData]);
+
+  const handleRetryTab = useCallback(() => {
+    void loadTabData();
+  }, [loadTabData]);
 
   const visibleTabs = useMemo(() => {
     return REPORT_TABS.filter((tab) => {
@@ -461,8 +1076,6 @@ export default function ReportsScreen() {
       </SafeAreaView>
     );
   }
-
-  const commissionPct = Math.max(0, Math.min(100, Number(commissionRateInput) || 0));
 
   return (
     <SafeAreaView style={styles.screen} edges={['top', 'bottom']}>
@@ -546,764 +1159,562 @@ export default function ReportsScreen() {
         </ScrollView>
       </View>
 
-      <ScrollView
-        contentContainerStyle={styles.scrollContent}
-        showsVerticalScrollIndicator={false}
-        refreshControl={
-          <RefreshControl
-            refreshing={refreshing}
-            onRefresh={() => void loadTabData(true)}
-            colors={[ui.primary]}
-          />
-        }
-      >
-        {loading ? (
-          <View style={styles.centerBox}>
-            <ActivityIndicator size="large" color={ui.primary} />
-            <Text style={styles.mutedText}>Generando reporte...</Text>
-          </View>
-        ) : tabError ? (
-          <View style={styles.errorCard}>
-            <Text style={styles.errorText}>{tabError}</Text>
-            <TouchableOpacity onPress={() => void loadTabData()} style={styles.retryBtn}>
-              <Text style={styles.retryBtnText}>Reintentar</Text>
-            </TouchableOpacity>
-          </View>
-        ) : null}
-
-        {/* 1. VENTAS */}
-        {!loading && !tabError && activeTab === 'sales' && salesData && (
-          <View style={styles.section}>
-            <View style={styles.exportRow}>
-              <TouchableOpacity
-                onPress={() => void handleServerExport('sales', 'csv')}
-                disabled={exportingKey !== null}
-                style={styles.exportBtn}
-              >
-                {exportingKey === 'sales_csv' ? (
-                  <ActivityIndicator size="small" color={ui.primary} />
-                ) : (
-                  <Download size={15} color={ui.primary} />
-                )}
-                <Text style={styles.exportBtnText}>Exportar CSV</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                onPress={() => void handleServerExport('sales', 'xlsx')}
-                disabled={exportingKey !== null}
-                style={styles.exportBtn}
-              >
-                {exportingKey === 'sales_xlsx' ? (
-                  <ActivityIndicator size="small" color={ui.primary} />
-                ) : (
-                  <FileSpreadsheet size={15} color={ui.primary} />
-                )}
-                <Text style={styles.exportBtnText}>Exportar XLSX</Text>
-              </TouchableOpacity>
+      {activeTab === 'kardex' ? (
+        <KardexReportTab
+          items={kardexItems}
+          loading={loading}
+          refreshing={refreshing}
+          tabError={tabError}
+          hasAllBranchesAccess={hasAllBranchesAccess}
+          branches={branches}
+          kardexBranchId={kardexBranchId}
+          onSelectBranch={setKardexBranchId}
+          onRefresh={handleRefreshTab}
+          onRetry={handleRetryTab}
+        />
+      ) : activeTab === 'closures' ? (
+        <ClosuresReportTab
+          closures={closures}
+          loading={loading}
+          refreshing={refreshing}
+          tabError={tabError}
+          onSelectClosure={setSelectedClosure}
+          onRefresh={handleRefreshTab}
+          onRetry={handleRetryTab}
+        />
+      ) : activeTab === 'sellers' ? (
+        <SellersReportTab
+          sellersData={sellersData}
+          loading={loading}
+          refreshing={refreshing}
+          tabError={tabError}
+          onRefresh={handleRefreshTab}
+          onRetry={handleRetryTab}
+        />
+      ) : (
+        <ScrollView
+          contentContainerStyle={styles.scrollContent}
+          showsVerticalScrollIndicator={false}
+          refreshControl={
+            <RefreshControl
+              refreshing={refreshing}
+              onRefresh={handleRefreshTab}
+              colors={[ui.primary]}
+            />
+          }
+        >
+          {loading ? (
+            <View style={styles.centerBox}>
+              <ActivityIndicator size="large" color={ui.primary} />
+              <Text style={styles.mutedText}>Generando reporte...</Text>
             </View>
-
-            <View style={styles.kpiRow}>
-              <View style={styles.kpiBox}>
-                <Text style={styles.kpiLabel}>Ventas Netas</Text>
-                <Text style={styles.kpiValue}>{formatPEN(salesData.salesSummary.totalRevenue)}</Text>
-                <Text style={styles.kpiMeta}>
-                  Devoluciones: {formatPEN(salesData.salesSummary.returnsTotal)}
-                </Text>
-              </View>
-              <View style={styles.kpiBox}>
-                <Text style={styles.kpiLabel}>Transacciones</Text>
-                <Text style={styles.kpiValue}>{salesData.salesSummary.transactionCount}</Text>
-                <Text style={styles.kpiMeta}>
-                  Ticket prom: {formatPEN(salesData.salesSummary.averageTicket)}
-                </Text>
-              </View>
-            </View>
-
-            <View style={styles.card}>
-              <Text style={styles.cardTitle}>Comprobantes por Tipo</Text>
-              {salesData.salesSummary.documentTypeBreakdown.length === 0 ? (
-                <Text style={styles.mutedText}>Sin comprobantes en este período.</Text>
-              ) : (
-                salesData.salesSummary.documentTypeBreakdown.map((doc) => (
-                  <View key={doc.typeKey} style={styles.lineRow}>
-                    <Text style={styles.lineLabel}>
-                      {doc.label} ({doc.count})
-                    </Text>
-                    <Text style={styles.lineValue}>{formatPEN(doc.total)}</Text>
-                  </View>
-                ))
-              )}
-            </View>
-
-            <View style={styles.card}>
-              <Text style={styles.cardTitle}>Top Ítems Vendidos</Text>
-              {salesData.salesSummary.topProducts.length === 0 ? (
-                <Text style={styles.mutedText}>Sin ítems vendidos en este período.</Text>
-              ) : (
-                salesData.salesSummary.topProducts.map((prod, idx) => (
-                  <View key={prod.productId} style={styles.lineRow}>
-                    <Text style={styles.lineLabel} numberOfLines={1}>
-                      #{idx + 1} {prod.name} ({prod.quantity} u.)
-                    </Text>
-                    <Text style={styles.lineValue}>{formatPEN(prod.revenue)}</Text>
-                  </View>
-                ))
-              )}
-            </View>
-          </View>
-        )}
-
-        {/* 2. P&L */}
-        {!loading && !tabError && activeTab === 'pnl' && (
-          <View style={styles.section}>
-            {!canViewMargins ? (
-              <View style={styles.card}>
-                <View style={styles.lockRow}>
-                  <Lock size={20} color={ui.warning} />
-                  <Text style={styles.cardTitle}>Acceso financiero restringido</Text>
-                </View>
-                <Text style={styles.mutedText}>
-                  El Estado de Resultados (P&L) requiere el permiso `view_margins`.
-                </Text>
-              </View>
-            ) : pnlReport ? (
-              <>
-                <View style={styles.exportRow}>
-                  <TouchableOpacity
-                    onPress={() => setPnlModalVisible(true)}
-                    style={styles.primaryActionBtn}
-                  >
-                    <FileText size={16} color={ui.onPrimary} />
-                    <Text style={styles.primaryActionBtnText}>Abrir P&L Completo</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    onPress={() => void handleExportPnlPdf()}
-                    disabled={exportingKey !== null}
-                    style={styles.exportBtn}
-                  >
-                    {exportingKey === 'pnl_pdf' ? (
-                      <ActivityIndicator size="small" color={ui.primary} />
-                    ) : (
-                      <Download size={15} color={ui.primary} />
-                    )}
-                    <Text style={styles.exportBtnText}>Exportar PDF</Text>
-                  </TouchableOpacity>
-                </View>
-
-                <View style={styles.kpiRow}>
-                  <View style={styles.kpiBox}>
-                    <Text style={styles.kpiLabel}>Ventas Netas Devengadas</Text>
-                    <Text style={styles.kpiValue}>{formatPEN(pnlReport.netRevenue)}</Text>
-                    <Text style={styles.kpiMeta}>
-                      Cerradas {formatPEN(pnlReport.salesClosed)} · Fiados {formatPEN(pnlReport.fiadosIssued)}
-                    </Text>
-                  </View>
-                  <View style={styles.kpiBox}>
-                    <Text style={styles.kpiLabel}>Utilidad Neta</Text>
-                    <Text
-                      style={[
-                        styles.kpiValue,
-                        { color: pnlReport.netProfit >= 0 ? ui.success : ui.danger },
-                      ]}
-                    >
-                      {formatPEN(pnlReport.netProfit)}
-                    </Text>
-                    <Text style={styles.kpiMeta}>
-                      Margen neto: {pnlReport.netMarginPercent.toFixed(1)}%
-                    </Text>
-                  </View>
-                </View>
-
-                <View style={styles.card}>
-                  <Text style={styles.cardTitle}>Cascada Operativa (P&L)</Text>
-                  <View style={styles.lineRow}>
-                    <Text style={styles.lineLabel}>Ventas Brutas</Text>
-                    <Text style={styles.lineValue}>{formatPEN(pnlReport.grossSales)}</Text>
-                  </View>
-                  <View style={styles.lineRow}>
-                    <Text style={styles.lineLabel}>(-) Devoluciones</Text>
-                    <Text style={[styles.lineValue, { color: ui.danger }]}>
-                      -{formatPEN(pnlReport.returns)}
-                    </Text>
-                  </View>
-                  <View style={styles.lineRow}>
-                    <Text style={styles.lineLabel}>(-) Costo de Mercadería (CMV)</Text>
-                    <Text style={[styles.lineValue, { color: ui.danger }]}>
-                      -{formatPEN(pnlReport.cogs)}
-                    </Text>
-                  </View>
-                  <View style={[styles.lineRow, styles.subtotalRow]}>
-                    <Text style={[styles.lineLabel, { fontWeight: '800' }]}>
-                      Utilidad Bruta ({pnlReport.grossMarginPercent.toFixed(1)}%)
-                    </Text>
-                    <Text style={[styles.lineValue, { color: ui.success }]}>
-                      {formatPEN(pnlReport.grossProfit)}
-                    </Text>
-                  </View>
-                  <View style={styles.lineRow}>
-                    <Text style={styles.lineLabel}>(-) Gastos Operativos</Text>
-                    <Text style={[styles.lineValue, { color: ui.danger }]}>
-                      -{formatPEN(pnlReport.operatingExpenses)}
-                    </Text>
-                  </View>
-                  <View style={styles.lineRow}>
-                    <Text style={styles.lineLabel}>Comisiones POS / Incobrables</Text>
-                    <Text style={styles.lineValue}>
-                      {formatPEN(pnlReport.terminalCommissions + pnlReport.badDebt)}
-                    </Text>
-                  </View>
-                </View>
-              </>
-            ) : null}
-          </View>
-        )}
-
-        {/* 3. INVENTARIO */}
-        {activeTab === 'inventory' && (
-          <View style={styles.section}>
-            <View style={styles.exportRow}>
-              <TouchableOpacity
-                onPress={() => void handleServerExport('inventory', 'csv')}
-                disabled={exportingKey !== null}
-                style={styles.exportBtn}
-              >
-                {exportingKey === 'inventory_csv' ? (
-                  <ActivityIndicator size="small" color={ui.primary} />
-                ) : (
-                  <Download size={15} color={ui.primary} />
-                )}
-                <Text style={styles.exportBtnText}>Exportar CSV</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                onPress={() => void handleServerExport('inventory', 'xlsx')}
-                disabled={exportingKey !== null}
-                style={styles.exportBtn}
-              >
-                {exportingKey === 'inventory_xlsx' ? (
-                  <ActivityIndicator size="small" color={ui.primary} />
-                ) : (
-                  <FileSpreadsheet size={15} color={ui.primary} />
-                )}
-                <Text style={styles.exportBtnText}>Exportar XLSX</Text>
+          ) : tabError ? (
+            <View style={styles.errorCard}>
+              <Text style={styles.errorText}>{tabError}</Text>
+              <TouchableOpacity onPress={handleRetryTab} style={styles.retryBtn}>
+                <Text style={styles.retryBtnText}>Reintentar</Text>
               </TouchableOpacity>
             </View>
+          ) : null}
 
-            <View style={styles.kpiRow}>
-              <View style={styles.kpiBox}>
-                <Text style={styles.kpiLabel}>Valor al Precio Venta</Text>
-                <Text style={styles.kpiValue}>{formatPEN(inventorySummary.retailValuation)}</Text>
-                <Text style={styles.kpiMeta}>
-                  {inventorySummary.activeCount} SKUs · {inventorySummary.totalUnits} u.
-                </Text>
-              </View>
-              <View style={styles.kpiBox}>
-                <Text style={styles.kpiLabel}>
-                  {canViewInventoryValue || isOwner || isAdmin ? 'Valorizado al Costo' : 'Alertas Stock'}
-                </Text>
-                <Text style={styles.kpiValue}>
-                  {canViewInventoryValue || isOwner || isAdmin
-                    ? formatPEN(inventorySummary.costValuation)
-                    : `${inventorySummary.lowStockCount + inventorySummary.outOfStockCount}`}
-                </Text>
-                <Text style={styles.kpiMeta}>
-                  Bajo: {inventorySummary.lowStockCount} · Agotado: {inventorySummary.outOfStockCount}
-                </Text>
-              </View>
-            </View>
-
-            <View style={styles.card}>
-              <Text style={styles.cardTitle}>Productos con Stock Bajo o Agotado</Text>
-              {inventorySummary.criticalList.length === 0 ? (
-                <Text style={styles.mutedText}>Todos los productos tienen stock saludable.</Text>
-              ) : (
-                inventorySummary.criticalList.map((p) => (
-                  <View key={p.id} style={styles.lineRow}>
-                    <Text style={styles.lineLabel} numberOfLines={1}>
-                      {p.name}
-                    </Text>
-                    <Text
-                      style={[
-                        styles.lineValue,
-                        { color: p.qty <= 0 ? ui.danger : ui.warning },
-                      ]}
-                    >
-                      {p.qty} / mín {p.minStock}
-                    </Text>
-                  </View>
-                ))
-              )}
-            </View>
-          </View>
-        )}
-
-        {/* 4. KARDEX */}
-        {!loading && !tabError && activeTab === 'kardex' && (
-          <View style={styles.section}>
-            <ScrollView
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              contentContainerStyle={styles.pillsRow}
-            >
-              {KARDEX_FILTERS.map((f) => {
-                const active = kardexFilter === f.key;
-                return (
-                  <TouchableOpacity
-                    key={f.key}
-                    onPress={() => setKardexFilter(f.key)}
-                    style={[styles.pill, active && styles.pillActive]}
-                  >
-                    <Text style={[styles.pillText, active && styles.pillTextActive]}>{f.label}</Text>
-                  </TouchableOpacity>
-                );
-              })}
-            </ScrollView>
-
-            {hasAllBranchesAccess && branches.length > 1 && (
-              <ScrollView
-                horizontal
-                showsHorizontalScrollIndicator={false}
-                contentContainerStyle={styles.pillsRow}
-              >
+          {/* 1. VENTAS */}
+          {!loading && !tabError && activeTab === 'sales' && salesData && (
+            <View style={styles.section}>
+              <View style={styles.exportRow}>
                 <TouchableOpacity
-                  onPress={() => setKardexBranchId('all')}
-                  style={[styles.pill, kardexBranchId === 'all' && styles.pillActive]}
+                  onPress={() => void handleServerExport('sales', 'csv')}
+                  disabled={exportingKey !== null}
+                  style={styles.exportBtn}
                 >
-                  <Text
-                    style={[styles.pillText, kardexBranchId === 'all' && styles.pillTextActive]}
-                  >
-                    Todas las sedes
-                  </Text>
+                  {exportingKey === 'sales_csv' ? (
+                    <ActivityIndicator size="small" color={ui.primary} />
+                  ) : (
+                    <Download size={15} color={ui.primary} />
+                  )}
+                  <Text style={styles.exportBtnText}>Exportar CSV</Text>
                 </TouchableOpacity>
-                {branches.map((b) => {
-                  if (!b.id) return null;
-                  const active = kardexBranchId === b.id;
-                  return (
-                    <TouchableOpacity
-                      key={b.id}
-                      onPress={() => setKardexBranchId(b.id!)}
-                      style={[styles.pill, active && styles.pillActive]}
-                    >
-                      <Text style={[styles.pillText, active && styles.pillTextActive]}>{b.name}</Text>
-                    </TouchableOpacity>
-                  );
-                })}
-              </ScrollView>
-            )}
-
-            {filteredKardex.length === 0 ? (
-              <View style={styles.card}>
-                <Text style={styles.mutedText}>No hay movimientos Kardex en este filtro.</Text>
+                <TouchableOpacity
+                  onPress={() => void handleServerExport('sales', 'xlsx')}
+                  disabled={exportingKey !== null}
+                  style={styles.exportBtn}
+                >
+                  {exportingKey === 'sales_xlsx' ? (
+                    <ActivityIndicator size="small" color={ui.primary} />
+                  ) : (
+                    <FileSpreadsheet size={15} color={ui.primary} />
+                  )}
+                  <Text style={styles.exportBtnText}>Exportar XLSX</Text>
+                </TouchableOpacity>
               </View>
-            ) : (
-              filteredKardex.map((mov, index) => {
-                const delta = Number(mov.quantityChanged ?? (mov.type === 'in' ? mov.quantity : -mov.quantity)) || 0;
-                const isPositive = delta >= 0;
-                return (
-                  <View key={mov.id || `${index}`} style={styles.card}>
+
+              <View style={styles.kpiRow}>
+                <View style={styles.kpiBox}>
+                  <Text style={styles.kpiLabel}>Ventas Netas</Text>
+                  <Text style={styles.kpiValue}>{formatPEN(salesData.salesSummary.totalRevenue)}</Text>
+                  <Text style={styles.kpiMeta}>
+                    Devoluciones: {formatPEN(salesData.salesSummary.returnsTotal)}
+                  </Text>
+                </View>
+                <View style={styles.kpiBox}>
+                  <Text style={styles.kpiLabel}>Transacciones</Text>
+                  <Text style={styles.kpiValue}>{salesData.salesSummary.transactionCount}</Text>
+                  <Text style={styles.kpiMeta}>
+                    Ticket prom: {formatPEN(salesData.salesSummary.averageTicket)}
+                  </Text>
+                </View>
+              </View>
+
+              <View style={styles.card}>
+                <Text style={styles.cardTitle}>Comprobantes por Tipo</Text>
+                {salesData.salesSummary.documentTypeBreakdown.length === 0 ? (
+                  <Text style={styles.mutedText}>Sin comprobantes en este período.</Text>
+                ) : (
+                  salesData.salesSummary.documentTypeBreakdown.map((doc) => (
+                    <View key={doc.typeKey} style={styles.lineRow}>
+                      <Text style={styles.lineLabel}>
+                        {doc.label} ({doc.count})
+                      </Text>
+                      <Text style={styles.lineValue}>{formatPEN(doc.total)}</Text>
+                    </View>
+                  ))
+                )}
+              </View>
+
+              <View style={styles.card}>
+                <Text style={styles.cardTitle}>Top Ítems Vendidos</Text>
+                {salesData.salesSummary.topProducts.length === 0 ? (
+                  <Text style={styles.mutedText}>Sin ítems vendidos en este período.</Text>
+                ) : (
+                  salesData.salesSummary.topProducts.map((prod, idx) => (
+                    <View key={prod.productId} style={styles.lineRow}>
+                      <Text style={styles.lineLabel} numberOfLines={1}>
+                        #{idx + 1} {prod.name} ({prod.quantity} u.)
+                      </Text>
+                      <Text style={styles.lineValue}>{formatPEN(prod.revenue)}</Text>
+                    </View>
+                  ))
+                )}
+              </View>
+            </View>
+          )}
+
+          {/* 2. P&L */}
+          {!loading && !tabError && activeTab === 'pnl' && (
+            <View style={styles.section}>
+              {!canViewMargins ? (
+                <View style={styles.card}>
+                  <View style={styles.lockRow}>
+                    <Lock size={20} color={ui.warning} />
+                    <Text style={styles.cardTitle}>Acceso financiero restringido</Text>
+                  </View>
+                  <Text style={styles.mutedText}>
+                    El Estado de Resultados (P&L) requiere el permiso `view_margins`.
+                  </Text>
+                </View>
+              ) : pnlReport ? (
+                <>
+                  <View style={styles.exportRow}>
+                    <TouchableOpacity
+                      onPress={() => setPnlModalVisible(true)}
+                      style={styles.primaryActionBtn}
+                    >
+                      <FileText size={16} color={ui.onPrimary} />
+                      <Text style={styles.primaryActionBtnText}>Abrir P&L Completo</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      onPress={() => void handleExportPnlPdf()}
+                      disabled={exportingKey !== null}
+                      style={styles.exportBtn}
+                    >
+                      {exportingKey === 'pnl_pdf' ? (
+                        <ActivityIndicator size="small" color={ui.primary} />
+                      ) : (
+                        <Download size={15} color={ui.primary} />
+                      )}
+                      <Text style={styles.exportBtnText}>Exportar PDF</Text>
+                    </TouchableOpacity>
+                  </View>
+
+                  <View style={styles.kpiRow}>
+                    <View style={styles.kpiBox}>
+                      <Text style={styles.kpiLabel}>Ventas Netas Devengadas</Text>
+                      <Text style={styles.kpiValue}>{formatPEN(pnlReport.netRevenue)}</Text>
+                      <Text style={styles.kpiMeta}>
+                        Cerradas {formatPEN(pnlReport.salesClosed)} · Fiados {formatPEN(pnlReport.fiadosIssued)}
+                      </Text>
+                    </View>
+                    <View style={styles.kpiBox}>
+                      <Text style={styles.kpiLabel}>Utilidad Neta</Text>
+                      <Text
+                        style={[
+                          styles.kpiValue,
+                          { color: pnlReport.netProfit >= 0 ? ui.success : ui.danger },
+                        ]}
+                      >
+                        {formatPEN(pnlReport.netProfit)}
+                      </Text>
+                      <Text style={styles.kpiMeta}>
+                        Margen neto: {pnlReport.netMarginPercent.toFixed(1)}%
+                      </Text>
+                    </View>
+                  </View>
+
+                  <View style={styles.card}>
+                    <Text style={styles.cardTitle}>Cascada Operativa (P&L)</Text>
                     <View style={styles.lineRow}>
-                      <Text style={styles.cardTitle} numberOfLines={1}>
-                        {mov.productName || 'Producto'}
+                      <Text style={styles.lineLabel}>Ventas Brutas</Text>
+                      <Text style={styles.lineValue}>{formatPEN(pnlReport.grossSales)}</Text>
+                    </View>
+                    <View style={styles.lineRow}>
+                      <Text style={styles.lineLabel}>(-) Devoluciones</Text>
+                      <Text style={[styles.lineValue, { color: ui.danger }]}>
+                        -{formatPEN(pnlReport.returns)}
+                      </Text>
+                    </View>
+                    <View style={styles.lineRow}>
+                      <Text style={styles.lineLabel}>(-) Costo de Mercadería (CMV)</Text>
+                      <Text style={[styles.lineValue, { color: ui.danger }]}>
+                        -{formatPEN(pnlReport.cogs)}
+                      </Text>
+                    </View>
+                    <View style={[styles.lineRow, styles.subtotalRow]}>
+                      <Text style={[styles.lineLabel, { fontWeight: '800' }]}>
+                        Utilidad Bruta ({pnlReport.grossMarginPercent.toFixed(1)}%)
+                      </Text>
+                      <Text style={[styles.lineValue, { color: ui.success }]}>
+                        {formatPEN(pnlReport.grossProfit)}
+                      </Text>
+                    </View>
+                    <View style={styles.lineRow}>
+                      <Text style={styles.lineLabel}>(-) Gastos Operativos</Text>
+                      <Text style={[styles.lineValue, { color: ui.danger }]}>
+                        -{formatPEN(pnlReport.operatingExpenses)}
+                      </Text>
+                    </View>
+                    <View style={styles.lineRow}>
+                      <Text style={styles.lineLabel}>Comisiones POS / Incobrables</Text>
+                      <Text style={styles.lineValue}>
+                        {formatPEN(pnlReport.terminalCommissions + pnlReport.badDebt)}
+                      </Text>
+                    </View>
+                  </View>
+                </>
+              ) : null}
+            </View>
+          )}
+
+          {/* 3. INVENTARIO */}
+          {activeTab === 'inventory' && (
+            <View style={styles.section}>
+              <View style={styles.exportRow}>
+                <TouchableOpacity
+                  onPress={() => void handleServerExport('inventory', 'csv')}
+                  disabled={exportingKey !== null}
+                  style={styles.exportBtn}
+                >
+                  {exportingKey === 'inventory_csv' ? (
+                    <ActivityIndicator size="small" color={ui.primary} />
+                  ) : (
+                    <Download size={15} color={ui.primary} />
+                  )}
+                  <Text style={styles.exportBtnText}>Exportar CSV</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  onPress={() => void handleServerExport('inventory', 'xlsx')}
+                  disabled={exportingKey !== null}
+                  style={styles.exportBtn}
+                >
+                  {exportingKey === 'inventory_xlsx' ? (
+                    <ActivityIndicator size="small" color={ui.primary} />
+                  ) : (
+                    <FileSpreadsheet size={15} color={ui.primary} />
+                  )}
+                  <Text style={styles.exportBtnText}>Exportar XLSX</Text>
+                </TouchableOpacity>
+              </View>
+
+              <View style={styles.kpiRow}>
+                <View style={styles.kpiBox}>
+                  <Text style={styles.kpiLabel}>Valor al Precio Venta</Text>
+                  <Text style={styles.kpiValue}>{formatPEN(inventorySummary.retailValuation)}</Text>
+                  <Text style={styles.kpiMeta}>
+                    {inventorySummary.activeCount} SKUs · {inventorySummary.totalUnits} u.
+                  </Text>
+                </View>
+                <View style={styles.kpiBox}>
+                  <Text style={styles.kpiLabel}>
+                    {canViewInventoryValue || isOwner || isAdmin ? 'Valorizado al Costo' : 'Alertas Stock'}
+                  </Text>
+                  <Text style={styles.kpiValue}>
+                    {canViewInventoryValue || isOwner || isAdmin
+                      ? formatPEN(inventorySummary.costValuation)
+                      : `${inventorySummary.lowStockCount + inventorySummary.outOfStockCount}`}
+                  </Text>
+                  <Text style={styles.kpiMeta}>
+                    Bajo: {inventorySummary.lowStockCount} · Agotado: {inventorySummary.outOfStockCount}
+                  </Text>
+                </View>
+              </View>
+
+              <View style={styles.card}>
+                <Text style={styles.cardTitle}>Productos con Stock Bajo o Agotado</Text>
+                {inventorySummary.criticalList.length === 0 ? (
+                  <Text style={styles.mutedText}>Todos los productos tienen stock saludable.</Text>
+                ) : (
+                  inventorySummary.criticalList.map((p) => (
+                    <View key={p.id} style={styles.lineRow}>
+                      <Text style={styles.lineLabel} numberOfLines={1}>
+                        {p.name}
                       </Text>
                       <Text
                         style={[
                           styles.lineValue,
-                          { color: isPositive ? ui.success : ui.danger },
+                          { color: p.qty <= 0 ? ui.danger : ui.warning },
                         ]}
                       >
-                        {isPositive ? '+' : ''}
-                        {delta}
+                        {p.qty} / mín {p.minStock}
                       </Text>
                     </View>
-                    <Text style={styles.mutedText}>
-                      Stock: {mov.quantityBefore ?? mov.previousStock ?? 0} →{' '}
-                      {mov.quantityAfter ?? mov.newStock ?? 0} ·{' '}
-                      {mov.reason || mov.movementType || 'Movimiento'}
-                    </Text>
-                    <Text style={styles.metaSmall}>
-                      {formatDatePE(toEpochMs(mov.createdAt || mov.date))}
-                      {mov.userName ? ` · ${mov.userName}` : ''}
-                    </Text>
-                  </View>
-                );
-              })
-            )}
-          </View>
-        )}
-
-        {/* 5. CIERRES Z */}
-        {!loading && !tabError && activeTab === 'closures' && (
-          <View style={styles.section}>
-            <View style={styles.kpiRow}>
-              <View style={styles.kpiBox}>
-                <Text style={styles.kpiLabel}>Cierres en Período</Text>
-                <Text style={styles.kpiValue}>{closures.length}</Text>
-                <Text style={styles.kpiMeta}>
-                  Esperado: {formatPEN(closuresSummary.expectedTotal)}
-                </Text>
-              </View>
-              <View style={styles.kpiBox}>
-                <Text style={styles.kpiLabel}>Diferencia Acumulada</Text>
-                <Text
-                  style={[
-                    styles.kpiValue,
-                    { color: closuresSummary.totalDiff >= 0 ? ui.success : ui.danger },
-                  ]}
-                >
-                  {closuresSummary.totalDiff >= 0 ? '+' : ''}
-                  {formatPEN(closuresSummary.totalDiff)}
-                </Text>
-                <Text style={styles.kpiMeta}>
-                  {closuresSummary.shortageCount} con faltante
-                </Text>
+                  ))
+                )}
               </View>
             </View>
+          )}
 
-            {closures.length === 0 ? (
-              <View style={styles.card}>
-                <Text style={styles.mutedText}>Sin cierres Z registrados en este rango.</Text>
-              </View>
-            ) : (
-              closures.map((c) => (
+          {/* 6. CLIENTES / CXC */}
+          {!loading && !tabError && activeTab === 'receivables' && receivables && (
+            <View style={styles.section}>
+              <View style={styles.exportRow}>
                 <TouchableOpacity
-                  key={c.id}
-                  onPress={() => setSelectedClosure(c)}
-                  style={styles.card}
-                  activeOpacity={0.78}
+                  onPress={() => void handleServerExport('receivables', 'csv')}
+                  disabled={exportingKey !== null}
+                  style={styles.exportBtn}
                 >
-                  <View style={styles.lineRow}>
-                    <Text style={styles.cardTitle}>
-                      {c.branchName || 'Caja'} · {c.closedByName || c.startedByName || 'Operador'}
-                    </Text>
-                    <Text
-                      style={[
-                        styles.lineValue,
-                        {
-                          color:
-                            c.difference === 0
-                              ? ui.success
-                              : c.difference > 0
-                                ? ui.primary
-                                : ui.danger,
-                        },
-                      ]}
-                    >
-                      {c.difference === 0
-                        ? 'Cuadrado'
-                        : `${c.difference > 0 ? '+' : ''}${formatPEN(c.difference)}`}
-                    </Text>
-                  </View>
-                  <Text style={styles.mutedText}>
-                    Esperado: {formatPEN(c.expectedAmount)} · Contado: {formatPEN(c.countedAmount)}
-                  </Text>
-                  <Text style={styles.metaSmall}>
-                    {formatDatePE(c.closeTime || c.createdAt)} · Tocar para detalle
-                  </Text>
+                  {exportingKey === 'receivables_csv' ? (
+                    <ActivityIndicator size="small" color={ui.primary} />
+                  ) : (
+                    <Download size={15} color={ui.primary} />
+                  )}
+                  <Text style={styles.exportBtnText}>Exportar CxC CSV</Text>
                 </TouchableOpacity>
-              ))
-            )}
-          </View>
-        )}
-
-        {/* 6. CLIENTES / CXC */}
-        {!loading && !tabError && activeTab === 'receivables' && receivables && (
-          <View style={styles.section}>
-            <View style={styles.exportRow}>
-              <TouchableOpacity
-                onPress={() => void handleServerExport('receivables', 'csv')}
-                disabled={exportingKey !== null}
-                style={styles.exportBtn}
-              >
-                {exportingKey === 'receivables_csv' ? (
-                  <ActivityIndicator size="small" color={ui.primary} />
-                ) : (
-                  <Download size={15} color={ui.primary} />
-                )}
-                <Text style={styles.exportBtnText}>Exportar CxC CSV</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                onPress={() => void handleServerExport('receivables', 'xlsx')}
-                disabled={exportingKey !== null}
-                style={styles.exportBtn}
-              >
-                {exportingKey === 'receivables_xlsx' ? (
-                  <ActivityIndicator size="small" color={ui.primary} />
-                ) : (
-                  <FileSpreadsheet size={15} color={ui.primary} />
-                )}
-                <Text style={styles.exportBtnText}>Exportar CxC XLSX</Text>
-              </TouchableOpacity>
-            </View>
-
-            <View style={styles.kpiRow}>
-              <View style={styles.kpiBox}>
-                <Text style={styles.kpiLabel}>Deuda Fiados Pendiente</Text>
-                <Text style={[styles.kpiValue, { color: ui.warning }]}>
-                  {formatPEN(receivables.totalDebt)}
-                </Text>
-                <Text style={styles.kpiMeta}>
-                  {receivables.activeFiadosCount} cuentas · {receivables.overdueFiadosCount} venc.
-                </Text>
+                <TouchableOpacity
+                  onPress={() => void handleServerExport('receivables', 'xlsx')}
+                  disabled={exportingKey !== null}
+                  style={styles.exportBtn}
+                >
+                  {exportingKey === 'receivables_xlsx' ? (
+                    <ActivityIndicator size="small" color={ui.primary} />
+                  ) : (
+                    <FileSpreadsheet size={15} color={ui.primary} />
+                  )}
+                  <Text style={styles.exportBtnText}>Exportar CxC XLSX</Text>
+                </TouchableOpacity>
               </View>
-              <View style={styles.kpiBox}>
-                <Text style={styles.kpiLabel}>Créditos a Favor</Text>
-                <Text style={[styles.kpiValue, { color: ui.success }]}>
-                  {formatPEN(receivables.totalCreditsInFavor)}
-                </Text>
-                <Text style={styles.kpiMeta}>
-                  Vencido: {formatPEN(receivables.overdueDebt)}
-                </Text>
-              </View>
-            </View>
 
-            <View style={styles.card}>
-              <Text style={styles.cardTitle}>Fiados Pendientes</Text>
-              {receivables.fiados.length === 0 ? (
-                <Text style={styles.mutedText}>No hay fiados pendientes por cobrar.</Text>
-              ) : (
-                receivables.fiados.slice(0, 15).map((f) => (
-                  <View key={f.id} style={styles.lineRow}>
-                    <View style={{ flex: 1, minWidth: 0 }}>
-                      <Text style={styles.lineLabel} numberOfLines={1}>
-                        {f.customerName}
-                      </Text>
-                      <Text
-                        style={[
-                          styles.metaSmall,
-                          f.isOverdue && { color: ui.danger, fontWeight: '700' },
-                        ]}
-                      >
-                        {f.isOverdue ? 'VENCIDO · ' : ''}
-                        {f.dueDate ? `Vence: ${formatDatePE(f.dueDate, false)}` : formatDatePE(f.date, false)}
-                      </Text>
-                    </View>
-                    <Text style={[styles.lineValue, f.isOverdue && { color: ui.danger }]}>
-                      {formatPEN(f.remainingAmount)}
-                    </Text>
-                  </View>
-                ))
-              )}
-            </View>
-
-            <View style={styles.card}>
-              <Text style={styles.cardTitle}>Top Clientes (Deuda / Compras)</Text>
-              {receivables.topCustomers.length === 0 ? (
-                <Text style={styles.mutedText}>Sin clientes registrados.</Text>
-              ) : (
-                receivables.topCustomers.slice(0, 10).map((c) => (
-                  <View key={c.id} style={styles.lineRow}>
-                    <View style={{ flex: 1, minWidth: 0 }}>
-                      <Text style={styles.lineLabel} numberOfLines={1}>
-                        {c.name}
-                      </Text>
-                      <Text style={styles.metaSmall}>
-                        {c.totalPurchases} compras · Gastado {formatPEN(c.totalSpent)}
-                      </Text>
-                    </View>
-                    <Text
-                      style={[
-                        styles.lineValue,
-                        c.currentDebt > 0 && { color: ui.warning },
-                      ]}
-                    >
-                      {c.currentDebt > 0 ? `Debe ${formatPEN(c.currentDebt)}` : 'Al día'}
-                    </Text>
-                  </View>
-                ))
-              )}
-            </View>
-          </View>
-        )}
-
-        {/* 7. VENDEDORES */}
-        {!loading && !tabError && activeTab === 'sellers' && sellersData && (
-          <View style={styles.section}>
-            <View style={styles.kpiRow}>
-              <View style={styles.kpiBox}>
-                <Text style={styles.kpiLabel}>Neto Atribuido</Text>
-                <Text style={styles.kpiValue}>{formatPEN(sellersData.report.totalNet)}</Text>
-                <Text style={styles.kpiMeta}>
-                  Bruto: {formatPEN(sellersData.report.totalGross)}
-                </Text>
-              </View>
-              <View style={styles.kpiBox}>
-                <Text style={styles.kpiLabel}>Devoluciones</Text>
-                <Text style={[styles.kpiValue, { color: ui.danger }]}>
-                  {formatPEN(sellersData.report.totalRefunds)}
-                </Text>
-                <Text style={styles.kpiMeta}>{sellersData.timeZone}</Text>
-              </View>
-            </View>
-
-            <View style={styles.card}>
-              <View style={styles.commissionRow}>
-                <Text style={styles.lineLabel}>Simular Comisión (% sobre Neto):</Text>
-                <TextInput
-                  value={commissionRateInput}
-                  onChangeText={setCommissionRateInput}
-                  keyboardType="decimal-pad"
-                  maxLength={5}
-                  style={styles.commissionInput}
-                />
-              </View>
-            </View>
-
-            {sellersData.report.rows.length === 0 ? (
-              <View style={styles.card}>
-                <Text style={styles.mutedText}>
-                  No hay ventas comerciales atribuidas en este período.
-                </Text>
-              </View>
-            ) : (
-              sellersData.report.rows.map((row, idx) => {
-                const commissionAmt = Math.round(row.net * (commissionPct / 100) * 100) / 100;
-                return (
-                  <View key={row.sellerId || `unassigned-${idx}`} style={styles.card}>
-                    <View style={styles.lineRow}>
-                      <Text style={styles.cardTitle}>
-                        #{idx + 1} {row.sellerName}
-                      </Text>
-                      <Text style={[styles.lineValue, { color: ui.primary }]}>
-                        {formatPEN(row.net)}
-                      </Text>
-                    </View>
-                    <Text style={styles.mutedText}>
-                      {row.salesCount} ventas · Bruto {formatPEN(row.gross)} · Dev.{' '}
-                      {formatPEN(row.refunds)}
-                    </Text>
-                    <Text style={styles.metaSmall}>
-                      Participación:{' '}
-                      {row.participation !== null ? `${row.participation.toFixed(1)}%` : '—'}
-                      {commissionPct > 0 ? ` · Comisión est.: ${formatPEN(commissionAmt)}` : ''}
-                    </Text>
-                  </View>
-                );
-              })
-            )}
-          </View>
-        )}
-
-        {/* 8. EGRESOS & NÓMINA */}
-        {!loading && !tabError && activeTab === 'expenses' && expensesData && (
-          <View style={styles.section}>
-            <View style={styles.exportRow}>
-              <TouchableOpacity
-                onPress={() => void handleServerExport('expenses', 'csv')}
-                disabled={exportingKey !== null}
-                style={styles.exportBtn}
-              >
-                {exportingKey === 'expenses_csv' ? (
-                  <ActivityIndicator size="small" color={ui.primary} />
-                ) : (
-                  <Download size={15} color={ui.primary} />
-                )}
-                <Text style={styles.exportBtnText}>Egresos CSV</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                onPress={() => void handleServerExport('expenses', 'xlsx')}
-                disabled={exportingKey !== null}
-                style={styles.exportBtn}
-              >
-                {exportingKey === 'expenses_xlsx' ? (
-                  <ActivityIndicator size="small" color={ui.primary} />
-                ) : (
-                  <FileSpreadsheet size={15} color={ui.primary} />
-                )}
-                <Text style={styles.exportBtnText}>Egresos XLSX</Text>
-              </TouchableOpacity>
-            </View>
-
-            {canViewMargins && (
-              <View style={styles.card}>
-                <Text style={styles.cardTitle}>Exportar Nómina Aprobada</Text>
-                <Text style={styles.mutedText}>
-                  Liquidaciones aprobadas que traslapan con el rango {bounds.fromIso} a {bounds.toIso}.
-                </Text>
-                <View style={styles.exportRow}>
-                  <TouchableOpacity
-                    onPress={() => void handleServerExport('payroll', 'csv')}
-                    disabled={exportingKey !== null}
-                    style={styles.exportBtn}
-                  >
-                    {exportingKey === 'payroll_csv' ? (
-                      <ActivityIndicator size="small" color={ui.primary} />
-                    ) : (
-                      <Download size={15} color={ui.primary} />
-                    )}
-                    <Text style={styles.exportBtnText}>Nómina CSV</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    onPress={() => void handleServerExport('payroll', 'xlsx')}
-                    disabled={exportingKey !== null}
-                    style={styles.exportBtn}
-                  >
-                    {exportingKey === 'payroll_xlsx' ? (
-                      <ActivityIndicator size="small" color={ui.primary} />
-                    ) : (
-                      <FileSpreadsheet size={15} color={ui.primary} />
-                    )}
-                    <Text style={styles.exportBtnText}>Nómina XLSX</Text>
-                  </TouchableOpacity>
+              <View style={styles.kpiRow}>
+                <View style={styles.kpiBox}>
+                  <Text style={styles.kpiLabel}>Deuda Fiados Pendiente</Text>
+                  <Text style={[styles.kpiValue, { color: ui.warning }]}>
+                    {formatPEN(receivables.totalDebt)}
+                  </Text>
+                  <Text style={styles.kpiMeta}>
+                    {receivables.activeFiadosCount} cuentas · {receivables.overdueFiadosCount} venc.
+                  </Text>
+                </View>
+                <View style={styles.kpiBox}>
+                  <Text style={styles.kpiLabel}>Créditos a Favor</Text>
+                  <Text style={[styles.kpiValue, { color: ui.success }]}>
+                    {formatPEN(receivables.totalCreditsInFavor)}
+                  </Text>
+                  <Text style={styles.kpiMeta}>
+                    Vencido: {formatPEN(receivables.overdueDebt)}
+                  </Text>
                 </View>
               </View>
-            )}
 
-            <View style={styles.kpiRow}>
-              <View style={styles.kpiBox}>
-                <Text style={styles.kpiLabel}>Egresos Operativos</Text>
-                <Text style={[styles.kpiValue, { color: ui.danger }]}>
-                  {formatPEN(expensesData.totalOperatingExpenses)}
-                </Text>
-                <Text style={styles.kpiMeta}>
-                  Adelantos: {formatPEN(expensesData.totalEmployeeAdvances)}
-                </Text>
-              </View>
-              <View style={styles.kpiBox}>
-                <Text style={styles.kpiLabel}>Devoluciones Caja</Text>
-                <Text style={styles.kpiValue}>{formatPEN(expensesData.totalRefunds)}</Text>
-                <Text style={styles.kpiMeta}>{expensesData.movementsCount} mov. analizados</Text>
-              </View>
-            </View>
-
-            <View style={styles.card}>
-              <Text style={styles.cardTitle}>Resumen por Categoría</Text>
-              {expensesData.categories.length === 0 ? (
-                <Text style={styles.mutedText}>Sin gastos operativos registrados en este período.</Text>
-              ) : (
-                expensesData.categories.map((cat) => (
-                  <View key={cat.category} style={styles.lineRow}>
-                    <Text style={styles.lineLabel}>
-                      {cat.label} ({cat.count}) · {cat.percentage}%
-                    </Text>
-                    <Text style={[styles.lineValue, { color: ui.danger }]}>
-                      {formatPEN(cat.amount)}
-                    </Text>
-                  </View>
-                ))
-              )}
-            </View>
-
-            {expensesData.recentExpenses.length > 0 && (
               <View style={styles.card}>
-                <Text style={styles.cardTitle}>Últimos Egresos</Text>
-                {expensesData.recentExpenses.slice(0, 12).map((exp) => (
-                  <View key={exp.id} style={styles.lineRow}>
-                    <View style={{ flex: 1, minWidth: 0 }}>
-                      <Text style={styles.lineLabel} numberOfLines={1}>
-                        {exp.reason}
-                      </Text>
-                      <Text style={styles.metaSmall}>
-                        {exp.label} · {formatDatePE(exp.createdAt)}
+                <Text style={styles.cardTitle}>Fiados Pendientes</Text>
+                {receivables.fiados.length === 0 ? (
+                  <Text style={styles.mutedText}>No hay fiados pendientes por cobrar.</Text>
+                ) : (
+                  receivables.fiados.slice(0, 15).map((f) => (
+                    <View key={f.id} style={styles.lineRow}>
+                      <View style={{ flex: 1, minWidth: 0 }}>
+                        <Text style={styles.lineLabel} numberOfLines={1}>
+                          {f.customerName}
+                        </Text>
+                        <Text
+                          style={[
+                            styles.metaSmall,
+                            f.isOverdue && { color: ui.danger, fontWeight: '700' },
+                          ]}
+                        >
+                          {f.isOverdue ? 'VENCIDO · ' : ''}
+                          {f.dueDate ? `Vence: ${formatDatePE(f.dueDate, false)}` : formatDatePE(f.date, false)}
+                        </Text>
+                      </View>
+                      <Text style={[styles.lineValue, f.isOverdue && { color: ui.danger }]}>
+                        {formatPEN(f.remainingAmount)}
                       </Text>
                     </View>
-                    <Text style={[styles.lineValue, { color: ui.danger }]}>
-                      -{formatPEN(exp.amount)}
-                    </Text>
-                  </View>
-                ))}
+                  ))
+                )}
               </View>
-            )}
-          </View>
-        )}
-      </ScrollView>
+
+              <View style={styles.card}>
+                <Text style={styles.cardTitle}>Top Clientes (Deuda / Compras)</Text>
+                {receivables.topCustomers.length === 0 ? (
+                  <Text style={styles.mutedText}>Sin clientes registrados.</Text>
+                ) : (
+                  receivables.topCustomers.slice(0, 10).map((c) => (
+                    <View key={c.id} style={styles.lineRow}>
+                      <View style={{ flex: 1, minWidth: 0 }}>
+                        <Text style={styles.lineLabel} numberOfLines={1}>
+                          {c.name}
+                        </Text>
+                        <Text style={styles.metaSmall}>
+                          {c.totalPurchases} compras · Gastado {formatPEN(c.totalSpent)}
+                        </Text>
+                      </View>
+                      <Text
+                        style={[
+                          styles.lineValue,
+                          c.currentDebt > 0 && { color: ui.warning },
+                        ]}
+                      >
+                        {c.currentDebt > 0 ? `Debe ${formatPEN(c.currentDebt)}` : 'Al día'}
+                      </Text>
+                    </View>
+                  ))
+                )}
+              </View>
+            </View>
+          )}
+
+          {/* 8. EGRESOS & NÓMINA */}
+          {!loading && !tabError && activeTab === 'expenses' && expensesData && (
+            <View style={styles.section}>
+              <View style={styles.exportRow}>
+                <TouchableOpacity
+                  onPress={() => void handleServerExport('expenses', 'csv')}
+                  disabled={exportingKey !== null}
+                  style={styles.exportBtn}
+                >
+                  {exportingKey === 'expenses_csv' ? (
+                    <ActivityIndicator size="small" color={ui.primary} />
+                  ) : (
+                    <Download size={15} color={ui.primary} />
+                  )}
+                  <Text style={styles.exportBtnText}>Egresos CSV</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  onPress={() => void handleServerExport('expenses', 'xlsx')}
+                  disabled={exportingKey !== null}
+                  style={styles.exportBtn}
+                >
+                  {exportingKey === 'expenses_xlsx' ? (
+                    <ActivityIndicator size="small" color={ui.primary} />
+                  ) : (
+                    <FileSpreadsheet size={15} color={ui.primary} />
+                  )}
+                  <Text style={styles.exportBtnText}>Egresos XLSX</Text>
+                </TouchableOpacity>
+              </View>
+
+              {canViewMargins && (
+                <View style={styles.card}>
+                  <Text style={styles.cardTitle}>Exportar Nómina Aprobada</Text>
+                  <Text style={styles.mutedText}>
+                    Liquidaciones aprobadas que traslapan con el rango {bounds.fromIso} a {bounds.toIso}.
+                  </Text>
+                  <View style={styles.exportRow}>
+                    <TouchableOpacity
+                      onPress={() => void handleServerExport('payroll', 'csv')}
+                      disabled={exportingKey !== null}
+                      style={styles.exportBtn}
+                    >
+                      {exportingKey === 'payroll_csv' ? (
+                        <ActivityIndicator size="small" color={ui.primary} />
+                      ) : (
+                        <Download size={15} color={ui.primary} />
+                      )}
+                      <Text style={styles.exportBtnText}>Nómina CSV</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      onPress={() => void handleServerExport('payroll', 'xlsx')}
+                      disabled={exportingKey !== null}
+                      style={styles.exportBtn}
+                    >
+                      {exportingKey === 'payroll_xlsx' ? (
+                        <ActivityIndicator size="small" color={ui.primary} />
+                      ) : (
+                        <FileSpreadsheet size={15} color={ui.primary} />
+                      )}
+                      <Text style={styles.exportBtnText}>Nómina XLSX</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              )}
+
+              <View style={styles.kpiRow}>
+                <View style={styles.kpiBox}>
+                  <Text style={styles.kpiLabel}>Egresos Operativos</Text>
+                  <Text style={[styles.kpiValue, { color: ui.danger }]}>
+                    {formatPEN(expensesData.totalOperatingExpenses)}
+                  </Text>
+                  <Text style={styles.kpiMeta}>
+                    Adelantos: {formatPEN(expensesData.totalEmployeeAdvances)}
+                  </Text>
+                </View>
+                <View style={styles.kpiBox}>
+                  <Text style={styles.kpiLabel}>Devoluciones Caja</Text>
+                  <Text style={styles.kpiValue}>{formatPEN(expensesData.totalRefunds)}</Text>
+                  <Text style={styles.kpiMeta}>{expensesData.movementsCount} mov. analizados</Text>
+                </View>
+              </View>
+
+              <View style={styles.card}>
+                <Text style={styles.cardTitle}>Resumen por Categoría</Text>
+                {expensesData.categories.length === 0 ? (
+                  <Text style={styles.mutedText}>Sin gastos operativos registrados en este período.</Text>
+                ) : (
+                  expensesData.categories.map((cat) => (
+                    <View key={cat.category} style={styles.lineRow}>
+                      <Text style={styles.lineLabel}>
+                        {cat.label} ({cat.count}) · {cat.percentage}%
+                      </Text>
+                      <Text style={[styles.lineValue, { color: ui.danger }]}>
+                        {formatPEN(cat.amount)}
+                      </Text>
+                    </View>
+                  ))
+                )}
+              </View>
+
+              {expensesData.recentExpenses.length > 0 && (
+                <View style={styles.card}>
+                  <Text style={styles.cardTitle}>Últimos Egresos</Text>
+                  {expensesData.recentExpenses.slice(0, 12).map((exp) => (
+                    <View key={exp.id} style={styles.lineRow}>
+                      <View style={{ flex: 1, minWidth: 0 }}>
+                        <Text style={styles.lineLabel} numberOfLines={1}>
+                          {exp.reason}
+                        </Text>
+                        <Text style={styles.metaSmall}>
+                          {exp.label} · {formatDatePE(exp.createdAt)}
+                        </Text>
+                      </View>
+                      <Text style={[styles.lineValue, { color: ui.danger }]}>
+                        -{formatPEN(exp.amount)}
+                      </Text>
+                    </View>
+                  ))}
+                </View>
+              )}
+            </View>
+          )}
+        </ScrollView>
+      )}
 
       {/* P&L Full Modal */}
       {pnlModalVisible && (
@@ -1479,6 +1890,21 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     gap: 8,
     paddingHorizontal: 14,
+  },
+  pillsRowEdge: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  flashListContent: {
+    padding: 14,
+    paddingBottom: 36,
+  },
+  listGap12: {
+    height: 12,
+  },
+  listHeaderBlock: {
+    gap: 12,
+    marginBottom: 12,
   },
   pill: {
     paddingHorizontal: 12,

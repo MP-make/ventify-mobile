@@ -1,4 +1,14 @@
-import { createProfileResolutionGate, loadIdentitySources } from '@/lib/auth-startup';
+import {
+  areCachedProfilesEqual,
+  createProfileResolutionGate,
+  evaluateCachedPlanAccess,
+  loadIdentitySources,
+  parseCachedPlan,
+  parseCachedUserProfile,
+  resolveOptimisticBranchId,
+  shouldRecheckAccessOnForeground,
+  type CachedUserProfileRecord,
+} from '@/lib/auth-startup';
 import React, {
   createContext,
   useContext,
@@ -41,9 +51,16 @@ import {
 import { auth, db } from '@/lib/firebase';
 import { clearRequestCache } from '@/lib/request-cache';
 import { UserProfile } from '@/types';
-import { hasAllBranchesAccess } from '@/lib/branch-access';
+import { canAccessBranch, hasAllBranchesAccess } from '@/lib/branch-access';
+import {
+  effectivePermissions,
+  normalizeRole,
+  type CustomPermissions,
+  type Permission,
+  type Role,
+} from '@/lib/role-permissions';
 import { cartStorageKeys } from '@/lib/cart-scope';
-import { cartKVStorage, catalogKVStorage } from '@/lib/native-kv-storage';
+import { cartKVStorage, catalogKVStorage, metaKVStorage } from '@/lib/native-kv-storage';
 import { productCatalogCacheKey } from '@/lib/product-catalog-cache';
 import {
   PIN_MIN_LENGTH,
@@ -91,7 +108,7 @@ export interface PlanSubscription extends SubscriptionAccess {
   cycle?: string;
 }
 
-export interface AuthContextType {
+export interface AuthSessionContextType {
   user: User | null;
   userProfile: UserProfile | null;
   accountId: string | null;
@@ -101,15 +118,31 @@ export interface AuthContextType {
   customPermissions: CustomUserPermissions | null;
   isActive: boolean;
   isSuperAdmin: boolean;
+  initialized: boolean;
+  loading: boolean;
+  login: (email: string, pass: string) => Promise<void>;
+  signup: (email: string, password: string, businessName: string, ownerName: string) => Promise<void>;
+  sendPasswordReset: (email: string) => Promise<void>;
+  logout: () => Promise<void>;
+  setActiveBranchId: (newBranchId: string) => void;
+  setBranchId: (newBranchId: string) => void;
+  syncAssignedBranchId: (assignedBranchId: string) => void;
+}
+
+export interface NetworkStatusContextType {
+  isOnline: boolean;
+}
+
+export interface PlanAccessContextType {
   limits: PlanLimits | null;
   subscription: PlanSubscription | null;
-  isOnline: boolean;
   accessChecking: boolean;
   accessError: string | null;
   accessBlocked: string | null;
   refreshAccess: () => Promise<void>;
-  initialized: boolean;
-  loading: boolean;
+}
+
+export interface PinLockContextType {
   isPinLocked: boolean;
   pinCode: string;
   pinLength: number;
@@ -118,16 +151,72 @@ export interface AuthContextType {
   closePinSetup: () => void;
   pinFailedAttempts: number;
   pinLockoutUntil: number | null;
-  login: (email: string, pass: string) => Promise<void>;
-  signup: (email: string, password: string, businessName: string, ownerName: string) => Promise<void>;
-  sendPasswordReset: (email: string) => Promise<void>;
-  logout: () => Promise<void>;
-  setActiveBranchId: (newBranchId: string) => void;
-  setBranchId: (newBranchId: string) => void;
-  syncAssignedBranchId: (assignedBranchId: string) => void;
   lockTerminal: () => void;
   unlockWithPin: (enteredPin: string) => boolean;
   updatePinCode: (newPin: string) => Promise<void>;
+}
+
+export interface AuthContextType
+  extends AuthSessionContextType,
+    NetworkStatusContextType,
+    PlanAccessContextType,
+    PinLockContextType {}
+
+export interface TransferScopeTarget {
+  sourceBranchId: string;
+  destinationBranchId: string;
+}
+
+export interface TransferStatusTarget extends TransferScopeTarget {
+  status: string;
+}
+
+export interface UsePermissionsResult {
+  role: Role;
+  userRole: Role;
+  userBranchId: string;
+  permissions: Permission[];
+  getEffectivePermissions: () => Permission[];
+  getUserRole: () => Role;
+  hasPermission: (permission: Permission) => boolean;
+  hasAnyPermission: (permissions: Permission[]) => boolean;
+  hasAllPermissions: (permissions: Permission[]) => boolean;
+  canManageProducts: boolean;
+  canManageUsers: boolean;
+  canViewReports: boolean;
+  canAccessDashboard: boolean;
+  canViewMargins: boolean;
+  canViewInventoryValue: boolean;
+  canModifyPrice: boolean;
+  canApplyDiscount: boolean;
+  canManageDiscounts: boolean;
+  canProcessReturn: boolean;
+  canCreateCreditNotes: boolean;
+  canManageInventoryAdjustments: boolean;
+  canRequestTransfer: boolean;
+  canApproveTransfer: boolean;
+  canManageTransfers: boolean;
+  canManageCashRegister: boolean;
+  canManageCustomers: boolean;
+  canManageSettings: boolean;
+  isOwner: boolean;
+  isAdmin: boolean;
+  isManager: boolean;
+  isCashier: boolean;
+  isSeller: boolean;
+  hasMultiBranchAccess: boolean;
+  canViewAllCashSessions: boolean;
+  canViewBranchCashSessions: boolean;
+  canCreateDirectTransfer: boolean;
+  canViewOwnCashSession: boolean;
+  canRequestTransferFromBranch: (targetBranchId: string) => boolean;
+  canApproveTransferToBranch: (targetBranchId: string) => boolean;
+  canViewTransfer: (transfer: TransferScopeTarget) => boolean;
+  canUpdateTransferStatus: (transfer: TransferStatusTarget, newStatus: string) => boolean;
+  isSuperAdmin: boolean;
+  hasAllBranchesAccess: boolean;
+  allBranchesAccess: boolean;
+  canAccessBranch: (targetBranchId?: string | null) => boolean;
 }
 
 const STORAGE_ACCOUNT_ID_KEY = '@ventify_mobile_account_id';
@@ -138,8 +227,8 @@ const PLAN_CACHE_PREFIX = '@ventify_plan:';
 const USER_PROFILE_CACHE_PREFIX = '@ventify_user_profile_v1:';
 const SETTINGS_CACHE_PREFIX = '@ventify_settings_cache_v1:';
 const CASH_SESSION_CACHE_PREFIX = '@ventify_cash_session_cache_v1:';
-const PLAN_CACHE_ONLINE_TTL_MS = 6 * 3600000;
-const PLAN_CACHE_OFFLINE_TTL_MS = 72 * 3600000;
+const PIN_ATTEMPTS_MIGRATED_KEY = '@ventify_kv_pin_attempts_migrated_v1';
+const PIN_FALLBACK_MIGRATED_KEY = '@ventify_kv_pin_fallback_migrated_v1';
 
 interface CachedPlanPayload {
   limits?: PlanLimits | null;
@@ -147,59 +236,111 @@ interface CachedPlanPayload {
   cachedAt: number;
 }
 
-interface CachedUserProfile {
-  accountId: string | null;
-  branchId?: string | null;
-  role: UserRole;
-  allBranchesAccess: boolean;
-  customPermissions: CustomUserPermissions | null;
-  isActive: boolean;
-  displayName?: string | null;
-  photoURL?: string | null;
-  email?: string | null;
-  cachedAt: number;
-}
+type CachedUserProfile = CachedUserProfileRecord;
 
-const VALID_USER_ROLES: readonly UserRole[] = ['owner', 'admin', 'manager', 'cashier', 'seller'];
-
-async function readCachedUserProfile(uid: string): Promise<CachedUserProfile | null> {
-  if (!uid) return null;
+function readMetaItemSync(key: string): string | null {
+  if (!metaKVStorage.isSyncCapable) return null;
   try {
-    const raw = await AsyncStorage.getItem(`${USER_PROFILE_CACHE_PREFIX}${uid}`);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as Partial<CachedUserProfile> | null;
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
-    const role =
-      typeof parsed.role === 'string' && VALID_USER_ROLES.includes(parsed.role as UserRole)
-        ? (parsed.role as UserRole)
-        : 'cashier';
-    const rawPerms = parsed.customPermissions;
-    const customPermissions =
-      rawPerms && typeof rawPerms === 'object'
-        ? {
-            granted: Array.isArray(rawPerms.granted)
-              ? rawPerms.granted.filter((item): item is string => typeof item === 'string')
-              : [],
-            revoked: Array.isArray(rawPerms.revoked)
-              ? rawPerms.revoked.filter((item): item is string => typeof item === 'string')
-              : [],
-          }
-        : null;
-    return {
-      accountId: typeof parsed.accountId === 'string' && parsed.accountId ? parsed.accountId : null,
-      branchId: typeof parsed.branchId === 'string' && parsed.branchId ? parsed.branchId : undefined,
-      role,
-      allBranchesAccess: Boolean(parsed.allBranchesAccess),
-      customPermissions,
-      isActive: parsed.isActive !== false,
-      displayName: typeof parsed.displayName === 'string' ? parsed.displayName : null,
-      photoURL: typeof parsed.photoURL === 'string' ? parsed.photoURL : null,
-      email: typeof parsed.email === 'string' ? parsed.email : null,
-      cachedAt: typeof parsed.cachedAt === 'number' ? parsed.cachedAt : 0,
-    };
+    return metaKVStorage.getItemSync(key);
   } catch {
     return null;
   }
+}
+
+async function readMetaItem(
+  key: string,
+  options?: { migrationSentinel?: string }
+): Promise<string | null> {
+  if (metaKVStorage.isSyncCapable) {
+    try {
+      const syncValue = metaKVStorage.getItemSync(key);
+      if (syncValue !== null) return syncValue;
+      if (options?.migrationSentinel && metaKVStorage.getItemSync(options.migrationSentinel) === '1') {
+        return null;
+      }
+    } catch {
+      // Continue to fallback below
+    }
+
+    try {
+      const legacyValue = await AsyncStorage.getItem(key);
+      if (legacyValue !== null) {
+        metaKVStorage.setItemSync(key, legacyValue);
+        void AsyncStorage.removeItem(key).catch(() => {});
+      }
+      if (options?.migrationSentinel) {
+        metaKVStorage.setItemSync(options.migrationSentinel, '1');
+      }
+      return legacyValue ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  try {
+    return (await metaKVStorage.getItem(key)) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeMetaItem(key: string, value: string): Promise<void> {
+  try {
+    if (metaKVStorage.isSyncCapable) {
+      metaKVStorage.setItemSync(key, value);
+      return;
+    }
+    await metaKVStorage.setItem(key, value);
+  } catch {
+    // Ignore storage write errors so auth flow never fails
+  }
+}
+
+function writeMetaItemSyncOrAsync(key: string, value: string): void {
+  try {
+    if (metaKVStorage.isSyncCapable) {
+      metaKVStorage.setItemSync(key, value);
+      return;
+    }
+    void metaKVStorage.setItem(key, value).catch(() => {});
+  } catch {
+    // Ignore storage write errors
+  }
+}
+
+async function removeMetaItem(key: string): Promise<void> {
+  try {
+    if (metaKVStorage.isSyncCapable) {
+      metaKVStorage.removeItemSync(key);
+      return;
+    }
+    await metaKVStorage.removeItem(key);
+  } catch {
+    // Ignore storage delete errors
+  }
+}
+
+function removeMetaItemSyncOrAsync(key: string): void {
+  try {
+    if (metaKVStorage.isSyncCapable) {
+      metaKVStorage.removeItemSync(key);
+      return;
+    }
+    void metaKVStorage.removeItem(key).catch(() => {});
+  } catch {
+    // Ignore storage delete errors
+  }
+}
+
+function readCachedUserProfileSync(uid: string): CachedUserProfile | null {
+  if (!uid) return null;
+  return parseCachedUserProfile(readMetaItemSync(`${USER_PROFILE_CACHE_PREFIX}${uid}`));
+}
+
+async function readCachedUserProfile(uid: string): Promise<CachedUserProfile | null> {
+  if (!uid) return null;
+  const raw = await readMetaItem(`${USER_PROFILE_CACHE_PREFIX}${uid}`);
+  return parseCachedUserProfile(raw);
 }
 
 async function writeCachedUserProfile(
@@ -211,16 +352,19 @@ async function writeCachedUserProfile(
     const record: CachedUserProfile = {
       accountId: payload.accountId ?? null,
       branchId: payload.branchId ?? undefined,
+      profileBranchId: payload.profileBranchId,
+      hasExplicitAccountId: payload.hasExplicitAccountId,
       role: payload.role,
       allBranchesAccess: Boolean(payload.allBranchesAccess),
       customPermissions: payload.customPermissions ?? null,
       isActive: payload.isActive !== false,
+      isSuperAdmin: Boolean(payload.isSuperAdmin),
       displayName: payload.displayName ?? null,
       photoURL: payload.photoURL ?? null,
       email: payload.email ?? null,
       cachedAt: typeof payload.cachedAt === 'number' ? payload.cachedAt : Date.now(),
     };
-    await AsyncStorage.setItem(`${USER_PROFILE_CACHE_PREFIX}${uid}`, JSON.stringify(record));
+    await writeMetaItem(`${USER_PROFILE_CACHE_PREFIX}${uid}`, JSON.stringify(record));
   } catch {
     // Ignore storage write errors so auth flow never fails
   }
@@ -236,7 +380,7 @@ function sameJsonValue<T>(a: T, b: T): boolean {
   }
 }
 
-const AuthContext = createContext<AuthContextType>({
+const DEFAULT_AUTH_SESSION: AuthSessionContextType = {
   user: null,
   userProfile: null,
   accountId: null,
@@ -246,15 +390,31 @@ const AuthContext = createContext<AuthContextType>({
   customPermissions: null,
   isActive: true,
   isSuperAdmin: false,
+  initialized: false,
+  loading: true,
+  login: async () => {},
+  signup: async () => {},
+  sendPasswordReset: async () => {},
+  logout: async () => {},
+  setActiveBranchId: () => {},
+  setBranchId: () => {},
+  syncAssignedBranchId: () => {},
+};
+
+const DEFAULT_NETWORK_STATUS: NetworkStatusContextType = {
+  isOnline: true,
+};
+
+const DEFAULT_PLAN_ACCESS: PlanAccessContextType = {
   limits: null,
   subscription: null,
-  isOnline: true,
   accessChecking: true,
   accessError: null,
   accessBlocked: null,
   refreshAccess: async () => {},
-  initialized: false,
-  loading: true,
+};
+
+const DEFAULT_PIN_LOCK: PinLockContextType = {
   isPinLocked: false,
   pinCode: '',
   pinLength: PIN_MIN_LENGTH,
@@ -263,17 +423,289 @@ const AuthContext = createContext<AuthContextType>({
   closePinSetup: () => {},
   pinFailedAttempts: 0,
   pinLockoutUntil: null,
-  login: async () => {},
-  signup: async () => {},
-  sendPasswordReset: async () => {},
-  logout: async () => {},
-  setActiveBranchId: () => {},
-  setBranchId: () => {},
-  syncAssignedBranchId: () => {},
   lockTerminal: () => {},
   unlockWithPin: () => false,
   updatePinCode: async () => {},
+};
+
+const AuthSessionContext = createContext<AuthSessionContextType>(DEFAULT_AUTH_SESSION);
+const NetworkStatusContext = createContext<NetworkStatusContextType>(DEFAULT_NETWORK_STATUS);
+const PlanAccessContext = createContext<PlanAccessContextType>(DEFAULT_PLAN_ACCESS);
+const PinLockContext = createContext<PinLockContextType>(DEFAULT_PIN_LOCK);
+const AuthContext = createContext<AuthContextType>({
+  ...DEFAULT_AUTH_SESSION,
+  ...DEFAULT_NETWORK_STATUS,
+  ...DEFAULT_PLAN_ACCESS,
+  ...DEFAULT_PIN_LOCK,
 });
+
+export const PermissionsContext = createContext<UsePermissionsResult | null>(null);
+
+export function useComputedPermissions(params: {
+  role: UserRole | string;
+  customPermissions: CustomUserPermissions | null | undefined;
+  branchId: string;
+  allBranchesAccess: boolean;
+  isSuperAdmin: boolean;
+}): UsePermissionsResult {
+  const { role, customPermissions, branchId, allBranchesAccess, isSuperAdmin } = params;
+
+  const canonicalRole: Role = useMemo(() => normalizeRole(role), [role]);
+  const typedCustomPermissions = customPermissions as CustomPermissions | null | undefined;
+
+  const userPermissions = useMemo<Permission[]>(
+    () => effectivePermissions(canonicalRole, typedCustomPermissions),
+    [canonicalRole, typedCustomPermissions]
+  );
+
+  const permissionSet = useMemo(() => new Set<Permission>(userPermissions), [userPermissions]);
+
+  const getEffectivePermissions = useCallback((): Permission[] => userPermissions, [userPermissions]);
+
+  const hasPermission = useCallback(
+    (permission: Permission): boolean => permissionSet.has(permission),
+    [permissionSet]
+  );
+
+  const hasAnyPermission = useCallback(
+    (permissions: Permission[]): boolean => permissions.some((p) => permissionSet.has(p)),
+    [permissionSet]
+  );
+
+  const hasAllPermissions = useCallback(
+    (permissions: Permission[]): boolean => permissions.every((p) => permissionSet.has(p)),
+    [permissionSet]
+  );
+
+  const derived = useMemo(() => {
+    const canManageProducts = permissionSet.has('manage_products');
+    const canManageUsers = permissionSet.has('manage_users');
+    const canViewReports = permissionSet.has('view_reports');
+    const canAccessDashboard = permissionSet.has('access_dashboard');
+    const canViewMargins = permissionSet.has('view_margins');
+    const canViewInventoryValue = permissionSet.has('view_inventory_value');
+    const canModifyPrice = permissionSet.has('modify_price');
+    const canApplyDiscount = canModifyPrice;
+    const canManageDiscounts = permissionSet.has('manage_discounts');
+    const canProcessReturn = permissionSet.has('process_return');
+    const canCreateCreditNotes = permissionSet.has('create_credit_notes');
+    const canManageInventoryAdjustments = permissionSet.has('manage_inventory_adjustments');
+    const canRequestTransfer = permissionSet.has('request_transfer');
+    const canApproveTransfer = permissionSet.has('approve_transfer');
+    const canManageTransfers = permissionSet.has('manage_transfers');
+    const canManageCashRegister = permissionSet.has('manage_cash_register');
+    const canManageCustomers = permissionSet.has('manage_customers');
+    const canManageSettings = permissionSet.has('manage_settings');
+
+    const isOwner = canonicalRole === 'owner';
+    const isAdmin = canonicalRole === 'admin';
+    const isManager = canonicalRole === 'manager';
+    const isCashier = canonicalRole === 'cashier';
+    const isSeller = canonicalRole === 'seller';
+
+    const hasMultiBranchAccess = hasAllBranchesAccess({
+      role: canonicalRole,
+      allBranchesAccess,
+    });
+    const canViewAllCashSessions = isOwner || isAdmin;
+    const canViewBranchCashSessions = isOwner || isAdmin || isManager || canManageCashRegister;
+    const canCreateDirectTransfer = isOwner || isAdmin;
+
+    return {
+      canManageProducts,
+      canManageUsers,
+      canViewReports,
+      canAccessDashboard,
+      canViewMargins,
+      canViewInventoryValue,
+      canModifyPrice,
+      canApplyDiscount,
+      canManageDiscounts,
+      canProcessReturn,
+      canCreateCreditNotes,
+      canManageInventoryAdjustments,
+      canRequestTransfer,
+      canApproveTransfer,
+      canManageTransfers,
+      canManageCashRegister,
+      canManageCustomers,
+      canManageSettings,
+      isOwner,
+      isAdmin,
+      isManager,
+      isCashier,
+      isSeller,
+      hasMultiBranchAccess,
+      canViewAllCashSessions,
+      canViewBranchCashSessions,
+      canCreateDirectTransfer,
+    };
+  }, [permissionSet, canonicalRole, allBranchesAccess]);
+
+  const checkCanAccessBranch = useCallback(
+    (targetBranchId?: string | null): boolean =>
+      canAccessBranch({ role: canonicalRole, branchId, allBranchesAccess }, targetBranchId),
+    [canonicalRole, branchId, allBranchesAccess]
+  );
+
+  const canRequestTransferFromBranch = useCallback(
+    (targetBranchId: string): boolean => {
+      if (!derived.canRequestTransfer) return false;
+      if (derived.isOwner || derived.isAdmin) return true;
+      if (derived.isManager || derived.isCashier) {
+        return canAccessBranch({ role: canonicalRole, branchId, allBranchesAccess }, targetBranchId);
+      }
+      return false;
+    },
+    [
+      derived.canRequestTransfer,
+      derived.isOwner,
+      derived.isAdmin,
+      derived.isManager,
+      derived.isCashier,
+      canonicalRole,
+      branchId,
+      allBranchesAccess,
+    ]
+  );
+
+  const canApproveTransferToBranch = useCallback(
+    (targetBranchId: string): boolean => {
+      if (!derived.canApproveTransfer) return false;
+      if (derived.isOwner || derived.isAdmin) return true;
+      if (derived.isManager) {
+        return canAccessBranch({ role: canonicalRole, branchId, allBranchesAccess }, targetBranchId);
+      }
+      return false;
+    },
+    [
+      derived.canApproveTransfer,
+      derived.isOwner,
+      derived.isAdmin,
+      derived.isManager,
+      canonicalRole,
+      branchId,
+      allBranchesAccess,
+    ]
+  );
+
+  const canViewTransfer = useCallback(
+    (transfer: TransferScopeTarget): boolean => {
+      if (derived.isOwner || derived.isAdmin) return true;
+      if (derived.isManager || derived.isCashier) {
+        return (
+          derived.hasMultiBranchAccess ||
+          branchId === transfer.sourceBranchId ||
+          branchId === transfer.destinationBranchId
+        );
+      }
+      return false;
+    },
+    [
+      derived.isOwner,
+      derived.isAdmin,
+      derived.isManager,
+      derived.isCashier,
+      derived.hasMultiBranchAccess,
+      branchId,
+    ]
+  );
+
+  const canUpdateTransferStatus = useCallback(
+    (transfer: TransferStatusTarget, newStatus: string): boolean => {
+      if (derived.isOwner || derived.isAdmin) return true;
+      switch (newStatus) {
+        case 'approved':
+        case 'rejected':
+          return (
+            derived.isManager &&
+            (derived.hasMultiBranchAccess || branchId === transfer.destinationBranchId) &&
+            transfer.status === 'pending'
+          );
+        case 'in_transit':
+          return (
+            (derived.isManager || derived.isCashier) &&
+            (derived.hasMultiBranchAccess || branchId === transfer.sourceBranchId) &&
+            transfer.status === 'approved'
+          );
+        case 'completed':
+          return (
+            (derived.isManager || derived.isCashier) &&
+            (derived.hasMultiBranchAccess || branchId === transfer.destinationBranchId) &&
+            (transfer.status === 'in_transit' || transfer.status === 'approved')
+          );
+        default:
+          return false;
+      }
+    },
+    [
+      derived.isOwner,
+      derived.isAdmin,
+      derived.isManager,
+      derived.isCashier,
+      derived.hasMultiBranchAccess,
+      branchId,
+    ]
+  );
+
+  const getUserRole = useCallback((): Role => canonicalRole, [canonicalRole]);
+
+  return useMemo<UsePermissionsResult>(
+    () => ({
+      role: canonicalRole,
+      userRole: canonicalRole,
+      userBranchId: branchId,
+      permissions: userPermissions,
+      getEffectivePermissions,
+      getUserRole,
+      hasPermission,
+      hasAnyPermission,
+      hasAllPermissions,
+      ...derived,
+      canViewOwnCashSession: true,
+      canRequestTransferFromBranch,
+      canApproveTransferToBranch,
+      canViewTransfer,
+      canUpdateTransferStatus,
+      isSuperAdmin,
+      hasAllBranchesAccess: derived.hasMultiBranchAccess,
+      allBranchesAccess: derived.hasMultiBranchAccess,
+      canAccessBranch: checkCanAccessBranch,
+    }),
+    [
+      canonicalRole,
+      branchId,
+      userPermissions,
+      getEffectivePermissions,
+      getUserRole,
+      hasPermission,
+      hasAnyPermission,
+      hasAllPermissions,
+      derived,
+      canRequestTransferFromBranch,
+      canApproveTransferToBranch,
+      canViewTransfer,
+      canUpdateTransferStatus,
+      isSuperAdmin,
+      checkCanAccessBranch,
+    ]
+  );
+}
+
+export const PermissionsProvider: React.FC<{ children: React.ReactNode }> = React.memo(
+  ({ children }) => {
+    const { role, customPermissions, branchId, allBranchesAccess, isSuperAdmin } =
+      useContext(AuthSessionContext);
+    const value = useComputedPermissions({
+      role,
+      customPermissions,
+      branchId,
+      allBranchesAccess,
+      isSuperAdmin,
+    });
+    return <PermissionsContext.Provider value={value}>{children}</PermissionsContext.Provider>;
+  }
+);
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [user, setUser] = useState<User | null>(null);
@@ -316,6 +748,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const isSuperAdminRef = useRef<boolean>(false);
   const subscriptionRef = useRef<PlanSubscription | null>(null);
   const checkedAccessScopeRef = useRef<string | null>(null);
+  const lastAccessCheckAtRef = useRef<number>(0);
+  const lastWrittenProfileRef = useRef<{
+    uid: string;
+    payload: Omit<CachedUserProfile, 'cachedAt'>;
+  } | null>(null);
+  const lastWrittenAccountIdRef = useRef<string | null>(null);
+  const lastWrittenBranchIdRef = useRef<string | null>(null);
+  const userProfileBranchIdRef = useRef<string | undefined>(undefined);
   const pinMetaLoadedRef = useRef<boolean>(false);
   const branchIdRef = useRef<string>('main');
 
@@ -325,6 +765,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   isActiveRef.current = isActive;
   isSuperAdminRef.current = isSuperAdmin;
   subscriptionRef.current = subscription;
+  userProfileBranchIdRef.current = userProfile?.branchId;
   if (user?.uid || accountId) {
     lastSessionRef.current = {
       uid: user?.uid ?? lastSessionRef.current.uid,
@@ -345,13 +786,17 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const isSecureAvailable = await SecureStore.isAvailableAsync();
       if (isSecureAvailable) {
         await SecureStore.setItemAsync(SECURE_PIN_KEY, serialized);
+        await removeMetaItem(SECURE_PIN_KEY);
         await AsyncStorage.removeItem(SECURE_PIN_KEY).catch(() => {});
         return;
       }
     } catch {
-      // Fallback to AsyncStorage below
+      // Fallback to metaKVStorage below
     }
-    await AsyncStorage.setItem(SECURE_PIN_KEY, serialized).catch(() => {});
+    await writeMetaItem(SECURE_PIN_KEY, serialized);
+    if (metaKVStorage.isSyncCapable) {
+      await AsyncStorage.removeItem(SECURE_PIN_KEY).catch(() => {});
+    }
   }, []);
 
   const clearSessionCaches = useCallback(
@@ -389,19 +834,29 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         }
       }
 
+      const metaKeysToRemove = new Set<string>([
+        STORAGE_ACCOUNT_ID_KEY,
+        STORAGE_BRANCH_ID_KEY,
+      ]);
       const asyncKeysToRemove = new Set<string>([
         STORAGE_ACCOUNT_ID_KEY,
         STORAGE_BRANCH_ID_KEY,
         '@ventify_pos_cart',
       ]);
       if (uidToClear) {
-        asyncKeysToRemove.add(`${USER_PROFILE_CACHE_PREFIX}${uidToClear}`);
+        const userKey = `${USER_PROFILE_CACHE_PREFIX}${uidToClear}`;
+        metaKeysToRemove.add(userKey);
+        asyncKeysToRemove.add(userKey);
       }
       if (accountToClear) {
-        asyncKeysToRemove.add(`${SETTINGS_CACHE_PREFIX}${accountToClear}`);
+        const settingsKey = `${SETTINGS_CACHE_PREFIX}${accountToClear}`;
+        metaKeysToRemove.add(settingsKey);
+        asyncKeysToRemove.add(settingsKey);
       }
       if (uidToClear && accountToClear) {
-        asyncKeysToRemove.add(`${PLAN_CACHE_PREFIX}${uidToClear}:${accountToClear}`);
+        const planKey = `${PLAN_CACHE_PREFIX}${uidToClear}:${accountToClear}`;
+        metaKeysToRemove.add(planKey);
+        asyncKeysToRemove.add(planKey);
       }
 
       try {
@@ -425,7 +880,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         // Ignore key enumeration failure
       }
 
+      const metaKeysArray = Array.from(metaKeysToRemove);
       await Promise.all([
+        metaKeysArray.length > 0
+          ? metaKVStorage.multiRemove(metaKeysArray).catch(() => {})
+          : Promise.resolve(),
         AsyncStorage.multiRemove(Array.from(asyncKeysToRemove)).catch(() => {}),
         cartKeysToRemove.length > 0
           ? cartKVStorage.multiRemove(Array.from(new Set(cartKeysToRemove))).catch(() => {})
@@ -473,23 +932,22 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     async function loadStoredAuthMeta() {
       try {
-        const [securePin, asyncPin, rawAttempts] = await Promise.all([
-          (async () => {
-            try {
-              const isSecureAvailable = await SecureStore.isAvailableAsync();
-              if (isSecureAvailable) {
-                return await SecureStore.getItemAsync(SECURE_PIN_KEY);
-              }
-            } catch {
-              // Fallback a AsyncStorage
-            }
-            return null;
-          })(),
-          AsyncStorage.getItem(SECURE_PIN_KEY).catch(() => null),
-          AsyncStorage.getItem(STORAGE_PIN_ATTEMPTS_KEY).catch(() => null),
-        ]);
+        let savedPinRaw: string | null = null;
+        try {
+          const isSecureAvailable = await SecureStore.isAvailableAsync();
+          if (isSecureAvailable) {
+            savedPinRaw = await SecureStore.getItemAsync(SECURE_PIN_KEY);
+          }
+        } catch {
+          // Fallback to metaKVStorage below
+        }
 
-        const savedPinRaw = securePin || asyncPin;
+        if (!savedPinRaw) {
+          savedPinRaw = await readMetaItem(SECURE_PIN_KEY, {
+            migrationSentinel: PIN_FALLBACK_MIGRATED_KEY,
+          });
+        }
+
         const parsedPin = parseStoredPin(savedPinRaw);
         if (parsedPin && savedPinRaw && isMounted) {
           storedPinRawRef.current = savedPinRaw;
@@ -497,6 +955,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           setHasConfiguredPin(true);
         }
 
+        const rawAttempts =
+          readMetaItemSync(STORAGE_PIN_ATTEMPTS_KEY) ??
+          (await readMetaItem(STORAGE_PIN_ATTEMPTS_KEY, {
+            migrationSentinel: PIN_ATTEMPTS_MIGRATED_KEY,
+          }));
         if (rawAttempts && isMounted) {
           try {
             const parsedAttempts = JSON.parse(rawAttempts) as Partial<PinAttemptState>;
@@ -533,7 +996,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     (firebaseUser: User) =>
       resolveProfileOnce(firebaseUser.uid, async () => {
         try {
-          const cachedProfilePromise = readCachedUserProfile(firebaseUser.uid);
+          const syncCachedProfile = readCachedUserProfileSync(firebaseUser.uid);
+          const cachedProfilePromise = syncCachedProfile
+            ? Promise.resolve(syncCachedProfile)
+            : readCachedUserProfile(firebaseUser.uid);
 
           let resolvedAccountId: string | null = null;
           let resolvedRole: UserRole = 'cashier';
@@ -544,6 +1010,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           let hasClaimsAllBranches = false;
           let hasFreshUserDoc = false;
           let freshIsActive = true;
+          let freshIsSuperAdmin = false;
+          let freshHasExplicitAccountId = false;
+          let freshProfileBranchId: string | null = null;
           let freshDisplayName: string | null | undefined = firebaseUser.displayName;
           let freshPhotoURL: string | null | undefined = firebaseUser.photoURL;
 
@@ -560,7 +1029,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             const tokenResult = claimsResult.value;
             const claims = tokenResult.claims;
             if (auth.currentUser?.uid !== firebaseUser.uid) return null;
-            setIsSuperAdmin(claims.isSuperAdmin === true || claims.superAdmin === true);
+            freshIsSuperAdmin = claims.isSuperAdmin === true || claims.superAdmin === true;
+            isSuperAdminRef.current = freshIsSuperAdmin;
+            setIsSuperAdmin(freshIsSuperAdmin);
 
             if (claims.accountId) {
               resolvedAccountId = String(claims.accountId);
@@ -595,15 +1066,18 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
               if (auth.currentUser?.uid !== firebaseUser.uid) return null;
               hasFreshUserDoc = true;
               freshIsActive = uData.isActive !== false;
+              isActiveRef.current = freshIsActive;
               setIsActive(freshIsActive);
               if (uData.accountId) {
                 resolvedAccountId = uData.accountId;
+                freshHasExplicitAccountId = true;
               }
               if (uData.role) {
                 resolvedRole = uData.role as UserRole;
               }
               if (uData.branchId) {
                 resolvedBranchId = uData.branchId;
+                freshProfileBranchId = uData.branchId;
               }
               if (uData.allBranchesAccess !== undefined) {
                 resolvedAllBranches = Boolean(uData.allBranchesAccess);
@@ -634,7 +1108,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
           if (shouldHydrateFromCache) {
             if (auth.currentUser?.uid !== firebaseUser.uid) return null;
-            setIsActive(cachedProfile?.isActive !== false);
+            freshIsActive = cachedProfile?.isActive !== false;
+            isActiveRef.current = freshIsActive;
+            setIsActive(freshIsActive);
             if (!resolvedAccountId && cachedProfile?.accountId) {
               resolvedAccountId = cachedProfile.accountId;
             }
@@ -654,10 +1130,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             if (!resolvedAccountId || !resolvedBranchId || resolvedBranchId === 'main') {
               const [storedAccountId, storedBranchId] = await Promise.all([
                 !resolvedAccountId
-                  ? AsyncStorage.getItem(STORAGE_ACCOUNT_ID_KEY).catch(() => null)
+                  ? (readMetaItemSync(STORAGE_ACCOUNT_ID_KEY) ?? readMetaItem(STORAGE_ACCOUNT_ID_KEY))
                   : Promise.resolve(null),
                 !resolvedBranchId || resolvedBranchId === 'main'
-                  ? AsyncStorage.getItem(STORAGE_BRANCH_ID_KEY).catch(() => null)
+                  ? (readMetaItemSync(STORAGE_BRANCH_ID_KEY) ?? readMetaItem(STORAGE_BRANCH_ID_KEY))
                   : Promise.resolve(null),
               ]);
               if (auth.currentUser?.uid !== firebaseUser.uid) return null;
@@ -702,27 +1178,53 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             }
           }
 
-          // 4. Si el usuario no tiene branchId fijo en su perfil, resolver la sucursal principal
+          // 4. Si el usuario multisede no tiene branchId válido cacheado ni fijo en su perfil, resolver la sucursal principal
           if (resolvedAccountId && (!resolvedBranchId || resolvedBranchId === 'main')) {
             if (resolvedRole !== 'seller') {
-              try {
-                const branchSnap = await getDocs(
-                  query(collection(db, 'branches'), where('accountId', '==', resolvedAccountId), limit(10))
-                );
-                if (!branchSnap.empty) {
-                  const activeDocs = branchSnap.docs.filter((d) => d.data().isActive !== false);
-                  if (activeDocs.length > 0) {
-                    const principalDoc =
-                      activeDocs.find((d) =>
-                        String(d.data().name || '')
-                          .toUpperCase()
-                          .includes('PRINCIPAL')
-                      ) || activeDocs[0];
-                    resolvedBranchId = principalDoc.id;
-                  }
+              const multiBranch = hasAllBranchesAccess({
+                role: resolvedRole,
+                allBranchesAccess: resolvedAllBranches,
+              });
+              if (multiBranch) {
+                const cachedAccount =
+                  readMetaItemSync(STORAGE_ACCOUNT_ID_KEY) ??
+                  (await readMetaItem(STORAGE_ACCOUNT_ID_KEY));
+                const cachedBranch =
+                  readMetaItemSync(STORAGE_BRANCH_ID_KEY) ??
+                  (await readMetaItem(STORAGE_BRANCH_ID_KEY));
+                if (
+                  cachedBranch &&
+                  cachedBranch !== 'main' &&
+                  (!cachedAccount || cachedAccount === resolvedAccountId)
+                ) {
+                  resolvedBranchId = cachedBranch;
                 }
-              } catch (branchErr) {
-                console.warn('[AuthContext] Error resolving default branch:', branchErr);
+              }
+
+              if (!resolvedBranchId || resolvedBranchId === 'main') {
+                try {
+                  const branchSnap = await getDocs(
+                    query(
+                      collection(db, 'branches'),
+                      where('accountId', '==', resolvedAccountId),
+                      limit(10)
+                    )
+                  );
+                  if (!branchSnap.empty) {
+                    const activeDocs = branchSnap.docs.filter((d) => d.data().isActive !== false);
+                    if (activeDocs.length > 0) {
+                      const principalDoc =
+                        activeDocs.find((d) =>
+                          String(d.data().name || '')
+                            .toUpperCase()
+                            .includes('PRINCIPAL')
+                        ) || activeDocs[0];
+                      resolvedBranchId = principalDoc.id;
+                    }
+                  }
+                } catch (branchErr) {
+                  console.warn('[AuthContext] Error resolving default branch:', branchErr);
+                }
               }
             }
           }
@@ -731,7 +1233,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             if (cachedProfile?.branchId && cachedProfile.branchId !== 'main') {
               resolvedBranchId = cachedProfile.branchId;
             } else if (!shouldHydrateFromCache) {
-              const storedBranchId = await AsyncStorage.getItem(STORAGE_BRANCH_ID_KEY).catch(() => null);
+              const storedBranchId =
+                readMetaItemSync(STORAGE_BRANCH_ID_KEY) ??
+                (await readMetaItem(STORAGE_BRANCH_ID_KEY));
               if (storedBranchId) {
                 resolvedBranchId = storedBranchId;
               }
@@ -740,11 +1244,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
           resolvedAllBranches = hasAllBranchesAccess({
             role: resolvedRole,
-            branchId: resolvedBranchId,
             allBranchesAccess: resolvedAllBranches,
           });
 
           if (auth.currentUser?.uid !== firebaseUser.uid) return null;
+          identityRef.current = `${firebaseUser.uid}:${resolvedAccountId || ''}`;
+          branchIdRef.current = resolvedBranchId || 'main';
           setAccountId(resolvedAccountId);
           setRole(resolvedRole);
           setAllBranchesAccess(resolvedAllBranches);
@@ -754,25 +1259,41 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           setBranchIdState(resolvedBranchId || 'main');
 
           if (hasFreshUserDoc) {
-            void writeCachedUserProfile(firebaseUser.uid, {
+            const profilePayload: Omit<CachedUserProfile, 'cachedAt'> = {
               accountId: resolvedAccountId,
               branchId: resolvedBranchId,
+              profileBranchId: freshProfileBranchId,
+              hasExplicitAccountId: freshHasExplicitAccountId,
               role: resolvedRole,
               allBranchesAccess: resolvedAllBranches,
               customPermissions: resolvedCustomPermissions,
               isActive: freshIsActive,
+              isSuperAdmin: freshIsSuperAdmin,
               displayName: freshDisplayName ?? null,
               photoURL: freshPhotoURL ?? null,
               email: firebaseUser.email ?? null,
-            });
+            };
+            const prevWritten = lastWrittenProfileRef.current;
+            if (
+              !prevWritten ||
+              prevWritten.uid !== firebaseUser.uid ||
+              !areCachedProfilesEqual(prevWritten.payload, profilePayload)
+            ) {
+              lastWrittenProfileRef.current = { uid: firebaseUser.uid, payload: profilePayload };
+              void writeCachedUserProfile(firebaseUser.uid, profilePayload);
+            }
           }
 
-          if (resolvedAccountId) {
-            AsyncStorage.setItem(STORAGE_ACCOUNT_ID_KEY, resolvedAccountId).catch(() => {});
+          if (resolvedAccountId && resolvedAccountId !== lastWrittenAccountIdRef.current) {
+            lastWrittenAccountIdRef.current = resolvedAccountId;
+            writeMetaItemSyncOrAsync(STORAGE_ACCOUNT_ID_KEY, resolvedAccountId);
           }
           if (resolvedBranchId && resolvedBranchId !== 'main') {
             visitedBranchesRef.current.add(resolvedBranchId);
-            AsyncStorage.setItem(STORAGE_BRANCH_ID_KEY, resolvedBranchId).catch(() => {});
+            if (resolvedBranchId !== lastWrittenBranchIdRef.current) {
+              lastWrittenBranchIdRef.current = resolvedBranchId;
+              writeMetaItemSyncOrAsync(STORAGE_BRANCH_ID_KEY, resolvedBranchId);
+            }
           }
 
           return resolvedAccountId;
@@ -810,159 +1331,19 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           if (!isMounted || auth.currentUser?.uid !== u.uid) return;
         }
 
-        setUser(u);
-        setUserProfile(null);
-        setIsSuperAdmin(false);
-        setAccountId(null);
-        setBranchIdState('main');
-        setRole('cashier');
-        setAllBranchesAccess(false);
-        setSubscription(null);
-        setLimits(null);
-        setAccessError(null);
-        setAccessChecking(Boolean(u));
-        setCustomPermissions(null);
-        setIsActive(true);
-
-        if (u) {
-          setLoading(true);
-          const resolvedAccount = await resolveUserProfile(u);
-          if (!isMounted || auth.currentUser?.uid !== u.uid) return;
-          if (!resolvedAccount) {
-            setAccessChecking(false);
-            setAccessError('No se pudo determinar la cuenta. Vuelve a iniciar sesión.');
-          }
-          setLoading(false);
-          setInitialized(true);
-
-          try {
-            const userDocRef = doc(db, 'users', u.uid);
-            let hasSeenExplicitAccount = false;
-            unsubUserDoc = onSnapshot(
-              userDocRef,
-              (snap) => {
-                if (!isMounted || auth.currentUser?.uid !== u.uid) return;
-                if (snap.exists()) {
-                  const data = snap.data();
-                  const activeFlag = data.isActive !== false;
-                  setIsActive(activeFlag);
-                  const uRole = (data.role as UserRole) || 'cashier';
-                  setRole(uRole);
-
-                  const liveAccountId = liveProfileAccount(
-                    data.accountId,
-                    resolvedAccount,
-                    hasSeenExplicitAccount
-                  );
-                  if (data.accountId) hasSeenExplicitAccount = true;
-                  const accountChanged = identityRef.current !== `${u.uid}:${liveAccountId || ''}`;
-                  if (accountChanged) {
-                    checkedAccessScopeRef.current = null;
-                    setSubscription(null);
-                    setLimits(null);
-                    setAccessChecking(Boolean(liveAccountId) && activeFlag);
-                  }
-                  setAccountId(liveAccountId);
-                  if (data.accountId) {
-                    AsyncStorage.setItem(STORAGE_ACCOUNT_ID_KEY, data.accountId).catch(() => {});
-                  }
-
-                  if (data.branchId) {
-                    visitedBranchesRef.current.add(data.branchId);
-                    setBranchIdState(data.branchId);
-                    AsyncStorage.setItem(STORAGE_BRANCH_ID_KEY, data.branchId).catch(() => {});
-                  } else if (accountChanged) {
-                    setBranchIdState('main');
-                    void resolveUserProfile(u);
-                  }
-
-                  const effectiveAllBranches = hasAllBranchesAccess({
-                    role: uRole,
-                    branchId: data.branchId,
-                    allBranchesAccess: data.allBranchesAccess === true,
-                  });
-                  setAllBranchesAccess(effectiveAllBranches);
-                  const nextPermissions = profilePermissions(data);
-                  setCustomPermissions((prev) =>
-                    sameJsonValue(prev, nextPermissions) ? prev : nextPermissions
-                  );
-
-                  const nextProfile: UserProfile = {
-                    uid: u.uid,
-                    email: u.email,
-                    displayName: data.displayName || data.name || u.displayName,
-                    photoURL: data.photoURL || u.photoURL,
-                    emailVerified: u.emailVerified,
-                    role: uRole,
-                    accountId: liveAccountId || undefined,
-                    branchId: data.branchId,
-                    createdAt: data.createdAt,
-                  };
-                  setUserProfile((prev) => {
-                    if (
-                      prev &&
-                      prev.uid === nextProfile.uid &&
-                      prev.email === nextProfile.email &&
-                      prev.displayName === nextProfile.displayName &&
-                      prev.photoURL === nextProfile.photoURL &&
-                      prev.role === nextProfile.role &&
-                      prev.accountId === nextProfile.accountId &&
-                      prev.branchId === nextProfile.branchId
-                    ) {
-                      return prev;
-                    }
-                    return nextProfile;
-                  });
-                  const effectiveCachedBranchId =
-                    data.branchId ||
-                    (!accountChanged && branchIdRef.current !== 'main' ? branchIdRef.current : undefined);
-                  void writeCachedUserProfile(u.uid, {
-                    accountId: liveAccountId,
-                    branchId: effectiveCachedBranchId,
-                    role: uRole,
-                    allBranchesAccess: effectiveAllBranches,
-                    customPermissions: nextPermissions,
-                    isActive: activeFlag,
-                    displayName: nextProfile.displayName ?? null,
-                    photoURL: nextProfile.photoURL ?? null,
-                    email: nextProfile.email ?? null,
-                  });
-                } else if (
-                  shouldDeactivateUserOnMissingDoc({
-                    exists: false,
-                    fromCache: snap.metadata?.fromCache,
-                    isOnline: isOnlineRef.current,
-                  })
-                ) {
-                  setIsActive(false);
-                  setCustomPermissions(null);
-                  void readCachedUserProfile(u.uid).then((prevCached) => {
-                    if (!isMounted || auth.currentUser?.uid !== u.uid) return;
-                    return writeCachedUserProfile(u.uid, {
-                      accountId: prevCached?.accountId ?? resolvedAccount ?? null,
-                      branchId: prevCached?.branchId,
-                      role: prevCached?.role ?? 'cashier',
-                      allBranchesAccess: prevCached?.allBranchesAccess ?? false,
-                      customPermissions: null,
-                      isActive: false,
-                      displayName: prevCached?.displayName ?? u.displayName ?? null,
-                      photoURL: prevCached?.photoURL ?? u.photoURL ?? null,
-                      email: prevCached?.email ?? u.email ?? null,
-                    });
-                  });
-                }
-              },
-              (err) => {
-                console.warn('[AuthContext] Realtime user doc subscription warning:', err);
-              }
-            );
-          } catch {
-            // ignore
-          }
-        } else {
+        if (!u) {
           const prevSession = lastSessionRef.current;
           lastSessionRef.current = { uid: null, accountId: null };
+          identityRef.current = ':';
+          branchIdRef.current = 'main';
+          isActiveRef.current = true;
+          isSuperAdminRef.current = false;
+          subscriptionRef.current = null;
           checkedAccessScopeRef.current = null;
+          lastAccessCheckAtRef.current = 0;
+          lastWrittenProfileRef.current = null;
+          lastWrittenAccountIdRef.current = null;
+          lastWrittenBranchIdRef.current = null;
           setUser(null);
           setUserProfile(null);
           setAccountId(null);
@@ -975,6 +1356,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           setIsSuperAdmin(false);
           setLimits(null);
           setSubscription(null);
+          setAccessError(null);
           setAccessChecking(false);
 
           if (isMounted) {
@@ -985,6 +1367,349 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           if (prevSession.uid || prevSession.accountId) {
             void clearSessionCaches(prevSession.uid, prevSession.accountId).catch(() => {});
           }
+          return;
+        }
+
+        let cachedProfile = readCachedUserProfileSync(u.uid);
+        let storedAccountId = readMetaItemSync(STORAGE_ACCOUNT_ID_KEY);
+        let storedBranchId = readMetaItemSync(STORAGE_BRANCH_ID_KEY);
+
+        if (!cachedProfile) {
+          const [asyncProfile, asyncAccountId, asyncBranchId] = await Promise.all([
+            readCachedUserProfile(u.uid),
+            storedAccountId !== null ? Promise.resolve(storedAccountId) : readMetaItem(STORAGE_ACCOUNT_ID_KEY),
+            storedBranchId !== null ? Promise.resolve(storedBranchId) : readMetaItem(STORAGE_BRANCH_ID_KEY),
+          ]);
+          if (!isMounted || auth.currentUser?.uid !== u.uid) return;
+          cachedProfile = asyncProfile;
+          storedAccountId = asyncAccountId;
+          storedBranchId = asyncBranchId;
+        }
+
+        let resolvedAccount: string | null = null;
+        let initialHasExplicitAccount = false;
+
+        if (cachedProfile && cachedProfile.accountId) {
+          resolvedAccount = cachedProfile.accountId;
+          initialHasExplicitAccount = Boolean(cachedProfile.hasExplicitAccountId);
+
+          const optimisticRole = cachedProfile.role as UserRole;
+          const optimisticAllBranches = hasAllBranchesAccess({
+            role: optimisticRole,
+            allBranchesAccess: cachedProfile.allBranchesAccess,
+          });
+          const optimisticBranchId = resolveOptimisticBranchId({
+            role: optimisticRole,
+            allBranchesAccess: optimisticAllBranches,
+            accountId: cachedProfile.accountId,
+            profileBranchId: cachedProfile.profileBranchId ?? cachedProfile.branchId,
+            storedBranchId,
+            storedAccountId,
+          });
+          const optimisticSuperAdmin = Boolean(cachedProfile.isSuperAdmin);
+          const optimisticIsActive = cachedProfile.isActive !== false;
+          const optimisticCustomPermissions =
+            cachedProfile.customPermissions as CustomUserPermissions | null;
+          const optimisticProfileBranch =
+            cachedProfile.profileBranchId !== undefined
+              ? (cachedProfile.profileBranchId ?? undefined)
+              : (cachedProfile.branchId ?? undefined);
+
+          const optimisticScope = `${u.uid}:${cachedProfile.accountId}`;
+          identityRef.current = optimisticScope;
+          branchIdRef.current = optimisticBranchId;
+          isActiveRef.current = optimisticIsActive;
+          isSuperAdminRef.current = optimisticSuperAdmin;
+          lastSessionRef.current = { uid: u.uid, accountId: cachedProfile.accountId };
+          if (optimisticBranchId && optimisticBranchId !== 'main') {
+            visitedBranchesRef.current.add(optimisticBranchId);
+          }
+
+          lastWrittenProfileRef.current = {
+            uid: u.uid,
+            payload: {
+              accountId: cachedProfile.accountId,
+              branchId: cachedProfile.branchId ?? undefined,
+              profileBranchId: cachedProfile.profileBranchId,
+              hasExplicitAccountId: cachedProfile.hasExplicitAccountId,
+              role: optimisticRole,
+              allBranchesAccess: optimisticAllBranches,
+              customPermissions: optimisticCustomPermissions,
+              isActive: optimisticIsActive,
+              isSuperAdmin: optimisticSuperAdmin,
+              displayName: cachedProfile.displayName ?? null,
+              photoURL: cachedProfile.photoURL ?? null,
+              email: cachedProfile.email ?? null,
+            },
+          };
+          lastWrittenAccountIdRef.current = storedAccountId;
+          lastWrittenBranchIdRef.current = storedBranchId;
+
+          let nextSubscription: PlanSubscription | null = null;
+          let nextLimits: PlanLimits | null = null;
+          let nextAccessChecking = true;
+
+          if (!optimisticIsActive || optimisticRole === 'seller' || optimisticSuperAdmin) {
+            nextAccessChecking = false;
+          } else {
+            const rawPlanSync = readMetaItemSync(`${PLAN_CACHE_PREFIX}${optimisticScope}`);
+            const parsedPlan = parseCachedPlan<PlanLimits, PlanSubscription>(rawPlanSync);
+            const evaluation = evaluateCachedPlanAccess({
+              cached: parsedPlan,
+              isActive: optimisticIsActive,
+              isSuperAdmin: optimisticSuperAdmin,
+            });
+            if (evaluation.usableOptimistic && evaluation.cached) {
+              nextSubscription = evaluation.cached.subscription;
+              nextLimits = evaluation.cached.limits ?? null;
+              nextAccessChecking = false;
+              checkedAccessScopeRef.current = optimisticScope;
+            }
+          }
+
+          subscriptionRef.current = nextSubscription;
+          setUser(u);
+          setUserProfile({
+            uid: u.uid,
+            email: u.email ?? cachedProfile.email ?? null,
+            displayName: cachedProfile.displayName ?? u.displayName ?? null,
+            photoURL: cachedProfile.photoURL ?? u.photoURL ?? null,
+            emailVerified: u.emailVerified,
+            role: optimisticRole,
+            accountId: cachedProfile.accountId,
+            branchId: optimisticProfileBranch,
+            allBranchesAccess: optimisticAllBranches,
+            customPermissions: optimisticCustomPermissions,
+            isActive: optimisticIsActive,
+          });
+          setIsSuperAdmin(optimisticSuperAdmin);
+          setAccountId(cachedProfile.accountId);
+          setBranchIdState(optimisticBranchId);
+          setRole(optimisticRole);
+          setAllBranchesAccess(optimisticAllBranches);
+          setCustomPermissions((prev) =>
+            sameJsonValue(prev, optimisticCustomPermissions) ? prev : optimisticCustomPermissions
+          );
+          setIsActive(optimisticIsActive);
+          setSubscription((prev) => (sameJsonValue(prev, nextSubscription) ? prev : nextSubscription));
+          setLimits((prev) => (sameJsonValue(prev, nextLimits) ? prev : nextLimits));
+          setAccessError(null);
+          setAccessChecking(nextAccessChecking);
+          setLoading(false);
+          setInitialized(true);
+
+          if (typeof u.getIdTokenResult === 'function') {
+            void u
+              .getIdTokenResult(false)
+              .then((tokenResult) => {
+                if (!isMounted || auth.currentUser?.uid !== u.uid) return;
+                const claims = tokenResult.claims;
+                const nextSuperAdmin = claims.isSuperAdmin === true || claims.superAdmin === true;
+                if (nextSuperAdmin !== isSuperAdminRef.current) {
+                  isSuperAdminRef.current = nextSuperAdmin;
+                  setIsSuperAdmin(nextSuperAdmin);
+                  if (lastWrittenProfileRef.current?.uid === u.uid) {
+                    const updatedPayload = {
+                      ...lastWrittenProfileRef.current.payload,
+                      isSuperAdmin: nextSuperAdmin,
+                    };
+                    lastWrittenProfileRef.current = { uid: u.uid, payload: updatedPayload };
+                    void writeCachedUserProfile(u.uid, updatedPayload);
+                  }
+                }
+              })
+              .catch(() => {});
+          }
+        } else {
+          identityRef.current = `${u.uid}:`;
+          branchIdRef.current = 'main';
+          isActiveRef.current = true;
+          isSuperAdminRef.current = false;
+          subscriptionRef.current = null;
+          checkedAccessScopeRef.current = null;
+          lastAccessCheckAtRef.current = 0;
+          lastWrittenProfileRef.current = null;
+          lastWrittenAccountIdRef.current = storedAccountId;
+          lastWrittenBranchIdRef.current = storedBranchId;
+
+          setUser(u);
+          setUserProfile(null);
+          setIsSuperAdmin(false);
+          setAccountId(null);
+          setBranchIdState('main');
+          setRole('cashier');
+          setAllBranchesAccess(false);
+          setSubscription(null);
+          setLimits(null);
+          setAccessError(null);
+          setAccessChecking(true);
+          setCustomPermissions(null);
+          setIsActive(true);
+          setLoading(true);
+
+          resolvedAccount = await resolveUserProfile(u);
+          if (!isMounted || auth.currentUser?.uid !== u.uid) return;
+          if (!resolvedAccount) {
+            setAccessChecking(false);
+            setAccessError('No se pudo determinar la cuenta. Vuelve a iniciar sesión.');
+          }
+          setLoading(false);
+          setInitialized(true);
+        }
+
+        try {
+          const userDocRef = doc(db, 'users', u.uid);
+          let hasSeenExplicitAccount = initialHasExplicitAccount;
+          unsubUserDoc = onSnapshot(
+            userDocRef,
+            (snap) => {
+              if (!isMounted || auth.currentUser?.uid !== u.uid) return;
+              if (snap.exists()) {
+                const data = snap.data();
+                const activeFlag = data.isActive !== false;
+                isActiveRef.current = activeFlag;
+                setIsActive(activeFlag);
+                const uRole = (data.role as UserRole) || 'cashier';
+                setRole(uRole);
+
+                const liveAccountId = liveProfileAccount(
+                  data.accountId,
+                  resolvedAccount,
+                  hasSeenExplicitAccount
+                );
+                if (data.accountId) hasSeenExplicitAccount = true;
+                const accountChanged = identityRef.current !== `${u.uid}:${liveAccountId || ''}`;
+                if (accountChanged) {
+                  identityRef.current = `${u.uid}:${liveAccountId || ''}`;
+                  checkedAccessScopeRef.current = null;
+                  lastAccessCheckAtRef.current = 0;
+                  setSubscription(null);
+                  setLimits(null);
+                  setAccessChecking(Boolean(liveAccountId) && activeFlag);
+                }
+                setAccountId(liveAccountId);
+                if (data.accountId && data.accountId !== lastWrittenAccountIdRef.current) {
+                  lastWrittenAccountIdRef.current = data.accountId;
+                  writeMetaItemSyncOrAsync(STORAGE_ACCOUNT_ID_KEY, data.accountId);
+                }
+
+                if (data.branchId) {
+                  visitedBranchesRef.current.add(data.branchId);
+                  branchIdRef.current = data.branchId;
+                  setBranchIdState(data.branchId);
+                  if (data.branchId !== lastWrittenBranchIdRef.current) {
+                    lastWrittenBranchIdRef.current = data.branchId;
+                    writeMetaItemSyncOrAsync(STORAGE_BRANCH_ID_KEY, data.branchId);
+                  }
+                } else if (accountChanged) {
+                  branchIdRef.current = 'main';
+                  setBranchIdState('main');
+                  void resolveUserProfile(u);
+                }
+
+                const effectiveAllBranches = hasAllBranchesAccess({
+                  role: uRole,
+                  allBranchesAccess: data.allBranchesAccess === true,
+                });
+                setAllBranchesAccess(effectiveAllBranches);
+                const nextPermissions = profilePermissions(data);
+                setCustomPermissions((prev) =>
+                  sameJsonValue(prev, nextPermissions) ? prev : nextPermissions
+                );
+
+                const nextProfile: UserProfile = {
+                  uid: u.uid,
+                  email: u.email,
+                  displayName: data.displayName || data.name || u.displayName,
+                  photoURL: data.photoURL || u.photoURL,
+                  emailVerified: u.emailVerified,
+                  role: uRole,
+                  accountId: liveAccountId || undefined,
+                  branchId: data.branchId,
+                  createdAt: data.createdAt,
+                };
+                setUserProfile((prev) => {
+                  if (
+                    prev &&
+                    prev.uid === nextProfile.uid &&
+                    prev.email === nextProfile.email &&
+                    prev.displayName === nextProfile.displayName &&
+                    prev.photoURL === nextProfile.photoURL &&
+                    prev.role === nextProfile.role &&
+                    prev.accountId === nextProfile.accountId &&
+                    prev.branchId === nextProfile.branchId
+                  ) {
+                    return prev;
+                  }
+                  return nextProfile;
+                });
+
+                const effectiveCachedBranchId =
+                  data.branchId ||
+                  (!accountChanged && branchIdRef.current !== 'main'
+                    ? branchIdRef.current
+                    : undefined);
+
+                const nextCachedPayload: Omit<CachedUserProfile, 'cachedAt'> = {
+                  accountId: liveAccountId,
+                  branchId: effectiveCachedBranchId,
+                  profileBranchId: data.branchId ?? null,
+                  hasExplicitAccountId: hasSeenExplicitAccount,
+                  role: uRole,
+                  allBranchesAccess: effectiveAllBranches,
+                  customPermissions: nextPermissions,
+                  isActive: activeFlag,
+                  isSuperAdmin: isSuperAdminRef.current,
+                  displayName: nextProfile.displayName ?? null,
+                  photoURL: nextProfile.photoURL ?? null,
+                  email: nextProfile.email ?? null,
+                };
+                const prevWritten = lastWrittenProfileRef.current;
+                if (
+                  !prevWritten ||
+                  prevWritten.uid !== u.uid ||
+                  !areCachedProfilesEqual(prevWritten.payload, nextCachedPayload)
+                ) {
+                  lastWrittenProfileRef.current = { uid: u.uid, payload: nextCachedPayload };
+                  void writeCachedUserProfile(u.uid, nextCachedPayload);
+                }
+              } else if (
+                shouldDeactivateUserOnMissingDoc({
+                  exists: false,
+                  fromCache: snap.metadata?.fromCache,
+                  isOnline: isOnlineRef.current,
+                })
+              ) {
+                isActiveRef.current = false;
+                setIsActive(false);
+                setCustomPermissions(null);
+                void readCachedUserProfile(u.uid).then((prevCached) => {
+                  if (!isMounted || auth.currentUser?.uid !== u.uid) return;
+                  const deactivatedPayload: Omit<CachedUserProfile, 'cachedAt'> = {
+                    accountId: prevCached?.accountId ?? resolvedAccount ?? null,
+                    branchId: prevCached?.branchId,
+                    profileBranchId: prevCached?.profileBranchId ?? null,
+                    hasExplicitAccountId: prevCached?.hasExplicitAccountId ?? hasSeenExplicitAccount,
+                    role: prevCached?.role ?? 'cashier',
+                    allBranchesAccess: prevCached?.allBranchesAccess ?? false,
+                    customPermissions: null,
+                    isActive: false,
+                    isSuperAdmin: prevCached?.isSuperAdmin ?? isSuperAdminRef.current,
+                    displayName: prevCached?.displayName ?? u.displayName ?? null,
+                    photoURL: prevCached?.photoURL ?? u.photoURL ?? null,
+                    email: prevCached?.email ?? u.email ?? null,
+                  };
+                  lastWrittenProfileRef.current = { uid: u.uid, payload: deactivatedPayload };
+                  return writeCachedUserProfile(u.uid, deactivatedPayload);
+                });
+              }
+            },
+            (err) => {
+              console.warn('[AuthContext] Realtime user doc subscription warning:', err);
+            }
+          );
+        } catch {
+          // ignore
         }
       });
     }
@@ -1018,19 +1743,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const isCurrent = () => identityRef.current === scope && accessRequestRef.current === requestId;
     const cacheKey = `${PLAN_CACHE_PREFIX}${scope}`;
 
-    let cached: CachedPlanPayload | null = null;
-    try {
-      const raw = await AsyncStorage.getItem(cacheKey);
-      const parsed = raw ? (JSON.parse(raw) as Partial<CachedPlanPayload>) : null;
-      if (parsed && typeof parsed.cachedAt === 'number') {
-        cached = {
-          limits: parsed.limits ?? null,
-          subscription: parsed.subscription ?? null,
-          cachedAt: parsed.cachedAt,
-        };
-      }
-    } catch {
-      /* A malformed cache never grants access. */
+    const rawSync = readMetaItemSync(cacheKey);
+    let cached = parseCachedPlan<PlanLimits, PlanSubscription>(rawSync);
+    if (!cached && rawSync === null) {
+      const rawAsync = await readMetaItem(cacheKey);
+      if (!isCurrent()) return;
+      cached = parseCachedPlan<PlanLimits, PlanSubscription>(rawAsync);
     }
 
     const updateClockIfBlockChanged = (targetSub: PlanSubscription | null) => {
@@ -1050,13 +1768,21 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       });
     };
 
-    const cacheAge = cached ? Date.now() - cached.cachedAt : Number.POSITIVE_INFINITY;
-    if (cached && cacheAge >= 0 && cacheAge < PLAN_CACHE_ONLINE_TTL_MS && isCurrent()) {
+    const evaluation = evaluateCachedPlanAccess({
+      cached,
+      isActive: isActiveRef.current,
+      isSuperAdmin: isSuperAdminRef.current,
+    });
+
+    if (evaluation.usableOptimistic && evaluation.cached && isCurrent()) {
       checkedAccessScopeRef.current = scope;
-      const cachedSub = cached.subscription;
-      const cachedLimits = cached.limits ?? null;
+      const cachedSub = evaluation.cached.subscription;
+      const cachedLimits = evaluation.cached.limits ?? null;
+      subscriptionRef.current = cachedSub;
       setSubscription((prev) => (sameJsonValue(prev, cachedSub) ? prev : cachedSub));
       setLimits((prev) => (sameJsonValue(prev, cachedLimits) ? prev : cachedLimits));
+      setAccessError(null);
+      updateClockIfBlockChanged(cachedSub);
       setAccessChecking(false);
     }
 
@@ -1066,10 +1792,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     if (!netOnline) {
       if (!isCurrent()) return;
       let effectiveSub: PlanSubscription | null = subscriptionRef.current;
-      if (cached && cacheAge >= 0 && cacheAge < PLAN_CACHE_OFFLINE_TTL_MS) {
-        const cachedSub = cached.subscription;
-        const cachedLimits = cached.limits ?? null;
+      if (evaluation.within72h && evaluation.cached) {
+        const cachedSub = evaluation.cached.subscription;
+        const cachedLimits = evaluation.cached.limits ?? null;
         effectiveSub = cachedSub;
+        subscriptionRef.current = cachedSub;
         setSubscription((prev) => (sameJsonValue(prev, cachedSub) ? prev : cachedSub));
         setLimits((prev) => (sameJsonValue(prev, cachedLimits) ? prev : cachedLimits));
         setAccessError(null);
@@ -1082,6 +1809,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       return;
     }
 
+    lastAccessCheckAtRef.current = Date.now();
     let resolvedSubForClock: PlanSubscription | null = subscriptionRef.current;
     try {
       const data = await apiRequest<{
@@ -1092,17 +1820,18 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const nextSub = data.subscription ?? null;
       const nextLimits = data.limits ?? null;
       resolvedSubForClock = nextSub;
+      subscriptionRef.current = nextSub;
       setSubscription((prev) => (sameJsonValue(prev, nextSub) ? prev : nextSub));
       setLimits((prev) => (sameJsonValue(prev, nextLimits) ? prev : nextLimits));
       setAccessError(null);
-      await AsyncStorage.setItem(
+      writeMetaItemSyncOrAsync(
         cacheKey,
         JSON.stringify({
           limits: nextLimits,
           subscription: nextSub,
           cachedAt: Date.now(),
         } satisfies CachedPlanPayload)
-      ).catch(() => {});
+      );
     } catch (error) {
       if (!isCurrent()) return;
       const status = (error as { status?: number }).status;
@@ -1111,13 +1840,17 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         ? Boolean(latestNet.isConnected && latestNet.isInternetReachable !== false)
         : isOnlineRef.current;
       const isTransient = !status || status === 408 || status >= 500;
-      const maxCacheTtl = !stillOnline || !status ? PLAN_CACHE_OFFLINE_TTL_MS : PLAN_CACHE_ONLINE_TTL_MS;
-      const mayUseCache = isTransient && cached && cacheAge >= 0 && cacheAge < maxCacheTtl;
+      const mayUseCache =
+        isTransient &&
+        evaluation.within72h &&
+        evaluation.cached &&
+        (!stillOnline || !status || evaluation.blockReason === null);
 
-      if (mayUseCache && cached) {
-        const cachedSub = cached.subscription;
-        const cachedLimits = cached.limits ?? null;
+      if (mayUseCache && evaluation.cached) {
+        const cachedSub = evaluation.cached.subscription;
+        const cachedLimits = evaluation.cached.limits ?? null;
         resolvedSubForClock = cachedSub;
+        subscriptionRef.current = cachedSub;
         setSubscription((prev) => (sameJsonValue(prev, cachedSub) ? prev : cachedSub));
         setLimits((prev) => (sameJsonValue(prev, cachedLimits) ? prev : cachedLimits));
         setAccessError(null);
@@ -1139,8 +1872,38 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     if (!user || !accountId || loading) return;
     const scope = `${user.uid}:${accountId}`;
     if (checkedAccessScopeRef.current !== scope) {
-      setAccessChecking(true);
-      setAccessError(null);
+      if (!isActive || role === 'seller' || isSuperAdmin) {
+        setAccessChecking(false);
+        setAccessError(null);
+      } else {
+        const syncPlan = parseCachedPlan<PlanLimits, PlanSubscription>(
+          readMetaItemSync(`${PLAN_CACHE_PREFIX}${scope}`)
+        );
+        const evalSync = evaluateCachedPlanAccess({
+          cached: syncPlan,
+          isActive,
+          isSuperAdmin,
+        });
+        if (evalSync.usableOptimistic && evalSync.cached) {
+          checkedAccessScopeRef.current = scope;
+          subscriptionRef.current = evalSync.cached.subscription;
+          setSubscription((prev) =>
+            sameJsonValue(prev, evalSync.cached!.subscription)
+              ? prev
+              : evalSync.cached!.subscription
+          );
+          setLimits((prev) =>
+            sameJsonValue(prev, evalSync.cached!.limits ?? null)
+              ? prev
+              : (evalSync.cached!.limits ?? null)
+          );
+          setAccessError(null);
+          setAccessChecking(false);
+        } else {
+          setAccessChecking(true);
+          setAccessError(null);
+        }
+      }
     }
     void refreshAccess();
     const foreground = AppState.addEventListener('change', (state) => {
@@ -1159,13 +1922,28 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           );
           return prevReason === nextReason ? prevClock : now;
         });
-        void refreshAccess();
+        const currentlyBlocked = Boolean(
+          accessBlockReason(
+            { isActive: isActiveRef.current, isSuperAdmin: isSuperAdminRef.current },
+            subscriptionRef.current,
+            now
+          )
+        );
+        if (
+          shouldRecheckAccessOnForeground({
+            isBlocked: currentlyBlocked,
+            lastCheckAt: lastAccessCheckAtRef.current,
+            now,
+          })
+        ) {
+          void refreshAccess();
+        }
       }
     });
     return () => {
       foreground.remove();
     };
-  }, [user?.uid, accountId, loading, refreshAccess]);
+  }, [user?.uid, accountId, loading, isActive, role, isSuperAdmin, refreshAccess]);
 
   // Al recuperar conectividad después de estar offline, re-validar el plan en segundo plano
   useEffect(() => {
@@ -1181,16 +1959,22 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const setActiveBranchId = useCallback(
     (newBranchId: string) => {
       if (!newBranchId) return;
-      const canChange = hasAllBranchesAccess({ role, branchId, allBranchesAccess });
+      const canChange = hasAllBranchesAccess({
+        role,
+        branchId: branchIdRef.current,
+        allBranchesAccess,
+      });
       if (!canChange) {
         console.warn('[AuthContext] Usuario sin acceso multisede no puede cambiar de sucursal');
         return;
       }
       visitedBranchesRef.current.add(newBranchId);
+      branchIdRef.current = newBranchId;
       setBranchIdState(newBranchId);
-      AsyncStorage.setItem(STORAGE_BRANCH_ID_KEY, newBranchId).catch(() => {});
+      lastWrittenBranchIdRef.current = newBranchId;
+      writeMetaItemSyncOrAsync(STORAGE_BRANCH_ID_KEY, newBranchId);
     },
-    [role, branchId, allBranchesAccess]
+    [role, allBranchesAccess]
   );
 
   // Inicialización segura de sucursal asignada cuando el estado inicial sigue en 'main'
@@ -1200,15 +1984,17 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setBranchIdState((prev) => {
         if (prev !== 'main') return prev;
         const multiBranch = hasAllBranchesAccess({ role, branchId: prev, allBranchesAccess });
-        if (!multiBranch && userProfile?.branchId !== assignedBranchId) {
+        if (!multiBranch && userProfileBranchIdRef.current !== assignedBranchId) {
           return prev;
         }
         visitedBranchesRef.current.add(assignedBranchId);
-        AsyncStorage.setItem(STORAGE_BRANCH_ID_KEY, assignedBranchId).catch(() => {});
+        branchIdRef.current = assignedBranchId;
+        lastWrittenBranchIdRef.current = assignedBranchId;
+        writeMetaItemSyncOrAsync(STORAGE_BRANCH_ID_KEY, assignedBranchId);
         return assignedBranchId;
       });
     },
-    [role, allBranchesAccess, userProfile?.branchId]
+    [role, allBranchesAccess]
   );
 
   // 6. Iniciar sesión con email y contraseña
@@ -1289,7 +2075,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     await sendPasswordResetEmail(auth, email.trim());
   }, []);
 
-  // 9. Cerrar sesión segura (limpia @ventify_plan:*, catalogKVStorage y cartKVStorage)
+  // 9. Cerrar sesión segura (limpia @ventify_plan:*, metaKVStorage, catalogKVStorage y cartKVStorage)
   const logout = useCallback(async () => {
     const uidToClear = user?.uid ?? lastSessionRef.current.uid;
     const accountToClear = accountId ?? lastSessionRef.current.accountId;
@@ -1297,7 +2083,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     try {
       await signOut(auth);
       lastSessionRef.current = { uid: null, accountId: null };
+      identityRef.current = ':';
+      branchIdRef.current = 'main';
+      isActiveRef.current = true;
+      isSuperAdminRef.current = false;
+      subscriptionRef.current = null;
       checkedAccessScopeRef.current = null;
+      lastAccessCheckAtRef.current = 0;
+      lastWrittenProfileRef.current = null;
+      lastWrittenAccountIdRef.current = null;
+      lastWrittenBranchIdRef.current = null;
       setUser(null);
       setUserProfile(null);
       setAccountId(null);
@@ -1314,7 +2109,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const resetAttempts = resetPinAttemptState();
       pinAttemptStateRef.current = resetAttempts;
       setPinAttemptState(resetAttempts);
-      await AsyncStorage.removeItem(STORAGE_PIN_ATTEMPTS_KEY).catch(() => {});
+      await Promise.all([
+        removeMetaItem(STORAGE_PIN_ATTEMPTS_KEY),
+        AsyncStorage.removeItem(STORAGE_PIN_ATTEMPTS_KEY).catch(() => {}),
+      ]);
       await clearSessionCaches(uidToClear, accountToClear);
     } finally {
       setLoading(false);
@@ -1348,7 +2146,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         const cleared = resetPinAttemptState();
         pinAttemptStateRef.current = cleared;
         setPinAttemptState(cleared);
-        void AsyncStorage.removeItem(STORAGE_PIN_ATTEMPTS_KEY).catch(() => {});
+        removeMetaItemSyncOrAsync(STORAGE_PIN_ATTEMPTS_KEY);
 
         if (result.upgradedRecord) {
           void persistPinRecord(result.upgradedRecord);
@@ -1360,9 +2158,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const nextAttempts = registerFailedPinAttempt(pinAttemptStateRef.current, now);
       pinAttemptStateRef.current = nextAttempts;
       setPinAttemptState(nextAttempts);
-      void AsyncStorage.setItem(STORAGE_PIN_ATTEMPTS_KEY, JSON.stringify(nextAttempts)).catch(
-        () => {}
-      );
+      writeMetaItemSyncOrAsync(STORAGE_PIN_ATTEMPTS_KEY, JSON.stringify(nextAttempts));
       return false;
     },
     [persistPinRecord]
@@ -1376,12 +2172,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const cleared = resetPinAttemptState();
       pinAttemptStateRef.current = cleared;
       setPinAttemptState(cleared);
-      await AsyncStorage.removeItem(STORAGE_PIN_ATTEMPTS_KEY).catch(() => {});
+      await removeMetaItem(STORAGE_PIN_ATTEMPTS_KEY);
     },
     [persistPinRecord]
   );
 
-  const contextValue = useMemo<AuthContextType>(
+  const authSessionValue = useMemo<AuthSessionContextType>(
     () => ({
       user,
       userProfile,
@@ -1392,23 +2188,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       customPermissions,
       isActive,
       isSuperAdmin,
-      limits,
-      subscription,
-      isOnline,
-      accessChecking,
-      accessError,
-      accessBlocked,
-      refreshAccess,
       initialized,
       loading,
-      isPinLocked,
-      pinCode: '',
-      pinLength,
-      hasConfiguredPin,
-      isPinSetupOpen,
-      closePinSetup,
-      pinFailedAttempts: pinAttemptState.failedAttempts,
-      pinLockoutUntil: pinAttemptState.lockoutUntil,
       login,
       signup,
       sendPasswordReset,
@@ -1416,9 +2197,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setActiveBranchId,
       setBranchId: setActiveBranchId,
       syncAssignedBranchId,
-      lockTerminal,
-      unlockWithPin,
-      updatePinCode,
     }),
     [
       user,
@@ -1430,15 +2208,49 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       customPermissions,
       isActive,
       isSuperAdmin,
+      initialized,
+      loading,
+      login,
+      signup,
+      sendPasswordReset,
+      logout,
+      setActiveBranchId,
+      syncAssignedBranchId,
+    ]
+  );
+
+  const networkStatusValue = useMemo<NetworkStatusContextType>(
+    () => ({ isOnline }),
+    [isOnline]
+  );
+
+  const planAccessValue = useMemo<PlanAccessContextType>(
+    () => ({
       limits,
       subscription,
-      isOnline,
       accessChecking,
       accessError,
       accessBlocked,
       refreshAccess,
-      initialized,
-      loading,
+    }),
+    [limits, subscription, accessChecking, accessError, accessBlocked, refreshAccess]
+  );
+
+  const pinLockValue = useMemo<PinLockContextType>(
+    () => ({
+      isPinLocked,
+      pinCode: '',
+      pinLength,
+      hasConfiguredPin,
+      isPinSetupOpen,
+      closePinSetup,
+      pinFailedAttempts: pinAttemptState.failedAttempts,
+      pinLockoutUntil: pinAttemptState.lockoutUntil,
+      lockTerminal,
+      unlockWithPin,
+      updatePinCode,
+    }),
+    [
       isPinLocked,
       pinLength,
       hasConfiguredPin,
@@ -1446,19 +2258,39 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       closePinSetup,
       pinAttemptState.failedAttempts,
       pinAttemptState.lockoutUntil,
-      login,
-      signup,
-      sendPasswordReset,
-      logout,
-      setActiveBranchId,
-      syncAssignedBranchId,
       lockTerminal,
       unlockWithPin,
       updatePinCode,
     ]
   );
 
-  return <AuthContext.Provider value={contextValue}>{children}</AuthContext.Provider>;
+  const contextValue = useMemo<AuthContextType>(
+    () => ({
+      ...authSessionValue,
+      ...networkStatusValue,
+      ...planAccessValue,
+      ...pinLockValue,
+    }),
+    [authSessionValue, networkStatusValue, planAccessValue, pinLockValue]
+  );
+
+  return (
+    <AuthSessionContext.Provider value={authSessionValue}>
+      <NetworkStatusContext.Provider value={networkStatusValue}>
+        <PlanAccessContext.Provider value={planAccessValue}>
+          <PinLockContext.Provider value={pinLockValue}>
+            <AuthContext.Provider value={contextValue}>
+              <PermissionsProvider>{children}</PermissionsProvider>
+            </AuthContext.Provider>
+          </PinLockContext.Provider>
+        </PlanAccessContext.Provider>
+      </NetworkStatusContext.Provider>
+    </AuthSessionContext.Provider>
+  );
 };
 
 export const useAuth = () => useContext(AuthContext);
+export const useAuthSession = () => useContext(AuthSessionContext);
+export const useNetworkStatus = () => useContext(NetworkStatusContext);
+export const usePlanAccess = () => useContext(PlanAccessContext);
+export const usePinLock = () => useContext(PinLockContext);

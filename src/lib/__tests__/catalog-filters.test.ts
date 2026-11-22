@@ -6,6 +6,7 @@ import {
   uniqueCatalogValues,
   normalizeCatalogLabel,
   buildCatalogProductIndex,
+  MutableCatalogProductIndex,
   filterCatalogIndex,
   getCatalogCategoryCounts,
 } from '../catalog-filters';
@@ -113,5 +114,61 @@ describe('catalog-filters', () => {
       { name: 'Abarrotes', count: 1 },
       { name: 'Sin Categoría', count: 1 },
     ]);
+  });
+
+  it('returns cached products array zero-copy when filterCatalogIndex has no active filters', () => {
+    const products = [
+      { id: '1', name: 'Alpha', category: 'General', brand: 'Nike', sizeLabel: 'M' },
+      { id: '2', name: 'Beta', category: 'General', brand: 'Adidas', sizeLabel: 'L' },
+    ] as any[];
+    const index = buildCatalogProductIndex(products);
+    const unfiltered = filterCatalogIndex(index, { category: 'Todas', brand: 'Todas', size: 'Todas' });
+    expect(unfiltered).toBe(index.products);
+    expect(unfiltered).toBe(products);
+  });
+
+  it('maintains incremental category/brand/size counters and preserves array identity on stock-only updates in MutableCatalogProductIndex', () => {
+    const p1 = { id: '1', name: 'Café', category: 'Bebidas', brand: 'Ventify', sizeLabel: '500 ml', stock: { main: 5 } } as any;
+    const p2 = { id: '2', name: 'Galleta', category: 'Snacks', brand: 'Inka', sizes: ['S', 'M'], stock: { main: 10 } } as any;
+    const p3 = { id: '3', name: 'Bolsa', category: '', stock: { main: 20 } } as any;
+
+    const mutable = new MutableCatalogProductIndex();
+    mutable.rebuildFrom([p1, p2, p3]);
+    const snap1 = mutable.snapshot();
+
+    expect(mutable.snapshot()).toBe(snap1);
+    expect(filterCatalogIndex(snap1, {})).toBe(snap1.products);
+    expect(snap1.brands).toEqual(['Ventify', 'Inka']);
+    expect(snap1.sizes).toEqual(['500 ml', 'S', 'M']);
+    expect(getCatalogCategoryCounts(['Bebidas', 'Snacks', 'Sin Categoría'], snap1)).toEqual([
+      { name: 'Todas', count: 3 },
+      { name: 'Bebidas', count: 1 },
+      { name: 'Snacks', count: 1 },
+      { name: 'Sin Categoría', count: 1 },
+    ]);
+
+    // Stock-only update keeps exact brands & sizes array references
+    mutable.upsert({ ...p1, stock: { main: 99 } });
+    const snap2 = mutable.snapshot();
+    expect(snap2).not.toBe(snap1);
+    expect(snap2.brands).toBe(snap1.brands);
+    expect(snap2.sizes).toBe(snap1.sizes);
+    expect(filterCatalogIndex(snap2, { query: 'cafe' })[0].stock.main).toBe(99);
+
+    // Category & brand change updates counters accurately
+    mutable.upsert({ ...p1, category: 'Snacks', brand: 'NuevaMarca', stock: { main: 99 } });
+    const snap3 = mutable.snapshot();
+    expect(snap3.brands).toEqual(['Inka', 'NuevaMarca']);
+    expect(snap3.categoryCounts.get('Bebidas')).toBeUndefined();
+    expect(snap3.categoryCounts.get('Snacks')).toBe(2);
+
+    // Removal cleans up uncategorized & sizes
+    mutable.remove('3');
+    mutable.remove('2');
+    const snap4 = mutable.snapshot();
+    expect(snap4.uncategorizedCount).toBe(0);
+    expect(snap4.brands).toEqual(['NuevaMarca']);
+    expect(snap4.sizes).toEqual(['500 ml']);
+    expect(filterCatalogIndex(snap4, {})).toHaveLength(1);
   });
 });

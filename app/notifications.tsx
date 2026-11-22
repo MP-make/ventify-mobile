@@ -1,14 +1,14 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
-  FlatList,
   StyleSheet,
   Text,
   TouchableOpacity,
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { FlashList } from '@shopify/flash-list';
 import { useRouter, type Href } from 'expo-router';
 import * as Haptics from 'expo-haptics';
 import {
@@ -22,14 +22,14 @@ import {
   Sparkles,
   Wallet,
 } from 'lucide-react-native';
-import { useAuth } from '@/context/AuthContext';
+import { useAuthSession } from '@/context/AuthContext';
 import { usePermissions } from '@/hooks/usePermissions';
 import {
   type AccountNotification,
   markAllNotificationsAsRead,
   markNotificationAsRead,
   subscribeAccountNotifications,
-} from '@/services/notification-service';
+} from '@/services/account-notifications-feed';
 import { formatDatePE, ui } from '@/lib/theme';
 
 function mapNotificationRoute(url?: string, type?: string): string | null {
@@ -76,9 +76,54 @@ function NotificationTypeIcon({ type }: { type: string }) {
   }
 }
 
+const ListGap8 = () => <View style={styles.listGap8} />;
+
+const getNotificationItemType = (item: AccountNotification) =>
+  `${item.read ? 'r' : 'u'}_${item.body ? 'b' : 'nb'}`;
+
+interface NotificationRowProps {
+  item: AccountNotification;
+  onPress: (item: AccountNotification) => void;
+}
+
+const NotificationRow = React.memo<NotificationRowProps>(({ item, onPress }) => {
+  const unread = !item.read;
+  return (
+    <TouchableOpacity
+      onPress={() => onPress(item)}
+      style={[styles.card, unread && styles.cardUnread]}
+      activeOpacity={0.78}
+      accessibilityRole="button"
+      accessibilityLabel={`${unread ? 'No leída: ' : ''}${item.title}`}
+    >
+      <View style={styles.cardIcon}>
+        <NotificationTypeIcon type={item.type} />
+      </View>
+      <View style={styles.cardBody}>
+        <View style={styles.cardTitleRow}>
+          <Text
+            style={[styles.cardTitle, unread && styles.cardTitleUnread]}
+            numberOfLines={2}
+          >
+            {item.title}
+          </Text>
+          {unread && <View style={styles.unreadDot} />}
+        </View>
+        {item.body ? (
+          <Text style={styles.cardMessage}>{item.body}</Text>
+        ) : null}
+        <Text style={styles.cardMeta}>
+          {formatDatePE(item.createdAt)}
+          {item.createdByName ? ` · ${item.createdByName}` : ''}
+        </Text>
+      </View>
+    </TouchableOpacity>
+  );
+});
+
 export default function NotificationsScreen() {
   const router = useRouter();
-  const { accountId, branchId } = useAuth();
+  const { accountId, branchId } = useAuthSession();
   const { isOwner, isAdmin, isSuperAdmin, hasAllBranchesAccess } = usePermissions();
 
   // firestore.rules allows account_notifications updates only for account admins (owner/admin/superAdmin).
@@ -125,20 +170,100 @@ export default function NotificationsScreen() {
     return notifications;
   }, [notifications, filterMode]);
 
-  const handleTapNotification = async (item: AccountNotification) => {
-    if (canMarkRead && !item.read) {
-      try {
-        await markNotificationAsRead(item.id);
-        Haptics.selectionAsync().catch(() => {});
-      } catch (err: any) {
-        Alert.alert('Error', err?.message || 'No se pudo marcar como leída.');
+  const handleTapNotification = useCallback(
+    async (item: AccountNotification) => {
+      if (canMarkRead && !item.read) {
+        try {
+          await markNotificationAsRead(item.id);
+          Haptics.selectionAsync().catch(() => {});
+        } catch (err: any) {
+          Alert.alert('Error', err?.message || 'No se pudo marcar como leída.');
+        }
       }
-    }
-    const targetRoute = mapNotificationRoute(item.url, item.type);
-    if (targetRoute) {
-      router.push(targetRoute as Href);
-    }
-  };
+      const targetRoute = mapNotificationRoute(item.url, item.type);
+      if (targetRoute) {
+        router.push(targetRoute as Href);
+      }
+    },
+    [canMarkRead, router]
+  );
+
+  const handlePressNotificationRow = useCallback(
+    (item: AccountNotification) => {
+      void handleTapNotification(item);
+    },
+    [handleTapNotification]
+  );
+
+  const notificationKeyExtractor = useCallback((item: AccountNotification) => item.id, []);
+
+  const renderNotificationItem = useCallback(
+    ({ item }: { item: AccountNotification }) => (
+      <NotificationRow item={item} onPress={handlePressNotificationRow} />
+    ),
+    [handlePressNotificationRow]
+  );
+
+  const listHeaderElement = useMemo(
+    () => (
+      <View style={styles.headerBlock}>
+        <View style={styles.pillsRow}>
+          <TouchableOpacity
+            onPress={() => setFilterMode('all')}
+            style={[styles.pill, filterMode === 'all' && styles.pillActive]}
+          >
+            <Text style={[styles.pillText, filterMode === 'all' && styles.pillTextActive]}>
+              Todas ({notifications.length})
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            onPress={() => setFilterMode('unread')}
+            style={[styles.pill, filterMode === 'unread' && styles.pillActive]}
+          >
+            <Text style={[styles.pillText, filterMode === 'unread' && styles.pillTextActive]}>
+              No leídas ({unreadIds.length})
+            </Text>
+          </TouchableOpacity>
+        </View>
+
+        {!canMarkRead && notifications.length > 0 && (
+          <Text style={styles.readOnlyNote}>
+            Solo propietarios o administradores pueden marcar notificaciones como leídas.
+          </Text>
+        )}
+
+        {loading && (
+          <View style={styles.centerBox}>
+            <ActivityIndicator size="large" color={ui.primary} />
+            <Text style={styles.mutedText}>Cargando alertas en tiempo real...</Text>
+          </View>
+        )}
+
+        {!!error && (
+          <View style={styles.errorCard}>
+            <Text style={styles.errorText}>{error}</Text>
+          </View>
+        )}
+      </View>
+    ),
+    [filterMode, notifications.length, unreadIds.length, canMarkRead, loading, error]
+  );
+
+  const listEmptyElement = useMemo(
+    () =>
+      !loading && !error ? (
+        <View style={styles.centerBox}>
+          <Bell size={32} color={ui.textMuted} />
+          <Text style={styles.emptyTitle}>
+            {filterMode === 'unread' ? 'Sin notificaciones pendientes' : 'Buzón vacío'}
+          </Text>
+          <Text style={styles.mutedText}>
+            Aquí verás alertas de stock crítico, caja, fiados y SUNAT.
+          </Text>
+        </View>
+      ) : null,
+    [loading, error, filterMode]
+  );
 
   const handleMarkAllRead = async () => {
     if (!canMarkRead || unreadIds.length === 0) return;
@@ -192,98 +317,16 @@ export default function NotificationsScreen() {
         )}
       </View>
 
-      <FlatList
+      <FlashList
         data={visibleItems}
-        keyExtractor={(item) => item.id}
+        keyExtractor={notificationKeyExtractor}
+        getItemType={getNotificationItemType}
+        estimatedItemSize={96}
+        ItemSeparatorComponent={ListGap8}
         contentContainerStyle={styles.listContent}
-        ListHeaderComponent={
-          <View style={styles.headerBlock}>
-            <View style={styles.pillsRow}>
-              <TouchableOpacity
-                onPress={() => setFilterMode('all')}
-                style={[styles.pill, filterMode === 'all' && styles.pillActive]}
-              >
-                <Text style={[styles.pillText, filterMode === 'all' && styles.pillTextActive]}>
-                  Todas ({notifications.length})
-                </Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                onPress={() => setFilterMode('unread')}
-                style={[styles.pill, filterMode === 'unread' && styles.pillActive]}
-              >
-                <Text style={[styles.pillText, filterMode === 'unread' && styles.pillTextActive]}>
-                  No leídas ({unreadIds.length})
-                </Text>
-              </TouchableOpacity>
-            </View>
-
-            {!canMarkRead && notifications.length > 0 && (
-              <Text style={styles.readOnlyNote}>
-                Solo propietarios o administradores pueden marcar notificaciones como leídas.
-              </Text>
-            )}
-
-            {loading && (
-              <View style={styles.centerBox}>
-                <ActivityIndicator size="large" color={ui.primary} />
-                <Text style={styles.mutedText}>Cargando alertas en tiempo real...</Text>
-              </View>
-            )}
-
-            {!!error && (
-              <View style={styles.errorCard}>
-                <Text style={styles.errorText}>{error}</Text>
-              </View>
-            )}
-          </View>
-        }
-        ListEmptyComponent={
-          !loading && !error ? (
-            <View style={styles.centerBox}>
-              <Bell size={32} color={ui.textMuted} />
-              <Text style={styles.emptyTitle}>
-                {filterMode === 'unread' ? 'Sin notificaciones pendientes' : 'Buzón vacío'}
-              </Text>
-              <Text style={styles.mutedText}>
-                Aquí verás alertas de stock crítico, caja, fiados y SUNAT.
-              </Text>
-            </View>
-          ) : null
-        }
-        renderItem={({ item }) => {
-          const unread = !item.read;
-          return (
-            <TouchableOpacity
-              onPress={() => void handleTapNotification(item)}
-              style={[styles.card, unread && styles.cardUnread]}
-              activeOpacity={0.78}
-              accessibilityRole="button"
-              accessibilityLabel={`${unread ? 'No leída: ' : ''}${item.title}`}
-            >
-              <View style={styles.cardIcon}>
-                <NotificationTypeIcon type={item.type} />
-              </View>
-              <View style={styles.cardBody}>
-                <View style={styles.cardTitleRow}>
-                  <Text
-                    style={[styles.cardTitle, unread && styles.cardTitleUnread]}
-                    numberOfLines={2}
-                  >
-                    {item.title}
-                  </Text>
-                  {unread && <View style={styles.unreadDot} />}
-                </View>
-                {item.body ? (
-                  <Text style={styles.cardMessage}>{item.body}</Text>
-                ) : null}
-                <Text style={styles.cardMeta}>
-                  {formatDatePE(item.createdAt)}
-                  {item.createdByName ? ` · ${item.createdByName}` : ''}
-                </Text>
-              </View>
-            </TouchableOpacity>
-          );
-        }}
+        ListHeaderComponent={listHeaderElement}
+        ListEmptyComponent={listEmptyElement}
+        renderItem={renderNotificationItem}
       />
     </SafeAreaView>
   );
@@ -345,12 +388,14 @@ const styles = StyleSheet.create({
   },
   listContent: {
     padding: 14,
-    gap: 8,
     paddingBottom: 32,
+  },
+  listGap8: {
+    height: 8,
   },
   headerBlock: {
     gap: 10,
-    marginBottom: 4,
+    marginBottom: 12,
   },
   pillsRow: {
     flexDirection: 'row',

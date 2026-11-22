@@ -7,7 +7,7 @@ import { formatDatePE, ui } from '@/lib/theme';
 import { amountToWordsSoles } from '@/lib/invoicing/types';
 import { receiptAmountsForSale, type TaxProfileInput } from '@/lib/invoicing/receipt-amounts';
 import { buildSaleQrContent } from '@/lib/invoicing/qr-content';
-import { generateQrMatrix } from '@/lib/invoicing/qr-matrix';
+import { generateQrSvgData } from '@/lib/invoicing/qr-matrix';
 
 export interface ReceiptTicketPreviewProps {
   sale: Partial<Sale> & {
@@ -190,14 +190,15 @@ export const ReceiptTicketPreview: React.FC<ReceiptTicketPreviewProps> = React.m
           emitterRuc: ruc,
           consultUrl: merged.consultUrl,
           taxProfile,
+          precomputedAmounts: amounts,
         }),
-      [sale, ruc, merged.consultUrl, taxProfile]
+      [sale, ruc, merged.consultUrl, taxProfile, amounts]
     );
 
-    const qrMatrix = useMemo(() => {
+    const qrSvgData = useMemo(() => {
       if (!qrContent) return null;
       try {
-        return generateQrMatrix(qrContent);
+        return generateQrSvgData(qrContent);
       } catch {
         return null;
       }
@@ -541,22 +542,22 @@ export const ReceiptTicketPreview: React.FC<ReceiptTicketPreviewProps> = React.m
         )}
 
         {/* QR Code + Hash + Footer */}
-        {qrMatrix && !isOfflinePending && (
+        {qrSvgData && !isOfflinePending && (
           <View style={styles.qrWrapper}>
             <View style={styles.qrFrame}>
               <Svg
                 width={108}
                 height={108}
-                viewBox={`-2 -2 ${qrMatrix.size + 4} ${qrMatrix.size + 4}`}
+                viewBox={`-2 -2 ${qrSvgData.size + 4} ${qrSvgData.size + 4}`}
               >
                 <Rect
                   x={-2}
                   y={-2}
-                  width={qrMatrix.size + 4}
-                  height={qrMatrix.size + 4}
+                  width={qrSvgData.size + 4}
+                  height={qrSvgData.size + 4}
                   fill="#FFFFFF"
                 />
-                <Path d={qrMatrix.pathData} fill="#000000" />
+                <Path d={qrSvgData.pathData} fill="#000000" />
               </Svg>
             </View>
             {isFiscalTitle && !isOfflinePending && (

@@ -66,34 +66,98 @@ interface FilterOptionRowProps {
   onSelect: (optName: string) => void;
 }
 
-const FilterOptionRow = React.memo<FilterOptionRowProps>(({ option, isActive, onSelect }) => (
-  <TouchableOpacity
-    style={[styles.optionRow, isActive && { backgroundColor: ui.primarySoft }]}
-    onPress={() => onSelect(option.name)}
-    activeOpacity={0.7}
-  >
-    <Text
-      style={[
-        styles.optionText,
-        {
-          color: isActive ? ui.primary : ui.text,
-          fontWeight: isActive ? '700' : '400',
-        },
-      ]}
-      numberOfLines={1}
+const FilterOptionRow = React.memo<FilterOptionRowProps>(({ option, isActive, onSelect }) => {
+  const handlePress = useCallback(() => {
+    onSelect(option.name);
+  }, [onSelect, option.name]);
+
+  return (
+    <TouchableOpacity
+      style={[styles.optionRow, isActive && styles.optionRowActive]}
+      onPress={handlePress}
+      activeOpacity={0.7}
     >
-      {option.name}
-    </Text>
-    <View style={styles.optionRightCol}>
-      {option.count !== undefined && (
-        <Text style={[styles.countBadgeText, { color: ui.textSecondary }]}>
-          ({option.count})
+      <Text
+        style={[styles.optionText, isActive && styles.optionTextActive]}
+        numberOfLines={1}
+      >
+        {option.name}
+      </Text>
+      <View style={styles.optionRightCol}>
+        {option.count !== undefined && (
+          <Text style={styles.countBadgeText}>({option.count})</Text>
+        )}
+        {isActive ? <Check size={14} color={ui.primary} /> : null}
+      </View>
+    </TouchableOpacity>
+  );
+});
+
+function renderGroupIcon(type?: string, isSelected?: boolean) {
+  const color = isSelected ? ui.primary : ui.textSecondary;
+  if (type === 'brand') return <Bookmark size={13} color={color} />;
+  if (type === 'size') return <Ruler size={13} color={color} />;
+  return <Tag size={13} color={color} />;
+}
+
+interface FilterGroupChipProps {
+  group: FilterGroup;
+  isOpen: boolean;
+  onToggle: (groupId: string) => void;
+}
+
+const FilterGroupChip = React.memo<FilterGroupChipProps>(({ group, isOpen, onToggle }) => {
+  const isSelected = group.selectedValue !== 'Todas' && group.selectedValue !== '';
+
+  const handleToggle = useCallback(() => {
+    onToggle(group.id);
+  }, [onToggle, group.id]);
+
+  const handleClear = useCallback(() => {
+    group.onClear();
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+  }, [group]);
+
+  return (
+    <View style={styles.btnWrapper}>
+      <TouchableOpacity
+        style={[
+          styles.pickerBtn,
+          isSelected ? styles.pickerBtnSelected : isOpen ? styles.pickerBtnOpen : null,
+        ]}
+        onPress={handleToggle}
+        activeOpacity={0.7}
+        accessibilityRole="button"
+        accessibilityLabel={`Filtrar ${group.label}: ${group.selectedValue}`}
+      >
+        {renderGroupIcon(group.icon, isSelected)}
+        <Text
+          style={[styles.pickerBtnText, isSelected && styles.pickerBtnTextSelected]}
+          numberOfLines={1}
+        >
+          {isSelected ? group.selectedValue : group.label}
         </Text>
-      )}
-      {isActive ? <Check size={14} color={ui.primary} /> : null}
+        {isOpen ? (
+          <ChevronUp size={12} color={isSelected ? ui.primary : ui.textSecondary} />
+        ) : (
+          <ChevronDown size={12} color={isSelected ? ui.primary : ui.textSecondary} />
+        )}
+      </TouchableOpacity>
+
+      {isSelected ? (
+        <TouchableOpacity
+          style={styles.clearBtn}
+          onPress={handleClear}
+          hitSlop={6}
+          accessibilityRole="button"
+          accessibilityLabel={`Limpiar filtro ${group.label}`}
+        >
+          <X size={11} color={ui.primary} />
+        </TouchableOpacity>
+      ) : null}
     </View>
-  </TouchableOpacity>
-));
+  );
+});
 
 export const InlineFilterBar: React.FC<InlineFilterBarProps> = React.memo(({ groups, rightElement }) => {
   const [activeGroupId, setActiveGroupId] = useState<string | null>(null);
@@ -159,12 +223,10 @@ export const InlineFilterBar: React.FC<InlineFilterBarProps> = React.memo(({ gro
     setDebouncedSearchQuery('');
   }, []);
 
-  const getGroupIcon = (type?: string, isSelected?: boolean) => {
-    const color = isSelected ? ui.primary : ui.textSecondary;
-    if (type === 'brand') return <Bookmark size={13} color={color} />;
-    if (type === 'size') return <Ruler size={13} color={color} />;
-    return <Tag size={13} color={color} />;
-  };
+  const handleClearSearch = useCallback(() => {
+    setSearchQuery('');
+    setDebouncedSearchQuery('');
+  }, []);
 
   const handleSelectAll = useCallback(() => {
     if (!activeGroup) return;
@@ -204,19 +266,11 @@ export const InlineFilterBar: React.FC<InlineFilterBarProps> = React.memo(({ gro
     const isSelected = activeGroup.selectedValue === 'Todas';
     return (
       <TouchableOpacity
-        style={[styles.optionRow, isSelected && { backgroundColor: ui.primarySoft }]}
+        style={[styles.optionRow, isSelected && styles.optionRowActive]}
         onPress={handleSelectAll}
         activeOpacity={0.7}
       >
-        <Text
-          style={[
-            styles.optionText,
-            {
-              color: isSelected ? ui.primary : ui.text,
-              fontWeight: isSelected ? '700' : '500',
-            },
-          ]}
-        >
+        <Text style={[styles.optionText, styles.allOptionText, isSelected && styles.optionTextActive]}>
           Todas las {activeGroup.label.toLowerCase()}
         </Text>
         {isSelected ? <Check size={14} color={ui.primary} /> : null}
@@ -227,13 +281,21 @@ export const InlineFilterBar: React.FC<InlineFilterBarProps> = React.memo(({ gro
   const emptyComponent = useMemo(
     () => (
       <View style={styles.emptyOptions}>
-        <Text style={[styles.emptyOptionsText, { color: ui.textMuted }]}>
+        <Text style={styles.emptyOptionsText}>
           Sin coincidencias para "{searchQuery}"
         </Text>
       </View>
     ),
     [searchQuery]
   );
+
+  const listContainerStyle = useMemo(() => {
+    const estimatedTotalHeight = (normalizedGroupOptions.length + 1) * 38;
+    const clampedHeight = Math.min(180, Math.max(84, estimatedTotalHeight));
+    return clampedHeight === 180
+      ? styles.flashListContainer
+      : [styles.flashListContainer, { height: clampedHeight }];
+  }, [normalizedGroupOptions.length]);
 
   return (
     <View style={styles.container}>
@@ -244,62 +306,14 @@ export const InlineFilterBar: React.FC<InlineFilterBarProps> = React.memo(({ gro
           showsHorizontalScrollIndicator={false}
           contentContainerStyle={styles.buttonsScroll}
         >
-          {groups.map((group) => {
-            const isSelected = group.selectedValue !== 'Todas' && group.selectedValue !== '';
-            const isOpen = activeGroupId === group.id;
-
-            return (
-              <View key={group.id} style={styles.btnWrapper}>
-                <TouchableOpacity
-                  style={[
-                    styles.pickerBtn,
-                    {
-                      backgroundColor: isSelected ? ui.primarySoft : ui.surface,
-                      borderColor: isSelected ? ui.primary : isOpen ? ui.primary : ui.border,
-                    },
-                  ]}
-                  onPress={() => toggleGroup(group.id)}
-                  activeOpacity={0.7}
-                  accessibilityRole="button"
-                  accessibilityLabel={`Filtrar ${group.label}: ${group.selectedValue}`}
-                >
-                  {getGroupIcon(group.icon, isSelected)}
-                  <Text
-                    style={[
-                      styles.pickerBtnText,
-                      {
-                        color: isSelected ? ui.primary : ui.text,
-                        fontWeight: isSelected ? '700' : '500',
-                      },
-                    ]}
-                    numberOfLines={1}
-                  >
-                    {isSelected ? group.selectedValue : group.label}
-                  </Text>
-                  {isOpen ? (
-                    <ChevronUp size={12} color={isSelected ? ui.primary : ui.textSecondary} />
-                  ) : (
-                    <ChevronDown size={12} color={isSelected ? ui.primary : ui.textSecondary} />
-                  )}
-                </TouchableOpacity>
-
-                {isSelected ? (
-                  <TouchableOpacity
-                    style={[styles.clearBtn, { backgroundColor: ui.primarySoft }]}
-                    onPress={() => {
-                      group.onClear();
-                      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-                    }}
-                    hitSlop={6}
-                    accessibilityRole="button"
-                    accessibilityLabel={`Limpiar filtro ${group.label}`}
-                  >
-                    <X size={11} color={ui.primary} />
-                  </TouchableOpacity>
-                ) : null}
-              </View>
-            );
-          })}
+          {groups.map((group) => (
+            <FilterGroupChip
+              key={group.id}
+              group={group}
+              isOpen={activeGroupId === group.id}
+              onToggle={toggleGroup}
+            />
+          ))}
         </ScrollView>
 
         {rightElement ? <View style={styles.rightWrapper}>{rightElement}</View> : null}
@@ -307,12 +321,12 @@ export const InlineFilterBar: React.FC<InlineFilterBarProps> = React.memo(({ gro
 
       {/* Menú Desplegable Inline con Buscador (sin modal invasivo) */}
       {activeGroup && (
-        <View style={[styles.dropdownContainer, { backgroundColor: ui.surface, borderColor: ui.border }]}>
+        <View style={styles.dropdownContainer}>
           {/* Barra de búsqueda dentro del selector */}
-          <View style={[styles.searchRow, { backgroundColor: ui.background, borderColor: ui.border }]}>
-            <Search size={14} color={ui.textSecondary} style={{ marginRight: 6 }} />
+          <View style={styles.searchRow}>
+            <Search size={14} color={ui.textSecondary} style={styles.searchIcon} />
             <TextInput
-              style={[styles.searchInput, { color: ui.text }]}
+              style={styles.searchInput}
               value={searchQuery}
               onChangeText={setSearchQuery}
               placeholder={`Buscar ${activeGroup.label.toLowerCase()} o iniciales...`}
@@ -322,52 +336,26 @@ export const InlineFilterBar: React.FC<InlineFilterBarProps> = React.memo(({ gro
               returnKeyType="done"
             />
             {searchQuery.length > 0 && (
-              <TouchableOpacity
-                onPress={() => {
-                  setSearchQuery('');
-                  setDebouncedSearchQuery('');
-                }}
-                hitSlop={6}
-              >
+              <TouchableOpacity onPress={handleClearSearch} hitSlop={6}>
                 <X size={14} color={ui.textSecondary} />
               </TouchableOpacity>
             )}
           </View>
 
-          {/* Lista Vertical Desplegable (Virtualizada con FlashList si > 40 opciones) */}
-          {filteredOptions.length > 40 ? (
-            <View style={styles.flashListContainer}>
-              <FlashList
-                data={filteredOptions}
-                renderItem={renderOptionItem}
-                estimatedItemSize={36}
-                extraData={selectedValue}
-                keyExtractor={keyExtractorByName}
-                ListHeaderComponent={allHeaderElement}
-                keyboardShouldPersistTaps="handled"
-                ListEmptyComponent={emptyComponent}
-              />
-            </View>
-          ) : (
-            <ScrollView
-              style={styles.optionsList}
+          {/* Lista Vertical Desplegable (siempre virtualizada con FlashList para evitar remounts al filtrar) */}
+          <View style={listContainerStyle}>
+            <FlashList
+              data={filteredOptions}
+              renderItem={renderOptionItem}
+              estimatedItemSize={36}
+              extraData={selectedValue}
+              keyExtractor={keyExtractorByName}
+              ListHeaderComponent={allHeaderElement}
               keyboardShouldPersistTaps="handled"
               nestedScrollEnabled
-            >
-              {allHeaderElement}
-
-              {filteredOptions.map((opt) => (
-                <FilterOptionRow
-                  key={opt.name}
-                  option={opt}
-                  isActive={selectedValue === opt.name}
-                  onSelect={handleSelectOption}
-                />
-              ))}
-
-              {filteredOptions.length === 0 && emptyComponent}
-            </ScrollView>
-          )}
+              ListEmptyComponent={emptyComponent}
+            />
+          </View>
         </View>
       )}
     </View>
@@ -408,16 +396,32 @@ const styles = StyleSheet.create({
     paddingVertical: 6,
     borderRadius: 8,
     borderWidth: 1,
+    borderColor: ui.border,
+    backgroundColor: ui.surface,
     minHeight: 32,
+  },
+  pickerBtnOpen: {
+    borderColor: ui.primary,
+  },
+  pickerBtnSelected: {
+    backgroundColor: ui.primarySoft,
+    borderColor: ui.primary,
   },
   pickerBtnText: {
     flex: 1,
     fontSize: 12,
+    color: ui.text,
+    fontWeight: '500',
+  },
+  pickerBtnTextSelected: {
+    color: ui.primary,
+    fontWeight: '700',
   },
   clearBtn: {
     marginLeft: 3,
     padding: 4,
     borderRadius: 10,
+    backgroundColor: ui.primarySoft,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -429,6 +433,8 @@ const styles = StyleSheet.create({
     marginHorizontal: 12,
     borderRadius: 10,
     borderWidth: 1,
+    borderColor: ui.border,
+    backgroundColor: ui.surface,
     padding: 8,
     elevation: 4,
     shadowColor: '#000',
@@ -444,15 +450,18 @@ const styles = StyleSheet.create({
     height: 34,
     borderRadius: 6,
     borderWidth: 1,
+    borderColor: ui.border,
+    backgroundColor: ui.background,
     marginBottom: 6,
+  },
+  searchIcon: {
+    marginRight: 6,
   },
   searchInput: {
     flex: 1,
     fontSize: 12,
+    color: ui.text,
     paddingVertical: 0,
-  },
-  optionsList: {
-    maxHeight: 180,
   },
   flashListContainer: {
     height: 180,
@@ -465,6 +474,9 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
     borderRadius: 6,
   },
+  optionRowActive: {
+    backgroundColor: ui.primarySoft,
+  },
   optionRightCol: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -473,9 +485,19 @@ const styles = StyleSheet.create({
   optionText: {
     fontSize: 13,
     flex: 1,
+    color: ui.text,
+    fontWeight: '400',
+  },
+  allOptionText: {
+    fontWeight: '500',
+  },
+  optionTextActive: {
+    color: ui.primary,
+    fontWeight: '700',
   },
   countBadgeText: {
     fontSize: 11,
+    color: ui.textSecondary,
   },
   emptyOptions: {
     paddingVertical: 12,
@@ -484,5 +506,6 @@ const styles = StyleSheet.create({
   emptyOptionsText: {
     fontSize: 12,
     fontStyle: 'italic',
+    color: ui.textMuted,
   },
 });

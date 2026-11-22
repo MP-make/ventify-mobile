@@ -12,12 +12,14 @@ vi.mock('firebase/firestore', () => ({
   query: vi.fn((...args: unknown[]) => args),
   where: vi.fn((field: string, op: string, value: unknown) => ({ field, op, value })),
   orderBy: vi.fn((field: string, dir: string) => ({ field, dir })),
+  limit: vi.fn((n: number) => ({ n })),
   getDocs: getDocsMock,
   Timestamp: { fromMillis: vi.fn((ms: number) => ({ ms })) },
 }));
 vi.mock('expo-print', () => ({ printToFileAsync: vi.fn() }));
 vi.mock('expo-sharing', () => ({ shareAsync: vi.fn() }));
 
+import { clearRequestCache } from '@/lib/request-cache';
 import { generatePnlReport } from '../pnl-report-service';
 
 const report = {
@@ -47,6 +49,7 @@ const makeSnap = (rows: Array<{ id: string; data: Record<string, any> }>) => ({
 });
 
 beforeEach(() => {
+  clearRequestCache();
   apiRequest.mockReset();
   getDocsMock.mockReset();
 });
@@ -356,5 +359,34 @@ describe('shared canonical P&L report', () => {
         endDate: report.toMs,
       })
     ).rejects.toThrow('salesClosed');
+  });
+
+  it('skips Firestore detail reads when server P&L response includes breakdown fields and caches repeat requests', async () => {
+    apiRequest.mockResolvedValue({
+      ...report,
+      detailsAvailable: true,
+      paymentBreakdown: [{ method: 'cash', label: 'Efectivo', amount: 120, count: 2, percentage: 100 }],
+      topProductsByRevenue: [{ id: 'p1', name: 'Café', quantity: 2, revenue: 120, cogs: 40, profit: 80, marginPercent: 66.67 }],
+      topProductsByProfit: [{ id: 'p1', name: 'Café', quantity: 2, revenue: 120, cogs: 40, profit: 80, marginPercent: 66.67 }],
+      sellerBreakdown: [],
+      expenseBreakdown: [{ category: 'rent', label: 'Alquiler', amount: 50, percentage: 100 }],
+      expensesByCategory: { rent: 50 },
+    });
+
+    const first = await generatePnlReport({
+      accountId: 'account-1',
+      startDate: report.fromMs,
+      endDate: report.toMs,
+    });
+    const second = await generatePnlReport({
+      accountId: 'account-1',
+      startDate: report.fromMs,
+      endDate: report.toMs,
+    });
+
+    expect(getDocsMock).not.toHaveBeenCalled();
+    expect(apiRequest).toHaveBeenCalledTimes(1);
+    expect(first.paymentBreakdown).toHaveLength(1);
+    expect(second).toBe(first);
   });
 });

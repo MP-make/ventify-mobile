@@ -17,8 +17,8 @@ import { doc, getDoc } from 'firebase/firestore';
 import { Printer, Share2, X } from 'lucide-react-native';
 import { BrandLogo, SectionHeading } from '@/components/ui';
 import { ReceiptTicketPreview } from '@/components/ReceiptTicketPreview';
-import { useAuth } from '@/context/AuthContext';
-import { useSettings } from '@/context/SettingsContext';
+import { useAuthSession } from '@/context/AuthContext';
+import { useBusinessSettings } from '@/context/SettingsContext';
 import { db } from '@/lib/firebase';
 import { ui, formatPEN, formatDatePE } from '@/lib/theme';
 import { sellerPresetDates, type SellerPreset } from '@/lib/seller-dates';
@@ -86,9 +86,11 @@ const SellerSaleRow = React.memo(({ sale, branchName, onPress }: SellerSaleRowPr
 
 const EMPTY_SALES: RecentSaleItem[] = [];
 
+const ListGap16 = () => <View style={styles.listGap16} />;
+
 export default function SellerScreen() {
   const insets = useSafeAreaInsets();
-  const { user, accountId, logout } = useAuth();
+  const { user, accountId, logout } = useAuthSession();
   const {
     businessSettings,
     businessData,
@@ -97,7 +99,7 @@ export default function SellerScreen() {
     taxProfile,
     emitterInfo,
     posSettings,
-  } = useSettings();
+  } = useBusinessSettings();
 
   const [metadata, setMetadata] = useState<SellerMetadata | null>(null);
   const [report, setReport] = useState<SellerOwnReport | null>(null);
@@ -109,6 +111,9 @@ export default function SellerScreen() {
   const [error, setError] = useState('');
   const [revision, setRevision] = useState(0);
   const requestVersion = useRef(0);
+  const perfAbortRef = useRef<AbortController | null>(null);
+  const detailReqIdRef = useRef(0);
+  const isMountedRef = useRef(true);
 
   // Detalle de venta y vista previa de recibo
   const [selectedSaleItem, setSelectedSaleItem] = useState<RecentSaleItem | null>(null);
@@ -170,6 +175,20 @@ export default function SellerScreen() {
   }, [metadata?.branches, branches]);
 
   useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      detailReqIdRef.current += 1;
+      perfAbortRef.current?.abort();
+      perfAbortRef.current = null;
+      requestVersion.current += 1;
+    };
+  }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    perfAbortRef.current?.abort();
+    perfAbortRef.current = null;
     let alive = true;
     setMetadata(null);
     setReport(null);
@@ -177,21 +196,31 @@ export default function SellerScreen() {
     setActivePreset('today');
     setBusy(true);
     setError('');
-    fetchSellerMetadata()
+    fetchSellerMetadata({ signal: controller.signal })
       .then((data) => {
-        if (!alive) return;
+        if (!alive || !isMountedRef.current || controller.signal.aborted) return;
         setMetadata(data);
         setFrom(data.today);
         setTo(data.today);
       })
       .catch((err) => {
-        if (alive) {
-          setError(err.message);
-          setBusy(false);
+        if (
+          !alive ||
+          !isMountedRef.current ||
+          controller.signal.aborted ||
+          err?.code === 'ABORTED' ||
+          err?.name === 'AbortError'
+        ) {
+          return;
         }
+        setError(err.message);
+        setBusy(false);
       });
     return () => {
       alive = false;
+      controller.abort();
+      perfAbortRef.current?.abort();
+      perfAbortRef.current = null;
       requestVersion.current++;
     };
   }, [user?.uid, accountId, revision]);
@@ -201,24 +230,45 @@ export default function SellerScreen() {
       setError('Ingresa fechas válidas como AAAA-MM-DD.');
       return;
     }
+    perfAbortRef.current?.abort();
+    const controller = new AbortController();
+    perfAbortRef.current = controller;
     const version = ++requestVersion.current;
     setReport(null);
     setBusy(true);
     setError('');
     try {
-      const data = await fetchSellerPerformance(start, end, branchId);
-      if (version === requestVersion.current) setReport(data);
-    } catch (err) {
-      if (version === requestVersion.current) {
+      const data = await fetchSellerPerformance(start, end, branchId, {
+        signal: controller.signal,
+      });
+      if (isMountedRef.current && version === requestVersion.current && !controller.signal.aborted) {
+        setReport(data);
+      }
+    } catch (err: any) {
+      if (
+        isMountedRef.current &&
+        version === requestVersion.current &&
+        !controller.signal.aborted &&
+        err?.code !== 'ABORTED' &&
+        err?.name !== 'AbortError'
+      ) {
         setError(err instanceof Error ? err.message : 'No se pudieron consultar tus ventas.');
       }
     } finally {
-      if (version === requestVersion.current) setBusy(false);
+      if (isMountedRef.current && version === requestVersion.current && !controller.signal.aborted) {
+        setBusy(false);
+      }
+      if (perfAbortRef.current === controller) {
+        perfAbortRef.current = null;
+      }
     }
   }, []);
 
   useEffect(() => {
     if (metadata) void load(metadata.today, metadata.today, '');
+    return () => {
+      perfAbortRef.current?.abort();
+    };
   }, [metadata, load]);
 
   const applyPreset = useCallback((value: Exclude<ExtendedPreset, 'custom'>) => {
@@ -234,21 +284,26 @@ export default function SellerScreen() {
   }, [metadata, branch, load]);
 
   const handleOpenSaleDetail = useCallback(async (saleItem: RecentSaleItem) => {
+    const reqId = ++detailReqIdRef.current;
     setSelectedSaleItem(saleItem);
     setSelectedFullSale(null);
     setDetailError('');
     setLoadingDetail(true);
     try {
       const snap = await getDoc(doc(db, 'sales', saleItem.id));
+      if (!isMountedRef.current || reqId !== detailReqIdRef.current) return;
       if (snap.exists()) {
         setSelectedFullSale({ id: snap.id, ...(snap.data() as Omit<Sale, 'id'>) });
       } else {
         setDetailError('No se encontró el detalle completo; mostrando resumen.');
       }
     } catch {
+      if (!isMountedRef.current || reqId !== detailReqIdRef.current) return;
       setDetailError('Sin conexión o sin detalle extendido; mostrando resumen.');
     } finally {
-      setLoadingDetail(false);
+      if (isMountedRef.current && reqId === detailReqIdRef.current) {
+        setLoadingDetail(false);
+      }
     }
   }, []);
 
@@ -370,7 +425,7 @@ export default function SellerScreen() {
   }, [report]);
 
   const headerElement = useMemo(() => (
-    <View style={{ gap: 16 }}>
+    <View style={[styles.headerBox, Boolean(report?.recentSales?.length) && styles.headerWithListMargin]}>
       <Text style={styles.title}>Mis ventas</Text>
       <Text style={styles.subtitle}>
         {metadata?.seller.name || 'Portal de vendedor'} · Consulta tus resultados y comprobantes.
@@ -549,142 +604,151 @@ export default function SellerScreen() {
         keyExtractor={saleKeyExtractor}
         estimatedItemSize={96}
         renderItem={renderSaleItem}
+        ItemSeparatorComponent={ListGap16}
         ListHeaderComponent={headerElement}
         contentContainerStyle={styles.content}
         keyboardShouldPersistTaps="handled"
       />
 
-      <Modal
-        visible={Boolean(selectedSaleItem)}
-        animationType="slide"
-        presentationStyle="pageSheet"
-        onRequestClose={() => setSelectedSaleItem(null)}
-      >
-        <View style={[styles.modalContainer, { paddingTop: Platform.OS === 'ios' ? insets.top : 14 }]}>
-          <View style={styles.modalHeader}>
-            <View style={{ flex: 1 }}>
-              <Text style={styles.modalTitle}>
-                {selectedSaleItem?.isReturn
-                  ? 'Detalle de Devolución'
-                  : `Venta #${selectedSaleItem?.saleNumber || selectedSaleItem?.id.slice(-6).toUpperCase() || ''}`}
-              </Text>
-              <Text style={styles.note}>
-                {selectedSaleItem ? formatDatePE(selectedSaleItem.date) : ''}
-              </Text>
-            </View>
-            <TouchableOpacity
-              style={styles.modalCloseBtn}
-              onPress={() => setSelectedSaleItem(null)}
-              accessibilityRole="button"
-              accessibilityLabel="Cerrar detalle de venta"
-            >
-              <X size={20} color={ui.textSecondary} />
-            </TouchableOpacity>
-          </View>
-
-          <ScrollView
-            style={{ flex: 1 }}
-            contentContainerStyle={[styles.modalScrollContent, { paddingBottom: insets.bottom + 24 }]}
-          >
-            {loadingDetail ? (
-              <View style={styles.modalLoadingBox}>
-                <ActivityIndicator color={ui.primary} />
-                <Text style={styles.note}>Cargando comprobante...</Text>
-              </View>
-            ) : null}
-
-            {!!detailError && (
-              <View style={styles.modalNotice}>
-                <Text style={styles.note}>{detailError}</Text>
-              </View>
-            )}
-
-            {fallbackPreviewSale && selectedFullSale ? (
-              <>
-                <View style={styles.paperRow}>
-                  <Text style={styles.label}>Ancho de ticket:</Text>
-                  <View style={styles.paperBtnGroup}>
-                    {([80, 58] as const).map((w) => (
-                      <TouchableOpacity
-                        key={w}
-                        style={[styles.paperBtn, paperWidth === w && styles.paperBtnActive]}
-                        onPress={() => setPaperWidth(w)}
-                      >
-                        <Text style={[styles.paperBtnText, paperWidth === w && styles.paperBtnTextActive]}>
-                          {w}mm
-                        </Text>
-                      </TouchableOpacity>
-                    ))}
-                  </View>
-                </View>
-
-                <View style={{ alignItems: 'center', marginBottom: 14 }}>
-                  <ReceiptTicketPreview
-                    sale={selectedFullSale}
-                    business={receiptBusiness}
-                    branch={selectedSaleBranch}
-                    taxProfile={taxProfile}
-                    receiptFooter={
-                      posSettings?.ticketFooterMessage ||
-                      businessSettings?.receiptFooter ||
-                      '¡Gracias por su compra!'
-                    }
-                    paperWidth={paperWidth}
-                  />
-                </View>
-              </>
-            ) : selectedSaleItem ? (
-              <View style={styles.summary}>
-                <Text style={styles.label}>Resumen de comprobante</Text>
-                <Text style={styles.value}>{formatPEN(selectedSaleItem.total)}</Text>
-                <Text style={styles.subtitle}>
-                  Cliente: {selectedSaleItem.customerName || 'Cliente general'}
+      {selectedSaleItem ? (
+        <Modal
+          visible
+          animationType="slide"
+          presentationStyle="pageSheet"
+          onRequestClose={() => {
+            detailReqIdRef.current += 1;
+            setSelectedSaleItem(null);
+          }}
+        >
+          <View style={[styles.modalContainer, { paddingTop: Platform.OS === 'ios' ? insets.top : 14 }]}>
+            <View style={styles.modalHeader}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.modalTitle}>
+                  {selectedSaleItem.isReturn
+                    ? 'Detalle de Devolución'
+                    : `Venta #${selectedSaleItem.saleNumber || selectedSaleItem.id.slice(-6).toUpperCase()}`}
                 </Text>
-                <Text style={styles.subtitle}>Pago: {selectedSaleItem.paymentMethod}</Text>
-                {typeof selectedSaleItem.itemsCount === 'number' && (
-                  <Text style={styles.subtitle}>Artículos: {selectedSaleItem.itemsCount}</Text>
-                )}
+                <Text style={styles.note}>
+                  {formatDatePE(selectedSaleItem.date)}
+                </Text>
               </View>
-            ) : null}
+              <TouchableOpacity
+                style={styles.modalCloseBtn}
+                onPress={() => {
+                  detailReqIdRef.current += 1;
+                  setSelectedSaleItem(null);
+                }}
+                accessibilityRole="button"
+                accessibilityLabel="Cerrar detalle de venta"
+              >
+                <X size={20} color={ui.textSecondary} />
+              </TouchableOpacity>
+            </View>
 
-            {fallbackPreviewSale && (
-              <View style={styles.modalActionsRow}>
-                <TouchableOpacity
-                  style={[styles.modalActionBtn, isPrinting && { opacity: 0.6 }]}
-                  onPress={() => void handlePrintDetailSale()}
-                  disabled={isPrinting}
-                  accessibilityRole="button"
-                >
-                  {isPrinting ? (
-                    <ActivityIndicator size="small" color={ui.primary} />
-                  ) : (
-                    <>
-                      <Printer size={18} color={ui.primary} />
-                      <Text style={styles.modalActionBtnText}>Imprimir / PDF</Text>
-                    </>
-                  )}
-                </TouchableOpacity>
+            <ScrollView
+              style={{ flex: 1 }}
+              contentContainerStyle={[styles.modalScrollContent, { paddingBottom: insets.bottom + 24 }]}
+            >
+              {loadingDetail ? (
+                <View style={styles.modalLoadingBox}>
+                  <ActivityIndicator color={ui.primary} />
+                  <Text style={styles.note}>Cargando comprobante...</Text>
+                </View>
+              ) : null}
 
-                <TouchableOpacity
-                  style={[styles.modalActionBtn, isSharing && { opacity: 0.6 }]}
-                  onPress={() => void handleShareDetailWhatsApp()}
-                  disabled={isSharing}
-                  accessibilityRole="button"
-                >
-                  {isSharing ? (
-                    <ActivityIndicator size="small" color={ui.primary} />
-                  ) : (
-                    <>
-                      <Share2 size={18} color={ui.primary} />
-                      <Text style={styles.modalActionBtnText}>WhatsApp</Text>
-                    </>
+              {!!detailError && (
+                <View style={styles.modalNotice}>
+                  <Text style={styles.note}>{detailError}</Text>
+                </View>
+              )}
+
+              {fallbackPreviewSale && selectedFullSale ? (
+                <>
+                  <View style={styles.paperRow}>
+                    <Text style={styles.label}>Ancho de ticket:</Text>
+                    <View style={styles.paperBtnGroup}>
+                      {([80, 58] as const).map((w) => (
+                        <TouchableOpacity
+                          key={w}
+                          style={[styles.paperBtn, paperWidth === w && styles.paperBtnActive]}
+                          onPress={() => setPaperWidth(w)}
+                        >
+                          <Text style={[styles.paperBtnText, paperWidth === w && styles.paperBtnTextActive]}>
+                            {w}mm
+                          </Text>
+                        </TouchableOpacity>
+                      ))}
+                    </View>
+                  </View>
+
+                  <View style={{ alignItems: 'center', marginBottom: 14 }}>
+                    <ReceiptTicketPreview
+                      sale={selectedFullSale}
+                      business={receiptBusiness}
+                      branch={selectedSaleBranch}
+                      taxProfile={taxProfile}
+                      receiptFooter={
+                        posSettings?.ticketFooterMessage ||
+                        businessSettings?.receiptFooter ||
+                        '¡Gracias por su compra!'
+                      }
+                      paperWidth={paperWidth}
+                    />
+                  </View>
+                </>
+              ) : (
+                <View style={styles.summary}>
+                  <Text style={styles.label}>Resumen de comprobante</Text>
+                  <Text style={styles.value}>{formatPEN(selectedSaleItem.total)}</Text>
+                  <Text style={styles.subtitle}>
+                    Cliente: {selectedSaleItem.customerName || 'Cliente general'}
+                  </Text>
+                  <Text style={styles.subtitle}>Pago: {selectedSaleItem.paymentMethod}</Text>
+                  {typeof selectedSaleItem.itemsCount === 'number' && (
+                    <Text style={styles.subtitle}>Artículos: {selectedSaleItem.itemsCount}</Text>
                   )}
-                </TouchableOpacity>
-              </View>
-            )}
-          </ScrollView>
-        </View>
-      </Modal>
+                </View>
+              )}
+
+              {fallbackPreviewSale && (
+                <View style={styles.modalActionsRow}>
+                  <TouchableOpacity
+                    style={[styles.modalActionBtn, isPrinting && { opacity: 0.6 }]}
+                    onPress={() => void handlePrintDetailSale()}
+                    disabled={isPrinting}
+                    accessibilityRole="button"
+                  >
+                    {isPrinting ? (
+                      <ActivityIndicator size="small" color={ui.primary} />
+                    ) : (
+                      <>
+                        <Printer size={18} color={ui.primary} />
+                        <Text style={styles.modalActionBtnText}>Imprimir / PDF</Text>
+                      </>
+                    )}
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={[styles.modalActionBtn, isSharing && { opacity: 0.6 }]}
+                    onPress={() => void handleShareDetailWhatsApp()}
+                    disabled={isSharing}
+                    accessibilityRole="button"
+                  >
+                    {isSharing ? (
+                      <ActivityIndicator size="small" color={ui.primary} />
+                    ) : (
+                      <>
+                        <Share2 size={18} color={ui.primary} />
+                        <Text style={styles.modalActionBtnText}>WhatsApp</Text>
+                      </>
+                    )}
+                  </TouchableOpacity>
+                </View>
+              )}
+            </ScrollView>
+          </View>
+        </Modal>
+      ) : null}
     </SafeAreaView>
   );
 }
@@ -699,7 +763,10 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     alignItems: 'center',
   },
-  content: { padding: 20, gap: 16, paddingBottom: 40 },
+  content: { padding: 20, paddingBottom: 40 },
+  listGap16: { height: 16 },
+  headerBox: { gap: 16 },
+  headerWithListMargin: { marginBottom: 16 },
   title: { fontSize: 28, fontWeight: '700', color: ui.text },
   subtitle: { fontSize: 14, lineHeight: 21, color: ui.textSecondary },
   link: { paddingVertical: 12, paddingHorizontal: 8, minHeight: 48, justifyContent: 'center' },

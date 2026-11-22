@@ -32,4 +32,33 @@ describe('authenticated backend client', () => {
     vi.stubGlobal('fetch', vi.fn(async () => { state.user = { uid: 'u2' }; return new Response('{"private":true}'); }));
     await expect(apiRequest('/api/test')).rejects.toMatchObject({ status: 409 });
   });
+
+  it('keeps timeout active through response.json() body parsing (408)', async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: () => new Promise(() => {}),
+    } as unknown as Response)));
+
+    const pending = apiRequest('/api/slow-body', { timeoutMs: 1200 });
+    const assertion = expect(pending).rejects.toMatchObject({ status: 408 });
+    await vi.advanceTimersByTimeAsync(1200);
+    await assertion;
+  });
+
+  it('aborts stalled response.json() body parsing with 499 ABORTED on external AbortSignal', async () => {
+    const controller = new AbortController();
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: () => new Promise(() => {}),
+    } as unknown as Response)));
+
+    const pending = apiRequest('/api/abort-body', { signal: controller.signal, timeoutMs: 5000 });
+    await Promise.resolve();
+    await Promise.resolve();
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ status: 499, code: 'ABORTED' });
+  });
 });

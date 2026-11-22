@@ -45,9 +45,11 @@ import {
   summarizeEinvoices,
 } from '@/services/dashboard-reports-service';
 import { ApiError } from '@/lib/api-client';
+import { clearRequestCache } from '@/lib/request-cache';
 
 describe('dashboard-reports-service', () => {
   beforeEach(() => {
+    clearRequestCache();
     state.user = {
       uid: 'user-1',
       getIdToken: vi.fn(async () => 'firebase-jwt-token'),
@@ -212,7 +214,7 @@ describe('dashboard-reports-service', () => {
       expect(scoped).toHaveLength(1);
       expect(scoped[0].id).toBe('e1');
       expect(fetchMock).toHaveBeenCalledWith(
-        'https://ventify.test/api/invoicing/status?accountId=acc-1&from=2026-11-01&to=2026-11-16',
+        'https://ventify.test/api/invoicing/status?accountId=acc-1&from=2026-11-01&to=2026-11-16&branchId=b1',
         expect.anything()
       );
     });

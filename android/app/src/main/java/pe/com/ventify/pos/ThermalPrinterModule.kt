@@ -13,9 +13,11 @@ import android.util.Base64
 import androidx.core.content.ContextCompat
 import com.facebook.react.bridge.*
 import java.io.IOException
+import java.io.InterruptedIOException
 import java.io.OutputStream
 import java.util.UUID
 import java.util.concurrent.Callable
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.RejectedExecutionException
@@ -26,6 +28,7 @@ class ThermalPrinterModule(reactContext: ReactApplicationContext) :
   ReactContextBaseJavaModule(reactContext) {
 
   companion object {
+    const val NAME = "ThermalPrinter"
     private val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
     private const val CONNECT_TIMEOUT_MS = 4000L
     private const val WRITE_CHUNK_SIZE = 512
@@ -33,15 +36,55 @@ class ThermalPrinterModule(reactContext: ReactApplicationContext) :
     private const val DRAIN_PAUSE_MS = 120L
   }
 
-  private val printExecutor = Executors.newSingleThreadExecutor { runnable ->
-    Thread(runnable, "VentifyThermalPrinter").apply { isDaemon = true }
+  private val printExecutorDelegate = lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+    Executors.newSingleThreadExecutor { runnable ->
+      Thread(runnable, "VentifyThermalPrinter").apply { isDaemon = true }
+    }
   }
+  private val printExecutor: ExecutorService
+    get() = printExecutorDelegate.value
 
-  override fun getName(): String = "ThermalPrinter"
+  private val connectExecutorDelegate = lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+    Executors.newSingleThreadExecutor { runnable ->
+      Thread(runnable, "VentifyBtConnect").apply { isDaemon = true }
+    }
+  }
+  private val connectExecutor: ExecutorService
+    get() = connectExecutorDelegate.value
+
+  @Volatile private var activeSocket: BluetoothSocket? = null
+  @Volatile private var isInvalidated = false
+
+  override fun getName(): String = NAME
 
   override fun invalidate() {
+    isInvalidated = true
     super.invalidate()
-    printExecutor.shutdownNow()
+    closeActiveSocket()
+    if (printExecutorDelegate.isInitialized()) {
+      printExecutorDelegate.value.shutdownNow()
+    }
+    if (connectExecutorDelegate.isInitialized()) {
+      connectExecutorDelegate.value.shutdownNow()
+    }
+  }
+
+  private fun closeSocketQuietly(socket: BluetoothSocket?) {
+    try {
+      socket?.close()
+    } catch (_: Exception) {}
+  }
+
+  private fun closeActiveSocket() {
+    val socket = activeSocket
+    activeSocket = null
+    closeSocketQuietly(socket)
+  }
+
+  private fun clearActiveSocketIfSame(socket: BluetoothSocket?) {
+    if (socket != null && activeSocket === socket) {
+      activeSocket = null
+    }
   }
 
   private fun getBluetoothAdapter(): BluetoothAdapter? {
@@ -65,55 +108,70 @@ class ThermalPrinterModule(reactContext: ReactApplicationContext) :
   }
 
   @SuppressLint("MissingPermission")
+  private fun connectAttemptWithTimeout(
+    adapter: BluetoothAdapter,
+    device: BluetoothDevice,
+    secure: Boolean,
+    timeoutMs: Long
+  ): BluetoothSocket {
+    if (isInvalidated || Thread.currentThread().isInterrupted) {
+      throw InterruptedIOException("Operación de impresión cancelada.")
+    }
+
+    val candidate = if (secure) {
+      device.createRfcommSocketToServiceRecord(SPP_UUID)
+    } else {
+      device.createInsecureRfcommSocketToServiceRecord(SPP_UUID)
+    }
+    activeSocket = candidate
+    adapter.cancelDiscovery()
+
+    var future: Future<Unit>? = null
+    try {
+      future = connectExecutor.submit(Callable {
+        candidate.connect()
+      })
+      future.get(timeoutMs, TimeUnit.MILLISECONDS)
+      if (isInvalidated) {
+        closeSocketQuietly(candidate)
+        clearActiveSocketIfSame(candidate)
+        throw InterruptedIOException("El módulo de impresión fue cerrado.")
+      }
+      return candidate
+    } catch (te: TimeoutException) {
+      future?.cancel(true)
+      closeSocketQuietly(candidate)
+      clearActiveSocketIfSame(candidate)
+      throw IOException("Tiempo de espera agotado al conectar con la impresora (${timeoutMs}ms)", te)
+    } catch (ie: InterruptedException) {
+      future?.cancel(true)
+      closeSocketQuietly(candidate)
+      clearActiveSocketIfSame(candidate)
+      Thread.currentThread().interrupt()
+      throw InterruptedIOException("Conexión Bluetooth cancelada.")
+    } catch (e: Exception) {
+      future?.cancel(true)
+      closeSocketQuietly(candidate)
+      clearActiveSocketIfSame(candidate)
+      val rootCause = e.cause ?: e
+      if (rootCause is Exception) throw rootCause
+      throw IOException(rootCause.message ?: "Error al conectar socket Bluetooth", rootCause)
+    }
+  }
+
+  @SuppressLint("MissingPermission")
   private fun connectWithTimeout(
     adapter: BluetoothAdapter,
     device: BluetoothDevice,
     timeoutMs: Long
   ): BluetoothSocket {
-    val connectExecutor = Executors.newSingleThreadExecutor { runnable ->
-      Thread(runnable, "VentifyBtConnect").apply { isDaemon = true }
-    }
-
-    fun attempt(secure: Boolean): BluetoothSocket {
-      val candidate = if (secure) {
-        device.createRfcommSocketToServiceRecord(SPP_UUID)
-      } else {
-        device.createInsecureRfcommSocketToServiceRecord(SPP_UUID)
+    return try {
+      connectAttemptWithTimeout(adapter, device, secure = true, timeoutMs = timeoutMs)
+    } catch (secureErr: Exception) {
+      if (secureErr is SecurityException || secureErr is InterruptedIOException || isInvalidated) {
+        throw secureErr
       }
-      adapter.cancelDiscovery()
-
-      val future: Future<Unit> = connectExecutor.submit(Callable {
-        candidate.connect()
-      })
-
-      try {
-        future.get(timeoutMs, TimeUnit.MILLISECONDS)
-        return candidate
-      } catch (te: TimeoutException) {
-        future.cancel(true)
-        try {
-          candidate.close()
-        } catch (_: Exception) {}
-        throw IOException("Tiempo de espera agotado al conectar con la impresora (${timeoutMs}ms)", te)
-      } catch (e: Exception) {
-        try {
-          candidate.close()
-        } catch (_: Exception) {}
-        val rootCause = e.cause ?: e
-        if (rootCause is Exception) throw rootCause
-        throw IOException(rootCause.message ?: "Error al conectar socket Bluetooth", rootCause)
-      }
-    }
-
-    try {
-      return try {
-        attempt(secure = true)
-      } catch (secureErr: Exception) {
-        if (secureErr is SecurityException) throw secureErr
-        attempt(secure = false)
-      }
-    } finally {
-      connectExecutor.shutdownNow()
+      connectAttemptWithTimeout(adapter, device, secure = false, timeoutMs = timeoutMs)
     }
   }
 
@@ -204,25 +262,13 @@ class ThermalPrinterModule(reactContext: ReactApplicationContext) :
       return
     }
 
-    val base64Data = if (params.hasKey("base64Data")) params.getString("base64Data") else null
-    if (base64Data.isNullOrEmpty()) {
+    val base64Payload = if (params.hasKey("base64Data")) params.getString("base64Data") else null
+    if (base64Payload.isNullOrEmpty()) {
       promise.reject("E_INVALID_ARGS", "Datos Base64 ESC/POS requeridos.")
       return
     }
 
-    val bytes: ByteArray = try {
-      Base64.decode(base64Data, Base64.DEFAULT)
-    } catch (e: IllegalArgumentException) {
-      promise.reject("E_INVALID_DATA", "Datos Base64 ESC/POS inválidos.", e)
-      return
-    }
-
-    if (bytes.isEmpty()) {
-      promise.reject("E_INVALID_DATA", "El buffer ESC/POS está vacío.")
-      return
-    }
-
-    if (printExecutor.isShutdown) {
+    if (isInvalidated || (printExecutorDelegate.isInitialized() && printExecutor.isShutdown)) {
       promise.reject("E_MODULE_DESTROYED", "El módulo de impresión fue cerrado.")
       return
     }
@@ -231,6 +277,23 @@ class ThermalPrinterModule(reactContext: ReactApplicationContext) :
       printExecutor.execute {
         var socket: BluetoothSocket? = null
         try {
+          val bytes: ByteArray = try {
+            Base64.decode(base64Payload, Base64.DEFAULT)
+          } catch (e: IllegalArgumentException) {
+            promise.reject("E_INVALID_DATA", "Datos Base64 ESC/POS inválidos.", e)
+            return@execute
+          }
+
+          if (bytes.isEmpty()) {
+            promise.reject("E_INVALID_DATA", "El buffer ESC/POS está vacío.")
+            return@execute
+          }
+
+          if (isInvalidated) {
+            promise.reject("E_MODULE_DESTROYED", "El módulo de impresión fue cerrado.")
+            return@execute
+          }
+
           if (!hasBluetoothConnectPermission()) {
             promise.reject(
               "E_PERMISSION_DENIED",
@@ -265,9 +328,8 @@ class ThermalPrinterModule(reactContext: ReactApplicationContext) :
         } catch (e: Exception) {
           promise.reject("PRINT_ERROR", e.message ?: "Error al imprimir en ticketera Bluetooth.", e)
         } finally {
-          try {
-            socket?.close()
-          } catch (_: Exception) {}
+          closeSocketQuietly(socket)
+          clearActiveSocketIfSame(socket)
         }
       }
     } catch (re: RejectedExecutionException) {

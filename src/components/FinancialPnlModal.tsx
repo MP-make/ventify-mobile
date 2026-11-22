@@ -42,9 +42,10 @@ import {
   ArrowUpRight,
 } from 'lucide-react-native';
 
-import { useAuth } from '@/context/AuthContext';
-import { useSettings } from '@/context/SettingsContext';
+import { useAuthSession } from '@/context/AuthContext';
+import { useBusinessSettings } from '@/context/SettingsContext';
 import { useProducts } from '@/context/ProductsContext';
+import type { Product } from '@/types';
 import { ui, formatPEN, formatDatePE } from '@/lib/theme';
 import { ScreenHeading } from '@/components/ui';
 import {
@@ -121,9 +122,9 @@ export const FinancialPnlModal: React.FC<FinancialPnlModalProps> = React.memo(({
   initialPeriod = 'today',
 }) => {
   const insets = useSafeAreaInsets();
-  const { accountId, branchId } = useAuth();
-  const { businessData, activeBranchName, businessSettings } = useSettings();
-  const { products } = useProducts();
+  const { accountId, branchId } = useAuthSession();
+  const { businessData, activeBranchName, businessSettings } = useBusinessSettings();
+  const { productsById } = useProducts();
 
   // Estados de control
   const [selectedPeriod, setSelectedPeriod] = useState<PnlPeriodType>(initialPeriod);
@@ -133,20 +134,9 @@ export const FinancialPnlModal: React.FC<FinancialPnlModalProps> = React.memo(({
   const [productRankingSort, setProductRankingSort] = useState<'profit' | 'revenue'>('profit');
   const [showExpenseDetails, setShowExpenseDetails] = useState(false);
 
-  // Mapa de productos indexado por ID para lookup instantáneo de costos (solo cuando el modal es visible)
-  const productsMap = useMemo(() => {
-    if (!visible) return new Map();
-    const map = new Map();
-    if (Array.isArray(products)) {
-      products.forEach((p) => {
-        if (p && p.id) map.set(p.id, p);
-      });
-    }
-    return map;
-  }, [visible, products]);
-
-  const productsMapRef = useRef(productsMap);
-  productsMapRef.current = productsMap;
+  const productsMapRef = useRef(productsById);
+  productsMapRef.current = productsById;
+  const loadAbortRef = useRef<AbortController | null>(null);
 
   // Nombre de empresa y sucursal resueltos
   const businessName =
@@ -156,9 +146,18 @@ export const FinancialPnlModal: React.FC<FinancialPnlModalProps> = React.memo(({
     'Mi Negocio';
   const branchName = activeBranchName || 'Sucursal Principal';
 
-  // Carga y cálculo del reporte P&L
-  const loadReport = useCallback(async () => {
+  // Carga y cálculo del reporte P&L con cancelación de peticiones obsoletas
+  const loadReport = useCallback(async (externalSignal?: AbortSignal) => {
     if (!accountId) return;
+    let localController: AbortController | null = null;
+    let signal = externalSignal;
+    if (!signal) {
+      loadAbortRef.current?.abort();
+      localController = new AbortController();
+      loadAbortRef.current = localController;
+      signal = localController.signal;
+    }
+
     setLoading(true);
     try {
       const { startDate, endDate } = getPeriodRange(selectedPeriod);
@@ -167,24 +166,46 @@ export const FinancialPnlModal: React.FC<FinancialPnlModalProps> = React.memo(({
         branchId: branchId && branchId !== 'all' ? branchId : undefined,
         startDate,
         endDate,
-        productsMap: productsMapRef.current,
+        productsMap: productsMapRef.current as Map<string, Product>,
+        signal,
       });
+      if (signal.aborted) return;
       setReport(result);
     } catch (err: any) {
+      if (signal.aborted || err?.code === 'ABORTED' || err?.name === 'AbortError') {
+        return;
+      }
       console.error('[FinancialPnlModal] Error generando reporte:', err);
       Alert.alert(
         'Error de Cálculo',
         err?.message || 'No se pudo generar el Estado de Resultados. Por favor verifique su conexión.'
       );
     } finally {
-      setLoading(false);
+      if (!signal.aborted) {
+        setLoading(false);
+      }
+      if (localController && loadAbortRef.current === localController) {
+        loadAbortRef.current = null;
+      }
     }
   }, [accountId, branchId, selectedPeriod]);
 
   useEffect(() => {
-    if (visible) {
-      loadReport();
+    if (!visible) {
+      loadAbortRef.current?.abort();
+      loadAbortRef.current = null;
+      return;
     }
+    loadAbortRef.current?.abort();
+    const controller = new AbortController();
+    loadAbortRef.current = controller;
+    void loadReport(controller.signal);
+    return () => {
+      controller.abort();
+      if (loadAbortRef.current === controller) {
+        loadAbortRef.current = null;
+      }
+    };
   }, [visible, loadReport]);
 
   // Manejo de cambio de período

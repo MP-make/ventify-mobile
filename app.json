@@ -62,7 +62,6 @@
         }
       ],
       "expo-secure-store",
-      "expo-font",
       "./plugins/withVentifyAndroid"
     ],
     "experiments": {

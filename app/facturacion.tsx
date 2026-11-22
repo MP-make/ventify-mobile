@@ -1,8 +1,7 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
-  FlatList,
   RefreshControl,
   ScrollView,
   StyleSheet,
@@ -12,6 +11,7 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { FlashList } from '@shopify/flash-list';
 import { useRouter } from 'expo-router';
 import {
   AlertTriangle,
@@ -24,8 +24,8 @@ import {
   ShieldAlert,
   X,
 } from 'lucide-react-native';
-import { useAuth } from '@/context/AuthContext';
-import { useSettings } from '@/context/SettingsContext';
+import { useAuthSession } from '@/context/AuthContext';
+import { useBusinessSettings } from '@/context/SettingsContext';
 import { usePermissions } from '@/hooks/usePermissions';
 import { useDebouncedValue } from '@/hooks/use-debounced-value';
 import { EinvoiceActionsModal } from '@/components/EinvoiceActionsModal';
@@ -67,6 +67,222 @@ const PRESETS: Array<{ key: DateRangePreset; label: string }> = [
   { key: '30d', label: '30 días' },
   { key: 'month', label: 'Este mes' },
 ];
+
+const getEinvoiceItemType = (item: PublicEinvoice) => {
+  const hasCustomer = item.receiptCustomer?.name ? 'c' : '';
+  const hasRef = item.reference?.number ? 'r' : '';
+  const hasErr =
+    (item.status === 'rejected' || item.status === 'error') &&
+    (item.lastError || item.cdr?.description)
+      ? 'e'
+      : '';
+  return `inv_${hasCustomer}${hasRef}${hasErr}` || 'inv_base';
+};
+
+const ListGap10 = () => <View style={styles.listGap10} />;
+
+interface FacturacionSearchBarProps {
+  onSearchChange: (debouncedQuery: string) => void;
+}
+
+const FacturacionSearchBar = React.memo<FacturacionSearchBarProps>(({ onSearchChange }) => {
+  const [query, setQuery] = useState('');
+  const debouncedQuery = useDebouncedValue(query, 150);
+
+  useEffect(() => {
+    onSearchChange(debouncedQuery);
+  }, [debouncedQuery, onSearchChange]);
+
+  return (
+    <View style={styles.searchBox}>
+      <Search size={16} color={ui.textMuted} />
+      <TextInput
+        value={query}
+        onChangeText={setQuery}
+        placeholder="Buscar serie, correlativo, cliente o RUC/DNI..."
+        placeholderTextColor={ui.textMuted}
+        style={styles.searchInput}
+      />
+      {query.length > 0 && (
+        <TouchableOpacity onPress={() => setQuery('')}>
+          <X size={16} color={ui.textMuted} />
+        </TouchableOpacity>
+      )}
+    </View>
+  );
+});
+
+interface FacturacionTopFiltersProps {
+  invoicingEnabled: boolean;
+  preset: DateRangePreset;
+  hasAllBranchesAccess: boolean;
+  scopeAllBranches: boolean;
+  onSelectPreset: (preset: DateRangePreset) => void;
+  onToggleScopeAllBranches: () => void;
+}
+
+const FacturacionTopFilters = React.memo<FacturacionTopFiltersProps>(
+  ({
+    invoicingEnabled,
+    preset,
+    hasAllBranchesAccess,
+    scopeAllBranches,
+    onSelectPreset,
+    onToggleScopeAllBranches,
+  }) => (
+    <>
+      {!invoicingEnabled && (
+        <View style={styles.warnBanner}>
+          <AlertTriangle size={16} color={ui.warning} />
+          <Text style={styles.warnBannerText}>
+            Facturación electrónica no activa en la cuenta. Puedes consultar documentos históricos aquí.
+          </Text>
+        </View>
+      )}
+
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        contentContainerStyle={styles.pillsRow}
+      >
+        {PRESETS.map((p) => {
+          const active = preset === p.key;
+          return (
+            <TouchableOpacity
+              key={p.key}
+              onPress={() => onSelectPreset(p.key)}
+              style={[styles.pill, active && styles.pillActive]}
+            >
+              <Text style={[styles.pillText, active && styles.pillTextActive]}>{p.label}</Text>
+            </TouchableOpacity>
+          );
+        })}
+        {hasAllBranchesAccess && (
+          <TouchableOpacity
+            onPress={onToggleScopeAllBranches}
+            style={[styles.pill, scopeAllBranches && styles.pillActive]}
+          >
+            <Text style={[styles.pillText, scopeAllBranches && styles.pillTextActive]}>
+              {scopeAllBranches ? 'Todas las sedes' : 'Solo esta sede'}
+            </Text>
+          </TouchableOpacity>
+        )}
+      </ScrollView>
+    </>
+  )
+);
+
+interface FacturacionTypeStatusFiltersProps {
+  typeFilter: TypeFilter;
+  statusFilter: StatusFilter;
+  onSelectTypeFilter: (filter: TypeFilter) => void;
+  onSelectStatusFilter: (filter: StatusFilter) => void;
+}
+
+const FacturacionTypeStatusFilters = React.memo<FacturacionTypeStatusFiltersProps>(
+  ({ typeFilter, statusFilter, onSelectTypeFilter, onSelectStatusFilter }) => (
+    <>
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        contentContainerStyle={styles.pillsRow}
+      >
+        {DOC_TYPE_FILTERS.map((f) => {
+          const active = typeFilter === f.key;
+          return (
+            <TouchableOpacity
+              key={f.key}
+              onPress={() => onSelectTypeFilter(f.key)}
+              style={[styles.pill, active && styles.pillActive]}
+            >
+              <Text style={[styles.pillText, active && styles.pillTextActive]}>{f.label}</Text>
+            </TouchableOpacity>
+          );
+        })}
+      </ScrollView>
+
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        contentContainerStyle={styles.pillsRow}
+      >
+        {STATUS_FILTERS.map((s) => {
+          const active = statusFilter === s.key;
+          return (
+            <TouchableOpacity
+              key={s.key}
+              onPress={() => onSelectStatusFilter(s.key)}
+              style={[styles.pill, active && styles.pillActive]}
+            >
+              <Text style={[styles.pillText, active && styles.pillTextActive]}>{s.label}</Text>
+            </TouchableOpacity>
+          );
+        })}
+      </ScrollView>
+    </>
+  )
+);
+
+interface FacturacionSummaryBarProps {
+  summary: ReturnType<typeof summarizeEinvoices>;
+  canViewReports: boolean;
+  exporting: 'csv' | 'xlsx' | null;
+  onExport: (format: 'csv' | 'xlsx') => void;
+}
+
+const FacturacionSummaryBar = React.memo<FacturacionSummaryBarProps>(
+  ({ summary, canViewReports, exporting, onExport }) => (
+    <>
+      <View style={styles.kpiRow}>
+        <View style={styles.kpiBox}>
+          <Text style={styles.kpiLabel}>Facturado Neto</Text>
+          <Text style={styles.kpiValue}>{formatPEN(summary.totalFacturado)}</Text>
+          <Text style={styles.kpiMeta}>
+            {summary.facturaCount} Fact. · {summary.boletaCount} Bol.
+          </Text>
+        </View>
+        <View style={styles.kpiBox}>
+          <Text style={styles.kpiLabel}>Estado SUNAT</Text>
+          <Text style={[styles.kpiValue, { color: ui.success }]}>
+            {summary.acceptedCount} acept.
+          </Text>
+          <Text style={styles.kpiMeta}>
+            {summary.pendingCount} pend. · {summary.rejectedOrErrorCount} obs.
+          </Text>
+        </View>
+      </View>
+
+      {canViewReports && (
+        <View style={styles.exportRow}>
+          <TouchableOpacity
+            onPress={() => onExport('csv')}
+            disabled={exporting !== null}
+            style={styles.exportBtn}
+          >
+            {exporting === 'csv' ? (
+              <ActivityIndicator size="small" color={ui.primary} />
+            ) : (
+              <Download size={15} color={ui.primary} />
+            )}
+            <Text style={styles.exportBtnText}>Exportar CSV</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            onPress={() => onExport('xlsx')}
+            disabled={exporting !== null}
+            style={styles.exportBtn}
+          >
+            {exporting === 'xlsx' ? (
+              <ActivityIndicator size="small" color={ui.primary} />
+            ) : (
+              <Download size={15} color={ui.primary} />
+            )}
+            <Text style={styles.exportBtnText}>Exportar XLSX</Text>
+          </TouchableOpacity>
+        </View>
+      )}
+    </>
+  )
+);
 
 interface EinvoiceRowProps {
   item: PublicEinvoice;
@@ -141,8 +357,8 @@ const EinvoiceRow = React.memo<EinvoiceRowProps>(({ item, onSelect }) => {
 
 export default function FacturacionScreen() {
   const router = useRouter();
-  const { accountId, branchId } = useAuth();
-  const { activeBranchName, invoicingEnabled, taxProfile } = useSettings();
+  const { accountId, branchId } = useAuthSession();
+  const { activeBranchName, invoicingEnabled, taxProfile } = useBusinessSettings();
   const {
     isOwner,
     isAdmin,
@@ -170,6 +386,10 @@ export default function FacturacionScreen() {
   const [error, setError] = useState<string | null>(null);
   const [selectedEinvoice, setSelectedEinvoice] = useState<PublicEinvoice | null>(null);
 
+  const abortRef = useRef<AbortController | null>(null);
+  const requestIdRef = useRef(0);
+  const isMountedRef = useRef(true);
+
   const effectiveBranch = useMemo(() => {
     if (hasAllBranchesAccess && scopeAllBranches) return undefined;
     return branchId || undefined;
@@ -179,10 +399,17 @@ export default function FacturacionScreen() {
 
   const loadEinvoices = useCallback(
     async (isRefresh = false) => {
+      abortRef.current?.abort();
       if (!accountId || !canAccessFacturacion) {
+        abortRef.current = null;
         setLoading(false);
+        setRefreshing(false);
         return;
       }
+      const controller = new AbortController();
+      abortRef.current = controller;
+      const reqId = ++requestIdRef.current;
+
       if (isRefresh) setRefreshing(true);
       else setLoading(true);
       setError(null);
@@ -191,26 +418,56 @@ export default function FacturacionScreen() {
           branchId: effectiveBranch,
           from: bounds.fromIso,
           to: bounds.toIso,
+          forceRefresh: isRefresh,
+          signal: controller.signal,
         });
+        if (!isMountedRef.current || controller.signal.aborted || reqId !== requestIdRef.current) {
+          return;
+        }
         setEinvoices(docs);
       } catch (err: any) {
+        if (
+          !isMountedRef.current ||
+          controller.signal.aborted ||
+          reqId !== requestIdRef.current ||
+          err?.code === 'ABORTED' ||
+          err?.name === 'AbortError'
+        ) {
+          return;
+        }
         setError(err?.message || 'No se pudieron cargar los comprobantes electrónicos.');
       } finally {
-        setLoading(false);
-        setRefreshing(false);
+        if (isMountedRef.current && reqId === requestIdRef.current) {
+          setLoading(false);
+          setRefreshing(false);
+        }
+        if (abortRef.current === controller) {
+          abortRef.current = null;
+        }
       }
     },
     [accountId, canAccessFacturacion, effectiveBranch, bounds.fromIso, bounds.toIso]
   );
 
   useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      requestIdRef.current += 1;
+      abortRef.current?.abort();
+      abortRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
     void loadEinvoices();
+    return () => {
+      abortRef.current?.abort();
+    };
   }, [loadEinvoices]);
 
-  const debouncedSearchQuery = useDebouncedValue(searchQuery, 150);
-
   const filtered = useMemo(() => {
-    const q = debouncedSearchQuery.trim().toLowerCase();
+    const q = searchQuery.trim().toLowerCase();
     return einvoices.filter((doc) => {
       if (typeFilter !== 'all' && doc.documentType !== typeFilter) return false;
       if (statusFilter !== 'all') {
@@ -236,7 +493,11 @@ export default function FacturacionScreen() {
       }
       return true;
     });
-  }, [einvoices, typeFilter, statusFilter, debouncedSearchQuery]);
+  }, [einvoices, typeFilter, statusFilter, searchQuery]);
+
+  const handleToggleScopeAllBranches = useCallback(() => {
+    setScopeAllBranches((v) => !v);
+  }, []);
 
   const handleSelectEinvoice = useCallback((item: PublicEinvoice) => {
     setSelectedEinvoice(item);
@@ -261,36 +522,123 @@ export default function FacturacionScreen() {
 
   const summary = useMemo(() => summarizeEinvoices(filtered), [filtered]);
 
-  const handleExport = async (format: 'csv' | 'xlsx') => {
-    if (!accountId) return;
-    setExporting(format);
-    try {
-      const params = new URLSearchParams({
-        accountId,
-        from: bounds.fromIso,
-        to: bounds.toIso,
-        format,
-      });
-      if (effectiveBranch) params.set('branchId', effectiveBranch);
-      if (typeFilter !== 'all') params.set('type', typeFilter);
-      if (statusFilter !== 'all') params.set('status', statusFilter);
+  const handleExport = useCallback(
+    async (format: 'csv' | 'xlsx') => {
+      if (!accountId) return;
+      setExporting(format);
+      try {
+        const params = new URLSearchParams({
+          accountId,
+          from: bounds.fromIso,
+          to: bounds.toIso,
+          format,
+        });
+        if (effectiveBranch) params.set('branchId', effectiveBranch);
+        if (typeFilter !== 'all') params.set('type', typeFilter);
+        if (statusFilter !== 'all') params.set('status', statusFilter);
 
-      const ext = format === 'xlsx' ? 'xlsx' : 'csv';
-      const mime =
-        format === 'xlsx'
-          ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-          : 'text/csv';
-      await downloadAndShareExportFile(
-        `/api/invoicing/export?${params.toString()}`,
-        `comprobantes_${bounds.fromIso}_${bounds.toIso}.${ext}`,
-        mime
-      );
-    } catch (err: any) {
-      Alert.alert('Error al exportar', err?.message || 'No se pudo generar la exportación.');
-    } finally {
-      setExporting(null);
-    }
-  };
+        const ext = format === 'xlsx' ? 'xlsx' : 'csv';
+        const mime =
+          format === 'xlsx'
+            ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            : 'text/csv';
+        await downloadAndShareExportFile(
+          `/api/invoicing/export?${params.toString()}`,
+          `comprobantes_${bounds.fromIso}_${bounds.toIso}.${ext}`,
+          mime
+        );
+      } catch (err: any) {
+        Alert.alert('Error al exportar', err?.message || 'No se pudo generar la exportación.');
+      } finally {
+        setExporting(null);
+      }
+    },
+    [accountId, bounds.fromIso, bounds.toIso, effectiveBranch, typeFilter, statusFilter]
+  );
+
+  const handleExportAction = useCallback(
+    (format: 'csv' | 'xlsx') => {
+      void handleExport(format);
+    },
+    [handleExport]
+  );
+
+  const listHeaderElement = useMemo(
+    () => (
+      <View style={styles.headerBlock}>
+        <FacturacionTopFilters
+          invoicingEnabled={invoicingEnabled}
+          preset={preset}
+          hasAllBranchesAccess={hasAllBranchesAccess}
+          scopeAllBranches={scopeAllBranches}
+          onSelectPreset={setPreset}
+          onToggleScopeAllBranches={handleToggleScopeAllBranches}
+        />
+
+        <FacturacionSearchBar onSearchChange={setSearchQuery} />
+
+        <FacturacionTypeStatusFilters
+          typeFilter={typeFilter}
+          statusFilter={statusFilter}
+          onSelectTypeFilter={setTypeFilter}
+          onSelectStatusFilter={setStatusFilter}
+        />
+
+        <FacturacionSummaryBar
+          summary={summary}
+          canViewReports={canViewReports}
+          exporting={exporting}
+          onExport={handleExportAction}
+        />
+
+        {loading && (
+          <View style={styles.centerBox}>
+            <ActivityIndicator size="large" color={ui.primary} />
+            <Text style={styles.loadingText}>Consultando comprobantes SUNAT...</Text>
+          </View>
+        )}
+
+        {!!error && !loading && (
+          <View style={styles.errorCard}>
+            <Text style={styles.errorText}>{error}</Text>
+            <TouchableOpacity onPress={() => void loadEinvoices()} style={styles.retryBtn}>
+              <Text style={styles.retryBtnText}>Reintentar</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+      </View>
+    ),
+    [
+      invoicingEnabled,
+      preset,
+      hasAllBranchesAccess,
+      scopeAllBranches,
+      handleToggleScopeAllBranches,
+      typeFilter,
+      statusFilter,
+      summary,
+      canViewReports,
+      exporting,
+      handleExportAction,
+      loading,
+      error,
+      loadEinvoices,
+    ]
+  );
+
+  const listEmptyElement = useMemo(
+    () =>
+      !loading && !error ? (
+        <View style={styles.centerBox}>
+          <ReceiptText size={32} color={ui.textMuted} />
+          <Text style={styles.emptyTitle}>Sin comprobantes en este filtro</Text>
+          <Text style={styles.loadingText}>
+            Prueba ampliando el rango de fechas o quitando filtros de tipo y estado.
+          </Text>
+        </View>
+      ) : null,
+    [loading, error]
+  );
 
   if (!canAccessFacturacion) {
     return (
@@ -343,9 +691,13 @@ export default function FacturacionScreen() {
         </TouchableOpacity>
       </View>
 
-      <FlatList
+      <FlashList
         data={filtered}
         keyExtractor={einvoiceKeyExtractor}
+        getItemType={getEinvoiceItemType}
+        estimatedItemSize={138}
+        ItemSeparatorComponent={ListGap10}
+        keyboardShouldPersistTaps="handled"
         refreshControl={
           <RefreshControl
             refreshing={refreshing}
@@ -354,182 +706,8 @@ export default function FacturacionScreen() {
           />
         }
         contentContainerStyle={styles.listContent}
-        ListHeaderComponent={
-          <View style={styles.headerBlock}>
-            {!invoicingEnabled && (
-              <View style={styles.warnBanner}>
-                <AlertTriangle size={16} color={ui.warning} />
-                <Text style={styles.warnBannerText}>
-                  Facturación electrónica no activa en la cuenta. Puedes consultar documentos históricos aquí.
-                </Text>
-              </View>
-            )}
-
-            {/* Presets + Branch scope */}
-            <ScrollView
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              contentContainerStyle={styles.pillsRow}
-            >
-              {PRESETS.map((p) => {
-                const active = preset === p.key;
-                return (
-                  <TouchableOpacity
-                    key={p.key}
-                    onPress={() => setPreset(p.key)}
-                    style={[styles.pill, active && styles.pillActive]}
-                  >
-                    <Text style={[styles.pillText, active && styles.pillTextActive]}>{p.label}</Text>
-                  </TouchableOpacity>
-                );
-              })}
-              {hasAllBranchesAccess && (
-                <TouchableOpacity
-                  onPress={() => setScopeAllBranches((v) => !v)}
-                  style={[styles.pill, scopeAllBranches && styles.pillActive]}
-                >
-                  <Text style={[styles.pillText, scopeAllBranches && styles.pillTextActive]}>
-                    {scopeAllBranches ? 'Todas las sedes' : 'Solo esta sede'}
-                  </Text>
-                </TouchableOpacity>
-              )}
-            </ScrollView>
-
-            {/* Search */}
-            <View style={styles.searchBox}>
-              <Search size={16} color={ui.textMuted} />
-              <TextInput
-                value={searchQuery}
-                onChangeText={setSearchQuery}
-                placeholder="Buscar serie, correlativo, cliente o RUC/DNI..."
-                placeholderTextColor={ui.textMuted}
-                style={styles.searchInput}
-              />
-              {searchQuery.length > 0 && (
-                <TouchableOpacity onPress={() => setSearchQuery('')}>
-                  <X size={16} color={ui.textMuted} />
-                </TouchableOpacity>
-              )}
-            </View>
-
-            {/* Doc types */}
-            <ScrollView
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              contentContainerStyle={styles.pillsRow}
-            >
-              {DOC_TYPE_FILTERS.map((f) => {
-                const active = typeFilter === f.key;
-                return (
-                  <TouchableOpacity
-                    key={f.key}
-                    onPress={() => setTypeFilter(f.key)}
-                    style={[styles.pill, active && styles.pillActive]}
-                  >
-                    <Text style={[styles.pillText, active && styles.pillTextActive]}>{f.label}</Text>
-                  </TouchableOpacity>
-                );
-              })}
-            </ScrollView>
-
-            {/* Statuses */}
-            <ScrollView
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              contentContainerStyle={styles.pillsRow}
-            >
-              {STATUS_FILTERS.map((s) => {
-                const active = statusFilter === s.key;
-                return (
-                  <TouchableOpacity
-                    key={s.key}
-                    onPress={() => setStatusFilter(s.key)}
-                    style={[styles.pill, active && styles.pillActive]}
-                  >
-                    <Text style={[styles.pillText, active && styles.pillTextActive]}>{s.label}</Text>
-                  </TouchableOpacity>
-                );
-              })}
-            </ScrollView>
-
-            {/* Summary KPIs */}
-            <View style={styles.kpiRow}>
-              <View style={styles.kpiBox}>
-                <Text style={styles.kpiLabel}>Facturado Neto</Text>
-                <Text style={styles.kpiValue}>{formatPEN(summary.totalFacturado)}</Text>
-                <Text style={styles.kpiMeta}>
-                  {summary.facturaCount} Fact. · {summary.boletaCount} Bol.
-                </Text>
-              </View>
-              <View style={styles.kpiBox}>
-                <Text style={styles.kpiLabel}>Estado SUNAT</Text>
-                <Text style={[styles.kpiValue, { color: ui.success }]}>
-                  {summary.acceptedCount} acept.
-                </Text>
-                <Text style={styles.kpiMeta}>
-                  {summary.pendingCount} pend. · {summary.rejectedOrErrorCount} obs.
-                </Text>
-              </View>
-            </View>
-
-            {/* Export bar */}
-            {canViewReports && (
-              <View style={styles.exportRow}>
-                <TouchableOpacity
-                  onPress={() => void handleExport('csv')}
-                  disabled={exporting !== null}
-                  style={styles.exportBtn}
-                >
-                  {exporting === 'csv' ? (
-                    <ActivityIndicator size="small" color={ui.primary} />
-                  ) : (
-                    <Download size={15} color={ui.primary} />
-                  )}
-                  <Text style={styles.exportBtnText}>Exportar CSV</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  onPress={() => void handleExport('xlsx')}
-                  disabled={exporting !== null}
-                  style={styles.exportBtn}
-                >
-                  {exporting === 'xlsx' ? (
-                    <ActivityIndicator size="small" color={ui.primary} />
-                  ) : (
-                    <Download size={15} color={ui.primary} />
-                  )}
-                  <Text style={styles.exportBtnText}>Exportar XLSX</Text>
-                </TouchableOpacity>
-              </View>
-            )}
-
-            {loading && (
-              <View style={styles.centerBox}>
-                <ActivityIndicator size="large" color={ui.primary} />
-                <Text style={styles.loadingText}>Consultando comprobantes SUNAT...</Text>
-              </View>
-            )}
-
-            {!!error && !loading && (
-              <View style={styles.errorCard}>
-                <Text style={styles.errorText}>{error}</Text>
-                <TouchableOpacity onPress={() => void loadEinvoices()} style={styles.retryBtn}>
-                  <Text style={styles.retryBtnText}>Reintentar</Text>
-                </TouchableOpacity>
-              </View>
-            )}
-          </View>
-        }
-        ListEmptyComponent={
-          !loading && !error ? (
-            <View style={styles.centerBox}>
-              <ReceiptText size={32} color={ui.textMuted} />
-              <Text style={styles.emptyTitle}>Sin comprobantes en este filtro</Text>
-              <Text style={styles.loadingText}>
-                Prueba ampliando el rango de fechas o quitando filtros de tipo y estado.
-              </Text>
-            </View>
-          ) : null
-        }
+        ListHeaderComponent={listHeaderElement}
+        ListEmptyComponent={listEmptyElement}
         renderItem={renderEinvoiceItem}
       />
 
@@ -588,12 +766,14 @@ const styles = StyleSheet.create({
   },
   listContent: {
     padding: 14,
-    gap: 10,
     paddingBottom: 32,
+  },
+  listGap10: {
+    height: 10,
   },
   headerBlock: {
     gap: 10,
-    marginBottom: 4,
+    marginBottom: 14,
   },
   warnBanner: {
     flexDirection: 'row',

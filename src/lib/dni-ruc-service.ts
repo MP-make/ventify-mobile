@@ -36,6 +36,8 @@ export class LookupError extends Error {
 }
 
 export const DOCUMENT_LOOKUP_CACHE_PREFIX = '@ventify_doc_lookup_';
+export const DOCUMENT_LOOKUP_INDEX_KEY = '@ventify_doc_lookup_index_v1';
+export const MAX_L2_KEYS = 500;
 const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days cache
 const MAX_MEMORY_CACHE_ENTRIES = 300;
 const LOOKUP_TIMEOUT_MS = 12000;
@@ -45,12 +47,24 @@ interface CachedDocumentEntry {
   cachedAt: number;
 }
 
+interface InFlightLookupEntry {
+  promise: Promise<DocumentLookupResult>;
+  controller: AbortController;
+  waiters: number;
+  settled: boolean;
+}
+
 const memoryCache = new Map<string, CachedDocumentEntry>();
-const inFlightLookups = new Map<string, Promise<DocumentLookupResult>>();
+const inFlightLookups = new Map<string, InFlightLookupEntry>();
+let l2KeysCache: string[] | null = null;
+let l2IndexQueue: Promise<void> = Promise.resolve();
+let l2Epoch = 0;
 
 /** Clears the in-memory L1 LRU cache for document lookups. */
 export function clearDocumentLookupMemoryCache(): void {
   memoryCache.clear();
+  l2KeysCache = null;
+  l2Epoch++;
 }
 
 function getFromMemoryCache(storageKey: string): DocumentLookupResult | null {
@@ -89,17 +103,80 @@ function deleteFromStorageNonBlocking(storageKey: string): void {
   }
 }
 
-async function awaitWithSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+function updateL2IndexNonBlocking(
+  action: 'touch' | 'remove',
+  storageKey: string
+): void {
+  const epoch = l2Epoch;
+  l2IndexQueue = l2IndexQueue
+    .then(async () => {
+      if (epoch !== l2Epoch) return;
+      if (!AsyncStorage?.getItem || !AsyncStorage?.setItem) return;
+
+      if (l2KeysCache === null) {
+        try {
+          const raw = await AsyncStorage.getItem(DOCUMENT_LOOKUP_INDEX_KEY);
+          if (epoch !== l2Epoch) return;
+          const parsed = raw ? JSON.parse(raw) : null;
+          l2KeysCache = Array.isArray(parsed)
+            ? parsed.filter((k): k is string => typeof k === 'string')
+            : [];
+        } catch {
+          if (epoch !== l2Epoch) return;
+          l2KeysCache = [];
+        }
+      }
+
+      const existingIdx = l2KeysCache.indexOf(storageKey);
+      if (action === 'remove') {
+        if (existingIdx === -1) return;
+        l2KeysCache.splice(existingIdx, 1);
+      } else {
+        if (existingIdx !== -1) {
+          if (existingIdx === l2KeysCache.length - 1) return;
+          l2KeysCache.splice(existingIdx, 1);
+        }
+        l2KeysCache.push(storageKey);
+
+        if (l2KeysCache.length > MAX_L2_KEYS) {
+          const overflow = l2KeysCache.length - MAX_L2_KEYS;
+          const evicted = l2KeysCache.splice(0, overflow);
+          for (let i = 0; i < evicted.length; i++) {
+            deleteFromStorageNonBlocking(evicted[i]);
+          }
+        }
+      }
+
+      if (epoch !== l2Epoch) return;
+      await AsyncStorage.setItem(
+        DOCUMENT_LOOKUP_INDEX_KEY,
+        JSON.stringify(l2KeysCache)
+      );
+    })
+    .catch(() => {});
+}
+
+async function awaitWithSignal<T>(
+  promise: Promise<T>,
+  signal?: AbortSignal,
+  onSettled?: () => void
+): Promise<T> {
   if (!signal) {
-    return promise;
+    try {
+      return await promise;
+    } finally {
+      onSettled?.();
+    }
   }
   if (signal.aborted) {
+    onSettled?.();
     throw new LookupError('Consulta cancelada', 'ABORTED');
   }
 
   let onAbort: (() => void) | undefined;
   const abortPromise = new Promise<never>((_, reject) => {
     onAbort = () => {
+      onSettled?.();
       reject(new LookupError('Consulta cancelada', 'ABORTED'));
     };
     signal.addEventListener?.('abort', onAbort, { once: true });
@@ -111,6 +188,7 @@ async function awaitWithSignal<T>(promise: Promise<T>, signal?: AbortSignal): Pr
     if (onAbort) {
       signal.removeEventListener?.('abort', onAbort);
     }
+    onSettled?.();
   }
 }
 
@@ -129,10 +207,15 @@ function pickValue(obj: Record<string, any>, keys: string[]): string | undefined
 async function executeDocumentFetch(
   cleanType: 'dni' | 'ruc',
   cleanNumber: string,
-  storageKey: string
+  storageKey: string,
+  controller: AbortController
 ): Promise<DocumentLookupResult> {
   // Query Ventify Backend API with its own timeout controller (shared across concurrent callers)
   const token = await auth.currentUser?.getIdToken().catch(() => null);
+
+  if (controller.signal.aborted) {
+    throw new LookupError('Consulta cancelada', 'ABORTED');
+  }
 
   const headers: Record<string, string> = {
     Accept: 'application/json',
@@ -145,7 +228,6 @@ async function executeDocumentFetch(
   const url = `${APP_URL}/api/dni-ruc/lookup?type=${cleanType}&number=${cleanNumber}`;
 
   let responseData: any;
-  const controller = new AbortController();
   let timedOut = false;
   const timeoutId = setTimeout(() => {
     timedOut = true;
@@ -177,8 +259,11 @@ async function executeDocumentFetch(
     responseData = rawBody ? JSON.parse(rawBody) : null;
   } catch (err: any) {
     if (err instanceof LookupError) throw err;
-    if (timedOut || err?.name === 'AbortError') {
+    if (timedOut || (err?.name === 'AbortError' && !controller.signal.aborted)) {
       throw new LookupError('La consulta superó el tiempo límite (timeout)', 'TIMEOUT');
+    }
+    if (err?.name === 'AbortError' || controller.signal.aborted) {
+      throw new LookupError('Consulta cancelada', 'ABORTED');
     }
     throw new LookupError(
       `No se pudo conectar con el servicio de consulta: ${err?.message || 'Error de red'}`,
@@ -256,6 +341,7 @@ async function executeDocumentFetch(
   } catch {
     // Non-blocking
   }
+  updateL2IndexNonBlocking('touch', storageKey);
 
   return result;
 }
@@ -329,10 +415,12 @@ export async function lookupDocument(
         Date.now() - cachedAt < CACHE_TTL_MS
       ) {
         setInMemoryCache(storageKey, parsed.result, cachedAt);
+        updateL2IndexNonBlocking('touch', storageKey);
         return parsed.result;
       }
       memoryCache.delete(storageKey);
       deleteFromStorageNonBlocking(storageKey);
+      updateL2IndexNonBlocking('remove', storageKey);
     }
   } catch {
     // Non-fatal: proceed to backend query if cache read fails
@@ -342,20 +430,51 @@ export async function lookupDocument(
     throw new LookupError('Consulta cancelada', 'ABORTED');
   }
 
-  // 3. Check/join in-flight lookup or start a shared fetch
-  let lookupPromise = inFlightLookups.get(storageKey);
-  if (!lookupPromise) {
-    const createdPromise = executeDocumentFetch(cleanType, cleanNumber, storageKey).finally(() => {
-      if (inFlightLookups.get(storageKey) === createdPromise) {
+  // 3. Check/join in-flight lookup or start a shared fetch with ref-counted cancellation
+  let entry = inFlightLookups.get(storageKey);
+  if (!entry) {
+    const controller = new AbortController();
+    const createdEntry: InFlightLookupEntry = {
+      promise: null as unknown as Promise<DocumentLookupResult>,
+      controller,
+      waiters: 0,
+      settled: false,
+    };
+    const createdPromise = executeDocumentFetch(
+      cleanType,
+      cleanNumber,
+      storageKey,
+      controller
+    ).finally(() => {
+      createdEntry.settled = true;
+      if (inFlightLookups.get(storageKey) === createdEntry) {
         inFlightLookups.delete(storageKey);
       }
     });
     createdPromise.catch(() => {});
-    inFlightLookups.set(storageKey, createdPromise);
-    lookupPromise = createdPromise;
+    createdEntry.promise = createdPromise;
+    inFlightLookups.set(storageKey, createdEntry);
+    entry = createdEntry;
   }
 
-  return awaitWithSignal(lookupPromise, options?.signal);
+  entry.waiters += 1;
+  let released = false;
+  const activeEntry = entry;
+  const releaseWaiter = () => {
+    if (released) return;
+    released = true;
+    activeEntry.waiters = Math.max(0, activeEntry.waiters - 1);
+    if (activeEntry.waiters === 0 && !activeEntry.settled) {
+      if (inFlightLookups.get(storageKey) === activeEntry) {
+        inFlightLookups.delete(storageKey);
+      }
+      if (!activeEntry.controller.signal.aborted) {
+        activeEntry.controller.abort();
+      }
+    }
+  };
+
+  return awaitWithSignal(activeEntry.promise, options?.signal, releaseWaiter);
 }
 
 /** Convenience shortcut for DNI */

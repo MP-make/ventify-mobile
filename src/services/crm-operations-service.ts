@@ -23,6 +23,10 @@ import {
   limit,
   setDoc,
   updateDoc,
+  type DocumentData,
+  type Query,
+  type QueryDocumentSnapshot,
+  type QuerySnapshot,
 } from 'firebase/firestore';
 
 // ============================================================================
@@ -73,7 +77,40 @@ import type { UserProfileInfo } from './sale-service';
 import { aggregateStockRequirements, getDepositSessionUpdates, normalizeOrderItems, toEpochMillis } from './crm-compat';
 import { apiRequest } from '@/lib/api-client';
 import { cleanFirestoreData } from '@/lib/firebase-utils';
+import { sharedRequestCache } from '@/lib/request-cache';
 import { deriveBranchIds, deriveLowStockBranches } from '@/lib/product-branch-ids';
+
+const CRM_CUSTOMERS_CACHE_TTL_MS = 60_000;
+const missingCrmIndexes = new Set<string>();
+
+const isMissingCrmIndexError = (err: any): boolean => {
+  const code = String(err?.code || '').toLowerCase();
+  const msg = String(err?.message || '').toLowerCase();
+  return (
+    code === 'failed-precondition' ||
+    msg.includes('requires an index') ||
+    msg.includes('failed-precondition')
+  );
+};
+
+async function getDocsCrmWithFallback(
+  indexKey: string,
+  buildIndexed: () => Query<DocumentData>,
+  buildFallback: () => Query<DocumentData>
+): Promise<QuerySnapshot<DocumentData>> {
+  if (missingCrmIndexes.has(indexKey)) {
+    return getDocs(buildFallback());
+  }
+  try {
+    return await getDocs(buildIndexed());
+  } catch (err: any) {
+    if (isMissingCrmIndexError(err)) {
+      missingCrmIndexes.add(indexKey);
+      return getDocs(buildFallback());
+    }
+    throw err;
+  }
+}
 
 export interface CustomerData {
   id?: string;
@@ -280,6 +317,7 @@ export interface AskVentyAIParams {
   history?: Array<{ role: 'user' | 'assistant' | 'system'; content: string }>;
   conversationHistory?: Array<{ role: 'user' | 'assistant'; content: string }>;
   onChunk?: (accumulatedText: string, delta: string) => void;
+  signal?: AbortSignal;
 }
 
 // ============================================================================
@@ -297,20 +335,29 @@ export const getCustomers = async (
   if (!accountId) return [];
 
   try {
-    const coll = collection(db, CUSTOMERS_COLLECTION);
-    const q = query(coll, where('accountId', '==', accountId), ...applyLimit(maxResults));
-    const snapshot = await getDocs(q);
+    const cacheKey = `customers:${accountId}:${maxResults}`;
+    let customers = await sharedRequestCache.getOrLoad(
+      cacheKey,
+      CRM_CUSTOMERS_CACHE_TTL_MS,
+      async () => {
+        const coll = collection(db, CUSTOMERS_COLLECTION);
+        const q = query(coll, where('accountId', '==', accountId), ...applyLimit(maxResults));
+        const snapshot = await getDocs(q);
 
-    let customers: Customer[] = snapshot.docs.map((d) => {
-      const data = d.data();
-      return {
-        id: d.id,
-        name: data.name || '',
-        totalPurchases: data.totalPurchases || 0,
-        totalSpent: data.totalSpent || 0,
-        ...data,
-      } as Customer;
-    });
+        const list: Customer[] = snapshot.docs.map((d) => {
+          const data = d.data();
+          return {
+            id: d.id,
+            name: data.name || '',
+            totalPurchases: data.totalPurchases || 0,
+            totalSpent: data.totalSpent || 0,
+            ...data,
+          } as Customer;
+        });
+        list.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+        return list;
+      }
+    );
 
     if (searchTerm && searchTerm.trim().length > 0) {
       const term = searchTerm.toLowerCase().trim();
@@ -320,10 +367,10 @@ export const getCustomers = async (
         const phone = (c.phone || '').toLowerCase();
         return name.includes(term) || docNum.includes(term) || phone.includes(term);
       });
+    } else {
+      customers = [...customers];
     }
 
-    // Ordenar por nombre alfabéticamente
-    customers.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
     return customers;
   } catch (err) {
     console.error('[CRMService] Error obteniendo clientes:', err);
@@ -379,6 +426,7 @@ export const saveCustomer = async (
     await updateDoc(docRef, payload);
   }
 
+  sharedRequestCache.invalidatePrefix(`customers:${customer.accountId}:`);
   return customerId;
 };
 
@@ -536,6 +584,7 @@ export const registerFiadoPayment = async (
     }
   });
 
+  sharedRequestCache.invalidatePrefix(`customers:${accountId}:`);
   return paymentId;
 };
 
@@ -544,28 +593,69 @@ export const registerFiadoPayment = async (
  */
 export const getCustomerFiadoHistory = async (
   accountId: string,
-  customerId: string
+  customerId: string,
+  knownFiadoIdsOrOptions?: string[] | { knownFiadoIds?: string[] }
 ): Promise<FiadoHistoryEntry[]> => {
   if (!accountId || !customerId) return [];
 
   try {
+    const knownFiadoIds = Array.isArray(knownFiadoIdsOrOptions)
+      ? knownFiadoIdsOrOptions
+      : knownFiadoIdsOrOptions?.knownFiadoIds;
+
     const coll = collection(db, RESERVATION_DEPOSITS_COLLECTION);
-    const q = query(
-      coll,
-      where('accountId', '==', accountId),
-      where('customerId', '==', customerId)
+    const depositsPromise = getDocsCrmWithFallback(
+      'crm_fiado_deposits_by_date',
+      () =>
+        query(
+          coll,
+          where('accountId', '==', accountId),
+          where('customerId', '==', customerId),
+          orderBy('date', 'desc'),
+          ...applyLimit(50)
+        ),
+      () =>
+        query(
+          coll,
+          where('accountId', '==', accountId),
+          where('customerId', '==', customerId),
+          ...applyLimit(50)
+        )
     );
+
+    const reservationsPromise =
+      knownFiadoIds !== undefined
+        ? Promise.resolve(null)
+        : getDocsCrmWithFallback(
+            'crm_customer_reservations_by_date',
+            () =>
+              query(
+                collection(db, RESERVATIONS_COLLECTION),
+                where('accountId', '==', accountId),
+                where('customerId', '==', customerId),
+                orderBy('date', 'desc'),
+                ...applyLimit(50)
+              ),
+            () =>
+              query(
+                collection(db, RESERVATIONS_COLLECTION),
+                where('accountId', '==', accountId),
+                where('customerId', '==', customerId),
+                ...applyLimit(50)
+              )
+          );
+
     const [snapshot, reservationsSnapshot] = await Promise.all([
-      getDocs(q),
-      getDocs(query(
-        collection(db, RESERVATIONS_COLLECTION),
-        where('accountId', '==', accountId),
-        where('customerId', '==', customerId)
-      )),
+      depositsPromise,
+      reservationsPromise,
     ]);
-    const fiadoIds = reservationsSnapshot.docs
-      .filter((d) => d.data().isFiado === true || d.data().isCreditSale === true || d.data().type === 'fiado')
-      .map((d) => d.id);
+
+    const fiadoIds =
+      knownFiadoIds !== undefined
+        ? Array.from(new Set(knownFiadoIds.filter(Boolean)))
+        : (reservationsSnapshot?.docs || [])
+            .filter((d: any) => d.data().isFiado === true || d.data().isCreditSale === true || d.data().type === 'fiado')
+            .map((d: any) => d.id);
 
     const BATCH_SIZE = 30;
     const fiadoIdBatches: string[][] = [];
@@ -579,14 +669,22 @@ export const getCustomerFiadoHistory = async (
           const linkedQuery = query(
             coll,
             where('accountId', '==', accountId),
-            where('reservationId', 'in', batch)
+            where('reservationId', 'in', batch),
+            ...applyLimit(50)
           );
           return await getDocs(linkedQuery);
         } catch {
           try {
             const individualSnaps = await Promise.all(
               batch.map((id) =>
-                getDocs(query(coll, where('accountId', '==', accountId), where('reservationId', '==', id))).catch(() => null)
+                getDocs(
+                  query(
+                    coll,
+                    where('accountId', '==', accountId),
+                    where('reservationId', '==', id),
+                    ...applyLimit(50)
+                  )
+                ).catch(() => null)
               )
             );
             const docs = individualSnaps.flatMap((s) => (s ? s.docs : []));
@@ -597,7 +695,9 @@ export const getCustomerFiadoHistory = async (
         }
       })
     );
-    const allDocs = new Map(snapshot.docs.map((d) => [d.id, d]));
+    const allDocs = new Map<string, QueryDocumentSnapshot<DocumentData>>(
+      snapshot.docs.map((d) => [d.id, d])
+    );
     linkedSnapshots.forEach((linked) => linked?.docs.forEach((d) => allDocs.set(d.id, d)));
 
     const history: FiadoHistoryEntry[] = [...allDocs.values()].filter((d) => {
@@ -691,18 +791,29 @@ const settleLinkedFiadoDeposits = async (accountId: string, reservationId: strin
         collection(db, RESERVATION_DEPOSITS_COLLECTION),
         where('accountId', '==', accountId),
         where('reservationId', '==', reservationId),
-        where('status', '==', 'active')
+        where('status', '==', 'active'),
+        ...applyLimit(50)
       )
     );
     if (snap.empty) return;
-    await runTransaction(db, async (tx) => {
-      const snaps = await Promise.all(snap.docs.map((d) => tx.get(d.ref)));
-      snaps.forEach((docSnap) => {
-        if (docSnap.exists() && docSnap.data()?.status === 'active') {
-          tx.update(docSnap.ref, { status: 'settled' });
-        }
+    let writeBatchFn: ((firestore: typeof db) => any) | null = null;
+    try {
+      const firestoreMod = await import('firebase/firestore');
+      if (typeof firestoreMod.writeBatch === 'function') {
+        writeBatchFn = firestoreMod.writeBatch;
+      }
+    } catch {
+      writeBatchFn = null;
+    }
+    if (writeBatchFn) {
+      const batch = writeBatchFn(db);
+      snap.docs.forEach((docSnap) => {
+        batch.update(docSnap.ref, { status: 'settled' });
       });
-    });
+      await batch.commit();
+    } else {
+      await Promise.all(snap.docs.map((docSnap) => updateDoc(docSnap.ref, { status: 'settled' })));
+    }
   } catch (err) {
     console.warn('[CRMService] No se pudieron liquidar depósitos vinculados:', err);
   }
@@ -915,6 +1026,7 @@ export const returnFiadoMerchandise = async (
     await settleLinkedFiadoDeposits(accountId, reservationId);
   }
 
+  sharedRequestCache.invalidatePrefix(`customers:${accountId}:`);
   return { remaining, settled, creditApplied, returnAmount: returnValue };
 };
 
@@ -971,6 +1083,7 @@ export const writeOffFiado = async (
   });
 
   await settleLinkedFiadoDeposits(accountId, reservationId);
+  sharedRequestCache.invalidatePrefix(`customers:${accountId}:`);
   return { writeOffAmount, nextDebt };
 };
 
@@ -1121,40 +1234,39 @@ export const createReservationOrOrder = async (
     const dayEnd = dayStart + 24 * 60 * 60 * 1000 - 1;
     const coll = collection(db, RESERVATIONS_COLLECTION);
     try {
-      const topReservationQ = query(
-        coll,
-        where('accountId', '==', accountId),
-        where('branchId', '==', branchId),
-        where('date', '>=', dayStart),
-        where('date', '<=', dayEnd),
-        orderBy('reservationNumber', 'desc'),
-        ...applyLimit(1)
+      const topSnap = await getDocsCrmWithFallback(
+        'crm_daily_reservation_number',
+        () =>
+          query(
+            coll,
+            where('accountId', '==', accountId),
+            where('branchId', '==', branchId),
+            where('date', '>=', dayStart),
+            where('date', '<=', dayEnd),
+            orderBy('date', 'desc'),
+            ...applyLimit(1)
+          ),
+        () =>
+          query(
+            coll,
+            where('accountId', '==', accountId),
+            where('branchId', '==', branchId),
+            where('date', '>=', dayStart),
+            where('date', '<=', dayEnd)
+          )
       );
-      const topSnap = await getDocs(topReservationQ);
       if (!topSnap.empty) {
-        const topVal = Number(topSnap.docs[0].data()?.reservationNumber);
-        canonicalReservationNumber = (Number.isFinite(topVal) ? topVal : 0) + 1;
+        let maxNumber = 0;
+        for (const reservation of topSnap.docs) {
+          const val = Number(reservation.data()?.reservationNumber);
+          if (Number.isFinite(val)) maxNumber = Math.max(maxNumber, val);
+        }
+        canonicalReservationNumber = maxNumber + 1;
       } else {
         canonicalReservationNumber = 1;
       }
-    } catch (err: any) {
-      console.warn('[CRMService] Fallback calculando canonicalReservationNumber:', err?.message);
-      try {
-        const fallbackQ = query(
-          coll,
-          where('accountId', '==', accountId),
-          where('branchId', '==', branchId),
-          where('date', '>=', dayStart),
-          where('date', '<=', dayEnd)
-        );
-        const dayReservations = await getDocs(fallbackQ);
-        canonicalReservationNumber = dayReservations.docs.reduce((max: number, reservation: any) => {
-          const value = Number(reservation.data()?.reservationNumber);
-          return Number.isFinite(value) ? Math.max(max, value) : max;
-        }, 0) + 1;
-      } catch {
-        canonicalReservationNumber = 1;
-      }
+    } catch {
+      canonicalReservationNumber = 1;
     }
   }
 
@@ -1939,9 +2051,20 @@ export const askVentyAI = async (
       content: m.content.trim(),
     }));
 
+  if (params.signal?.aborted) {
+    return '';
+  }
+
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 45_000);
+  let externallyAborted = false;
+  const onExternalAbort = () => {
+    externallyAborted = true;
+    controller.abort();
+  };
+  params.signal?.addEventListener?.('abort', onExternalAbort, { once: true });
 
+  let bodyReader: ReadableStreamDefaultReader<any> | undefined;
   try {
     const apiBase = (APP_URL || 'https://ventify.com.pe').replace(/\/$/, '');
     const response = await fetch(`${apiBase}/api/chat/stream`, {
@@ -1976,7 +2099,7 @@ export const askVentyAI = async (
       return json?.reply || json?.content || json?.message || json?.error || 'Venty IA no devolvió contenido.';
     }
 
-    const bodyReader = (response as any).body?.getReader?.();
+    bodyReader = (response as any).body?.getReader?.();
     if (bodyReader && typeof bodyReader.read === 'function') {
       const decoder = typeof TextDecoder !== 'undefined' ? new TextDecoder() : null;
       const state: VentySseState = { buffer: '', reply: '' };
@@ -2002,12 +2125,17 @@ export const askVentyAI = async (
     const parsed = parseVentySseText(text, params.onChunk).trim();
     return parsed || 'Venty IA no devolvió contenido. Intenta reformular tu consulta.';
   } catch (netErr: any) {
+    if (externallyAborted) {
+      return '';
+    }
     if (netErr?.name === 'AbortError') {
       return 'Venty IA tardó demasiado en responder. Verifica tu conexión e inténtalo de nuevo.';
     }
     return 'Sin conexión con Venty IA en este momento. Verifica tu acceso a internet e inténtalo nuevamente.';
   } finally {
+    await bodyReader?.cancel().catch(() => {});
     clearTimeout(timeoutId);
+    params.signal?.removeEventListener?.('abort', onExternalAbort);
   }
 };
 

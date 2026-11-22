@@ -2,12 +2,19 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import type { CatalogCacheStorage } from './product-catalog-cache';
 
 export interface NativeKVStorage extends CatalogCacheStorage {
+  readonly isSyncCapable: boolean;
   getItem(key: string): Promise<string | null>;
   setItem(key: string, value: string): Promise<void>;
   removeItem(key: string): Promise<void>;
   multiRemove(keys: string[]): Promise<void>;
+  getItemSync(key: string): string | null;
+  setItemSync(key: string, value: string): void;
+  removeItemSync(key: string): void;
   trim?: () => Promise<void>;
 }
+
+const MULTI_REMOVE_YIELD_CHUNK = 20;
+const yieldMultiRemove = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
 type MMKVInstance = {
   getString: (key: string) => string | undefined;
@@ -42,6 +49,7 @@ function resolveMMKVConstructor(): MMKVConstructor | null {
 
 function createAsyncStorageFallback(): NativeKVStorage {
   return {
+    isSyncCapable: false,
     getItem: async (key: string) => {
       try {
         return await AsyncStorage.getItem(key);
@@ -59,13 +67,28 @@ function createAsyncStorageFallback(): NativeKVStorage {
     },
     multiRemove: async (keys: string[]) => {
       try {
-        if (typeof AsyncStorage.multiRemove === 'function') {
+        if (keys.length > MULTI_REMOVE_YIELD_CHUNK) {
+          for (let i = 0; i < keys.length; i += MULTI_REMOVE_YIELD_CHUNK) {
+            const batch = keys.slice(i, i + MULTI_REMOVE_YIELD_CHUNK);
+            if (typeof AsyncStorage.multiRemove === 'function') {
+              await AsyncStorage.multiRemove(batch);
+            } else {
+              await Promise.all(batch.map((k) => AsyncStorage.removeItem(k)));
+            }
+            if (i + MULTI_REMOVE_YIELD_CHUNK < keys.length) {
+              await yieldMultiRemove();
+            }
+          }
+        } else if (typeof AsyncStorage.multiRemove === 'function') {
           await AsyncStorage.multiRemove(keys);
         } else {
           await Promise.all(keys.map((k) => AsyncStorage.removeItem(k)));
         }
       } catch {}
     },
+    getItemSync: () => null,
+    setItemSync: () => {},
+    removeItemSync: () => {},
   };
 }
 
@@ -81,10 +104,8 @@ export function createNativeKVStorage(id: string): NativeKVStorage {
         const mmkv = new MMKV({ id });
         if (typeof mmkv.getString === 'function' && typeof mmkv.set === 'function') {
           backend = {
-            getItem: async (key: string) => {
-              const val = mmkv.getString(key);
-              return val !== undefined ? val : null;
-            },
+            isSyncCapable: true,
+            getItem: async (key: string) => mmkv.getString(key) ?? null,
             setItem: async (key: string, value: string) => {
               mmkv.set(key, value);
             },
@@ -92,9 +113,23 @@ export function createNativeKVStorage(id: string): NativeKVStorage {
               mmkv.delete(key);
             },
             multiRemove: async (keys: string[]) => {
-              for (const k of keys) {
-                mmkv.delete(k);
+              for (let i = 0; i < keys.length; i += 1) {
+                mmkv.delete(keys[i]);
+                if (
+                  keys.length > MULTI_REMOVE_YIELD_CHUNK &&
+                  (i + 1) % MULTI_REMOVE_YIELD_CHUNK === 0 &&
+                  i + 1 < keys.length
+                ) {
+                  await yieldMultiRemove();
+                }
               }
+            },
+            getItemSync: (key: string) => mmkv.getString(key) ?? null,
+            setItemSync: (key: string, value: string) => {
+              mmkv.set(key, value);
+            },
+            removeItemSync: (key: string) => {
+              mmkv.delete(key);
             },
             trim: async () => {
               mmkv.trim?.();
@@ -112,13 +147,20 @@ export function createNativeKVStorage(id: string): NativeKVStorage {
   };
 
   return {
+    get isSyncCapable(): boolean {
+      return getBackend().isSyncCapable;
+    },
     getItem: (key: string) => getBackend().getItem(key),
     setItem: (key: string, value: string) => getBackend().setItem(key, value),
     removeItem: (key: string) => getBackend().removeItem(key),
     multiRemove: (keys: string[]) => getBackend().multiRemove(keys),
+    getItemSync: (key: string) => getBackend().getItemSync(key),
+    setItemSync: (key: string, value: string) => getBackend().setItemSync(key, value),
+    removeItemSync: (key: string) => getBackend().removeItemSync(key),
     trim: () => getBackend().trim?.() ?? Promise.resolve(),
   };
 }
 
 export const catalogKVStorage: NativeKVStorage = createNativeKVStorage('ventify-catalog');
 export const cartKVStorage: NativeKVStorage = createNativeKVStorage('ventify-cart');
+export const metaKVStorage: NativeKVStorage = createNativeKVStorage('ventify-meta');

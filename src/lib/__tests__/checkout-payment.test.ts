@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { resolveCheckoutPayment } from '../checkout-payment';
+import {
+  resolveCheckoutPayment,
+  tryResolveCheckoutPayment,
+  type ResolveCheckoutPaymentResult,
+} from '../checkout-payment';
 import type { PosPaymentMethodConfig } from '@/types';
 
 const methods: PosPaymentMethodConfig[] = [
@@ -93,5 +97,66 @@ describe('resolveCheckoutPayment', () => {
         splits: [{ category: 'cash', methodId: 'disabled-cash', amount: 30 }],
       })
     ).toThrow();
+  });
+});
+
+describe('tryResolveCheckoutPayment', () => {
+  it('returns { ok: true, value } matching resolveCheckoutPayment on valid single and split inputs', () => {
+    const single: ResolveCheckoutPaymentResult = tryResolveCheckoutPayment({
+      methods,
+      selectedMethodId: 'qr-yape-local',
+      category: 'yape',
+      total: 100,
+    });
+    expect(single).toEqual({
+      ok: true,
+      value: resolveCheckoutPayment({
+        methods,
+        selectedMethodId: 'qr-yape-local',
+        category: 'yape',
+        total: 100,
+      }),
+    });
+
+    const mixedInput = {
+      methods,
+      selectedMethodId: 'mix-method',
+      category: 'mixed' as const,
+      total: 100,
+      splits: [
+        { category: 'cash' as const, amount: 40 },
+        { category: 'digital' as const, digitalProvider: 'yape' as const, amount: 30 },
+        { category: 'card' as const, amount: 30 },
+      ],
+    };
+    const mixed = tryResolveCheckoutPayment(mixedInput);
+    expect(mixed).toEqual({
+      ok: true,
+      value: resolveCheckoutPayment(mixedInput),
+    });
+  });
+
+  it('returns { ok: false, error } without throwing for validation and mismatch failures', () => {
+    const cases = [
+      { methods, selectedMethodId: 'cash-main', category: 'cash' as const, total: -10 },
+      { methods, selectedMethodId: 'cash-main', category: 'cash' as const, total: Number.NaN },
+      { methods, selectedMethodId: 'missing', category: 'card' as const, total: 50 },
+      { methods, selectedMethodId: 'cash-main', category: 'cash' as const, total: 50, splits: [{ category: 'cash' as const, amount: 50 }] },
+      { methods, selectedMethodId: 'mix-method', category: 'mixed' as const, total: 50, splits: [] },
+      { methods, selectedMethodId: 'mix-method', category: 'mixed' as const, total: 50, splits: [{ category: 'cash' as const, amount: -5 }] },
+      { methods, selectedMethodId: 'mix-method', category: 'mixed' as const, total: 50, splits: [{ category: 'cash' as const, amount: 40 }] },
+      { methods, selectedMethodId: 'mix-method', category: 'mixed' as const, total: 0, splits: [{ category: 'cash' as const, amount: 0 }] },
+      { methods, selectedMethodId: 'mix-method', category: 'mixed' as const, total: 30, splits: [{ category: 'cash' as const, methodId: 'disabled-cash', amount: 30 }] },
+    ];
+
+    for (const input of cases) {
+      const res = tryResolveCheckoutPayment(input);
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(typeof res.error).toBe('string');
+        expect(res.error.length).toBeGreaterThan(0);
+        expect(() => resolveCheckoutPayment(input)).toThrow(res.error);
+      }
+    }
   });
 });

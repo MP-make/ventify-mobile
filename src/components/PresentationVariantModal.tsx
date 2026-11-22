@@ -25,8 +25,8 @@ import { formatPEN, ui } from '@/lib/theme';
 import { SectionHeading } from '@/components/ui';
 import { getAllPresentations, getBranchPricingConfig } from '@/lib/product-search';
 import { presentationFactor } from '@/lib/presentation-parity';
-import { useAuth } from '@/context/AuthContext';
-import { useSettings } from '@/context/SettingsContext';
+import { useAuthSession } from '@/context/AuthContext';
+import { useBusinessSettings } from '@/context/SettingsContext';
 import {
   getVariantBranchStock,
   resolvePresentationVariantPrice,
@@ -48,31 +48,30 @@ export interface PresentationVariantModalProps {
   ) => void;
 }
 
-export const PresentationVariantModal: React.FC<PresentationVariantModalProps> = React.memo(({
+const PresentationVariantModalContent: React.FC<
+  PresentationVariantModalProps & { product: Product; isModalVisible: boolean }
+> = React.memo(({
   product,
-  visible,
-  isOpen,
+  isModalVisible,
   onClose,
   onConfirm,
 }) => {
   const insets = useSafeAreaInsets();
-  const { branchId } = useAuth();
-  const { posSettings } = useSettings();
+  const { branchId } = useAuthSession();
+  const { posSettings } = useBusinessSettings();
   const effectiveBranchId = branchId || 'main';
   const enableMinSalePrice = posSettings?.enableMinSalePrice !== false;
-  const isModalVisible = visible !== undefined ? visible : Boolean(isOpen);
 
   const [selectedPresentation, setSelectedPresentation] = useState<ProductPresentation | null>(null);
   const [selectedVariant, setSelectedVariant] = useState<ProductVariant | null>(null);
   const [quantity, setQuantity] = useState<number>(1);
 
-  const branchPricing = useMemo(() => {
-    if (!product) return null;
-    return getBranchPricingConfig(product, effectiveBranchId, enableMinSalePrice);
-  }, [product, effectiveBranchId, enableMinSalePrice]);
+  const branchPricing = useMemo(
+    () => getBranchPricingConfig(product, effectiveBranchId, enableMinSalePrice),
+    [product, effectiveBranchId, enableMinSalePrice]
+  );
 
   const presentations = useMemo(() => {
-    if (!product) return [];
     const raw =
       branchPricing?.presentations && branchPricing.presentations.length > 0
         ? branchPricing.presentations
@@ -82,31 +81,29 @@ export const PresentationVariantModal: React.FC<PresentationVariantModalProps> =
 
   // Inicializar selecciones cuando se abre el modal
   useEffect(() => {
-    if (isModalVisible && product) {
-      setQuantity(1);
+    setQuantity(1);
 
-      if (presentations.length > 0) {
-        setSelectedPresentation(presentations[0]);
-      } else {
-        setSelectedPresentation(null);
-      }
+    if (presentations.length > 0) {
+      setSelectedPresentation(presentations[0]);
+    } else {
+      setSelectedPresentation(null);
+    }
 
-      if (Array.isArray(product.variants) && product.variants.length > 0) {
-        const firstInStock = product.variants.find(
-          (v) => getVariantBranchStock(v, effectiveBranchId) > 0
-        );
-        setSelectedVariant(firstInStock ?? product.variants[0]);
-      } else {
-        setSelectedVariant(null);
-      }
+    if (Array.isArray(product.variants) && product.variants.length > 0) {
+      const firstInStock = product.variants.find(
+        (v) => getVariantBranchStock(v, effectiveBranchId) > 0
+      );
+      setSelectedVariant(firstInStock ?? product.variants[0]);
+    } else {
+      setSelectedVariant(null);
     }
   }, [isModalVisible, product, presentations, effectiveBranchId]);
 
   const basePrice = Number(
-    branchPricing?.suggestedPrice ?? product?.suggestedPrice ?? product?.price ?? 0
+    branchPricing?.suggestedPrice ?? product.suggestedPrice ?? product.price ?? 0
   );
   const effectiveMinSalePrice = enableMinSalePrice
-    ? Number(branchPricing?.minSalePrice ?? product?.minSalePrice ?? 0)
+    ? Number(branchPricing?.minSalePrice ?? product.minSalePrice ?? 0)
     : 0;
 
   // Calcular precio unitario e importe total de la combinación presentación + variante
@@ -122,13 +119,63 @@ export const PresentationVariantModal: React.FC<PresentationVariantModalProps> =
     [basePrice, selectedPresentation, selectedVariant, effectiveMinSalePrice, enableMinSalePrice]
   );
 
+  // Memoizar precios de unidad base y de cada presentación para evitar recálculos al cambiar cantidad
+  const { baseWithVariantPrice, presentationPricingList } = useMemo(() => {
+    const baseVariantPrice = resolvePresentationVariantPrice({
+      basePrice,
+      presentation: null,
+      variant: selectedVariant,
+      minSalePrice: effectiveMinSalePrice > 0 ? effectiveMinSalePrice : undefined,
+      enableMinSalePrice,
+    }).unitPrice;
+
+    const list = presentations.map((pres) => {
+      const presFactor = presentationFactor(pres);
+      const presPrice = resolvePresentationVariantPrice({
+        basePrice,
+        presentation: pres,
+        variant: selectedVariant,
+        minSalePrice: effectiveMinSalePrice > 0 ? effectiveMinSalePrice : undefined,
+        enableMinSalePrice,
+      }).unitPrice;
+      const singleEquivalent = presFactor > 0 ? presPrice / presFactor : presPrice;
+      const savings =
+        baseVariantPrice > singleEquivalent
+          ? Math.round(((baseVariantPrice - singleEquivalent) / baseVariantPrice) * 100)
+          : 0;
+      return {
+        pres,
+        presFactor,
+        presPrice,
+        singleEquivalent,
+        savings,
+      };
+    });
+
+    return {
+      baseWithVariantPrice: baseVariantPrice,
+      presentationPricingList: list,
+    };
+  }, [product, selectedVariant, branchId, posSettings, presentations, basePrice, effectiveMinSalePrice, enableMinSalePrice]);
+
+  const variantStockList = useMemo(
+    () =>
+      Array.isArray(product.variants) && product.variants.length > 0
+        ? product.variants.map((v) => ({
+            variant: v,
+            stock: getVariantBranchStock(v, effectiveBranchId),
+          }))
+        : [],
+    [product, effectiveBranchId]
+  );
+
   const lineTotal = Math.round(unitPrice * quantity * 100) / 100;
 
   // Validar disponibilidad real considerando stock reservado y stock específico de la variante
   const { productAvailable, variantStock, effectiveAvailable, maxUnits } = useMemo(
     () =>
       resolvePresentationVariantStock({
-        product: product ?? { stock: {} },
+        product,
         branchId: effectiveBranchId,
         presentation: selectedPresentation,
         variant: selectedVariant,
@@ -146,16 +193,7 @@ export const PresentationVariantModal: React.FC<PresentationVariantModalProps> =
     }
   }, [maxUnits, quantity]);
 
-  if (!isModalVisible || !product) return null;
-
-  const hasVariants = Array.isArray(product.variants) && product.variants.length > 0;
-  const baseWithVariantPrice = resolvePresentationVariantPrice({
-    basePrice,
-    presentation: null,
-    variant: selectedVariant,
-    minSalePrice: effectiveMinSalePrice > 0 ? effectiveMinSalePrice : undefined,
-    enableMinSalePrice,
-  }).unitPrice;
+  const hasVariants = variantStockList.length > 0;
 
   const handleConfirm = () => {
     if (isStockInsufficient) return;
@@ -262,23 +300,8 @@ export const PresentationVariantModal: React.FC<PresentationVariantModalProps> =
                 </TouchableOpacity>
 
                 {/* Opciones de Presentaciones (Packs, Cajas) */}
-                {presentations.map((pres) => {
+                {presentationPricingList.map(({ pres, presFactor, presPrice, singleEquivalent, savings }) => {
                   const isSelected = selectedPresentation?.id === pres.id;
-                  const presFactor = presentationFactor(pres);
-                  const presResolved = resolvePresentationVariantPrice({
-                    basePrice,
-                    presentation: pres,
-                    variant: selectedVariant,
-                    minSalePrice: effectiveMinSalePrice > 0 ? effectiveMinSalePrice : undefined,
-                    enableMinSalePrice,
-                  });
-                  const presPrice = presResolved.unitPrice;
-
-                  // Ahorro estimado por unidad comparado con unidad base equivalente
-                  const singleEquivalent = presFactor > 0 ? presPrice / presFactor : presPrice;
-                  const savings = baseWithVariantPrice > singleEquivalent
-                    ? Math.round(((baseWithVariantPrice - singleEquivalent) / baseWithVariantPrice) * 100)
-                    : 0;
 
                   return (
                     <TouchableOpacity
@@ -336,9 +359,8 @@ export const PresentationVariantModal: React.FC<PresentationVariantModalProps> =
                 <SectionHeading title="Variante" subtitle="Selecciona color o talla" />
 
                 <View style={styles.variantsGrid}>
-                  {product.variants!.map((v) => {
+                  {variantStockList.map(({ variant: v, stock: vStock }) => {
                     const isSelected = selectedVariant?.id === v.id;
-                    const vStock = getVariantBranchStock(v, effectiveBranchId);
 
                     return (
                       <TouchableOpacity
@@ -460,6 +482,18 @@ export const PresentationVariantModal: React.FC<PresentationVariantModalProps> =
         </View>
       </View>
     </Modal>
+  );
+});
+
+export const PresentationVariantModal: React.FC<PresentationVariantModalProps> = React.memo((props) => {
+  const isModalVisible = props.visible !== undefined ? props.visible : Boolean(props.isOpen);
+  if (!isModalVisible || !props.product) return null;
+  return (
+    <PresentationVariantModalContent
+      {...props}
+      product={props.product}
+      isModalVisible={isModalVisible}
+    />
   );
 });
 

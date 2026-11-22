@@ -22,10 +22,9 @@ import {
   ActivityIndicator,
   Switch,
   Platform,
-  KeyboardAvoidingView,
 } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
-import { FlashList } from '@shopify/flash-list';
+import { FlashList, type ContentStyle } from '@shopify/flash-list';
 import {
   X,
   Users,
@@ -34,61 +33,43 @@ import {
   Search,
   Plus,
   CheckCircle2,
-  XCircle,
-  Clock,
   Shield,
-  DollarSign,
-  AlertCircle,
-  ChevronRight,
-  ChevronDown,
   ShoppingCart,
-  Send,
   Building2,
   Phone,
   Mail,
   Check,
-  RotateCcw,
-  Receipt,
-  UserCheck,
 } from 'lucide-react-native';
 import * as Haptics from 'expo-haptics';
 
-import { useAuth } from '@/context/AuthContext';
-import { useSettings } from '@/context/SettingsContext';
-import { useCart } from '@/context/CartContext';
-import { useProducts } from '@/context/ProductsContext';
+import { useAuthSession } from '@/context/AuthContext';
+import { useBusinessSettings, useCashSession } from '@/context/SettingsContext';
+import { useCartActions } from '@/context/CartContext';
 import { usePermissions } from '@/hooks/usePermissions';
-import { ui, theme, formatPEN, formatDatePE } from '@/lib/theme';
-import { ScreenHeading, SectionHeading } from '@/components/ui';
-import {
-  ROLE_PERMISSIONS,
-  type CustomPermissions,
-  type Permission,
-} from '@/lib/role-permissions';
+import { useDebouncedValue } from '@/hooks/use-debounced-value';
+import { ui, formatPEN, formatDatePE } from '@/lib/theme';
+import { ScreenHeading } from '@/components/ui';
 import {
   TeamMember,
-  TeamRole,
   BranchItem,
   PayrollMovement,
   PayrollConceptType,
   SaleRequest,
   SaleRequestStatus,
-  PERMISSION_GROUPS,
   subscribeToTeamMembers,
   subscribeToPayrollMovements,
   subscribeToSaleRequests,
   registerPayrollPayment,
   resolveSaleRequest,
   convertSaleRequest,
-  createSaleRequest,
-  createTeamUser,
-  updateTeamUser,
-  toggleCustomPermission,
   getBranchesList,
-  saveBranchRecord,
   toggleBranchActive,
 } from '@/services/enterprise-ops-service';
 import type { Product, Customer } from '@/types';
+import { CreateSaleRequestModal } from './payroll/CreateSaleRequestModal';
+import { RejectSaleRequestModal } from './payroll/RejectSaleRequestModal';
+import { UserFormModal } from './payroll/UserFormModal';
+import { BranchFormModal } from './payroll/BranchFormModal';
 
 export interface PayrollUsersModalProps {
   visible?: boolean;
@@ -425,6 +406,12 @@ const SaleRequestCardItem = React.memo<SaleRequestCardItemProps>(({
   );
 });
 
+const teamMemberKeyExtractor = (item: TeamMember) => item.id;
+const payrollMovementKeyExtractor = (item: PayrollMovement) => item.id;
+const saleRequestKeyExtractor = (item: SaleRequest) => item.id;
+const branchKeyExtractor = (item: BranchItem) => item.id;
+const PayrollListGap10 = () => <View style={{ height: 10 }} />;
+
 export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
   visible,
   isOpen,
@@ -435,11 +422,11 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
   const insets = useSafeAreaInsets();
   const isVisible = visible !== undefined ? visible : Boolean(isOpen);
 
-  const { accountId, branchId, userProfile, role } = useAuth();
+  const { accountId, branchId, userProfile } = useAuthSession();
   const { hasPermission, isOwner, isAdmin } = usePermissions();
-  const { isCashOpen, activeCashSession, activeBranchName, refreshConfiguration } = useSettings();
-  const { clearCart, addItem, setCustomer, setNotes, setSaleRequestId, setShippingAmount } = useCart();
-  const { products } = useProducts();
+  const { activeBranchName, refreshConfiguration } = useBusinessSettings();
+  const { isCashOpen, activeCashSession } = useCashSession();
+  const { clearCart, addItem, setCustomer, setNotes, setSaleRequestId, setShippingAmount } = useCartActions();
 
   const canManageUsers = isOwner || isAdmin || hasPermission('manage_users');
   const canManageBranches = isOwner || isAdmin || hasPermission('manage_branches');
@@ -464,6 +451,7 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
 
   // Filtros
   const [searchQuery, setSearchQuery] = useState<string>('');
+  const debouncedSearchQuery = useDebouncedValue(searchQuery, 150);
   const [requestFilter, setRequestFilter] = useState<SaleRequestStatus | 'all'>('all');
 
   // Sub-vista en Planilla ('history' o 'new_payment')
@@ -477,50 +465,13 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
   const [paymentNotes, setPaymentNotes] = useState<string>('');
   const [deductFromCash, setDeductFromCash] = useState<boolean>(true);
 
-  // Modal de rechazo cross-platform (sin Alert.prompt)
+  // Disparadores para sub-modales montados condicionalmente
   const [rejectTarget, setRejectTarget] = useState<SaleRequest | null>(null);
-  const [rejectReason, setRejectReason] = useState<string>('');
-
-  // Modal Crear / Editar Usuario + PermissionEditor
   const [userFormVisible, setUserFormVisible] = useState<boolean>(false);
   const [editingMember, setEditingMember] = useState<TeamMember | null>(null);
-  const [userFormName, setUserFormName] = useState<string>('');
-  const [userFormEmail, setUserFormEmail] = useState<string>('');
-  const [userFormRole, setUserFormRole] = useState<TeamRole>('cashier');
-  const [userFormBranchId, setUserFormBranchId] = useState<string>('');
-  const [userFormAllBranches, setUserFormAllBranches] = useState<boolean>(false);
-  const [userFormPhone, setUserFormPhone] = useState<string>('');
-  const [userFormDni, setUserFormDni] = useState<string>('');
-  const [userFormSalary, setUserFormSalary] = useState<string>('');
-  const [userFormIsActive, setUserFormIsActive] = useState<boolean>(true);
-  const [userFormCustomPerms, setUserFormCustomPerms] = useState<CustomPermissions | null>(null);
-  const [openPermGroups, setOpenPermGroups] = useState<Record<string, boolean>>({
-    ventas: true,
-    caja: true,
-  });
-
-  // Modal Crear / Editar Sucursal
   const [branchFormVisible, setBranchFormVisible] = useState<boolean>(false);
   const [editingBranch, setEditingBranch] = useState<BranchItem | null>(null);
-  const [branchFormName, setBranchFormName] = useState<string>('');
-  const [branchFormAddress, setBranchFormAddress] = useState<string>('');
-  const [branchFormPhone, setBranchFormPhone] = useState<string>('');
-  const [branchFormEmail, setBranchFormEmail] = useState<string>('');
-  const [branchFormManager, setBranchFormManager] = useState<string>('');
-  const [branchFormBusinessName, setBranchFormBusinessName] = useState<string>('');
-  const [branchFormRuc, setBranchFormRuc] = useState<string>('');
-  const [branchFormFooter, setBranchFormFooter] = useState<string>('');
-  const [branchFormIsActive, setBranchFormIsActive] = useState<boolean>(true);
-
-  // Formulario rápido para crear solicitud de prueba/vendedor
   const [showCreateRequestModal, setShowCreateRequestModal] = useState<boolean>(false);
-  const [reqCustomerName, setReqCustomerName] = useState<string>('');
-  const [reqProductName, setReqProductName] = useState<string>('');
-  const [reqSelectedProduct, setReqSelectedProduct] = useState<Product | null>(null);
-  const [reqOriginalPrice, setReqOriginalPrice] = useState<string>('');
-  const [reqRequestedPrice, setReqRequestedPrice] = useState<string>('');
-  const [reqQuantity, setReqQuantity] = useState<string>('1');
-  const [reqReason, setReqReason] = useState<string>('');
 
   const branchesLoadStateRef = useRef<{
     loadedAccountId: string | null;
@@ -631,8 +582,8 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
 
   // Lista filtrada de miembros del equipo
   const filteredTeam = useMemo(() => {
-    if (!searchQuery.trim()) return teamMembers;
-    const q = searchQuery.toLowerCase().trim();
+    const q = debouncedSearchQuery.toLowerCase().trim();
+    if (!q) return teamMembers;
     return teamMembers.filter(
       (m) =>
         m.name.toLowerCase().includes(q) ||
@@ -640,48 +591,47 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
         m.roleLabel.toLowerCase().includes(q) ||
         (m.phone && m.phone.includes(q))
     );
-  }, [teamMembers, searchQuery]);
+  }, [teamMembers, debouncedSearchQuery]);
 
-  // Lista filtrada de solicitudes de venta
+  // Lista filtrada de solicitudes de venta (sin clonar el array innecesariamente)
   const filteredRequests = useMemo(() => {
-    let result = [...saleRequests];
-    if (requestFilter !== 'all') {
-      result = result.filter((r) => r.status === requestFilter);
+    const q = debouncedSearchQuery.toLowerCase().trim();
+    if (requestFilter === 'all' && !q) {
+      return saleRequests;
     }
-    if (searchQuery.trim()) {
-      const q = searchQuery.toLowerCase().trim();
-      result = result.filter(
-        (r) =>
-          r.requestNumber.toLowerCase().includes(q) ||
-          r.customerName.toLowerCase().includes(q) ||
-          r.sellerName.toLowerCase().includes(q) ||
-          r.items.some((it) => it.productName.toLowerCase().includes(q))
+    return saleRequests.filter((r) => {
+      if (requestFilter !== 'all' && r.status !== requestFilter) return false;
+      if (!q) return true;
+      return (
+        r.requestNumber.toLowerCase().includes(q) ||
+        r.customerName.toLowerCase().includes(q) ||
+        r.sellerName.toLowerCase().includes(q) ||
+        r.items.some((it) => it.productName.toLowerCase().includes(q))
       );
+    });
+  }, [saleRequests, requestFilter, debouncedSearchQuery]);
+
+  const pendingRequestsCount = useMemo(() => {
+    let count = 0;
+    for (let i = 0; i < saleRequests.length; i += 1) {
+      if (saleRequests[i].status === 'pending') count += 1;
     }
-    return result;
-  }, [saleRequests, requestFilter, searchQuery]);
+    return count;
+  }, [saleRequests]);
 
-  const requestProductMatches = useMemo(() => {
-    const query = reqProductName.trim().toLowerCase();
-    if (!query) return [];
-    return products
-      .filter((product) => product.name.toLowerCase().includes(query)
-        || (product.sku || '').toLowerCase().includes(query))
-      .slice(0, 8);
-  }, [products, reqProductName]);
-
-  // Totales de nómina
+  // Totales de nómina en una sola pasada
   const payrollStats = useMemo(() => {
-    const totalAdvances = payrollMovements
-      .filter((p) => p.conceptType === 'advance')
-      .reduce((sum, p) => sum + p.amount, 0);
-    const totalSalaries = payrollMovements
-      .filter((p) => p.conceptType === 'salary')
-      .reduce((sum, p) => sum + p.amount, 0);
-    const totalCommissions = payrollMovements
-      .filter((p) => p.conceptType === 'commission')
-      .reduce((sum, p) => sum + p.amount, 0);
-    const totalPaid = payrollMovements.reduce((sum, p) => sum + p.amount, 0);
+    let totalAdvances = 0;
+    let totalSalaries = 0;
+    let totalCommissions = 0;
+    let totalPaid = 0;
+    for (let i = 0; i < payrollMovements.length; i += 1) {
+      const p = payrollMovements[i];
+      totalPaid += p.amount;
+      if (p.conceptType === 'advance') totalAdvances += p.amount;
+      else if (p.conceptType === 'salary') totalSalaries += p.amount;
+      else if (p.conceptType === 'commission') totalCommissions += p.amount;
+    }
 
     return { totalAdvances, totalSalaries, totalCommissions, totalPaid };
   }, [payrollMovements]);
@@ -775,32 +725,14 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
     }
   }, [userProfile, branchId]);
 
-  // Rechazar solicitud (modal cross-platform con TextInput en lugar de Alert.prompt)
+  // Rechazar solicitud (modal cross-platform montado condicionalmente)
   const handleRejectRequest = useCallback((request: SaleRequest) => {
-    setRejectReason('');
     setRejectTarget(request);
   }, []);
 
-  const handleConfirmRejectRequest = useCallback(async () => {
-    if (!rejectTarget) return;
-    try {
-      setIsSubmitting(true);
-      await resolveSaleRequest(
-        rejectTarget.id,
-        'rejected',
-        userProfile,
-        rejectReason.trim() || 'Descuento no autorizado',
-        branchId
-      );
-      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning).catch(() => {});
-      setRejectTarget(null);
-      setRejectReason('');
-    } catch (err: any) {
-      Alert.alert('Error', err?.message || 'No se pudo rechazar la solicitud.');
-    } finally {
-      setIsSubmitting(false);
-    }
-  }, [rejectTarget, rejectReason, userProfile, branchId]);
+  const handleCloseRejectModal = useCallback(() => {
+    setRejectTarget(null);
+  }, []);
 
   const handleConvertRequest = useCallback((request: SaleRequest) => {
     const sessionId = activeCashSession?.sessionId || activeCashSession?.id;
@@ -840,181 +772,37 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
   // Handlers de Usuarios y Permisos
   const handleOpenCreateUser = useCallback(() => {
     setEditingMember(null);
-    setUserFormName('');
-    setUserFormEmail('');
-    setUserFormRole('cashier');
-    setUserFormBranchId(branchId || branchesList.find((b) => b.isActive)?.id || '');
-    setUserFormAllBranches(false);
-    setUserFormPhone('');
-    setUserFormDni('');
-    setUserFormSalary('');
-    setUserFormIsActive(true);
-    setUserFormCustomPerms(null);
     setUserFormVisible(true);
-  }, [branchId, branchesList]);
+  }, []);
 
   const handleOpenEditUser = useCallback((member: TeamMember) => {
     setEditingMember(member);
-    setUserFormName(member.name || '');
-    setUserFormEmail(member.email || '');
-    setUserFormRole(member.role || 'cashier');
-    setUserFormBranchId(member.branchId || branchId || '');
-    setUserFormAllBranches(Boolean(member.allBranchesAccess));
-    setUserFormPhone(member.phone || '');
-    setUserFormDni(member.dni || '');
-    setUserFormSalary(member.baseSalary ? String(member.baseSalary) : '');
-    setUserFormIsActive(member.isActive !== false);
-    setUserFormCustomPerms(member.customPermissions || null);
     setUserFormVisible(true);
-  }, [branchId]);
+  }, []);
 
-  const handleSaveUser = useCallback(async () => {
-    if (!accountId) return;
-    if (!userFormName.trim()) {
-      Alert.alert('Dato requerido', 'Ingresa el nombre del colaborador.');
-      return;
-    }
-    if (!editingMember && !userFormEmail.trim()) {
-      Alert.alert('Correo requerido', 'Ingresa un correo electrónico válido.');
-      return;
-    }
-    const numericSalary = userFormSalary.trim() ? parseFloat(userFormSalary.replace(',', '.')) : undefined;
-    if (numericSalary !== undefined && (isNaN(numericSalary) || numericSalary < 0)) {
-      Alert.alert('Sueldo inválido', 'Ingresa un sueldo base válido mayor o igual a 0.');
-      return;
-    }
-
-    try {
-      setIsSubmitting(true);
-      if (editingMember) {
-        await updateTeamUser(editingMember.id, {
-          accountId,
-          name: userFormName.trim(),
-          role: userFormRole,
-          branchId: userFormAllBranches ? null : userFormBranchId || null,
-          allBranchesAccess: isAdminOrOwner ? userFormAllBranches : Boolean(editingMember.allBranchesAccess),
-          phone: userFormPhone.trim(),
-          dni: userFormDni.trim(),
-          baseSalary: numericSalary !== undefined ? numericSalary : null,
-          isActive: userFormIsActive,
-          customPermissions: userFormCustomPerms,
-        });
-        Alert.alert('Usuario Actualizado', `Se guardaron los cambios para ${userFormName.trim()}.`);
-      } else {
-        const res = await createTeamUser({
-          accountId,
-          name: userFormName.trim(),
-          email: userFormEmail.trim().toLowerCase(),
-          role: userFormRole,
-          branchId: userFormAllBranches ? undefined : userFormBranchId || undefined,
-          allBranchesAccess: isAdminOrOwner ? userFormAllBranches : false,
-          phone: userFormPhone.trim() || undefined,
-          dni: userFormDni.trim() || undefined,
-          baseSalary: numericSalary,
-          customPermissions: userFormCustomPerms,
-        });
-        Alert.alert(
-          'Usuario Creado',
-          res?.message || `Se creó la cuenta para ${userFormName.trim()}. Se envió enlace de contraseña al correo.`
-        );
-      }
-      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
-      setUserFormVisible(false);
-    } catch (err: any) {
-      Alert.alert('Error', err?.message || 'No se pudo guardar el colaborador.');
-    } finally {
-      setIsSubmitting(false);
-    }
-  }, [
-    accountId,
-    editingMember,
-    userFormName,
-    userFormEmail,
-    userFormRole,
-    userFormBranchId,
-    userFormAllBranches,
-    userFormPhone,
-    userFormDni,
-    userFormSalary,
-    userFormIsActive,
-    userFormCustomPerms,
-    isAdminOrOwner,
-  ]);
+  const handleCloseUserForm = useCallback(() => {
+    setUserFormVisible(false);
+  }, []);
 
   // Handlers de Sucursales (Branches CRUD)
   const handleOpenCreateBranch = useCallback(() => {
     setEditingBranch(null);
-    setBranchFormName('');
-    setBranchFormAddress('');
-    setBranchFormPhone('');
-    setBranchFormEmail('');
-    setBranchFormManager('');
-    setBranchFormBusinessName('');
-    setBranchFormRuc('');
-    setBranchFormFooter('');
-    setBranchFormIsActive(true);
     setBranchFormVisible(true);
   }, []);
 
   const handleOpenEditBranch = useCallback((b: BranchItem) => {
     setEditingBranch(b);
-    setBranchFormName(b.name || '');
-    setBranchFormAddress(b.address || '');
-    setBranchFormPhone(b.phone || '');
-    setBranchFormEmail(b.email || '');
-    setBranchFormManager(b.manager || '');
-    setBranchFormBusinessName(b.businessName || '');
-    setBranchFormRuc(b.ruc || '');
-    setBranchFormFooter(b.receiptFooter || '');
-    setBranchFormIsActive(b.isActive !== false);
     setBranchFormVisible(true);
   }, []);
 
-  const handleSaveBranch = useCallback(async () => {
-    if (!accountId) return;
-    if (!branchFormName.trim()) {
-      Alert.alert('Nombre requerido', 'Ingresa el nombre de la sucursal.');
-      return;
-    }
-    try {
-      setIsSubmitting(true);
-      await saveBranchRecord({
-        id: editingBranch?.id,
-        accountId,
-        name: branchFormName.trim(),
-        address: branchFormAddress.trim(),
-        phone: branchFormPhone.trim(),
-        email: branchFormEmail.trim(),
-        manager: branchFormManager.trim(),
-        businessName: branchFormBusinessName.trim(),
-        ruc: branchFormRuc.trim(),
-        receiptFooter: branchFormFooter.trim(),
-        isActive: branchFormIsActive,
-      });
-      await loadBranches(true);
-      void refreshConfiguration();
-      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
-      setBranchFormVisible(false);
-    } catch (err: any) {
-      Alert.alert('Error', err?.message || 'No se pudo guardar la sucursal.');
-    } finally {
-      setIsSubmitting(false);
-    }
-  }, [
-    accountId,
-    editingBranch,
-    branchFormName,
-    branchFormAddress,
-    branchFormPhone,
-    branchFormEmail,
-    branchFormManager,
-    branchFormBusinessName,
-    branchFormRuc,
-    branchFormFooter,
-    branchFormIsActive,
-    loadBranches,
-    refreshConfiguration,
-  ]);
+  const handleCloseBranchForm = useCallback(() => {
+    setBranchFormVisible(false);
+  }, []);
+
+  const handleBranchSaved = useCallback(async () => {
+    await loadBranches(true);
+    void refreshConfiguration();
+  }, [loadBranches, refreshConfiguration]);
 
   const handleToggleBranchActive = useCallback(async (branch: BranchItem, next: boolean) => {
     const activeCount = branchesList.filter((b) => b.isActive).length;
@@ -1122,66 +910,66 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
     }
   }, [accountId, clearCart, setCustomer, addItem, setSaleRequestId, setShippingAmount, setNotes, onLoadSaleRequestToPos, onClose]);
 
-  // Crear nueva solicitud de venta (para vendedores de piso)
-  const handleCreateSaleRequest = async () => {
-    const origPrice = parseFloat(reqOriginalPrice.replace(',', '.'));
-    const reqPrice = parseFloat(reqRequestedPrice.replace(',', '.'));
-    const qty = parseFloat(reqQuantity) || 1;
+  const handleOpenCreateRequestModal = useCallback(() => {
+    setShowCreateRequestModal(true);
+  }, []);
 
-    if (!reqSelectedProduct?.id || isNaN(origPrice) || isNaN(reqPrice) || !Number.isFinite(qty) || qty <= 0 || reqPrice <= 0 || origPrice <= 0) {
-      Alert.alert('Datos Incompletos', 'Selecciona un producto del catálogo e ingresa cantidad y precios válidos.');
-      return;
-    }
+  const handleCloseCreateRequestModal = useCallback(() => {
+    setShowCreateRequestModal(false);
+  }, []);
 
-    try {
-      setIsSubmitting(true);
-      const discount = Math.max(0, (origPrice - reqPrice) * qty);
-      const subtotal = origPrice * qty;
-      const total = reqPrice * qty;
+  const listContentContainerStyle = useMemo<ContentStyle>(
+    () => ({ paddingHorizontal: 20, paddingTop: 8, paddingBottom: insets.bottom + 20 }),
+    [insets.bottom]
+  );
 
-      await createSaleRequest({
-        accountId: accountId || '',
-        branchId: branchId || 'main',
-        branchName: activeBranchName || 'Tienda Principal',
-        sellerId: userProfile?.uid || 'seller_pos',
-        sellerName: userProfile?.displayName || userProfile?.email || 'Vendedor de Piso',
-        sellerEmail: userProfile?.email || '',
-        customerName: reqCustomerName.trim() || 'Cliente General',
-        items: [
-          {
-            productId: reqSelectedProduct.id,
-            productName: reqSelectedProduct.name,
-            sku: reqSelectedProduct.sku || '',
-            quantity: qty,
-            originalPrice: origPrice,
-            requestedPrice: reqPrice,
-            price: reqPrice,
-            subtotal: total,
-            discountAmount: discount,
-          },
-        ],
-        subtotal,
-        discountTotal: discount,
-        total,
-        reason: reqReason.trim() || 'Descuento especial por volumen',
-      });
+  const renderTeamMemberItem = useCallback(
+    ({ item }: { item: TeamMember }) => (
+      <TeamMemberCardItem
+        member={item}
+        canEdit={canManageUsers}
+        onEdit={handleOpenEditUser}
+      />
+    ),
+    [canManageUsers, handleOpenEditUser]
+  );
 
-      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
-      setShowCreateRequestModal(false);
-      setReqCustomerName('');
-      setReqProductName('');
-      setReqSelectedProduct(null);
-      setReqProductName('');
-      setReqOriginalPrice('');
-      setReqRequestedPrice('');
-      setReqReason('');
-      Alert.alert('Solicitud Enviada', 'La solicitud de venta fue enviada a la bandeja de autorización.');
-    } catch (err: any) {
-      Alert.alert('Error', err?.message || 'No se pudo enviar la solicitud.');
-    } finally {
-      setIsSubmitting(false);
-    }
-  };
+  const renderPayrollMovementItem = useCallback(
+    ({ item }: { item: PayrollMovement }) => <PayrollMovementCardItem mov={item} />,
+    []
+  );
+
+  const renderSaleRequestItem = useCallback(
+    ({ item }: { item: SaleRequest }) => (
+      <SaleRequestCardItem
+        req={item}
+        isSubmitting={isSubmitting}
+        onApprove={handleApproveRequest}
+        onReject={handleRejectRequest}
+        onLoadPos={handleLoadRequestToPos}
+        onConvert={handleConvertRequest}
+      />
+    ),
+    [
+      isSubmitting,
+      handleApproveRequest,
+      handleRejectRequest,
+      handleLoadRequestToPos,
+      handleConvertRequest,
+    ]
+  );
+
+  const renderBranchItem = useCallback(
+    ({ item }: { item: BranchItem }) => (
+      <BranchCardItem
+        branch={item}
+        canManage={canManageBranches}
+        onEdit={handleOpenEditBranch}
+        onToggleActive={handleToggleBranchActive}
+      />
+    ),
+    [canManageBranches, handleOpenEditBranch, handleToggleBranchActive]
+  );
 
   if (!isVisible) return null;
 
@@ -1253,7 +1041,7 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
               setActiveTab('requests');
             }}
             accessibilityRole="tab"
-            accessibilityLabel={`Solicitudes (${saleRequests.filter((r) => r.status === 'pending').length})`}
+            accessibilityLabel={`Solicitudes (${pendingRequestsCount})`}
             accessibilityState={{ selected: activeTab === 'requests' }}
           >
             <ClipboardList
@@ -1262,9 +1050,9 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
             />
             {activeTab === 'requests' ? (
               <Text style={[styles.tabButtonText, styles.tabButtonTextActive]} numberOfLines={1}>
-                Solicitudes ({saleRequests.filter((r) => r.status === 'pending').length})
+                Solicitudes ({pendingRequestsCount})
               </Text>
-            ) : saleRequests.some((r) => r.status === 'pending') ? (
+            ) : pendingRequestsCount > 0 ? (
               <View style={styles.tabPendingDot} />
             ) : null}
           </TouchableOpacity>
@@ -1334,16 +1122,12 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
 
                 <FlashList
                   data={filteredTeam}
-                  renderItem={({ item }) => (
-                    <TeamMemberCardItem
-                      member={item}
-                      canEdit={canManageUsers}
-                      onEdit={handleOpenEditUser}
-                    />
-                  )}
+                  renderItem={renderTeamMemberItem}
                   estimatedItemSize={100}
-                  keyExtractor={(item) => item.id}
-                  contentContainerStyle={[styles.scrollContent, { paddingBottom: insets.bottom + 20 }] as any}
+                  keyExtractor={teamMemberKeyExtractor}
+                  extraData={canManageUsers}
+                  contentContainerStyle={listContentContainerStyle}
+                  ItemSeparatorComponent={PayrollListGap10}
                   showsVerticalScrollIndicator={false}
                 />
               </View>
@@ -1590,10 +1374,11 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
                     ) : (
                       <FlashList
                         data={payrollMovements}
-                        renderItem={({ item }) => <PayrollMovementCardItem mov={item} />}
+                        renderItem={renderPayrollMovementItem}
                         estimatedItemSize={110}
-                        keyExtractor={(item) => item.id}
-                        contentContainerStyle={[styles.scrollContent, { paddingBottom: insets.bottom + 20 }] as any}
+                        keyExtractor={payrollMovementKeyExtractor}
+                        contentContainerStyle={listContentContainerStyle}
+                        ItemSeparatorComponent={PayrollListGap10}
                         showsVerticalScrollIndicator={false}
                       />
                     )}
@@ -1611,7 +1396,7 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
                   </Text>
                   <TouchableOpacity
                     style={styles.newRequestBtn}
-                    onPress={() => setShowCreateRequestModal(true)}
+                    onPress={handleOpenCreateRequestModal}
                     accessibilityRole="button"
                     accessibilityLabel="Crear solicitud de venta"
                   >
@@ -1657,23 +1442,16 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
                     </Text>
                   </View>
                 ) : (
-                    <FlashList
-                      data={filteredRequests}
-                      renderItem={({ item }) => (
-                        <SaleRequestCardItem
-                          req={item}
-                          isSubmitting={isSubmitting}
-                          onApprove={handleApproveRequest}
-                          onReject={handleRejectRequest}
-                          onLoadPos={handleLoadRequestToPos}
-                          onConvert={handleConvertRequest}
-                        />
-                      )}
-                      estimatedItemSize={190}
-                      keyExtractor={(item) => item.id}
-                      contentContainerStyle={[styles.scrollContent, { paddingBottom: insets.bottom + 20 }] as any}
-                      showsVerticalScrollIndicator={false}
-                    />
+                  <FlashList
+                    data={filteredRequests}
+                    renderItem={renderSaleRequestItem}
+                    estimatedItemSize={190}
+                    keyExtractor={saleRequestKeyExtractor}
+                    extraData={isSubmitting}
+                    contentContainerStyle={listContentContainerStyle}
+                    ItemSeparatorComponent={PayrollListGap10}
+                    showsVerticalScrollIndicator={false}
+                  />
                 )}
               </View>
             )}
@@ -1708,17 +1486,12 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
                 ) : (
                   <FlashList
                     data={branchesList}
-                    renderItem={({ item }) => (
-                      <BranchCardItem
-                        branch={item}
-                        canManage={canManageBranches}
-                        onEdit={handleOpenEditBranch}
-                        onToggleActive={handleToggleBranchActive}
-                      />
-                    )}
+                    renderItem={renderBranchItem}
                     estimatedItemSize={100}
-                    keyExtractor={(item) => item.id}
-                    contentContainerStyle={[styles.scrollContent, { paddingBottom: insets.bottom + 20 }] as any}
+                    keyExtractor={branchKeyExtractor}
+                    extraData={canManageBranches}
+                    contentContainerStyle={listContentContainerStyle}
+                    ItemSeparatorComponent={PayrollListGap10}
                     showsVerticalScrollIndicator={false}
                   />
                 )}
@@ -1727,678 +1500,51 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
           </View>
         )}
 
-        {/* MODAL INTERNO: CREAR NUEVA SOLICITUD DE DESCUENTO */}
-        <Modal
-          visible={showCreateRequestModal}
-          transparent
-          animationType="fade"
-          onRequestClose={() => setShowCreateRequestModal(false)}
-        >
-          <SafeAreaView edges={['top', 'bottom']} style={styles.modalSafe}>
-            <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.modalOverlay}>
-              <View style={styles.modalDialog}>
-                <View style={styles.modalHeader}>
-                  <Text style={styles.modalTitle}>Nueva Solicitud de Venta</Text>
-                  <TouchableOpacity
-                    style={styles.closeButton}
-                    onPress={() => setShowCreateRequestModal(false)}
-                    accessibilityRole="button"
-                    accessibilityLabel="Cerrar nueva solicitud"
-                  >
-                    <X size={18} color={ui.textSecondary} />
-                  </TouchableOpacity>
-                </View>
+        {showCreateRequestModal && (
+          <CreateSaleRequestModal
+            visible={showCreateRequestModal}
+            accountId={accountId}
+            branchId={branchId}
+            activeBranchName={activeBranchName}
+            userProfile={userProfile}
+            onClose={handleCloseCreateRequestModal}
+          />
+        )}
 
-              <ScrollView style={{ maxHeight: 420 }}>
-                <Text style={styles.dialogInputLabel}>Cliente:</Text>
-                <TextInput
-                  style={styles.dialogInput}
-                  placeholder="Nombre de cliente o razón social"
-                  placeholderTextColor={ui.textMuted}
-                  value={reqCustomerName}
-                  onChangeText={setReqCustomerName}
-                />
+        {rejectTarget && (
+          <RejectSaleRequestModal
+            visible={Boolean(rejectTarget)}
+            target={rejectTarget}
+            userProfile={userProfile}
+            branchId={branchId}
+            onClose={handleCloseRejectModal}
+          />
+        )}
 
-                <Text style={styles.dialogInputLabel}>Producto del catálogo:</Text>
-                <TextInput
-                  style={styles.dialogInput}
-                  placeholder="Buscar por nombre o SKU"
-                  placeholderTextColor={ui.textMuted}
-                  value={reqProductName}
-                  onChangeText={(value) => { setReqProductName(value); setReqSelectedProduct(null); }}
-                />
-                {reqSelectedProduct ? (
-                  <TouchableOpacity
-                    style={[styles.dialogInput, { borderColor: ui.primary, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }]}
-                    onPress={() => { setReqSelectedProduct(null); setReqProductName(''); }}
-                  >
-                    <Text style={{ color: ui.text, flex: 1 }}>{reqSelectedProduct.name} · {reqSelectedProduct.sku || 'Sin SKU'}</Text>
-                    <Text style={{ color: ui.primary }}>Cambiar</Text>
-                  </TouchableOpacity>
-                ) : requestProductMatches.length > 0 ? (
-                  <View style={{ borderWidth: 1, borderColor: ui.border, borderRadius: 10, marginBottom: 10, overflow: 'hidden' }}>
-                    {requestProductMatches.map((product) => (
-                      <TouchableOpacity
-                        key={product.id}
-                        style={{ padding: 11, borderBottomWidth: 1, borderBottomColor: ui.border }}
-                        onPress={() => {
-                          setReqSelectedProduct(product);
-                          setReqProductName(product.name);
-                          const listPrice = Number(product.suggestedPrice || product.price || 0);
-                          setReqOriginalPrice(String(listPrice));
-                          setReqRequestedPrice(String(listPrice));
-                        }}
-                      >
-                        <Text style={{ color: ui.text, fontWeight: '600' }}>{product.name}</Text>
-                        <Text style={{ color: ui.textMuted, fontSize: 12 }}>{product.sku || 'Sin SKU'} · {formatPEN(Number(product.suggestedPrice || product.price || 0))}</Text>
-                      </TouchableOpacity>
-                    ))}
-                  </View>
-                ) : reqProductName.trim() ? <Text style={{ color: ui.textMuted, fontSize: 12, marginBottom: 10 }}>No hay productos coincidentes en el catálogo.</Text> : null}
+        {userFormVisible && (
+          <UserFormModal
+            key={editingMember?.id || 'new'}
+            visible={userFormVisible}
+            editingMember={editingMember}
+            accountId={accountId}
+            defaultBranchId={branchId}
+            branchesList={branchesList}
+            isOwner={isOwner}
+            isAdminOrOwner={isAdminOrOwner}
+            onClose={handleCloseUserForm}
+          />
+        )}
 
-                <View style={{ flexDirection: 'row', gap: 10 }}>
-                  <View style={{ flex: 1 }}>
-                    <Text style={styles.dialogInputLabel}>Cantidad:</Text>
-                    <TextInput
-                      style={styles.dialogInput}
-                      placeholder="1"
-                      placeholderTextColor={ui.textMuted}
-                      keyboardType="numeric"
-                      value={reqQuantity}
-                      onChangeText={setReqQuantity}
-                    />
-                  </View>
-                  <View style={{ flex: 1 }}>
-                    <Text style={styles.dialogInputLabel}>Precio Lista (S/):</Text>
-                    <TextInput
-                      style={styles.dialogInput}
-                      placeholder="100.00"
-                      placeholderTextColor={ui.textMuted}
-                      keyboardType="decimal-pad"
-                      value={reqOriginalPrice}
-                      onChangeText={setReqOriginalPrice}
-                    />
-                  </View>
-                </View>
-
-                <Text style={styles.dialogInputLabel}>Precio con Descuento Solicitado (S/):</Text>
-                <TextInput
-                  style={[styles.dialogInput, { borderColor: ui.primary }]}
-                  placeholder="85.00"
-                  placeholderTextColor={ui.textMuted}
-                  keyboardType="decimal-pad"
-                  value={reqRequestedPrice}
-                  onChangeText={setReqRequestedPrice}
-                />
-
-                <Text style={styles.dialogInputLabel}>Justificación / Motivo:</Text>
-                <TextInput
-                  style={styles.dialogInput}
-                  placeholder="Ej: Cliente mayorista, paga al contado..."
-                  placeholderTextColor={ui.textMuted}
-                  value={reqReason}
-                  onChangeText={setReqReason}
-                />
-              </ScrollView>
-
-              <View style={styles.modalFooter}>
-                <TouchableOpacity
-                  style={styles.dialogCancelBtn}
-                  onPress={() => setShowCreateRequestModal(false)}
-                >
-                  <Text style={styles.dialogCancelText}>Cancelar</Text>
-                </TouchableOpacity>
-
-                <TouchableOpacity
-                  style={[styles.dialogSubmitBtn, isSubmitting && styles.buttonDisabled]}
-                  onPress={handleCreateSaleRequest}
-                  disabled={isSubmitting}
-                >
-                  <Send size={15} color={ui.onPrimary} />
-                  <Text style={styles.dialogSubmitText}>Enviar a Caja</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-            </KeyboardAvoidingView>
-          </SafeAreaView>
-        </Modal>
-
-        {/* MODAL INTERNO: RECHAZAR SOLICITUD DE VENTA (SIN Alert.prompt) */}
-        <Modal
-          visible={Boolean(rejectTarget)}
-          transparent
-          animationType="fade"
-          onRequestClose={() => {
-            if (!isSubmitting) setRejectTarget(null);
-          }}
-        >
-          <SafeAreaView edges={['top', 'bottom']} style={styles.modalSafe}>
-            <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.modalOverlay}>
-              <View style={styles.modalDialog}>
-                <View style={styles.modalHeader}>
-                  <Text style={styles.modalTitle}>Rechazar Solicitud</Text>
-                  <TouchableOpacity
-                    style={styles.closeButton}
-                    onPress={() => {
-                      if (!isSubmitting) setRejectTarget(null);
-                    }}
-                    disabled={isSubmitting}
-                    accessibilityRole="button"
-                    accessibilityLabel="Cerrar rechazo de solicitud"
-                  >
-                    <X size={18} color={ui.textSecondary} />
-                  </TouchableOpacity>
-                </View>
-
-                <Text style={styles.modalSubtext}>
-                  {rejectTarget ? `${rejectTarget.requestNumber} · ${rejectTarget.customerName}` : ''}
-                </Text>
-
-                <Text style={styles.dialogInputLabel}>Motivo del rechazo:</Text>
-                <TextInput
-                  style={[styles.dialogInput, styles.dialogTextArea]}
-                  placeholder="Ej: Descuento excede el margen permitido"
-                  placeholderTextColor={ui.textMuted}
-                  value={rejectReason}
-                  onChangeText={setRejectReason}
-                  multiline
-                  textAlignVertical="top"
-                />
-
-                <View style={styles.modalFooter}>
-                  <TouchableOpacity
-                    style={styles.dialogCancelBtn}
-                    onPress={() => setRejectTarget(null)}
-                    disabled={isSubmitting}
-                  >
-                    <Text style={styles.dialogCancelText}>Cancelar</Text>
-                  </TouchableOpacity>
-
-                  <TouchableOpacity
-                    style={[styles.dialogDangerBtn, isSubmitting && styles.buttonDisabled]}
-                    onPress={handleConfirmRejectRequest}
-                    disabled={isSubmitting}
-                  >
-                    {isSubmitting ? (
-                      <ActivityIndicator color={ui.onPrimary} size="small" />
-                    ) : (
-                      <>
-                        <XCircle size={15} color={ui.onPrimary} />
-                        <Text style={styles.dialogSubmitText}>Rechazar</Text>
-                      </>
-                    )}
-                  </TouchableOpacity>
-                </View>
-              </View>
-            </KeyboardAvoidingView>
-          </SafeAreaView>
-        </Modal>
-
-        {/* MODAL INTERNO: CREAR / EDITAR COLABORADOR Y PERMISOS CUSTOM */}
-        <Modal
-          visible={userFormVisible}
-          transparent
-          animationType="slide"
-          onRequestClose={() => {
-            if (!isSubmitting) setUserFormVisible(false);
-          }}
-        >
-          <SafeAreaView edges={['top', 'bottom']} style={styles.modalSafe}>
-            <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.modalOverlay}>
-              <View style={[styles.modalDialog, styles.modalDialogTall]}>
-                <View style={styles.modalHeader}>
-                  <Text style={styles.modalTitle}>
-                    {editingMember ? 'Editar Colaborador' : 'Nuevo Colaborador'}
-                  </Text>
-                  <TouchableOpacity
-                    style={styles.closeButton}
-                    onPress={() => {
-                      if (!isSubmitting) setUserFormVisible(false);
-                    }}
-                    disabled={isSubmitting}
-                    accessibilityRole="button"
-                    accessibilityLabel="Cerrar formulario de colaborador"
-                  >
-                    <X size={18} color={ui.textSecondary} />
-                  </TouchableOpacity>
-                </View>
-
-                <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
-                  <Text style={styles.dialogInputLabel}>Nombre completo:</Text>
-                  <TextInput
-                    style={styles.dialogInput}
-                    placeholder="Ej: María López"
-                    placeholderTextColor={ui.textMuted}
-                    value={userFormName}
-                    onChangeText={setUserFormName}
-                  />
-
-                  <Text style={styles.dialogInputLabel}>Correo electrónico:</Text>
-                  <TextInput
-                    style={[styles.dialogInput, editingMember && styles.dialogInputDisabled]}
-                    placeholder="correo@negocio.com"
-                    placeholderTextColor={ui.textMuted}
-                    keyboardType="email-address"
-                    autoCapitalize="none"
-                    editable={!editingMember}
-                    value={userFormEmail}
-                    onChangeText={setUserFormEmail}
-                  />
-                  {!editingMember && (
-                    <Text style={styles.fieldHintText}>
-                      Se enviará un enlace de creación de contraseña a este correo.
-                    </Text>
-                  )}
-
-                  <Text style={styles.dialogInputLabel}>Rol en el negocio:</Text>
-                  <View style={styles.chipsWrapRow}>
-                    {(
-                      [
-                        ...(isOwner && editingMember?.role === 'owner'
-                          ? ([{ key: 'owner', label: 'Dueño' }] as const)
-                          : []),
-                        { key: 'admin', label: 'Administrador' },
-                        { key: 'manager', label: 'Gerente' },
-                        { key: 'cashier', label: 'Cajero' },
-                      ] as Array<{ key: TeamRole; label: string }>
-                    ).map((r) => {
-                      const active = userFormRole === r.key;
-                      return (
-                        <TouchableOpacity
-                          key={r.key}
-                          style={[styles.selectPill, active && styles.selectPillActive]}
-                          onPress={() => {
-                            setUserFormRole(r.key);
-                            setUserFormCustomPerms(null);
-                          }}
-                        >
-                          <Text style={[styles.selectPillText, active && styles.selectPillTextActive]}>
-                            {r.label}
-                          </Text>
-                        </TouchableOpacity>
-                      );
-                    })}
-                  </View>
-
-                  {isAdminOrOwner && (
-                    <View style={styles.switchFieldRow}>
-                      <View style={{ flex: 1, marginRight: 10 }}>
-                        <Text style={styles.switchTitle}>Acceso multisede</Text>
-                        <Text style={styles.switchDesc}>
-                          Permite operar en todas las sucursales de la cuenta.
-                        </Text>
-                      </View>
-                      <Switch
-                        value={userFormAllBranches}
-                        onValueChange={setUserFormAllBranches}
-                        trackColor={{ false: ui.border, true: ui.primarySoft }}
-                        thumbColor={userFormAllBranches ? ui.primary : ui.textMuted}
-                      />
-                    </View>
-                  )}
-
-                  {!userFormAllBranches && branchesList.length > 0 && (
-                    <>
-                      <Text style={styles.dialogInputLabel}>Sucursal asignada:</Text>
-                      <View style={styles.chipsWrapRow}>
-                        {branchesList
-                          .filter((b) => b.isActive || b.id === userFormBranchId)
-                          .map((b) => {
-                            const active = userFormBranchId === b.id;
-                            return (
-                              <TouchableOpacity
-                                key={b.id}
-                                style={[styles.selectPill, active && styles.selectPillActive]}
-                                onPress={() => setUserFormBranchId(b.id)}
-                              >
-                                <Text style={[styles.selectPillText, active && styles.selectPillTextActive]}>
-                                  {b.name}
-                                </Text>
-                              </TouchableOpacity>
-                            );
-                          })}
-                      </View>
-                    </>
-                  )}
-
-                  <View style={styles.twoColRow}>
-                    <View style={{ flex: 1 }}>
-                      <Text style={styles.dialogInputLabel}>Teléfono:</Text>
-                      <TextInput
-                        style={styles.dialogInput}
-                        placeholder="987654321"
-                        placeholderTextColor={ui.textMuted}
-                        keyboardType="phone-pad"
-                        value={userFormPhone}
-                        onChangeText={setUserFormPhone}
-                      />
-                    </View>
-                    <View style={{ flex: 1 }}>
-                      <Text style={styles.dialogInputLabel}>DNI:</Text>
-                      <TextInput
-                        style={styles.dialogInput}
-                        placeholder="8 dígitos"
-                        placeholderTextColor={ui.textMuted}
-                        keyboardType="numeric"
-                        maxLength={12}
-                        value={userFormDni}
-                        onChangeText={setUserFormDni}
-                      />
-                    </View>
-                  </View>
-
-                  <Text style={styles.dialogInputLabel}>Sueldo Base (S/):</Text>
-                  <TextInput
-                    style={styles.dialogInput}
-                    placeholder="Opcional (ej: 1500.00)"
-                    placeholderTextColor={ui.textMuted}
-                    keyboardType="decimal-pad"
-                    value={userFormSalary}
-                    onChangeText={setUserFormSalary}
-                  />
-
-                  {editingMember && (
-                    <View style={styles.switchFieldRow}>
-                      <View style={{ flex: 1, marginRight: 10 }}>
-                        <Text style={styles.switchTitle}>Colaborador activo</Text>
-                        <Text style={styles.switchDesc}>
-                          Si se desactiva, no podrá iniciar sesión ni operar en caja.
-                        </Text>
-                      </View>
-                      <Switch
-                        value={userFormIsActive}
-                        onValueChange={setUserFormIsActive}
-                        trackColor={{ false: ui.border, true: ui.primarySoft }}
-                        thumbColor={userFormIsActive ? ui.primary : ui.textMuted}
-                      />
-                    </View>
-                  )}
-
-                  {userFormRole !== 'seller' && (
-                    <View style={styles.permSection}>
-                      <View style={styles.permSectionHeader}>
-                        <View>
-                          <Text style={styles.permSectionTitle}>Permisos personalizados</Text>
-                          <Text style={styles.permSectionSub}>
-                            Ajusta permisos específicos sobre el rol base
-                          </Text>
-                        </View>
-                        {((userFormCustomPerms?.granted?.length || 0) > 0 ||
-                          (userFormCustomPerms?.revoked?.length || 0) > 0) && (
-                          <TouchableOpacity
-                            style={styles.permResetBtn}
-                            onPress={() => setUserFormCustomPerms(null)}
-                          >
-                            <RotateCcw size={13} color={ui.primary} />
-                            <Text style={styles.permResetText}>Restaurar</Text>
-                          </TouchableOpacity>
-                        )}
-                      </View>
-
-                      {Object.entries(PERMISSION_GROUPS).map(([groupKey, group]) => {
-                        const isExpanded = Boolean(openPermGroups[groupKey]);
-                        const basePerms = ROLE_PERMISSIONS[userFormRole] || [];
-                        const granted = userFormCustomPerms?.granted || [];
-                        const revoked = userFormCustomPerms?.revoked || [];
-                        const activeCount = group.permissions.filter(({ key }) =>
-                          revoked.includes(key) ? false : granted.includes(key) ? true : basePerms.includes(key)
-                        ).length;
-
-                        return (
-                          <View key={groupKey} style={styles.permGroupCard}>
-                            <TouchableOpacity
-                              style={styles.permGroupHeader}
-                              onPress={() =>
-                                setOpenPermGroups((prev) => ({
-                                  ...prev,
-                                  [groupKey]: !prev[groupKey],
-                                }))
-                              }
-                            >
-                              <Text style={styles.permGroupTitle}>
-                                {group.label} ({activeCount}/{group.permissions.length})
-                              </Text>
-                              {isExpanded ? (
-                                <ChevronDown size={16} color={ui.textSecondary} />
-                              ) : (
-                                <ChevronRight size={16} color={ui.textSecondary} />
-                              )}
-                            </TouchableOpacity>
-
-                            {isExpanded && (
-                              <View style={styles.permGroupList}>
-                                {group.permissions.map(({ key, label }) => {
-                                  const isBase = basePerms.includes(key);
-                                  const isGranted = granted.includes(key);
-                                  const isRevoked = revoked.includes(key);
-                                  const checked = isRevoked ? false : isGranted ? true : isBase;
-                                  return (
-                                    <TouchableOpacity
-                                      key={key}
-                                      style={styles.permItemRow}
-                                      onPress={() =>
-                                        setUserFormCustomPerms((prev) =>
-                                          toggleCustomPermission(userFormRole, prev, key, !checked)
-                                        )
-                                      }
-                                      accessibilityRole="checkbox"
-                                      accessibilityState={{ checked }}
-                                    >
-                                      <View style={[styles.permCheckbox, checked && styles.permCheckboxChecked]}>
-                                        {checked && <Check size={12} color={ui.onPrimary} />}
-                                      </View>
-                                      <Text style={styles.permItemLabel}>{label}</Text>
-                                      {isGranted && (
-                                        <Text style={styles.permTagGranted}>Extra</Text>
-                                      )}
-                                      {isRevoked && (
-                                        <Text style={styles.permTagRevoked}>Revocado</Text>
-                                      )}
-                                    </TouchableOpacity>
-                                  );
-                                })}
-                              </View>
-                            )}
-                          </View>
-                        );
-                      })}
-                    </View>
-                  )}
-                </ScrollView>
-
-                <View style={styles.modalFooter}>
-                  <TouchableOpacity
-                    style={styles.dialogCancelBtn}
-                    onPress={() => setUserFormVisible(false)}
-                    disabled={isSubmitting}
-                  >
-                    <Text style={styles.dialogCancelText}>Cancelar</Text>
-                  </TouchableOpacity>
-
-                  <TouchableOpacity
-                    style={[styles.dialogSubmitBtn, isSubmitting && styles.buttonDisabled]}
-                    onPress={handleSaveUser}
-                    disabled={isSubmitting}
-                  >
-                    {isSubmitting ? (
-                      <ActivityIndicator color={ui.onPrimary} size="small" />
-                    ) : (
-                      <>
-                        <Check size={15} color={ui.onPrimary} />
-                        <Text style={styles.dialogSubmitText}>
-                          {editingMember ? 'Guardar cambios' : 'Crear colaborador'}
-                        </Text>
-                      </>
-                    )}
-                  </TouchableOpacity>
-                </View>
-              </View>
-            </KeyboardAvoidingView>
-          </SafeAreaView>
-        </Modal>
-
-        {/* MODAL INTERNO: CREAR / EDITAR SUCURSAL */}
-        <Modal
-          visible={branchFormVisible}
-          transparent
-          animationType="slide"
-          onRequestClose={() => {
-            if (!isSubmitting) setBranchFormVisible(false);
-          }}
-        >
-          <SafeAreaView edges={['top', 'bottom']} style={styles.modalSafe}>
-            <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.modalOverlay}>
-              <View style={[styles.modalDialog, styles.modalDialogTall]}>
-                <View style={styles.modalHeader}>
-                  <Text style={styles.modalTitle}>
-                    {editingBranch ? 'Editar Sucursal' : 'Nueva Sucursal'}
-                  </Text>
-                  <TouchableOpacity
-                    style={styles.closeButton}
-                    onPress={() => {
-                      if (!isSubmitting) setBranchFormVisible(false);
-                    }}
-                    disabled={isSubmitting}
-                    accessibilityRole="button"
-                    accessibilityLabel="Cerrar formulario de sucursal"
-                  >
-                    <X size={18} color={ui.textSecondary} />
-                  </TouchableOpacity>
-                </View>
-
-                <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
-                  <Text style={styles.dialogInputLabel}>Nombre de sucursal *:</Text>
-                  <TextInput
-                    style={styles.dialogInput}
-                    placeholder="Ej: Sede Centro"
-                    placeholderTextColor={ui.textMuted}
-                    value={branchFormName}
-                    onChangeText={setBranchFormName}
-                  />
-
-                  <Text style={styles.dialogInputLabel}>Dirección:</Text>
-                  <TextInput
-                    style={styles.dialogInput}
-                    placeholder="Av. Principal 123"
-                    placeholderTextColor={ui.textMuted}
-                    value={branchFormAddress}
-                    onChangeText={setBranchFormAddress}
-                  />
-
-                  <View style={styles.twoColRow}>
-                    <View style={{ flex: 1 }}>
-                      <Text style={styles.dialogInputLabel}>Teléfono:</Text>
-                      <TextInput
-                        style={styles.dialogInput}
-                        placeholder="987654321"
-                        placeholderTextColor={ui.textMuted}
-                        keyboardType="phone-pad"
-                        value={branchFormPhone}
-                        onChangeText={setBranchFormPhone}
-                      />
-                    </View>
-                    <View style={{ flex: 1 }}>
-                      <Text style={styles.dialogInputLabel}>RUC (opcional):</Text>
-                      <TextInput
-                        style={styles.dialogInput}
-                        placeholder="20XXXXXXXXX"
-                        placeholderTextColor={ui.textMuted}
-                        keyboardType="numeric"
-                        maxLength={11}
-                        value={branchFormRuc}
-                        onChangeText={setBranchFormRuc}
-                      />
-                    </View>
-                  </View>
-
-                  <Text style={styles.dialogInputLabel}>Correo de sucursal:</Text>
-                  <TextInput
-                    style={styles.dialogInput}
-                    placeholder="sucursal@negocio.com"
-                    placeholderTextColor={ui.textMuted}
-                    keyboardType="email-address"
-                    autoCapitalize="none"
-                    value={branchFormEmail}
-                    onChangeText={setBranchFormEmail}
-                  />
-
-                  <Text style={styles.dialogInputLabel}>Encargado / Administrador:</Text>
-                  <TextInput
-                    style={styles.dialogInput}
-                    placeholder="Nombre del encargado"
-                    placeholderTextColor={ui.textMuted}
-                    value={branchFormManager}
-                    onChangeText={setBranchFormManager}
-                  />
-
-                  <Text style={styles.dialogInputLabel}>Razón Social / Nombre Comercial:</Text>
-                  <TextInput
-                    style={styles.dialogInput}
-                    placeholder="Opcional para comprobantes"
-                    placeholderTextColor={ui.textMuted}
-                    value={branchFormBusinessName}
-                    onChangeText={setBranchFormBusinessName}
-                  />
-
-                  <Text style={styles.dialogInputLabel}>Pie de Ticket:</Text>
-                  <TextInput
-                    style={[styles.dialogInput, styles.dialogTextArea]}
-                    placeholder="Mensaje al pie del comprobante"
-                    placeholderTextColor={ui.textMuted}
-                    value={branchFormFooter}
-                    onChangeText={setBranchFormFooter}
-                    multiline
-                    textAlignVertical="top"
-                  />
-
-                  {editingBranch && (
-                    <View style={styles.switchFieldRow}>
-                      <View style={{ flex: 1, marginRight: 10 }}>
-                        <Text style={styles.switchTitle}>Sucursal activa</Text>
-                        <Text style={styles.switchDesc}>
-                          Las sucursales inactivas no aparecen al abrir caja o vender.
-                        </Text>
-                      </View>
-                      <Switch
-                        value={branchFormIsActive}
-                        onValueChange={setBranchFormIsActive}
-                        trackColor={{ false: ui.border, true: ui.primarySoft }}
-                        thumbColor={branchFormIsActive ? ui.primary : ui.textMuted}
-                      />
-                    </View>
-                  )}
-                </ScrollView>
-
-                <View style={styles.modalFooter}>
-                  <TouchableOpacity
-                    style={styles.dialogCancelBtn}
-                    onPress={() => setBranchFormVisible(false)}
-                    disabled={isSubmitting}
-                  >
-                    <Text style={styles.dialogCancelText}>Cancelar</Text>
-                  </TouchableOpacity>
-
-                  <TouchableOpacity
-                    style={[styles.dialogSubmitBtn, isSubmitting && styles.buttonDisabled]}
-                    onPress={handleSaveBranch}
-                    disabled={isSubmitting}
-                  >
-                    {isSubmitting ? (
-                      <ActivityIndicator color={ui.onPrimary} size="small" />
-                    ) : (
-                      <>
-                        <Check size={15} color={ui.onPrimary} />
-                        <Text style={styles.dialogSubmitText}>
-                          {editingBranch ? 'Guardar sucursal' : 'Crear sucursal'}
-                        </Text>
-                      </>
-                    )}
-                  </TouchableOpacity>
-                </View>
-              </View>
-            </KeyboardAvoidingView>
-          </SafeAreaView>
-        </Modal>
+        {branchFormVisible && (
+          <BranchFormModal
+            key={editingBranch?.id || 'new'}
+            visible={branchFormVisible}
+            editingBranch={editingBranch}
+            accountId={accountId}
+            onSaved={handleBranchSaved}
+            onClose={handleCloseBranchForm}
+          />
+        )}
       </SafeAreaView>
     </Modal>
   );
@@ -2537,11 +1683,6 @@ const styles = StyleSheet.create({
   },
   scrollList: {
     flex: 1,
-  },
-  scrollContent: {
-    paddingHorizontal: 20,
-    paddingTop: 8,
-    gap: 10,
   },
   // Tarjetas de miembros
   memberCard: {
@@ -3209,270 +2350,6 @@ const styles = StyleSheet.create({
   },
   buttonDisabled: {
     opacity: 0.6,
-  },
-  // Modales internos
-  modalSafe: {
-    flex: 1,
-  },
-  modalOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(0, 0, 0, 0.75)',
-    justifyContent: 'center',
-    padding: 20,
-  },
-  modalDialog: {
-    backgroundColor: ui.surface,
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: ui.border,
-    padding: 16,
-  },
-  modalDialogTall: {
-    maxHeight: '90%',
-  },
-  modalHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 12,
-    paddingBottom: 8,
-    borderBottomWidth: 1,
-    borderBottomColor: ui.border,
-  },
-  modalTitle: {
-    fontSize: 16,
-    fontWeight: '700',
-    color: ui.text,
-  },
-  modalSubtext: {
-    fontSize: 13,
-    fontWeight: '600',
-    color: ui.textSecondary,
-    marginBottom: 8,
-  },
-  dialogInputLabel: {
-    fontSize: 13,
-    fontWeight: '700',
-    color: ui.textSecondary,
-    marginTop: 8,
-    marginBottom: 3,
-  },
-  dialogInput: {
-    backgroundColor: ui.surface,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: ui.border,
-    paddingHorizontal: 10,
-    minHeight: 48,
-    paddingVertical: 10,
-    fontSize: 15,
-    color: ui.text,
-  },
-  dialogInputDisabled: {
-    backgroundColor: ui.surfaceMuted,
-    color: ui.textMuted,
-  },
-  dialogTextArea: {
-    minHeight: 80,
-  },
-  fieldHintText: {
-    fontSize: 11,
-    color: ui.textMuted,
-    marginTop: 4,
-  },
-  twoColRow: {
-    flexDirection: 'row',
-    gap: 10,
-  },
-  chipsWrapRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 8,
-    marginTop: 4,
-  },
-  selectPill: {
-    minHeight: 40,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: ui.border,
-    backgroundColor: ui.surfaceMuted,
-    justifyContent: 'center',
-  },
-  selectPillActive: {
-    backgroundColor: ui.primarySoft,
-    borderColor: ui.primary,
-  },
-  selectPillText: {
-    fontSize: 12,
-    fontWeight: '600',
-    color: ui.textSecondary,
-  },
-  selectPillTextActive: {
-    color: ui.primary,
-    fontWeight: '700',
-  },
-  switchFieldRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    backgroundColor: ui.surfaceMuted,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: ui.border,
-    padding: 12,
-    marginTop: 12,
-  },
-  permSection: {
-    marginTop: 16,
-    paddingTop: 12,
-    borderTopWidth: 1,
-    borderTopColor: ui.border,
-    gap: 8,
-  },
-  permSectionHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-  },
-  permSectionTitle: {
-    fontSize: 14,
-    fontWeight: '700',
-    color: ui.text,
-  },
-  permSectionSub: {
-    fontSize: 11,
-    color: ui.textSecondary,
-  },
-  permResetBtn: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    borderRadius: 8,
-    backgroundColor: ui.primarySoft,
-  },
-  permResetText: {
-    fontSize: 11,
-    fontWeight: '700',
-    color: ui.primary,
-  },
-  permGroupCard: {
-    backgroundColor: ui.surfaceMuted,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: ui.border,
-    overflow: 'hidden',
-  },
-  permGroupHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    minHeight: 44,
-  },
-  permGroupTitle: {
-    fontSize: 13,
-    fontWeight: '700',
-    color: ui.text,
-  },
-  permGroupList: {
-    borderTopWidth: 1,
-    borderTopColor: ui.border,
-    backgroundColor: ui.surface,
-    paddingVertical: 4,
-  },
-  permItemRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    minHeight: 44,
-    gap: 10,
-  },
-  permCheckbox: {
-    width: 20,
-    height: 20,
-    borderRadius: 6,
-    borderWidth: 1.5,
-    borderColor: ui.border,
-    backgroundColor: ui.surface,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  permCheckboxChecked: {
-    backgroundColor: ui.primary,
-    borderColor: ui.primary,
-  },
-  permItemLabel: {
-    flex: 1,
-    fontSize: 13,
-    color: ui.text,
-  },
-  permTagGranted: {
-    fontSize: 10,
-    fontWeight: '700',
-    color: ui.success,
-    backgroundColor: ui.successSoft,
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-    borderRadius: 6,
-  },
-  permTagRevoked: {
-    fontSize: 10,
-    fontWeight: '700',
-    color: ui.danger,
-    backgroundColor: ui.dangerSoft,
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-    borderRadius: 6,
-  },
-  modalFooter: {
-    flexDirection: 'row',
-    justifyContent: 'flex-end',
-    gap: 10,
-    marginTop: 16,
-    paddingTop: 12,
-    borderTopWidth: 1,
-    borderTopColor: ui.border,
-  },
-  dialogCancelBtn: {
-    minHeight: 48,
-    justifyContent: 'center',
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-  },
-  dialogCancelText: {
-    color: ui.textSecondary,
-    fontSize: 13,
-  },
-  dialogSubmitBtn: {
-    backgroundColor: ui.primary,
-    borderRadius: 8,
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 14,
-    minHeight: 48,
-    paddingVertical: 10,
-    gap: 6,
-  },
-  dialogDangerBtn: {
-    backgroundColor: ui.danger,
-    borderRadius: 8,
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 14,
-    minHeight: 48,
-    paddingVertical: 10,
-    gap: 6,
-  },
-  dialogSubmitText: {
-    color: ui.onPrimary,
-    fontSize: 13,
-    fontWeight: '700',
   },
 });
 

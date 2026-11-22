@@ -55,6 +55,10 @@ vi.mock('@/services/sale-service', () => ({
 }));
 
 import { shouldDeactivateUserOnMissingDoc } from '../access-policy';
+import { buildSaleQrContent } from '../invoicing/qr-content';
+import { generateQrMatrix, generateQrSvgData } from '../invoicing/qr-matrix';
+import { buildReservationReceiptHtml, EscPosBuilder } from '../printing/escpos-builder';
+import { effectivePermissions, ROLE_PERMISSIONS } from '../role-permissions';
 import {
   computeOfflineCashDelta,
   mergeSalesWithOfflinePending,
@@ -63,6 +67,7 @@ import {
 import {
   enqueueOfflineSale,
   getOfflineQueue,
+  offlineSyncService,
   processOfflineQueue,
   subscribeOfflineQueueChanges,
   type OfflineQueueChangeEvent,
@@ -72,6 +77,7 @@ import {
 describe('offline auth policy, offline Caja/Ventas helpers, and offline sync regressions', () => {
   beforeEach(() => {
     syncMocks.storage.clear();
+    offlineSyncService.resetQueueCache();
     syncMocks.netState = { isConnected: true, isInternetReachable: true };
     syncMocks.user = {
       uid: 'user-1',
@@ -241,6 +247,127 @@ describe('offline auth policy, offline Caja/Ventas helpers, and offline sync reg
       expect(merged.map((s) => s.id)).toEqual([mixedPending.offlineId, 'srv-1', 'srv-0']);
       expect(merged[0].isOfflinePending).toBe(true);
     });
+
+    it('returns the exact serverSales array reference when pending offline queue has no new scoped records', () => {
+      const serverSales: Array<Record<string, any>> = [
+        { id: 'srv-1', offlineId: yape63Pending.offlineId, date: 1795136100000, total: 63 },
+        { id: 'srv-0', date: 1795135000000, total: 25 },
+      ];
+
+      // 1. Empty offline queue -> zero-copy fast-path
+      expect(mergeSalesWithOfflinePending(serverSales, [], scope)).toBe(serverSales);
+
+      // 2. Pending list only contains already-synced or out-of-scope sales -> zero-copy fast-path
+      const otherBranchPending: PendingOfflineSale = {
+        ...mixedPending,
+        id: 'offline_other_branch',
+        offlineId: 'offline_other_branch',
+        salePayload: {
+          ...mixedPending.salePayload,
+          branchId: 'branch-other',
+        },
+      };
+      expect(
+        mergeSalesWithOfflinePending(serverSales, [yape63Pending, otherBranchPending], scope)
+      ).toBe(serverSales);
+    });
+
+    it('pre-extracts createdAt.toMillis once per sale instead of repeating inside the sort comparator', () => {
+      const toMillisSpy1 = vi.fn(() => 1795136100000);
+      const toMillisSpy2 = vi.fn(() => 1795136300000);
+      const toMillisSpy3 = vi.fn(() => 1795135000000);
+
+      const serverSales: Array<Record<string, any>> = [
+        { id: 'srv-mid', createdAt: { toMillis: toMillisSpy1 }, total: 10 },
+        { id: 'srv-top', createdAt: { toMillis: toMillisSpy2 }, total: 20 },
+        { id: 'srv-low', createdAt: { toMillis: toMillisSpy3 }, total: 30 },
+      ];
+
+      const merged = mergeSalesWithOfflinePending(serverSales, [mixedPending], scope);
+      expect(merged.map((s) => s.id)).toEqual(['srv-top', mixedPending.offlineId, 'srv-mid', 'srv-low']);
+      expect(toMillisSpy1).toHaveBeenCalledTimes(1);
+      expect(toMillisSpy2).toHaveBeenCalledTimes(1);
+      expect(toMillisSpy3).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('qr-matrix generateQrSvgData parity', () => {
+    it('returns null for empty input and matches generateQrMatrix size/pathData across QR versions', () => {
+      expect(generateQrSvgData('')).toBeNull();
+
+      const payloads = [
+        '20512345678|03|B001|42|7.63|50.00|2026-11-12|1|12345678',
+        '20512345678|01|F001|123|18.00|118.00|2026-11-12|6|20100070970',
+        'https://ventify.com.pe/comprobantes/verificacion?ruc=20512345678&tipo=01&serie=F001&correlativo=00001234&total=1480.50&fecha=2026-11-12&hash=AbCdEf1234567890XyZ',
+      ];
+
+      const expected = payloads.map((payload) => {
+        const matrixRes = generateQrMatrix(payload);
+        const svgRes = generateQrSvgData(payload);
+        expect(svgRes).toEqual({
+          size: matrixRes.size,
+          pathData: matrixRes.pathData,
+        });
+        return svgRes;
+      });
+
+      // Re-generating and checking first entry ensures scratch buffers never corrupt cached outputs
+      expect(generateQrSvgData(payloads[0])).toEqual(expected[0]);
+    });
+
+    it('reuses precomputedAmounts in buildSaleQrContent without altering output', () => {
+      const sale = {
+        documentType: 'factura' as const,
+        documentNumber: 'F001-000123',
+        sunatStatus: 'accepted' as const,
+        customerRuc: '20100070970',
+        subtotal: 100,
+        tax: 18,
+        total: 118,
+        date: new Date('2026-11-12T15:30:00-05:00').getTime(),
+      };
+      const standard = buildSaleQrContent(sale, { emitterRuc: '20512345678' });
+      const withPrecomputed = buildSaleQrContent(sale, {
+        emitterRuc: '20512345678',
+        precomputedAmounts: { igv: 18, total: 118 },
+      });
+      expect(withPrecomputed).toBe(standard);
+    });
+  });
+
+  describe('EscPosBuilder, reservation HTML, and effectivePermissions optimizations', () => {
+    it('grows Uint8Array buffer past 2048 bytes and preserves sanitizeText rules', () => {
+      const builder = new EscPosBuilder({ paperWidth: 80 });
+      builder.line('ASCII\tTab-stripped Café • ñÑ ¿Hola!');
+      for (let i = 0; i < 60; i++) {
+        builder.twoColumns(`Item ${i} pure ASCII`, `S/ ${(i + 1).toFixed(2)}`);
+      }
+      const bytes = builder.build();
+      expect(bytes).toBeInstanceOf(Uint8Array);
+      expect(bytes.length).toBeGreaterThan(2048);
+      const decoded = Buffer.from(bytes).toString('latin1');
+      expect(decoded).toContain('ASCIITab-stripped Cafe - nN Hola!');
+      expect(decoded).not.toContain('\t');
+    });
+
+    it('formats numeric HH:MM time in buildReservationReceiptHtml and fast-returns base permissions', () => {
+      const html = buildReservationReceiptHtml({
+        id: 'res_1',
+        reservationNumber: 7,
+        createdAt: new Date(2026, 10, 12, 9, 5),
+        total: 100,
+        depositAmount: 40,
+        items: [{ productName: 'Producto', quantity: 1, price: 100 }],
+      });
+      expect(html).toContain('12/11/2026 09:05 09:05');
+
+      expect(effectivePermissions('cashier', { granted: [], revoked: [] })).toBe(
+        ROLE_PERMISSIONS.cashier
+      );
+      expect(effectivePermissions('seller', { granted: [], revoked: [] })).toBe(
+        ROLE_PERMISSIONS.seller
+      );
+    });
   });
 
   describe('offline-sync-service enqueue & pre-check index tolerance', () => {
@@ -264,7 +391,9 @@ describe('offline auth policy, offline Caja/Ventas helpers, and offline sync reg
       const queue = await getOfflineQueue();
       expect(queue).toHaveLength(1);
       expect((queue[0].salePayload as any).skipOfflineDedup).toBeUndefined();
-      expect(events).toEqual([{ type: 'enqueued', queueCount: 1 }]);
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({ type: 'enqueued', queueCount: 1, count: 1 });
+      expect(events[0].items).toHaveLength(1);
 
       unsub();
     });

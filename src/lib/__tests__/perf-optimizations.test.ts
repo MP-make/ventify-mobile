@@ -16,6 +16,10 @@ vi.mock('@/lib/firebase', () => ({
 import { ProductCatalogIndex, removeCatalogProduct } from '../product-catalog-index';
 import { buildCatalogProductIndex, filterCatalogIndex } from '../catalog-filters';
 import { ApiError, apiRawRequest, apiRequest, getApiRequestInit } from '../api-client';
+import { MemoryTtlCache } from '../request-cache';
+import { formatPEN } from '../theme';
+import { sanitizeRemoteImageUrls } from '../product-normalization';
+import { findProductByBarcode, resolveProductBranchStock } from '../product-search';
 import { buildQrSvgMarkup, generateQrMatrix } from '../invoicing/qr-matrix';
 import { uint8ArrayToBase64 } from '../printing/escpos-builder';
 
@@ -240,6 +244,148 @@ describe('performance optimization regressions & utilities', () => {
         const expected = Buffer.from(bytes).toString('base64');
         expect(uint8ArrayToBase64(bytes)).toBe(expected);
       }
+    });
+  });
+
+  describe('MemoryTtlCache epoch / generation guards', () => {
+    it('prevents an older in-flight loader from populating cache after clear()', async () => {
+      const cache = new MemoryTtlCache(10);
+      let resolveOld!: (v: string) => void;
+      const oldLoad = cache.getOrLoad('sellers:b1', 60_000, () => new Promise<string>((r) => { resolveOld = r; }));
+
+      cache.clear();
+      resolveOld('stale-after-clear');
+      await expect(oldLoad).resolves.toBe('stale-after-clear');
+      expect(cache.get('sellers:b1')).toBeUndefined();
+    });
+
+    it('prevents an older in-flight loader from populating cache after invalidate(key) or invalidatePrefix()', async () => {
+      const cache = new MemoryTtlCache(10);
+      let resolveOld!: (v: string) => void;
+      const oldLoad = cache.getOrLoad('sellers:b1', 60_000, () => new Promise<string>((r) => { resolveOld = r; }));
+
+      cache.invalidate('sellers:b1');
+      let resolveFresh!: (v: string) => void;
+      const freshLoad = cache.getOrLoad('sellers:b1', 60_000, () => new Promise<string>((r) => { resolveFresh = r; }));
+
+      resolveFresh('fresh');
+      await expect(freshLoad).resolves.toBe('fresh');
+      expect(cache.get('sellers:b1')).toBe('fresh');
+
+      resolveOld('stale-after-invalidate');
+      await expect(oldLoad).resolves.toBe('stale-after-invalidate');
+      expect(cache.get('sellers:b1')).toBe('fresh');
+
+      let resolvePrefixed!: (v: string) => void;
+      const prefixedLoad = cache.getOrLoad('sellers:b2', 60_000, () => new Promise<string>((r) => { resolvePrefixed = r; }));
+      cache.invalidatePrefix('sellers:');
+      resolvePrefixed('stale-prefixed');
+      await expect(prefixedLoad).resolves.toBe('stale-prefixed');
+      expect(cache.get('sellers:b2')).toBeUndefined();
+    });
+
+    it('bypasses inFlight and prevents stale overwrite when forceRefresh is true', async () => {
+      const cache = new MemoryTtlCache(10);
+      let resolveOld!: (v: string) => void;
+      let resolveForced!: (v: string) => void;
+
+      const oldPromise = cache.getOrLoad('k', 60_000, () => new Promise<string>((r) => { resolveOld = r; }));
+      const forcedPromise = cache.getOrLoad(
+        'k',
+        60_000,
+        () => new Promise<string>((r) => { resolveForced = r; }),
+        { forceRefresh: true }
+      );
+      expect(forcedPromise).not.toBe(oldPromise);
+
+      resolveForced('forced-value');
+      await expect(forcedPromise).resolves.toBe('forced-value');
+      expect(cache.get('k')).toBe('forced-value');
+
+      resolveOld('stale-value');
+      await expect(oldPromise).resolves.toBe('stale-value');
+      expect(cache.get('k')).toBe('forced-value');
+    });
+  });
+
+  describe('Single-code index, branch prices, currency & image fast-paths', () => {
+    it('indexes single-code products and branch presentation barcodes cleanly', () => {
+      const index = new ProductCatalogIndex();
+      const single = { id: 's1', name: 'Single', barcode: '7759001', sku: '7759001', active: true } as any;
+      const multi = {
+        id: 'm1',
+        name: 'Multi',
+        branchPrices: {
+          b1: { presentations: [{ id: 'bp-1', name: 'Pack', conversionFactor: 6, price: 20, barcode: 'BP-CODE' }] },
+        },
+        active: true,
+      } as any;
+
+      index.upsert(single);
+      index.upsert(multi);
+      expect(index.get('7759001')?.product.id).toBe('s1');
+      expect(index.get('bp-code')?.matchedPresentation?.id).toBe('bp-1');
+      expect(findProductByBarcode([single, multi], 'bp-code')?.matchedPresentation?.id).toBe('bp-1');
+
+      index.remove('s1');
+      expect(index.get('7759001')).toBeUndefined();
+    });
+
+    it('fast-paths formatPEN under 1000 without losing rounding boundary commas', () => {
+      expect(formatPEN(0)).toBe('S/ 0.00');
+      expect(formatPEN(999.99)).toBe('S/ 999.99');
+      expect(formatPEN(-42.5)).toBe('-S/ 42.50');
+      expect(formatPEN(999.999)).toBe('S/ 1,000.00');
+      expect(formatPEN(1234567.8)).toBe('S/ 1,234,567.80');
+      expect(formatPEN(Number.NaN)).toBe('S/ 0.00');
+    });
+
+    it('fast-paths 1-element remote URLs and resolves principal fallback branch stock', () => {
+      expect(sanitizeRemoteImageUrls([' https://cdn.test/img.jpg '])).toEqual(['https://cdn.test/img.jpg']);
+      expect(sanitizeRemoteImageUrls(['file:///local/photo.jpg'])).toEqual([]);
+      expect(sanitizeRemoteImageUrls(['https://cdn.test/a.jpg', 'https://cdn.test/a.jpg', 'https://cdn.test/b.jpg'])).toEqual([
+        'https://cdn.test/a.jpg',
+        'https://cdn.test/b.jpg',
+      ]);
+
+      expect(resolveProductBranchStock({ stock: { 'Sucursal Principal': 14 } } as any, 'branch-2')).toBe(14);
+      expect(resolveProductBranchStock({ stock: { 'branch-2': 7, main: 14 } } as any, 'branch-2')).toBe(7);
+    });
+  });
+
+  describe('native-kv-storage sync methods, metaKVStorage, and multiRemove chunk yielding', () => {
+    it('provides non-sync fallback with chunked multiRemove and exposes metaKVStorage', async () => {
+      vi.resetModules();
+      const removedBatches: string[][] = [];
+      const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+
+      vi.doMock('@react-native-async-storage/async-storage', () => ({
+        default: {
+          getItem: vi.fn(async () => null),
+          setItem: vi.fn(async () => {}),
+          removeItem: vi.fn(async () => {}),
+          multiRemove: vi.fn(async (keys: string[]) => {
+            removedBatches.push(keys);
+          }),
+        },
+      }));
+
+      const { createNativeKVStorage, metaKVStorage } = await import('../native-kv-storage');
+      expect(metaKVStorage).toBeDefined();
+      expect(metaKVStorage.isSyncCapable).toBe(false);
+      expect(metaKVStorage.getItemSync('missing')).toBeNull();
+      metaKVStorage.setItemSync('k', 'v');
+      metaKVStorage.removeItemSync('k');
+
+      const storage = createNativeKVStorage('test-async');
+      const keys = Array.from({ length: 45 }, (_, i) => `k-${i}`);
+      await storage.multiRemove(keys);
+
+      expect(removedBatches.map((b) => b.length)).toEqual([20, 20, 5]);
+      // 45 keys -> 3 batches -> 2 inter-batch yields
+      expect(setTimeoutSpy.mock.calls.filter(([, delay]) => delay === 0).length).toBeGreaterThanOrEqual(2);
+      setTimeoutSpy.mockRestore();
+      vi.doUnmock('@react-native-async-storage/async-storage');
     });
   });
 });

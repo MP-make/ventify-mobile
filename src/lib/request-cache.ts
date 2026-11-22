@@ -9,6 +9,9 @@ const DEFAULT_MAX_ENTRIES = 80;
 export class MemoryTtlCache {
   private readonly store = new Map<string, CacheEntry<unknown>>();
   private readonly inFlight = new Map<string, Promise<unknown>>();
+  private readonly keyEpochs = new Map<string, number>();
+  private clearGeneration = 0;
+  private nextEpoch = 1;
   private readonly maxEntries: number;
 
   constructor(maxEntries: number = DEFAULT_MAX_ENTRIES) {
@@ -47,14 +50,22 @@ export class MemoryTtlCache {
     if (!options?.forceRefresh) {
       const cached = this.get<T>(key);
       if (cached !== undefined) return cached;
+
+      const pending = this.inFlight.get(key);
+      if (pending) return pending as Promise<T>;
     }
 
-    const pending = this.inFlight.get(key);
-    if (pending) return pending as Promise<T>;
+    const capturedClearGen = this.clearGeneration;
+    const epoch = this.nextEpoch++;
+    this.keyEpochs.set(key, epoch);
 
     const promise = loader()
       .then((value) => {
-        if (options?.cacheNullish !== false || (value !== null && value !== undefined)) {
+        if (
+          this.clearGeneration === capturedClearGen &&
+          this.keyEpochs.get(key) === epoch &&
+          (options?.cacheNullish !== false || (value !== null && value !== undefined))
+        ) {
           this.set(key, value, ttlMs);
         }
         return value;
@@ -62,6 +73,9 @@ export class MemoryTtlCache {
       .finally(() => {
         if (this.inFlight.get(key) === promise) {
           this.inFlight.delete(key);
+        }
+        if (this.clearGeneration === capturedClearGen && this.keyEpochs.get(key) === epoch) {
+          this.keyEpochs.delete(key);
         }
       });
 
@@ -72,20 +86,29 @@ export class MemoryTtlCache {
   invalidate(key: string): void {
     this.store.delete(key);
     this.inFlight.delete(key);
+    this.keyEpochs.set(key, this.nextEpoch++);
   }
 
   invalidatePrefix(prefix: string): void {
     for (const key of this.store.keys()) {
-      if (key.startsWith(prefix)) this.store.delete(key);
+      if (key.startsWith(prefix)) {
+        this.store.delete(key);
+        this.keyEpochs.set(key, this.nextEpoch++);
+      }
     }
     for (const key of this.inFlight.keys()) {
-      if (key.startsWith(prefix)) this.inFlight.delete(key);
+      if (key.startsWith(prefix)) {
+        this.inFlight.delete(key);
+        this.keyEpochs.set(key, this.nextEpoch++);
+      }
     }
   }
 
   clear(): void {
+    this.clearGeneration += 1;
     this.store.clear();
     this.inFlight.clear();
+    this.keyEpochs.clear();
   }
 }
 

@@ -14,8 +14,8 @@ import * as Haptics from 'expo-haptics';
 import { Product } from '@/types';
 import { formatPEN, ui } from '@/lib/theme';
 import { ScreenHeading } from '@/components/ui';
-import { useAuth } from '@/context/AuthContext';
-import { useSettings } from '@/context/SettingsContext';
+import { useAuthSession } from '@/context/AuthContext';
+import { useBusinessSettings } from '@/context/SettingsContext';
 import { getBranchPricingConfig } from '@/lib/product-search';
 import { calculateWeightEntry } from '@/services/inventory-kardex-service';
 
@@ -40,44 +40,42 @@ const KEYPAD_ROW_1 = ['1', '2', '3'] as const;
 const KEYPAD_ROW_2 = ['4', '5', '6'] as const;
 const KEYPAD_ROW_3 = ['7', '8', '9'] as const;
 
-export const WeightQuantityModal: React.FC<WeightQuantityModalProps> = React.memo(({
+const WeightQuantityModalContent: React.FC<
+  WeightQuantityModalProps & { product: Product; isModalVisible: boolean }
+> = React.memo(({
   product,
-  visible,
-  isOpen,
+  isModalVisible,
   onClose,
   onConfirm,
 }) => {
   const insets = useSafeAreaInsets();
-  const { branchId } = useAuth();
-  const { posSettings } = useSettings();
+  const { branchId } = useAuthSession();
+  const { posSettings } = useBusinessSettings();
   const enableMinSalePrice = posSettings?.enableMinSalePrice !== false;
-  const isModalVisible = visible !== undefined ? visible : Boolean(isOpen);
 
   // Modo: 'weight' (escribir kg/fracción) o 'amount' (escribir importe en Soles)
   const [entryMode, setEntryMode] = useState<'weight' | 'amount'>('weight');
   const [valueString, setValueString] = useState<string>('1.000');
 
   useEffect(() => {
-    if (isModalVisible) {
-      setEntryMode('weight');
-      setValueString('1.000');
-    }
-  }, [isModalVisible]);
+    setEntryMode('weight');
+    setValueString('1.000');
+  }, [isModalVisible, product.id]);
 
-  const branchPricing = useMemo(() => {
-    if (!product) return null;
-    return getBranchPricingConfig(product, branchId || undefined, enableMinSalePrice);
-  }, [product, branchId, enableMinSalePrice]);
+  const branchPricing = useMemo(
+    () => getBranchPricingConfig(product, branchId || undefined, enableMinSalePrice),
+    [product, branchId, enableMinSalePrice]
+  );
 
   const unitPrice = Number(
-    branchPricing?.suggestedPrice ?? product?.suggestedPrice ?? product?.price ?? 0
+    branchPricing?.suggestedPrice ?? product.suggestedPrice ?? product.price ?? 0
   );
   const effectiveMinSalePrice = enableMinSalePrice
-    ? Number(branchPricing?.minSalePrice ?? product?.minSalePrice ?? 0)
+    ? Number(branchPricing?.minSalePrice ?? product.minSalePrice ?? 0)
     : 0;
-  const unitLabel = product?.unitOfMeasure || 'kg';
+  const unitLabel = product.unitOfMeasure || 'kg';
 
-  // Cálculos reactivos según el modo de entrada (antes del early return para cumplir reglas de hooks)
+  // Cálculos reactivos según el modo de entrada
   const {
     weight: calculatedWeight,
     subtotal: calculatedSubtotal,
@@ -91,8 +89,6 @@ export const WeightQuantityModal: React.FC<WeightQuantityModalProps> = React.mem
       minSalePrice: effectiveMinSalePrice > 0 ? effectiveMinSalePrice : undefined,
     });
   }, [valueString, entryMode, unitPrice, effectiveMinSalePrice]);
-
-  if (!isModalVisible || !product) return null;
 
   const handleDigit = (digit: string) => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
@@ -358,6 +354,18 @@ export const WeightQuantityModal: React.FC<WeightQuantityModalProps> = React.mem
         </View>
       </View>
     </Modal>
+  );
+});
+
+export const WeightQuantityModal: React.FC<WeightQuantityModalProps> = React.memo((props) => {
+  const isModalVisible = props.visible !== undefined ? props.visible : Boolean(props.isOpen);
+  if (!isModalVisible || !props.product) return null;
+  return (
+    <WeightQuantityModalContent
+      {...props}
+      product={props.product}
+      isModalVisible={isModalVisible}
+    />
   );
 });
 

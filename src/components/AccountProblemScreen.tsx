@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useCallback, useMemo } from 'react';
 import {
   View,
   Text,
@@ -188,7 +188,7 @@ interface AccountProblemScreenProps {
   onLogout: () => void;
 }
 
-export function AccountProblemScreen({
+export const AccountProblemScreen = React.memo(function AccountProblemScreen({
   accessBlocked,
   accessError,
   accountId,
@@ -199,21 +199,25 @@ export function AccountProblemScreen({
   onRefresh,
   onLogout,
 }: AccountProblemScreenProps) {
-  const card = buildRecoveryContent(
-    accessBlocked,
-    accessError,
-    accountId,
-    subscription,
-    isOnline,
-    userLabel
+  const card = useMemo(
+    () =>
+      buildRecoveryContent(
+        accessBlocked,
+        accessError,
+        accountId,
+        subscription,
+        isOnline,
+        userLabel
+      ),
+    [accessBlocked, accessError, accountId, subscription, isOnline, userLabel]
   );
 
-  const badgeBg =
+  const badgeBgStyle =
     card.tone === 'warning'
-      ? ui.warningSoft
+      ? styles.badgeBgWarning
       : card.tone === 'muted'
-        ? ui.surfaceMuted
-        : ui.dangerSoft;
+        ? styles.badgeBgMuted
+        : styles.badgeBgDanger;
   const badgeColor =
     card.tone === 'warning'
       ? ui.warning
@@ -221,13 +225,23 @@ export function AccountProblemScreen({
         ? ui.textSecondary
         : ui.danger;
 
-  const handleOpenUrl = async (url: string) => {
+  const handleOpenUrl = useCallback(async (url: string) => {
     try {
       await Linking.openURL(url);
     } catch {
       Alert.alert('No se pudo abrir el enlace', 'Intenta abrirlo manualmente desde tu navegador.');
     }
-  };
+  }, []);
+
+  const handleOpenWhatsapp = useCallback(() => {
+    if (!card.whatsappText) return;
+    void handleOpenUrl(`${SUPPORT_WHATSAPP}?text=${encodeURIComponent(card.whatsappText)}`);
+  }, [card.whatsappText, handleOpenUrl]);
+
+  const handleOpenPayment = useCallback(() => {
+    if (!card.paymentHref) return;
+    void handleOpenUrl(card.paymentHref);
+  }, [card.paymentHref, handleOpenUrl]);
 
   return (
     <SafeAreaView style={styles.recoverySafe} edges={['top', 'bottom']}>
@@ -245,7 +259,7 @@ export function AccountProblemScreen({
           </View>
 
           <View style={styles.recoveryHeaderRow}>
-            <View style={[styles.recoveryIconBadge, { backgroundColor: badgeBg }]}>
+            <View style={[styles.recoveryIconBadge, badgeBgStyle]}>
               {accessBlocked === 'paused_subscription' ? (
                 <PauseCircle size={24} color={badgeColor} />
               ) : accessBlocked === 'expired_subscription' ||
@@ -293,14 +307,10 @@ export function AccountProblemScreen({
               <TouchableOpacity
                 accessibilityRole="button"
                 accessibilityLabel={card.whatsappLabel}
-                onPress={() =>
-                  void handleOpenUrl(
-                    `${SUPPORT_WHATSAPP}?text=${encodeURIComponent(card.whatsappText!)}`
-                  )
-                }
+                onPress={handleOpenWhatsapp}
                 style={[
                   styles.primaryActionBtn,
-                  accessBlocked === 'paused_subscription' && { backgroundColor: ui.warning },
+                  accessBlocked === 'paused_subscription' && styles.primaryActionBtnWarning,
                 ]}
                 activeOpacity={0.85}
               >
@@ -313,7 +323,7 @@ export function AccountProblemScreen({
               <TouchableOpacity
                 accessibilityRole="button"
                 accessibilityLabel="Ver planes en la web"
-                onPress={() => void handleOpenUrl(card.paymentHref!)}
+                onPress={handleOpenPayment}
                 style={styles.secondaryActionBtn}
                 activeOpacity={0.8}
               >
@@ -327,7 +337,7 @@ export function AccountProblemScreen({
               accessibilityLabel="Volver a verificar"
               onPress={onRefresh}
               disabled={rechecking}
-              style={[styles.secondaryActionBtn, rechecking && { opacity: 0.6 }]}
+              style={[styles.secondaryActionBtn, rechecking && styles.actionBtnDisabled]}
               activeOpacity={0.8}
             >
               {rechecking ? (
@@ -355,7 +365,7 @@ export function AccountProblemScreen({
       </ScrollView>
     </SafeAreaView>
   );
-}
+});
 
 const styles = StyleSheet.create({
   recoverySafe: {
@@ -409,6 +419,15 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     flexShrink: 0,
+  },
+  badgeBgWarning: {
+    backgroundColor: ui.warningSoft,
+  },
+  badgeBgMuted: {
+    backgroundColor: ui.surfaceMuted,
+  },
+  badgeBgDanger: {
+    backgroundColor: ui.dangerSoft,
   },
   recoveryTitleGroup: {
     flex: 1,
@@ -477,6 +496,12 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     gap: 8,
     paddingHorizontal: 16,
+  },
+  primaryActionBtnWarning: {
+    backgroundColor: ui.warning,
+  },
+  actionBtnDisabled: {
+    opacity: 0.6,
   },
   primaryActionText: {
     color: ui.onPrimary,

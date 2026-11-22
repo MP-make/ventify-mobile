@@ -7,8 +7,7 @@
 # For more details, see
 #   http://developer.android.com/guide/developing/tools/proguard.html
 
-# react-native-reanimated
--keep class com.swmansion.reanimated.** { *; }
+# React Native TurboModules
 -keep class com.facebook.react.turbomodule.** { *; }
 
 # Add any project specific keep options here:
@@ -41,9 +40,8 @@
 # Expo Image
 -keep class expo.modules.image.** { *; }
 
-# Safe Area Context, Gesture Handler, SplashScreen, FlashList & React Native UI/JNI
+# Safe Area Context, SplashScreen, FlashList & React Native UI/JNI
 -keep class com.th3rdwave.safeareacontext.** { *; }
--keep class com.swmansion.gesturehandler.** { *; }
 -keep class androidx.core.splashscreen.** { *; }
 -keep class com.shopify.reactnative.flash_list.** { *; }
 -keep class com.reactnativecommunity.netinfo.** { *; }

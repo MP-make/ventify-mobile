@@ -42,10 +42,10 @@ vi.mock('firebase/firestore', () => {
     },
     serverTimestamp: () => 'server-time',
     query: (collection: any, ...constraints: unknown[]) => ({ isQuery: true, collection, constraints }),
-    where: (...args: unknown[]) => args, orderBy: (...args: unknown[]) => ['__orderBy__',...args],
+    where: (...args: unknown[]) => args, orderBy: (...args: unknown[]) => ['__orderBy__',...args], limit: (n: number) => ['__limit__', n],
     getDocs: vi.fn(async (ref: any) => ({ docs: [...store.docs.entries()]
       .filter(([key, data]) => key.startsWith(`${ref.collection.name}/`) && ref.constraints.every(([field, op, value]: any[]) =>
-        field === '__orderBy__' ? true : op === '==' ? data[field] === value : op === '>=' ? data[field] >= value : data[field] <= value))
+        field === '__orderBy__' || field === '__limit__' ? true : op === '==' ? data[field] === value : op === '>=' ? data[field] >= value : data[field] <= value))
       .map(([key, data]) => ({id:key.split('/')[1],data:()=>data})) })), setDoc: vi.fn(), updateDoc: vi.fn(),
   };
 });

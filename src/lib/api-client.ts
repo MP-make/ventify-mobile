@@ -77,11 +77,18 @@ export async function getApiRequestInit(
   };
 }
 
-/** Executes an authenticated backend request and returns the raw Response without consuming the body (e.g. SSE). */
-export async function apiRawRequest(
+interface RawRequestContext {
+  response: Response;
+  controller: AbortController;
+  wasTimedOut: () => boolean;
+  wasExternallyAborted: () => boolean;
+  cleanup: () => void;
+}
+
+async function apiRawRequestWithCleanup(
   path: string,
   options: ApiOptions = {}
-): Promise<Response> {
+): Promise<RawRequestContext> {
   const prepared = await getApiRequestInit(path, options);
   const controller = new AbortController();
   const effectiveTimeoutMs = options.timeoutMs ?? DEFAULT_API_TIMEOUT_MS;
@@ -112,6 +119,14 @@ export async function apiRawRequest(
         }, effectiveTimeoutMs)
       : null;
 
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    if (timeout !== null) clearTimeout(timeout);
+    options.signal?.removeEventListener?.('abort', onExternalAbort);
+  };
+
   try {
     const response = await fetch(prepared.url, {
       ...prepared.init,
@@ -121,15 +136,29 @@ export async function apiRawRequest(
       throw new ApiError('La sesión cambió. Repite la operación.', 409);
     }
     if (!response.ok) {
-      const body = await response.json().catch(() => null);
+      const body = await parseJsonWithinSignal(response, controller.signal);
+      if (externallyAborted && !timedOut) {
+        throw new ApiError('Solicitud cancelada.', 499, 'ABORTED');
+      }
+      if (timedOut || controller.signal.aborted) {
+        throw new ApiError('El servidor tardó demasiado. Vuelve a intentarlo.', 408);
+      }
+      const parsedBody = body as { error?: string; message?: string; code?: string } | null;
       throw new ApiError(
-        body?.error || body?.message || 'No se pudo completar la operación.',
+        parsedBody?.error || parsedBody?.message || 'No se pudo completar la operación.',
         response.status,
-        body?.code
+        parsedBody?.code
       );
     }
-    return response;
+    return {
+      response,
+      controller,
+      wasTimedOut: () => timedOut,
+      wasExternallyAborted: () => externallyAborted,
+      cleanup,
+    };
   } catch (error) {
+    cleanup();
     if (externallyAborted && !timedOut) {
       throw new ApiError('Solicitud cancelada.', 499, 'ABORTED');
     }
@@ -137,18 +166,72 @@ export async function apiRawRequest(
       throw new ApiError('El servidor tardó demasiado. Vuelve a intentarlo.', 408);
     }
     throw error;
-  } finally {
-    if (timeout !== null) clearTimeout(timeout);
-    options.signal?.removeEventListener?.('abort', onExternalAbort);
   }
+}
+
+function parseJsonWithinSignal(response: Response, signal: AbortSignal): Promise<unknown> {
+  if (signal.aborted) {
+    return Promise.reject(new Error('aborted'));
+  }
+  return new Promise<unknown>((resolve, reject) => {
+    const onAbort = () => {
+      reject(new Error('aborted'));
+    };
+    signal.addEventListener?.('abort', onAbort, { once: true });
+    response
+      .json()
+      .then(
+        (parsed) => {
+          signal.removeEventListener?.('abort', onAbort);
+          resolve(parsed);
+        },
+        (err) => {
+          signal.removeEventListener?.('abort', onAbort);
+          if (signal.aborted) {
+            reject(err);
+          } else {
+            resolve(null);
+          }
+        }
+      );
+  });
+}
+
+/** Executes an authenticated backend request and returns the raw Response without consuming the body (e.g. SSE). */
+export async function apiRawRequest(
+  path: string,
+  options: ApiOptions = {}
+): Promise<Response> {
+  const { response, cleanup } = await apiRawRequestWithCleanup(path, options);
+  cleanup();
+  return response;
 }
 
 /** Firebase identity and server validation are shared with the web APIs. */
 export async function apiRequest<T>(path: string, options: ApiOptions = {}): Promise<T> {
-  const response = await apiRawRequest(path, options);
-  const body = await response.json().catch(() => null);
-  if (body === null && response.status !== 204) {
-    throw new ApiError('El servidor devolvió una respuesta inválida.', 502);
+  const { response, controller, wasTimedOut, wasExternallyAborted, cleanup } =
+    await apiRawRequestWithCleanup(path, options);
+  try {
+    const body = await parseJsonWithinSignal(response, controller.signal);
+    if (wasExternallyAborted() && !wasTimedOut()) {
+      throw new ApiError('Solicitud cancelada.', 499, 'ABORTED');
+    }
+    if (wasTimedOut() || controller.signal.aborted) {
+      throw new ApiError('El servidor tardó demasiado. Vuelve a intentarlo.', 408);
+    }
+    if (body === null && response.status !== 204) {
+      throw new ApiError('El servidor devolvió una respuesta inválida.', 502);
+    }
+    return body as T;
+  } catch (error) {
+    if (wasExternallyAborted() && !wasTimedOut()) {
+      throw new ApiError('Solicitud cancelada.', 499, 'ABORTED');
+    }
+    if (wasTimedOut() || controller.signal.aborted) {
+      throw new ApiError('El servidor tardó demasiado. Vuelve a intentarlo.', 408);
+    }
+    throw error;
+  } finally {
+    cleanup();
   }
-  return body as T;
 }

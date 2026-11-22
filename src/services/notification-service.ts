@@ -9,20 +9,22 @@
 import * as Notifications from 'expo-notifications';
 import * as Haptics from 'expo-haptics';
 import Constants from 'expo-constants';
-import { AppState, Platform } from 'react-native';
+import { Platform } from 'react-native';
 import {
-  collection,
-  doc,
-  limit,
-  onSnapshot,
-  orderBy,
-  query,
-  updateDoc,
-  where,
-  writeBatch,
-  type Unsubscribe,
-} from 'firebase/firestore';
-import { db } from '@/lib/firebase';
+  subscribeAccountNotifications,
+  markNotificationAsRead,
+  markAllNotificationsAsRead,
+  type AccountNotification,
+  type AccountNotificationType,
+} from './account-notifications-feed';
+
+export {
+  subscribeAccountNotifications,
+  markNotificationAsRead,
+  markAllNotificationsAsRead,
+  type AccountNotification,
+  type AccountNotificationType,
+};
 
 // ============================================================================
 // CONFIGURACIÓN GLOBAL DEL GESTOR DE NOTIFICACIONES
@@ -44,30 +46,6 @@ export type VentifyNotificationChannelId =
   | 'sunat_alerts'
   | 'cash_shifts'
   | 'general_alerts';
-
-export type AccountNotificationType =
-  | 'quote'
-  | 'stock'
-  | 'reservation'
-  | 'fiado'
-  | 'cash_register'
-  | 'ai_insight'
-  | 'system';
-
-export interface AccountNotification {
-  id: string;
-  accountId: string;
-  branchId?: string;
-  title: string;
-  body: string;
-  type: AccountNotificationType | string;
-  url?: string;
-  read: boolean;
-  readAt?: number;
-  createdAt: number;
-  createdBy?: string | null;
-  createdByName?: string | null;
-}
 
 export interface LocalNotificationPayload {
   title: string;
@@ -307,194 +285,6 @@ export const notifyShiftClosed = async (
   } catch (err) {
     console.warn('[NotificationService] notifyShiftClosed error:', err);
   }
-};
-
-// ============================================================================
-// SUSCRIPCIÓN FIRESTORE IN-APP (`account_notifications`)
-// ============================================================================
-
-const toEpochMillis = (value: any): number => {
-  if (typeof value === 'number' && Number.isFinite(value)) return value;
-  if (value && typeof value.toMillis === 'function') return value.toMillis();
-  if (value && typeof value.seconds === 'number') return value.seconds * 1000;
-  return Date.now();
-};
-
-interface NotificationSubscriber {
-  cb: (notifications: AccountNotification[]) => void;
-  onError?: (error: Error) => void;
-}
-
-interface SharedNotificationChannel {
-  key: string;
-  accountId: string;
-  branchId?: string | null;
-  subscribers: Set<NotificationSubscriber>;
-  lastItems: AccountNotification[] | null;
-  unsubscribeFirestore: Unsubscribe | null;
-  appStateSub: { remove: () => void } | null;
-  backgroundPauseTimer: ReturnType<typeof setTimeout> | null;
-}
-
-const sharedNotificationChannels = new Map<string, SharedNotificationChannel>();
-const NOTIFICATION_BACKGROUND_PAUSE_MS = 15_000;
-
-function attachNotificationFirestoreListener(channel: SharedNotificationChannel): void {
-  if (channel.unsubscribeFirestore || channel.subscribers.size === 0) return;
-
-  const notifQuery = query(
-    collection(db, 'account_notifications'),
-    where('accountId', '==', channel.accountId),
-    orderBy('createdAt', 'desc'),
-    limit(40)
-  );
-
-  channel.unsubscribeFirestore = onSnapshot(
-    notifQuery,
-    (snapshot) => {
-      const items: AccountNotification[] = [];
-      snapshot.forEach((docSnap) => {
-        const data = docSnap.data() || {};
-        if (channel.branchId && data.branchId && data.branchId !== channel.branchId) {
-          return;
-        }
-        items.push({
-          id: docSnap.id,
-          accountId: String(data.accountId || channel.accountId),
-          branchId: data.branchId ? String(data.branchId) : undefined,
-          title: String(data.title || 'Notificación de Ventify'),
-          body: String(data.body || ''),
-          type: String(data.type || 'system'),
-          url: data.url ? String(data.url) : undefined,
-          read: Boolean(data.read),
-          readAt: typeof data.readAt === 'number' ? data.readAt : undefined,
-          createdAt: toEpochMillis(data.createdAt ?? data.serverTimestamp),
-          createdBy: data.createdBy ?? null,
-          createdByName: data.createdByName ?? null,
-        });
-      });
-      channel.lastItems = items;
-      for (const sub of channel.subscribers) {
-        sub.cb(items);
-      }
-    },
-    (err) => {
-      console.warn('[NotificationService] subscribeAccountNotifications error:', err);
-      const normalizedError = err instanceof Error ? err : new Error('No se pudieron cargar las notificaciones.');
-      for (const sub of channel.subscribers) {
-        sub.onError?.(normalizedError);
-      }
-    }
-  );
-}
-
-/**
- * Suscribe en tiempo real a las notificaciones in-app de la cuenta (`account_notifications`),
- * multiplexando un único listener por `(accountId, branchId)` entre Header, Settings y Notifications.
- */
-export const subscribeAccountNotifications = (
-  accountId: string,
-  branchId: string | null | undefined,
-  cb: (notifications: AccountNotification[]) => void,
-  onError?: (error: Error) => void
-): Unsubscribe => {
-  if (!accountId) {
-    cb([]);
-    return () => {};
-  }
-
-  const key = `${accountId}:${branchId || 'all'}`;
-  let channel = sharedNotificationChannels.get(key);
-  if (!channel) {
-    channel = {
-      key,
-      accountId,
-      branchId,
-      subscribers: new Set(),
-      lastItems: null,
-      unsubscribeFirestore: null,
-      appStateSub: null,
-      backgroundPauseTimer: null,
-    };
-    sharedNotificationChannels.set(key, channel);
-
-    if (typeof AppState?.addEventListener === 'function') {
-      const targetChannel = channel;
-      targetChannel.appStateSub = AppState.addEventListener('change', (nextState) => {
-        if (nextState === 'active') {
-          if (targetChannel.backgroundPauseTimer) {
-            clearTimeout(targetChannel.backgroundPauseTimer);
-            targetChannel.backgroundPauseTimer = null;
-          }
-          attachNotificationFirestoreListener(targetChannel);
-        } else if (nextState === 'background' || nextState === 'inactive') {
-          if (!targetChannel.backgroundPauseTimer && targetChannel.unsubscribeFirestore) {
-            targetChannel.backgroundPauseTimer = setTimeout(() => {
-              targetChannel.backgroundPauseTimer = null;
-              if (AppState.currentState !== 'active' && targetChannel.unsubscribeFirestore) {
-                targetChannel.unsubscribeFirestore();
-                targetChannel.unsubscribeFirestore = null;
-              }
-            }, NOTIFICATION_BACKGROUND_PAUSE_MS);
-          }
-        }
-      });
-    }
-  }
-
-  const subscriber: NotificationSubscriber = { cb, onError };
-  channel.subscribers.add(subscriber);
-  if (channel.lastItems) {
-    cb(channel.lastItems);
-  }
-  if (typeof AppState?.currentState !== 'string' || AppState.currentState === 'active') {
-    attachNotificationFirestoreListener(channel);
-  } else if (!channel.unsubscribeFirestore) {
-    attachNotificationFirestoreListener(channel);
-  }
-
-  return () => {
-    const activeChannel = sharedNotificationChannels.get(key);
-    if (!activeChannel) return;
-    activeChannel.subscribers.delete(subscriber);
-    if (activeChannel.subscribers.size === 0) {
-      if (activeChannel.backgroundPauseTimer) {
-        clearTimeout(activeChannel.backgroundPauseTimer);
-        activeChannel.backgroundPauseTimer = null;
-      }
-      activeChannel.appStateSub?.remove?.();
-      activeChannel.appStateSub = null;
-      activeChannel.unsubscribeFirestore?.();
-      activeChannel.unsubscribeFirestore = null;
-      sharedNotificationChannels.delete(key);
-    }
-  };
-};
-
-/**
- * Marca una notificación de `account_notifications` como leída.
- */
-export const markNotificationAsRead = async (notificationId: string): Promise<void> => {
-  if (!notificationId) return;
-  await updateDoc(doc(db, 'account_notifications', notificationId), {
-    read: true,
-    readAt: Date.now(),
-  });
-};
-
-/**
- * Marca múltiples notificaciones no leídas como leídas en un batch.
- */
-export const markAllNotificationsAsRead = async (notificationIds: string[]): Promise<void> => {
-  const uniqueIds = Array.from(new Set(notificationIds.filter(Boolean)));
-  if (uniqueIds.length === 0) return;
-
-  const batch = writeBatch(db);
-  const readAt = Date.now();
-  for (const id of uniqueIds.slice(0, 400)) {
-    batch.update(doc(db, 'account_notifications', id), { read: true, readAt });
-  }
-  await batch.commit();
 };
 
 // ============================================================================

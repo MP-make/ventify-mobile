@@ -11,7 +11,7 @@
  *   en useProducts(), transmisión instantánea en <50ms y registro histórico.
  */
 
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
   Modal,
   View,
@@ -56,7 +56,7 @@ import {
   ExternalLink,
 } from 'lucide-react-native';
 
-import { useProducts } from '@/context/ProductsContext';
+import { useProductsActions } from '@/context/ProductsContext';
 import { formatPEN, ui } from '@/lib/theme';
 import {
   connectScannerSession,
@@ -96,6 +96,37 @@ const BARCODE_SCANNER_CONFIG: any = {
   ],
 };
 
+const UNLINKED_FAIL_COOLDOWN_MS = 1600;
+
+interface CompanionCameraLayerProps {
+  active: boolean;
+  torch: boolean;
+  scanPaused: boolean;
+  onBarcodeScanned: (result: BarcodeScanningResult) => void;
+}
+
+const CompanionCameraLayer = React.memo<CompanionCameraLayerProps>(
+  ({ active, torch, scanPaused, onBarcodeScanned }) => {
+    if (!active) {
+      return (
+        <View style={styles.centerContainer}>
+          <ActivityIndicator size="large" color={ui.primary} />
+          <Text style={styles.loadingText}>Cámara en pausa</Text>
+        </View>
+      );
+    }
+    return (
+      <CameraView
+        style={StyleSheet.absoluteFillObject}
+        facing="back"
+        enableTorch={torch}
+        barcodeScannerSettings={BARCODE_SCANNER_CONFIG}
+        onBarcodeScanned={scanPaused ? undefined : onBarcodeScanned}
+      />
+    );
+  }
+);
+
 interface ScannedHistoryCardItemProps {
   item: ScannedCodeHistoryItem;
 }
@@ -132,7 +163,7 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
 }) => {
   const insets = useSafeAreaInsets();
   const [permission, requestPermission] = useCameraPermissions();
-  const { findByBarcode } = useProducts();
+  const { findByBarcode } = useProductsActions();
 
   const [isAppActive, setIsAppActive] = useState<boolean>(true);
   useEffect(() => {
@@ -168,9 +199,15 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
   const lastScannedCodeRef = useRef<string>('');
   const lastScannedTimeRef = useRef<number>(0);
   const lastProcessedScanKeyRef = useRef<string | null>(null);
+  const lastFailedConnectCodeRef = useRef<string>('');
+  const lastFailedConnectTimeRef = useRef<number>(0);
   const isScanBusyRef = useRef<boolean>(false);
   const isConnectingRef = useRef<boolean>(false);
   const scanBusyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const connectCooldownTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const onSessionConnectedRef = useRef(onSessionConnected);
+  onSessionConnectedRef.current = onSessionConnected;
+  const [scanPaused, setScanPaused] = useState<boolean>(false);
 
   // ============================================================================
   // ANIMACIONES: LÁSER Y PULSO DE VINCULACIÓN (RN ANIMATED NATIVE DRIVER)
@@ -206,19 +243,25 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
     };
   }, [visible, isAppActive, laserProgress]);
 
-  const laserAnimatedStyle = {
-    transform: [
-      {
-        translateY: laserProgress.interpolate({
-          inputRange: [0, 1],
-          outputRange: [10, session ? 150 : 210],
-        }),
-      },
-    ],
-  };
+  const hasSession = Boolean(session);
+  const laserTranslateY = useMemo(
+    () =>
+      laserProgress.interpolate({
+        inputRange: [0, 1],
+        outputRange: [10, hasSession ? 150 : 210],
+      }),
+    [laserProgress, hasSession]
+  );
+
+  const laserAnimatedStyle = useMemo(
+    () => ({
+      transform: [{ translateY: laserTranslateY }],
+    }),
+    [laserTranslateY]
+  );
 
   useEffect(() => {
-    if (!visible || !session || !isAppActive) return;
+    if (!visible || !hasSession || !isAppActive) return;
     pulseScale.setValue(1);
     const loop = Animated.loop(
       Animated.sequence([
@@ -240,17 +283,41 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
     return () => {
       loop.stop();
     };
-  }, [visible, session, isAppActive, pulseScale]);
+  }, [visible, hasSession, isAppActive, pulseScale]);
 
-  const pulseAnimatedStyle = {
-    transform: [{ scale: pulseScale }],
-    opacity: pulseScale.interpolate({
-      inputRange: [1, 1.4],
-      outputRange: [0.8, 0],
+  const pulseOpacity = useMemo(
+    () =>
+      pulseScale.interpolate({
+        inputRange: [1, 1.4],
+        outputRange: [0.8, 0],
+      }),
+    [pulseScale]
+  );
+
+  const pulseAnimatedStyle = useMemo(
+    () => ({
+      transform: [{ scale: pulseScale }],
+      opacity: pulseOpacity,
     }),
-  };
+    [pulseScale, pulseOpacity]
+  );
 
   const bannerHideTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    if (!visible) {
+      if (scanBusyTimeoutRef.current) {
+        clearTimeout(scanBusyTimeoutRef.current);
+        scanBusyTimeoutRef.current = null;
+      }
+      if (connectCooldownTimerRef.current) {
+        clearTimeout(connectCooldownTimerRef.current);
+        connectCooldownTimerRef.current = null;
+      }
+      isScanBusyRef.current = false;
+      setScanPaused(false);
+    }
+  }, [visible]);
 
   useEffect(() => {
     return () => {
@@ -259,6 +326,9 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
       }
       if (scanBusyTimeoutRef.current) {
         clearTimeout(scanBusyTimeoutRef.current);
+      }
+      if (connectCooldownTimerRef.current) {
+        clearTimeout(connectCooldownTimerRef.current);
       }
     };
   }, []);
@@ -386,29 +456,65 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
   // HANDLERS DE ACCIONES DE VINCULACIÓN
   // ============================================================================
 
-  const handleConnect = async (rawCodeOrUrl: string) => {
-    if (!rawCodeOrUrl.trim() || isConnectingRef.current) return;
-    isConnectingRef.current = true;
-    setIsConnecting(true);
-    setConnectionError(null);
-    void triggerScanHaptic('light');
+  const handleConnect = useCallback(
+    async (rawCodeOrUrl: string, options?: { fromCamera?: boolean }) => {
+      const trimmed = rawCodeOrUrl.trim();
+      if (!trimmed || isConnectingRef.current) return;
 
-    try {
-      const activeSession = await connectScannerSession(rawCodeOrUrl);
-      setSession(activeSession);
-      void triggerScanHaptic('success');
-      setManualInputModalVisible(false);
-      setManualSessionInput('');
-      if (onSessionConnected) onSessionConnected(activeSession);
-    } catch (err: any) {
-      const msg = err?.message || 'No se pudo conectar con la computadora. Revisa el código QR e intenta de nuevo.';
-      setConnectionError(msg);
-      void triggerScanHaptic('error');
-    } finally {
-      isConnectingRef.current = false;
-      setIsConnecting(false);
-    }
-  };
+      if (options?.fromCamera) {
+        const now = Date.now();
+        if (
+          trimmed === lastFailedConnectCodeRef.current &&
+          now - lastFailedConnectTimeRef.current < UNLINKED_FAIL_COOLDOWN_MS
+        ) {
+          return;
+        }
+      }
+
+      if (connectCooldownTimerRef.current) {
+        clearTimeout(connectCooldownTimerRef.current);
+        connectCooldownTimerRef.current = null;
+      }
+
+      isConnectingRef.current = true;
+      setIsConnecting(true);
+      setScanPaused(true);
+      setConnectionError(null);
+      void triggerScanHaptic('light');
+
+      try {
+        const activeSession = await connectScannerSession(trimmed);
+        lastFailedConnectCodeRef.current = '';
+        lastFailedConnectTimeRef.current = 0;
+        setSession(activeSession);
+        void triggerScanHaptic('success');
+        setManualInputModalVisible(false);
+        setManualSessionInput('');
+        setScanPaused(false);
+        if (onSessionConnectedRef.current) onSessionConnectedRef.current(activeSession);
+      } catch (err: any) {
+        const msg =
+          err?.message ||
+          'No se pudo conectar con la computadora. Revisa el código QR e intenta de nuevo.';
+        setConnectionError(msg);
+        void triggerScanHaptic('error');
+        if (options?.fromCamera) {
+          lastFailedConnectCodeRef.current = trimmed;
+          lastFailedConnectTimeRef.current = Date.now();
+          connectCooldownTimerRef.current = setTimeout(() => {
+            setScanPaused(false);
+            connectCooldownTimerRef.current = null;
+          }, UNLINKED_FAIL_COOLDOWN_MS);
+        } else {
+          setScanPaused(false);
+        }
+      } finally {
+        isConnectingRef.current = false;
+        setIsConnecting(false);
+      }
+    },
+    []
+  );
 
   const handleDisconnect = async () => {
     if (!session) return;
@@ -449,8 +555,15 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
 
       // ESTADO 1: Si aún no está vinculado, este escáner busca el código QR de la PC
       if (!session) {
-        if (isConnecting) return;
-        void handleConnect(trimmedCode);
+        if (isConnectingRef.current) return;
+        const now = Date.now();
+        if (
+          trimmedCode === lastFailedConnectCodeRef.current &&
+          now - lastFailedConnectTimeRef.current < UNLINKED_FAIL_COOLDOWN_MS
+        ) {
+          return;
+        }
+        void handleConnect(trimmedCode, { fromCamera: true });
         return;
       }
 
@@ -474,6 +587,7 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
       lastScannedCodeRef.current = trimmedCode;
       lastScannedTimeRef.current = now;
       isScanBusyRef.current = true;
+      setScanPaused(true);
 
       // Si no es modo continuo, desarmar hasta la siguiente pulsación
       if (!continuousMode) {
@@ -568,11 +682,12 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
         }
         scanBusyTimeoutRef.current = setTimeout(() => {
           isScanBusyRef.current = false;
+          setScanPaused(false);
           scanBusyTimeoutRef.current = null;
         }, 500);
       }
     },
-    [session, continuousMode, isArmed, findByBarcode, showDetectedBanner]
+    [session, continuousMode, isArmed, findByBarcode, showDetectedBanner, handleConnect]
   );
 
   // Envío de código escrito manualmente a la PC
@@ -675,6 +790,9 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
     ]);
   };
 
+  const effectiveScanPaused =
+    scanPaused || isConnecting || Boolean(session && !continuousMode && !isArmed);
+
   if (!visible) return null;
 
   // ============================================================================
@@ -724,24 +842,12 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
           /* VISTA PRINCIPAL DE CÁMARA NATIVA (EXPO-CAMERA) */
           /* ================================================================= */
           <View style={StyleSheet.absoluteFillObject}>
-            {isAppActive && !manualInputModalVisible && !manualBarcodeModalVisible ? (
-              <CameraView
-                style={StyleSheet.absoluteFillObject}
-                facing="back"
-                enableTorch={torch}
-                barcodeScannerSettings={BARCODE_SCANNER_CONFIG}
-                onBarcodeScanned={
-                  !isConnecting && (!session || continuousMode || isArmed)
-                    ? handleBarcodeScanned
-                    : undefined
-                }
-              />
-            ) : (
-              <View style={styles.centerContainer}>
-                <ActivityIndicator size="large" color={ui.primary} />
-                <Text style={styles.loadingText}>Cámara en pausa</Text>
-              </View>
-            )}
+            <CompanionCameraLayer
+              active={isAppActive && !manualInputModalVisible && !manualBarcodeModalVisible}
+              torch={torch}
+              scanPaused={effectiveScanPaused}
+              onBarcodeScanned={handleBarcodeScanned}
+            />
 
             {/* =============================================================== */}
             {/* OVERLAY NATIVO ESMERALDA: ESTADO 1 vs ESTADO 2 */}
@@ -1495,11 +1601,6 @@ const styles = StyleSheet.create({
     right: 8,
     height: 2,
     backgroundColor: ui.primary,
-    shadowColor: ui.primary,
-    shadowOffset: { width: 0, height: 0 },
-    shadowOpacity: 0.9,
-    shadowRadius: 8,
-    elevation: 4,
   },
   reticleInstruction: {
     marginTop: 18,

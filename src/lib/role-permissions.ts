@@ -214,18 +214,28 @@ export function effectivePermissions(
 ): Permission[] {
   const canonRole = normalizeRole(role);
   const base = ROLE_PERMISSIONS[canonRole] || [];
+  const granted = customPermissions?.granted;
+  const revoked = customPermissions?.revoked;
 
   if (canonRole === 'seller') {
-    return base.filter((p) => !customPermissions?.revoked?.includes(p));
+    if (!revoked?.length) return base;
+    return base.filter((p) => !revoked.includes(p));
   }
 
-  if (!customPermissions) return base;
+  if (!granted?.length && !revoked?.length) return base;
 
-  const granted = (customPermissions.granted || []) as Permission[];
-  const revoked = (customPermissions.revoked || []) as Permission[];
-  const set = new Set<Permission>([...base, ...granted]);
-  revoked.forEach((p) => set.delete(p));
-  return [...set];
+  const set = new Set<Permission>(base);
+  if (granted?.length) {
+    for (let i = 0; i < granted.length; i++) {
+      set.add(granted[i]);
+    }
+  }
+  if (revoked?.length) {
+    for (let i = 0; i < revoked.length; i++) {
+      set.delete(revoked[i]);
+    }
+  }
+  return Array.from(set);
 }
 
 /**

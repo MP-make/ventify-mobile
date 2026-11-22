@@ -14,13 +14,17 @@ const METHODS = [
   { label: 'Digital', value: 'digital' },
 ];
 
-export const ReservationCancellationModal: React.FC<{
+interface ReservationCancellationModalProps {
   visible: boolean;
   item: CancellationItem | null;
   sessionId?: string;
   onClose: () => void;
   onConfirm: (choice: RefundChoice) => Promise<void>;
-}> = React.memo(({
+}
+
+const ReservationCancellationModalContent: React.FC<
+  Omit<ReservationCancellationModalProps, 'item'> & { item: CancellationItem }
+> = React.memo(({
   visible,
   item,
   sessionId,
@@ -30,16 +34,18 @@ export const ReservationCancellationModal: React.FC<{
   const [method, setMethod] = useState('');
   const [percent, setPercent] = useState('100');
   const [busy, setBusy] = useState(false);
-  const deposit = Math.max(0, Number(item?.depositAmount) || 0);
+  const deposit = Math.max(0, Number(item.depositAmount) || 0);
   const parsedPercent = Number(percent);
   const validPercent = Number.isFinite(parsedPercent) && parsedPercent > 0 && parsedPercent <= 100;
 
   useEffect(() => {
-    if (visible) { setMethod(''); setPercent('100'); setBusy(false); }
-  }, [visible, item?.id]);
+    setMethod('');
+    setPercent('100');
+    setBusy(false);
+  }, [item.id]);
 
   const confirm = async () => {
-    if (!item || busy) return;
+    if (busy) return;
     if (method && (!validPercent || !sessionId)) return;
     setBusy(true);
     try {
@@ -48,8 +54,6 @@ export const ReservationCancellationModal: React.FC<{
       setBusy(false);
     }
   };
-
-  if (!visible || !item) return null;
 
   const title = item.type === 'order' ? 'Cancelar pedido' : 'Cancelar reserva';
   const customer = item.customer?.name || item.customerName || 'el cliente';
@@ -135,6 +139,11 @@ export const ReservationCancellationModal: React.FC<{
       </SafeAreaView>
     </Modal>
   );
+});
+
+export const ReservationCancellationModal: React.FC<ReservationCancellationModalProps> = React.memo((props) => {
+  if (!props.visible || !props.item) return null;
+  return <ReservationCancellationModalContent {...props} item={props.item} />;
 });
 
 const styles = StyleSheet.create({

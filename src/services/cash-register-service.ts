@@ -10,6 +10,7 @@
 import { db, auth } from '@/lib/firebase';
 import { cleanFirestoreData } from '@/lib/firebase-utils';
 import { apiRequest } from '@/lib/api-client';
+import { sharedRequestCache } from '@/lib/request-cache';
 import type { Sale } from '@/types';
 import {
   collection,
@@ -39,6 +40,83 @@ const CASH_REPORTS_COLLECTION = 'cash_register_reports';
 const SALES_COLLECTION = 'sales';
 
 export const MAX_OPENING_BALANCE = 50_000;
+const CASH_REPORT_MAX_ENTRIES = 250;
+let cashMovementsSubIndexMissing = false;
+
+const isMissingCashIndexError = (err: any): boolean => {
+  const code = String(err?.code || '').toLowerCase();
+  const msg = String(err?.message || '').toLowerCase();
+  return (
+    code === 'failed-precondition' ||
+    msg.includes('requires an index') ||
+    msg.includes('failed-precondition')
+  );
+};
+
+const projectCompactCashReportSale = (sale: Record<string, any>): Record<string, any> => ({
+  id: sale.id,
+  ...(sale.saleNumber !== undefined ? { saleNumber: sale.saleNumber } : {}),
+  ...(sale.correlative !== undefined ? { correlative: sale.correlative } : {}),
+  ...(sale.documentType !== undefined ? { documentType: sale.documentType } : {}),
+  total: Number(sale.total) || 0,
+  ...(sale.chargedAmount !== undefined ? { chargedAmount: sale.chargedAmount } : {}),
+  ...(sale.amountReceived !== undefined ? { amountReceived: sale.amountReceived } : {}),
+  status: sale.status || 'completed',
+  ...(sale.paymentMethod !== undefined ? { paymentMethod: sale.paymentMethod } : {}),
+  ...(sale.paymentMethodId !== undefined ? { paymentMethodId: sale.paymentMethodId } : {}),
+  ...(sale.paymentCategory !== undefined ? { paymentCategory: sale.paymentCategory } : {}),
+  ...(sale.digitalProvider !== undefined ? { digitalProvider: sale.digitalProvider } : {}),
+  ...(sale.date !== undefined ? { date: sale.date } : {}),
+  ...(sale.sellerId !== undefined ? { sellerId: sale.sellerId } : {}),
+  ...(sale.sellerName !== undefined ? { sellerName: sale.sellerName } : {}),
+  ...(sale.customerName !== undefined ? { customerName: sale.customerName } : {}),
+  ...(sale.isReturn ? { isReturn: true } : {}),
+  ...(sale.refundAmount !== undefined ? { refundAmount: sale.refundAmount } : {}),
+  ...(sale.isDepositPayment ? { isDepositPayment: true } : {}),
+  ...(sale.isStaffConsumption ? { isStaffConsumption: true } : {}),
+  ...(sale.commissionAmount !== undefined ? { commissionAmount: sale.commissionAmount } : {}),
+  ...(sale.surchargeAmount !== undefined ? { surchargeAmount: sale.surchargeAmount } : {}),
+  ...(sale.sessionId !== undefined ? { sessionId: sale.sessionId } : {}),
+  ...(sale.branchId !== undefined ? { branchId: sale.branchId } : {}),
+  itemsCount: Array.isArray(sale.items) ? sale.items.length : 0,
+  ...(Array.isArray(sale.payments) && sale.payments.length > 0
+    ? {
+        payments: sale.payments.map((p: any) => ({
+          category: p.category,
+          amount: p.amount,
+          ...(p.chargedAmount !== undefined ? { chargedAmount: p.chargedAmount } : {}),
+          ...(p.digitalProvider ? { digitalProvider: p.digitalProvider } : {}),
+          ...(p.methodId ? { methodId: p.methodId } : {}),
+          ...(p.methodName ? { methodName: p.methodName } : {}),
+        })),
+      }
+    : {}),
+});
+
+const projectCompactCashReportMovement = (m: CashMovement): Record<string, any> => ({
+  id: m.id,
+  sessionId: m.sessionId,
+  accountId: m.accountId,
+  branchId: m.branchId,
+  ...(m.type !== undefined ? { type: m.type } : {}),
+  category: m.category,
+  amount: m.amount,
+  description: m.description,
+  ...(m.reason !== undefined ? { reason: m.reason } : {}),
+  ...(m.expenseCategoryId !== undefined ? { expenseCategoryId: m.expenseCategoryId } : {}),
+  ...(m.isEmployeeAdvance !== undefined ? { isEmployeeAdvance: m.isEmployeeAdvance } : {}),
+  ...(m.employeeId !== undefined ? { employeeId: m.employeeId } : {}),
+  ...(m.method !== undefined ? { method: m.method } : {}),
+  ...(m.paymentMethod !== undefined ? { paymentMethod: m.paymentMethod } : {}),
+  ...(m.originalPaymentMethod !== undefined ? { originalPaymentMethod: m.originalPaymentMethod } : {}),
+  ...(m.refundAmount !== undefined ? { refundAmount: m.refundAmount } : {}),
+  ...(m.saleId !== undefined ? { saleId: m.saleId } : {}),
+  ...(m.sellerId !== undefined ? { sellerId: m.sellerId } : {}),
+  ...(m.sellerName !== undefined ? { sellerName: m.sellerName } : {}),
+  createdBy: m.createdBy,
+  createdByName: m.createdByName,
+  createdAt: m.createdAt,
+});
 
 // ============================================================================
 // CATEGORÍAS DE GASTO, LÍMITE DE CAJERO Y RENDIMIENTO DE VENDEDORES (PARIDAD WEB)
@@ -519,16 +597,26 @@ export const openCashSession = async (
     );
   }
 
-  // Snapshot del tope de egresos para cajeros de settings/${accountId}_expenses
+  // Snapshot del tope de egresos para cajeros de settings/${accountId}_expenses (cacheado)
   let cashierExpenseLimit: number | undefined;
   try {
-    const expensesRef = doc(db, 'settings', `${accountId}_expenses`);
-    const expensesSnap = await getDoc(expensesRef);
-    if (expensesSnap.exists()) {
-      const limitVal = Number(expensesSnap.data()?.cashierExpenseLimit);
-      if (Number.isFinite(limitVal) && limitVal > 0) {
-        cashierExpenseLimit = limitVal;
+    const cachedLimit = await sharedRequestCache.getOrLoad<number | null>(
+      `settings_expenses:${accountId}`,
+      120_000,
+      async () => {
+        const expensesRef = doc(db, 'settings', `${accountId}_expenses`);
+        const expensesSnap = await getDoc(expensesRef);
+        if (expensesSnap.exists()) {
+          const limitVal = Number(expensesSnap.data()?.cashierExpenseLimit);
+          if (Number.isFinite(limitVal) && limitVal > 0) {
+            return limitVal;
+          }
+        }
+        return null;
       }
+    );
+    if (typeof cachedLimit === 'number' && cachedLimit > 0) {
+      cashierExpenseLimit = cachedLimit;
     }
   } catch (expErr) {
     console.warn('[CashRegisterService] Error reading cashierExpenseLimit:', expErr);
@@ -645,7 +733,8 @@ export const getBranchOpenSessions = async (
     collection(db, CASH_SESSIONS_COLLECTION),
     where('accountId', '==', accountId),
     where('branchId', '==', branchId),
-    where('status', '==', 'open')
+    where('status', '==', 'open'),
+    limit(30)
   );
   const snap = await getDocs(openQ);
   const sessions: CashSession[] = snap.docs
@@ -1349,6 +1438,14 @@ export const closeCashSession = async (
 
   const reportRef = doc(collection(db, CASH_REPORTS_COLLECTION));
   const reportId = reportRef.id;
+  const salesTruncated = sales.length > CASH_REPORT_MAX_ENTRIES;
+  const movementsTruncated = movements.length > CASH_REPORT_MAX_ENTRIES;
+  const compactSales = sales
+    .slice(0, CASH_REPORT_MAX_ENTRIES)
+    .map(projectCompactCashReportSale);
+  const compactMovements = movements
+    .slice(0, CASH_REPORT_MAX_ENTRIES)
+    .map(projectCompactCashReportMovement);
 
   // 3. Transacción atómica de Cierre Z
   await runTransaction(db, async (tx) => {
@@ -1375,14 +1472,16 @@ export const closeCashSession = async (
       auditSummary: cleanFirestoreData(audit),
     });
 
-    // Guardar reporte inmutable de cierre Z con esquema web completo + sessionSnapshot
+    // Guardar reporte inmutable de cierre Z con esquema web completo + proyecciones compactas
     tx.set(reportRef, cleanFirestoreData({
       id: reportId,
       sessionId,
       sessionSnapshot: sessionData,
       ...(sellerSummary ? { sellerSummary } : {}),
-      sales,
-      movements,
+      sales: compactSales,
+      movements: compactMovements,
+      ...(salesTruncated ? { salesTruncated: true } : {}),
+      ...(movementsTruncated ? { movementsTruncated: true } : {}),
       computed,
       accountId,
       branchId,
@@ -1402,37 +1501,46 @@ export const closeCashSession = async (
     }));
   });
 
-  // Limpieza del puntero de sesión activa del operador fuera de la transacción para nunca abortar el Cierre Z
-  if (sessionData.startedBy) {
-    try {
-      const userPointerRef = doc(
-        db,
-        CASH_SESSIONS_COLLECTION,
-        `active_${accountId}_${branchId}_${sessionData.startedBy}`
-      );
-      await clearActiveCashSessionPointer(userPointerRef, sessionId);
-    } catch (cleanupErr) {
-      console.warn('[CashRegisterService] No se pudo eliminar el puntero de sesión activa del operador tras cerrar:', cleanupErr);
-    }
-  }
+  // Limpieza paralela del puntero del operador y búsqueda de punteros huérfanos
+  const userPointerId = sessionData.startedBy
+    ? `active_${accountId}_${branchId}_${sessionData.startedBy}`
+    : null;
+  const userCleanupPromise = userPointerId
+    ? clearActiveCashSessionPointer(
+        doc(db, CASH_SESSIONS_COLLECTION, userPointerId),
+        sessionId
+      ).catch((cleanupErr) => {
+        console.warn('[CashRegisterService] No se pudo eliminar el puntero de sesión activa del operador tras cerrar:', cleanupErr);
+      })
+    : Promise.resolve();
 
-  // Limpieza de punteros huérfanos de otros operadores (p. ej. admin/owner vendiendo en esta caja)
-  try {
-    const stalePointersSnap = await getDocs(
-      query(
-        collection(db, CASH_SESSIONS_COLLECTION),
-        where('accountId', '==', accountId),
-        where('activeSessionId', '==', sessionId),
-        limit(20)
-      )
+  const staleQueryPromise = getDocs(
+    query(
+      collection(db, CASH_SESSIONS_COLLECTION),
+      where('accountId', '==', accountId),
+      where('activeSessionId', '==', sessionId),
+      limit(20)
+    )
+  ).catch((staleErr) => {
+    console.warn('[CashRegisterService] No se pudieron consultar punteros huérfanos tras cerrar:', staleErr);
+    return null;
+  });
+
+  const [, stalePointersSnap] = await Promise.all([userCleanupPromise, staleQueryPromise]);
+  if (stalePointersSnap && !stalePointersSnap.empty) {
+    const remainingPointers = stalePointersSnap.docs.filter(
+      (pDoc) => pDoc.id.startsWith('active_') && pDoc.id !== userPointerId
     );
-    for (const pDoc of stalePointersSnap.docs) {
-      if (pDoc.id.startsWith('active_')) {
-        await clearActiveCashSessionPointer(doc(db, CASH_SESSIONS_COLLECTION, pDoc.id), sessionId);
-      }
+    if (remainingPointers.length > 0) {
+      await Promise.allSettled(
+        remainingPointers.map((pDoc) =>
+          clearActiveCashSessionPointer(
+            doc(db, CASH_SESSIONS_COLLECTION, pDoc.id),
+            sessionId
+          )
+        )
+      );
     }
-  } catch (staleErr) {
-    console.warn('[CashRegisterService] No se pudieron limpiar punteros huérfanos tras cerrar:', staleErr);
   }
 
   return {
@@ -1464,35 +1572,66 @@ export const subscribeToSessionMovements = (
   }
 
   const coll = collection(db, CASH_MOVEMENTS_COLLECTION);
-  const constraints: any[] = [where('sessionId', '==', sessionId)];
+  const baseConstraints: any[] = [where('sessionId', '==', sessionId)];
   if (accountId) {
-    constraints.push(where('accountId', '==', accountId));
+    baseConstraints.push(where('accountId', '==', accountId));
   }
-  constraints.push(limit(100));
-  const q = query(coll, ...constraints);
 
-  return onSnapshot(
-    q,
-    (snap: QuerySnapshot<DocumentData>) => {
-      const items: CashMovement[] = snap.docs.map((d) => {
-        const data = d.data() as any;
-        const text = data.reason || data.description || '';
-        return {
-          id: d.id,
-          ...data,
-          description: text,
-          reason: text,
-        };
-      });
+  let disposed = false;
+  let activeUnsub: (() => void) | null = null;
+  let generation = 0;
 
-      items.sort((a, b) => toMillisValue(a.createdAt) - toMillisValue(b.createdAt));
+  const subscribeWithOrder = (useOrdered: boolean) => {
+    if (disposed) return;
+    const currentGen = ++generation;
+    const q = useOrdered
+      ? query(coll, ...baseConstraints, orderBy('createdAt', 'desc'), limit(100))
+      : query(coll, ...baseConstraints, limit(100));
 
-      callback(items);
-    },
-    (err) => {
-      console.error('[CashRegisterService] Error en suscripción a movimientos:', err);
+    const unsub = onSnapshot(
+      q,
+      (snap: QuerySnapshot<DocumentData>) => {
+        const items: CashMovement[] = snap.docs.map((d) => {
+          const data = d.data() as any;
+          const text = data.reason || data.description || '';
+          return {
+            id: d.id,
+            ...data,
+            description: text,
+            reason: text,
+          };
+        });
+
+        items.sort((a, b) => toMillisValue(a.createdAt) - toMillisValue(b.createdAt));
+
+        callback(items);
+      },
+      (err) => {
+        if (disposed || currentGen !== generation) return;
+        if (useOrdered && isMissingCashIndexError(err)) {
+          cashMovementsSubIndexMissing = true;
+          unsub?.();
+          subscribeWithOrder(false);
+          return;
+        }
+        console.error('[CashRegisterService] Error en suscripción a movimientos:', err);
+      }
+    );
+
+    if (disposed || currentGen !== generation) {
+      unsub?.();
+    } else {
+      activeUnsub = unsub;
     }
-  );
+  };
+
+  subscribeWithOrder(!cashMovementsSubIndexMissing);
+
+  return () => {
+    disposed = true;
+    activeUnsub?.();
+    activeUnsub = null;
+  };
 };
 
 export const subscribeToCashMovements = subscribeToSessionMovements;

@@ -18,29 +18,30 @@ export interface CatalogInventoryAlert {
   minStock: number;
 }
 
+export type CriticalInventoryAlert = CatalogInventoryAlert;
+
 export interface CatalogInventorySummary {
   stats: CatalogInventoryStats;
   alerts: CatalogInventoryAlert[];
 }
+
+export const EMPTY_CRITICAL_ALERTS: readonly CatalogInventoryAlert[] = Object.freeze([]);
 
 interface ProductInventoryContribution {
   active: boolean;
   inventoryValue: number;
   lowStockCount: number;
   outOfStockCount: number;
-  alert: CatalogInventoryAlert | null;
 }
 
 /** Maintains stock KPIs from changed documents instead of rescanning the full catalog. */
 export class ProductCatalogInventoryIndex {
   private readonly contributions = new Map<string, ProductInventoryContribution>();
-  private readonly alerts = new Map<string, CatalogInventoryAlert>();
   private activeProducts = 0;
   private inventoryValue = 0;
   private lowStockCount = 0;
   private outOfStockCount = 0;
-  private alertsDirty = true;
-  private cachedAlerts: CatalogInventoryAlert[] = [];
+  private lastSnapshot: CatalogInventorySummary | null = null;
 
   constructor(private readonly branchId: string) {}
 
@@ -53,9 +54,6 @@ export class ProductCatalogInventoryIndex {
     this.inventoryValue -= contribution.inventoryValue;
     this.lowStockCount -= contribution.lowStockCount;
     this.outOfStockCount -= contribution.outOfStockCount;
-    if (this.alerts.delete(productId)) {
-      this.alertsDirty = true;
-    }
   }
 
   upsert(product: Product): void {
@@ -67,7 +65,6 @@ export class ProductCatalogInventoryIndex {
         inventoryValue: 0,
         lowStockCount: 0,
         outOfStockCount: 0,
-        alert: null,
       });
       return;
     }
@@ -78,19 +75,12 @@ export class ProductCatalogInventoryIndex {
     const inventoryValue = currentStock > 0 ? currentStock * costPrice : 0;
     const outOfStockCount = currentStock <= 0 ? 1 : 0;
     const lowStockCount = currentStock > 0 && currentStock <= minStock ? 1 : 0;
-    const alert = outOfStockCount || lowStockCount
-      ? { productId: product.id, name: product.name, currentStock, minStock }
-      : null;
 
-    this.contributions.set(product.id, { active: true, inventoryValue, lowStockCount, outOfStockCount, alert });
+    this.contributions.set(product.id, { active: true, inventoryValue, lowStockCount, outOfStockCount });
     this.activeProducts += 1;
     this.inventoryValue += inventoryValue;
     this.lowStockCount += lowStockCount;
     this.outOfStockCount += outOfStockCount;
-    if (alert) {
-      this.alerts.set(product.id, alert);
-      this.alertsDirty = true;
-    }
   }
 
   remove(productId: string): void {
@@ -99,22 +89,27 @@ export class ProductCatalogInventoryIndex {
 
   clear(): void {
     this.contributions.clear();
-    this.alerts.clear();
     this.activeProducts = 0;
     this.inventoryValue = 0;
     this.lowStockCount = 0;
     this.outOfStockCount = 0;
-    this.alertsDirty = false;
-    this.cachedAlerts = [];
+    this.lastSnapshot = null;
   }
 
   snapshot(): CatalogInventorySummary {
     const roundedValue = Math.round(this.inventoryValue * 100) / 100;
-    if (this.alertsDirty) {
-      this.cachedAlerts = Array.from(this.alerts.values());
-      this.alertsDirty = false;
+    if (
+      this.lastSnapshot &&
+      this.lastSnapshot.stats.totalProducts === this.activeProducts &&
+      this.lastSnapshot.stats.skuCount === this.activeProducts &&
+      this.lastSnapshot.stats.totalInventoryValue === roundedValue &&
+      this.lastSnapshot.stats.valuation === roundedValue &&
+      this.lastSnapshot.stats.lowStockCount === this.lowStockCount &&
+      this.lastSnapshot.stats.outOfStockCount === this.outOfStockCount
+    ) {
+      return this.lastSnapshot;
     }
-    return {
+    this.lastSnapshot = {
       stats: {
         totalProducts: this.activeProducts,
         skuCount: this.activeProducts,
@@ -123,8 +118,9 @@ export class ProductCatalogInventoryIndex {
         lowStockCount: this.lowStockCount,
         outOfStockCount: this.outOfStockCount,
       },
-      alerts: this.cachedAlerts,
+      alerts: EMPTY_CRITICAL_ALERTS as CatalogInventoryAlert[],
     };
+    return this.lastSnapshot;
   }
 }
 
@@ -249,39 +245,104 @@ export class ProductCatalogIndex {
     this.codesByProduct.delete(productId);
   }
 
+  private insertCodeEntry(
+    code: string,
+    productId: string,
+    match: ScannedProductMatch,
+    unconditional: boolean
+  ): void {
+    const existing = this.byCode.get(code);
+    if (!existing) {
+      this.byCode.set(code, { productId, match, unconditional });
+      return;
+    }
+    if (!(existing instanceof Map)) {
+      if (existing.productId === productId) {
+        existing.match = match;
+        existing.unconditional = unconditional;
+        return;
+      }
+      const bucket = new Map<string, CodeCandidate>();
+      bucket.set(existing.productId, {
+        match: existing.match,
+        unconditional: existing.unconditional,
+      });
+      bucket.set(productId, { match, unconditional });
+      this.byCode.set(code, bucket);
+      return;
+    }
+    existing.set(productId, { match, unconditional });
+  }
+
   upsert(product: Product): void {
     this.remove(product.id);
     if (product.active === false) return;
-    const productMatches = new Map<string, CodeCandidate>();
-    const set = (code: string | undefined, match: ScannedProductMatch, overwrite: boolean) => {
-      const normalized = normalizeCode(code);
-      if (normalized && (overwrite || !productMatches.has(normalized))) {
+
+    let firstCode: string | null = null;
+    let firstMatch: ScannedProductMatch | undefined;
+    let firstUnconditional = false;
+    let productMatches: Map<string, CodeCandidate> | null = null;
+
+    const addCode = (
+      rawCode: string | undefined,
+      match: ScannedProductMatch,
+      overwrite: boolean
+    ) => {
+      const normalized = normalizeCode(rawCode);
+      if (!normalized) return;
+
+      if (productMatches === null) {
+        if (firstCode === null) {
+          firstCode = normalized;
+          firstMatch = match;
+          firstUnconditional = overwrite;
+          return;
+        }
+        if (normalized === firstCode) {
+          if (overwrite) {
+            firstMatch = match;
+            firstUnconditional = true;
+          }
+          return;
+        }
+        productMatches = new Map<string, CodeCandidate>();
+        productMatches.set(firstCode, {
+          match: firstMatch!,
+          unconditional: firstUnconditional,
+        });
+      }
+
+      if (overwrite || !productMatches.has(normalized)) {
         productMatches.set(normalized, { match, unconditional: overwrite });
       }
     };
 
-    if (product.barcode) set(product.barcode, { product }, true);
-    if (product.sku) set(product.sku, { product }, false);
+    if (product.barcode) addCode(product.barcode, { product }, true);
+    if (product.sku) addCode(product.sku, { product }, false);
     if (Array.isArray(product.barcodes)) {
       for (let i = 0; i < product.barcodes.length; i += 1) {
-        set(product.barcodes[i], { product }, false);
+        addCode(product.barcodes[i], { product }, false);
       }
     }
     if (Array.isArray(product.presentations)) {
       for (let i = 0; i < product.presentations.length; i += 1) {
         const presentation = product.presentations[i];
         if (presentation?.barcode) {
-          set(presentation.barcode, { product, matchedPresentation: normalizePresentation(presentation) }, true);
+          addCode(presentation.barcode, { product, matchedPresentation: normalizePresentation(presentation) }, true);
         }
       }
     }
-    if (product.branchPrices) {
-      for (const config of Object.values(product.branchPrices)) {
-        if (Array.isArray(config?.presentations)) {
-          for (let i = 0; i < config.presentations.length; i += 1) {
-            const presentation = config.presentations[i];
+    const branchPrices = product.branchPrices;
+    if (branchPrices) {
+      for (const branchKey in branchPrices) {
+        if (!Object.prototype.hasOwnProperty.call(branchPrices, branchKey)) continue;
+        const config = branchPrices[branchKey];
+        const branchPresentations = config?.presentations;
+        if (Array.isArray(branchPresentations)) {
+          for (let i = 0; i < branchPresentations.length; i += 1) {
+            const presentation = branchPresentations[i];
             if (presentation?.barcode) {
-              set(
+              addCode(
                 presentation.barcode,
                 { product, matchedPresentation: normalizePresentation(presentation) },
                 true
@@ -294,45 +355,26 @@ export class ProductCatalogIndex {
     if (Array.isArray(product.variants)) {
       for (let i = 0; i < product.variants.length; i += 1) {
         const variant = product.variants[i];
-        if (variant?.barcode) set(variant.barcode, { product, matchedVariant: variant }, true);
-        if (variant?.sku) set(variant.sku, { product, matchedVariant: variant }, false);
+        if (variant?.barcode) addCode(variant.barcode, { product, matchedVariant: variant }, true);
+        if (variant?.sku) addCode(variant.sku, { product, matchedVariant: variant }, false);
       }
     }
 
-    if (productMatches.size === 0) return;
+    if (firstCode === null) return;
 
-    if (productMatches.size === 1) {
-      const onlyCode = productMatches.keys().next().value as string;
-      this.codesByProduct.set(product.id, onlyCode);
-    } else {
-      this.codesByProduct.set(product.id, Array.from(productMatches.keys()));
+    const multiMatches = productMatches as Map<string, CodeCandidate> | null;
+    if (multiMatches === null) {
+      this.codesByProduct.set(product.id, firstCode);
+      this.insertCodeEntry(firstCode, product.id, firstMatch!, firstUnconditional);
+      return;
     }
 
-    for (const [code, candidate] of productMatches) {
-      const existing = this.byCode.get(code);
-      if (!existing) {
-        this.byCode.set(code, {
-          productId: product.id,
-          match: candidate.match,
-          unconditional: candidate.unconditional,
-        });
-      } else if (!(existing instanceof Map)) {
-        if (existing.productId === product.id) {
-          existing.match = candidate.match;
-          existing.unconditional = candidate.unconditional;
-        } else {
-          const bucket = new Map<string, CodeCandidate>();
-          bucket.set(existing.productId, {
-            match: existing.match,
-            unconditional: existing.unconditional,
-          });
-          bucket.set(product.id, candidate);
-          this.byCode.set(code, bucket);
-        }
-      } else {
-        existing.set(product.id, candidate);
-      }
+    const codeList: string[] = [];
+    for (const [code, candidate] of multiMatches) {
+      codeList.push(code);
+      this.insertCodeEntry(code, product.id, candidate.match, candidate.unconditional);
     }
+    this.codesByProduct.set(product.id, codeList);
   }
 
   clear(): void {

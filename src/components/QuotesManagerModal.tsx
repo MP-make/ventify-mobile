@@ -23,11 +23,10 @@ import {
   StyleSheet,
   Alert,
   ActivityIndicator,
-  Share,
   Platform,
   KeyboardAvoidingView,
 } from 'react-native';
-import { FlashList } from '@shopify/flash-list';
+import { FlashList, type ContentStyle } from '@shopify/flash-list';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { doc, updateDoc, serverTimestamp } from 'firebase/firestore';
 import {
@@ -40,17 +39,13 @@ import {
   XCircle,
   Clock,
   User,
-  Calendar,
-  AlertCircle,
   FileText,
-  DollarSign,
   ChevronRight,
   ArrowLeft,
   Phone,
   Mail,
   MapPin,
   Check,
-  RefreshCw,
   Edit3,
   Plus,
   Minus,
@@ -58,22 +53,21 @@ import {
 import * as Haptics from 'expo-haptics';
 
 import { db } from '@/lib/firebase';
-import { useAuth } from '@/context/AuthContext';
-import { useSettings } from '@/context/SettingsContext';
-import { useCart } from '@/context/CartContext';
-import { useProducts } from '@/context/ProductsContext';
+import { useAuthSession } from '@/context/AuthContext';
+import { useBusinessSettings } from '@/context/SettingsContext';
+import { useCartActions } from '@/context/CartContext';
+import { useProductsActions } from '@/context/ProductsContext';
+import { useDebouncedValue } from '@/hooks/use-debounced-value';
 import { parseNormalizedDecimal } from '@/lib/product-search';
-import { theme, ui, formatPEN, formatDatePE } from '@/lib/theme';
+import { ui, formatPEN, formatDatePE } from '@/lib/theme';
 import { ScreenHeading, SectionHeading } from '@/components/ui';
 import {
   Quote,
   QuoteItem,
   QuoteStatus,
   subscribeToQuotes,
-  getQuotes,
   updateQuoteStatus,
   deleteQuote,
-  convertQuoteToSale,
 } from '@/services/enterprise-ops-service';
 import { shareTicketWhatsApp } from '@/services/thermal-printer-service';
 import type { Product, Customer } from '@/types';
@@ -194,6 +188,9 @@ const QuoteCardItem = React.memo<QuoteCardItemProps>(({ quote, onSelect }) => {
   );
 });
 
+const quoteKeyExtractor = (item: Quote) => item.id;
+const QuoteListGap = () => <View style={{ height: 10 }} />;
+
 export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(({
   visible,
   isOpen,
@@ -203,15 +200,16 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
   const insets = useSafeAreaInsets();
   const isVisible = visible !== undefined ? visible : Boolean(isOpen);
 
-  const { accountId, branchId, userProfile } = useAuth();
-  const { businessSettings, activeBranchName } = useSettings();
-  const { getProductById } = useProducts();
-  const { clearCart, addItem, setCustomer, setNotes, setSourceQuoteId, setSaleRequestId, setDiscount, setShippingAmount } = useCart();
+  const { accountId, branchId, userProfile } = useAuthSession();
+  const { businessSettings } = useBusinessSettings();
+  const { getProductById } = useProductsActions();
+  const { clearCart, addItem, setCustomer, setNotes, setSourceQuoteId, setSaleRequestId, setDiscount, setShippingAmount } = useCartActions();
 
   // Estados de lista y filtros
   const [quotes, setQuotes] = useState<Quote[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [searchQuery, setSearchQuery] = useState<string>('');
+  const debouncedSearchQuery = useDebouncedValue(searchQuery, 150);
   const [statusFilter, setStatusFilter] = useState<QuoteStatus | 'all'>('all');
 
   // Estado de cotización seleccionada para ver detalles y edición
@@ -256,39 +254,44 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
     };
   }, [isVisible, accountId, branchId]);
 
-  // 2. Filtrar cotizaciones por texto y estado
+  // 2. Filtrar cotizaciones por texto y estado (sin clonar quotes innecesariamente)
   const filteredQuotes = useMemo(() => {
-    let result = [...quotes];
-
-    if (statusFilter !== 'all') {
-      result = result.filter((q) => q.status === statusFilter);
+    const term = debouncedSearchQuery.toLowerCase().trim();
+    if (statusFilter === 'all' && !term) {
+      return quotes;
     }
 
-    if (searchQuery.trim()) {
-      const term = searchQuery.toLowerCase().trim();
-      result = result.filter(
-        (q) =>
-          q.customerName.toLowerCase().includes(term) ||
-          q.formattedNumber.toLowerCase().includes(term) ||
-          (q.customerDni && q.customerDni.includes(term)) ||
-          (q.customerRuc && q.customerRuc.includes(term)) ||
-          (q.customerPhone && q.customerPhone.includes(term)) ||
-          q.items.some((it) => it.name.toLowerCase().includes(term))
+    return quotes.filter((q) => {
+      if (statusFilter !== 'all' && q.status !== statusFilter) {
+        return false;
+      }
+      if (!term) {
+        return true;
+      }
+      return (
+        q.customerName.toLowerCase().includes(term) ||
+        q.formattedNumber.toLowerCase().includes(term) ||
+        (q.customerDni && q.customerDni.includes(term)) ||
+        (q.customerRuc && q.customerRuc.includes(term)) ||
+        (q.customerPhone && q.customerPhone.includes(term)) ||
+        q.items.some((it) => it.name.toLowerCase().includes(term))
       );
+    });
+  }, [quotes, statusFilter, debouncedSearchQuery]);
+
+  // Métricas rápidas en una sola pasada
+  const metrics = useMemo(() => {
+    let pendingCount = 0;
+    let pendingAmount = 0;
+    for (let i = 0; i < quotes.length; i += 1) {
+      const q = quotes[i];
+      if (q.status === 'pending') {
+        pendingCount += 1;
+        pendingAmount += q.total || 0;
+      }
     }
 
-    return result;
-  }, [quotes, statusFilter, searchQuery]);
-
-  // Métricas rápidas
-  const metrics = useMemo(() => {
-    const totalCount = quotes.length;
-    const pendingCount = quotes.filter((q) => q.status === 'pending').length;
-    const pendingAmount = quotes
-      .filter((q) => q.status === 'pending')
-      .reduce((sum, q) => sum + (q.total || 0), 0);
-
-    return { totalCount, pendingCount, pendingAmount };
+    return { totalCount: quotes.length, pendingCount, pendingAmount };
   }, [quotes]);
 
   // 3. ACCIÓN: Cargar al Carrito POS / Convertir a Venta
@@ -776,7 +779,10 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
     [handleSelectQuote]
   );
 
-  const quoteKeyExtractor = useCallback((item: Quote) => item.id, []);
+  const listContentContainerStyle = useMemo<ContentStyle>(
+    () => ({ paddingHorizontal: 16, paddingBottom: insets.bottom + 20 }),
+    [insets.bottom]
+  );
 
   if (!isVisible) return null;
 
@@ -1118,7 +1124,7 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
                 <FileText size={48} color={ui.textMuted} />
                 <Text style={styles.emptyTitle}>No hay cotizaciones</Text>
                 <Text style={styles.emptySubtitle}>
-                  {searchQuery || statusFilter !== 'all'
+                  {debouncedSearchQuery.trim() || statusFilter !== 'all'
                     ? 'No se encontraron cotizaciones con los filtros actuales.'
                     : 'Las cotizaciones creadas en el POS o web aparecerán aquí.'}
                 </Text>
@@ -1129,7 +1135,8 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
                 renderItem={renderQuoteItem}
                 keyExtractor={quoteKeyExtractor}
                 estimatedItemSize={115}
-                contentContainerStyle={[styles.listScrollContent, { paddingBottom: insets.bottom + 20 }] as any}
+                contentContainerStyle={listContentContainerStyle}
+                ItemSeparatorComponent={QuoteListGap}
                 showsVerticalScrollIndicator={false}
               />
             )}
@@ -1480,10 +1487,6 @@ const styles = StyleSheet.create({
   },
   listScroll: {
     flex: 1,
-  },
-  listScrollContent: {
-    paddingHorizontal: 16,
-    gap: 10,
   },
   quoteCard: {
     backgroundColor: ui.surface,

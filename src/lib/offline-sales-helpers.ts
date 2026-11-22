@@ -75,16 +75,22 @@ const classifyHintToBucket = (category: string, hint: string): PaymentBucket | n
   return null;
 };
 
+const joinTruthy4 = (a: unknown, b: unknown, c: unknown, d: unknown): string => {
+  let out = '';
+  if (a) out = String(a);
+  if (b) out = out ? `${out} ${String(b)}` : String(b);
+  if (c) out = out ? `${out} ${String(c)}` : String(c);
+  if (d) out = out ? `${out} ${String(d)}` : String(d);
+  return out;
+};
+
 const buildParentPaymentHint = (payload: Record<string, any>): string =>
-  [
+  joinTruthy4(
     payload.digitalProvider,
     payload.paymentMethodId,
     payload.paymentMethodName,
-    payload.paymentMethod,
-  ]
-    .filter(Boolean)
-    .map(String)
-    .join(' ');
+    payload.paymentMethod
+  );
 
 const extractPaymentBreakdown = (payload: Record<string, any>): PaymentBreakdown => {
   const breakdown: PaymentBreakdown = {
@@ -96,28 +102,43 @@ const extractPaymentBreakdown = (payload: Record<string, any>): PaymentBreakdown
     credit: 0,
   };
 
-  const parentHint = buildParentPaymentHint(payload);
-  const splits = Array.isArray(payload.payments) ? payload.payments : [];
+  let cachedParentHint: string | undefined;
+  const getParentHint = (): string => {
+    if (cachedParentHint === undefined) {
+      cachedParentHint = buildParentPaymentHint(payload);
+    }
+    return cachedParentHint;
+  };
 
-  if (splits.length > 0) {
+  const splits = Array.isArray(payload.payments) ? payload.payments : null;
+
+  if (splits && splits.length > 0) {
     let splitSum = 0;
-    for (const split of splits) {
+    for (let i = 0; i < splits.length; i++) {
+      const split = splits[i];
       const amount = Number(split?.chargedAmount ?? split?.amount ?? 0);
       if (!Number.isFinite(amount) || amount <= 0) continue;
 
       const splitCategory = String(split?.category || '');
-      const splitHint = [
-        split?.digitalProvider,
-        split?.paymentMethod,
-        split?.methodId,
-        split?.methodName,
-      ]
-        .filter(Boolean)
-        .map(String)
-        .join(' ');
+      const splitCatLower = splitCategory.toLowerCase().trim();
+      let bucket: PaymentBucket | null;
+      if (splitCatLower === 'cash') {
+        bucket = 'cash';
+      } else if (splitCatLower === 'credit') {
+        bucket = 'credit';
+      } else if (splitCatLower === 'card' || splitCatLower === 'terminal') {
+        bucket = 'card';
+      } else {
+        const splitHint = joinTruthy4(
+          split?.digitalProvider,
+          split?.paymentMethod,
+          split?.methodId,
+          split?.methodName
+        );
+        bucket = classifyHintToBucket(splitCategory, splitHint || getParentHint());
+      }
 
-      const bucket = classifyHintToBucket(splitCategory, splitHint || parentHint) ?? 'cash';
-      breakdown[bucket] += amount;
+      breakdown[bucket ?? 'cash'] += amount;
       splitSum += amount;
     }
 
@@ -136,7 +157,7 @@ const extractPaymentBreakdown = (payload: Record<string, any>): PaymentBreakdown
     if (cardAmt > 0) breakdown.card += cardAmt;
     if (creditAmt > 0) breakdown.credit += creditAmt;
     if (digitalAmt > 0) {
-      const digitalBucket = classifyHintToBucket('digital', parentHint);
+      const digitalBucket = classifyHintToBucket('digital', getParentHint());
       if (digitalBucket === 'yape' || digitalBucket === 'plin') {
         breakdown[digitalBucket] += digitalAmt;
       } else {
@@ -149,7 +170,7 @@ const extractPaymentBreakdown = (payload: Record<string, any>): PaymentBreakdown
   const fallbackAmount = Number(payload.chargedAmount ?? payload.total ?? 0);
   if (Number.isFinite(fallbackAmount) && fallbackAmount > 0) {
     const bucket =
-      classifyHintToBucket(String(payload.paymentCategory || ''), parentHint) ?? 'cash';
+      classifyHintToBucket(String(payload.paymentCategory || ''), getParentHint()) ?? 'cash';
     breakdown[bucket] += fallbackAmount;
   }
 
@@ -248,13 +269,21 @@ export function pendingOfflineSaleToSaleRecord(
   };
 }
 
+const extractSaleTimestampMs = (sale: Record<string, any>): number =>
+  Number(sale?.createdAt?.toMillis?.() || sale?._dateMs || sale?.date || 0);
+
 export function mergeSalesWithOfflinePending<T extends Record<string, any>>(
   serverSales: T[],
   pendingOfflineSales: PendingOfflineSale[],
   scope: OfflineSaleScope
 ): T[] {
+  if (pendingOfflineSales.length === 0) {
+    return serverSales;
+  }
+
   const seenIds = new Set<string>();
-  for (const sale of serverSales) {
+  for (let i = 0; i < serverSales.length; i++) {
+    const sale = serverSales[i];
     if (typeof sale?.offlineId === 'string' && sale.offlineId) {
       seenIds.add(sale.offlineId);
     }
@@ -264,7 +293,8 @@ export function mergeSalesWithOfflinePending<T extends Record<string, any>>(
   }
 
   const pendingRecords: T[] = [];
-  for (const item of pendingOfflineSales) {
+  for (let i = 0; i < pendingOfflineSales.length; i++) {
+    const item = pendingOfflineSales[i];
     const offlineId = item?.offlineId;
     if (!offlineId) continue;
     if (seenIds.has(offlineId) || (item.id && seenIds.has(item.id))) continue;
@@ -275,13 +305,28 @@ export function mergeSalesWithOfflinePending<T extends Record<string, any>>(
     pendingRecords.push(pendingOfflineSaleToSaleRecord(item) as unknown as T);
   }
 
-  const combined = [...pendingRecords, ...serverSales];
-  combined.sort((a, b) => {
-    const tsA = Number(a?.createdAt?.toMillis?.() || a?._dateMs || a?.date || 0);
-    const tsB = Number(b?.createdAt?.toMillis?.() || b?._dateMs || b?.date || 0);
-    return tsB - tsA;
-  });
+  if (pendingRecords.length === 0) {
+    return serverSales;
+  }
 
+  const totalLen = pendingRecords.length + serverSales.length;
+  const entries = new Array<{ sale: T; ts: number }>(totalLen);
+  let idx = 0;
+  for (let i = 0; i < pendingRecords.length; i++) {
+    const sale = pendingRecords[i];
+    entries[idx++] = { sale, ts: extractSaleTimestampMs(sale) };
+  }
+  for (let i = 0; i < serverSales.length; i++) {
+    const sale = serverSales[i];
+    entries[idx++] = { sale, ts: extractSaleTimestampMs(sale) };
+  }
+
+  entries.sort((a, b) => b.ts - a.ts);
+
+  const combined = new Array<T>(totalLen);
+  for (let i = 0; i < totalLen; i++) {
+    combined[i] = entries[i].sale;
+  }
   return combined;
 }
 

@@ -38,9 +38,9 @@ import {
   updateDoc,
   Timestamp,
 } from 'firebase/firestore';
-import { getStorage, ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { cleanFirestoreData } from '@/lib/firebase-utils';
 import { apiRequest } from '@/lib/api-client';
+import { sharedRequestCache } from '@/lib/request-cache';
 import {
   findProductByBarcode,
   getAvailableStock,
@@ -655,6 +655,7 @@ export const uploadProductImageToStorage = async (
     const fileName = `${safePrefix}${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
     // Debe mantener un solo segmento tras accountId para cumplir storage.rules (`match /products/{accountId}/{file}`).
     const storagePath = `products/${accountId}/${fileName}`;
+    const { getStorage, ref, uploadBytes, getDownloadURL } = await import('firebase/storage');
     const storage = app ? getStorage(app) : getStorage();
     const storageRef = ref(storage, storagePath);
 
@@ -837,14 +838,12 @@ export const saveProduct = async (
 
     await setDoc(newDocRef, cleanFirestoreData(payload));
 
-    // Si tiene stock inicial en alguna sucursal, registrar movimientos en inventory_movements
+    // Si tiene stock inicial en alguna sucursal, registrar movimientos en inventory_movements usando writeBatch
     const initialMovements = Object.entries(stockMap).filter(([_, qty]) => typeof qty === 'number' && qty > 0);
-
-    await Promise.all(
-      initialMovements.map(async ([branchId, qty]) => {
-        try {
-          const mvRef = doc(collection(db, INVENTORY_MOVEMENTS_COLLECTION));
-          await setDoc(mvRef, cleanFirestoreData({
+    if (initialMovements.length > 0) {
+      try {
+        const buildInitialMovement = (branchId: string, qty: number) =>
+          cleanFirestoreData({
             accountId: productData.accountId,
             branchId,
             productId,
@@ -867,16 +866,41 @@ export const saveProduct = async (
             notes: 'Inventario inicial al crear producto',
             createdAt: serverTimestamp(),
             date: Date.now(),
-          }));
-        } catch (err) {
-          console.warn(`[InventoryService] Error registrando Kardex inicial para ${productId}:`, err);
+          });
+
+        let writeBatchFn: ((firestore: typeof db) => any) | null = null;
+        try {
+          const firestoreMod = await import('firebase/firestore');
+          if (typeof firestoreMod.writeBatch === 'function') {
+            writeBatchFn = firestoreMod.writeBatch;
+          }
+        } catch {
+          writeBatchFn = null;
         }
-      })
-    );
+        if (writeBatchFn) {
+          const batch = writeBatchFn(db);
+          for (const [branchId, qty] of initialMovements) {
+            const mvRef = doc(collection(db, INVENTORY_MOVEMENTS_COLLECTION));
+            batch.set(mvRef, buildInitialMovement(branchId, qty));
+          }
+          await batch.commit();
+        } else {
+          await Promise.all(
+            initialMovements.map(async ([branchId, qty]) => {
+              const mvRef = doc(collection(db, INVENTORY_MOVEMENTS_COLLECTION));
+              await setDoc(mvRef, buildInitialMovement(branchId, qty));
+            })
+          );
+        }
+      } catch (err) {
+        console.warn(`[InventoryService] Error registrando Kardex inicial para ${productId}:`, err);
+      }
+    }
   } else {
     await updateDoc(existingRef!, cleanFirestoreData(payload));
   }
 
+  sharedRequestCache.invalidatePrefix(`barcode_remote:${productData.accountId}:`);
   return productId;
 };
 
@@ -891,48 +915,56 @@ export const findByBarcodeRemote = async (
 ): Promise<ScannedProductMatch | null> => {
   if (!accountId || !code?.trim()) return null;
   const cleanCode = code.trim();
-  const productsColl = collection(db, PRODUCTS_COLLECTION);
+  const cacheKey = `barcode_remote:${accountId}:${cleanCode}`;
 
-  // Consultar barcode, SKU y barcodes alternativos en paralelo manteniendo precedencia
-  const [barcodeSnap, skuSnap, barcodesSnap] = await Promise.all([
-    getDocs(
-      query(
-        productsColl,
-        where('accountId', '==', accountId),
-        where('barcode', '==', cleanCode),
-        firestoreLimit(1)
-      )
-    ),
-    getDocs(
-      query(
-        productsColl,
-        where('accountId', '==', accountId),
-        where('sku', '==', cleanCode),
-        firestoreLimit(1)
-      )
-    ),
-    getDocs(
-      query(
-        productsColl,
-        where('accountId', '==', accountId),
-        where('barcodes', 'array-contains', cleanCode),
-        firestoreLimit(1)
-      )
-    ),
-  ]);
+  return sharedRequestCache.getOrLoad<ScannedProductMatch | null>(
+    cacheKey,
+    30_000,
+    async () => {
+      const productsColl = collection(db, PRODUCTS_COLLECTION);
 
-  for (const snap of [barcodeSnap, skuSnap, barcodesSnap]) {
-    if (snap.docs?.length) {
-      const products = snap.docs.map((productDoc) => ({
-        id: productDoc.id,
-        ...productDoc.data(),
-      })) as Product[];
-      const match = findProductByBarcode(products, cleanCode);
-      if (match) return match;
+      // Consultar barcode, SKU y barcodes alternativos en paralelo manteniendo precedencia
+      const [barcodeSnap, skuSnap, barcodesSnap] = await Promise.all([
+        getDocs(
+          query(
+            productsColl,
+            where('accountId', '==', accountId),
+            where('barcode', '==', cleanCode),
+            firestoreLimit(1)
+          )
+        ),
+        getDocs(
+          query(
+            productsColl,
+            where('accountId', '==', accountId),
+            where('sku', '==', cleanCode),
+            firestoreLimit(1)
+          )
+        ),
+        getDocs(
+          query(
+            productsColl,
+            where('accountId', '==', accountId),
+            where('barcodes', 'array-contains', cleanCode),
+            firestoreLimit(1)
+          )
+        ),
+      ]);
+
+      for (const snap of [barcodeSnap, skuSnap, barcodesSnap]) {
+        if (snap.docs?.length) {
+          const products = snap.docs.map((productDoc) => ({
+            id: productDoc.id,
+            ...productDoc.data(),
+          })) as Product[];
+          const match = findProductByBarcode(products, cleanCode);
+          if (match) return match;
+        }
+      }
+
+      return null;
     }
-  }
-
-  return null;
+  );
 };
 
 
@@ -1134,26 +1166,53 @@ export const adjustProductStock = async (
  * - (accountId, productId, createdAt DESC)
  * - (accountId, createdAt DESC)
  */
+const missingInventoryIndexes = new Set<string>();
+
+const isMissingInventoryIndexError = (err: any): boolean => {
+  const code = String(err?.code || '').toLowerCase();
+  const msg = String(err?.message || '').toLowerCase();
+  return (
+    code === 'failed-precondition' ||
+    msg.includes('requires an index') ||
+    msg.includes('failed-precondition')
+  );
+};
+
 export const getProductKardex = async (
   accountId: string,
   branchId: string,
   productId?: string,
   limitCount: number = 50
 ): Promise<any[]> => {
+  const coll = collection(db, INVENTORY_MOVEMENTS_COLLECTION);
+  const constraints: any[] = [where('accountId', '==', accountId)];
+  if (branchId && branchId !== 'all') {
+    constraints.push(where('branchId', '==', branchId));
+  }
+  if (productId) {
+    constraints.push(where('productId', '==', productId));
+  }
+
+  const indexKey = `kardex:${branchId && branchId !== 'all' ? 'b' : 'all'}:${productId ? 'p' : 'all'}`;
+
+  const runFallback = async (): Promise<any[]> => {
+    const fallbackQuery = query(coll, ...constraints, firestoreLimit(limitCount));
+    const snap = await getDocs(fallbackQuery);
+    const items = snap.docs.map((d) => normalizeInventoryMovement(d.data(), d.id));
+
+    items.sort((a: any, b: any) => {
+      const tA = a.createdAt?.seconds ? a.createdAt.seconds * 1000 : Number(a.createdAt) || a.date || 0;
+      const tB = b.createdAt?.seconds ? b.createdAt.seconds * 1000 : Number(b.createdAt) || b.date || 0;
+      return tB - tA;
+    });
+
+    return items;
+  };
+
   try {
-    const coll = collection(db, INVENTORY_MOVEMENTS_COLLECTION);
-    const constraints: any[] = [
-      where('accountId', '==', accountId),
-    ];
-
-    if (branchId && branchId !== 'all') {
-      constraints.push(where('branchId', '==', branchId));
+    if (missingInventoryIndexes.has(indexKey)) {
+      return await runFallback();
     }
-
-    if (productId) {
-      constraints.push(where('productId', '==', productId));
-    }
-
     const q = query(
       coll,
       ...constraints,
@@ -1164,29 +1223,12 @@ export const getProductKardex = async (
     const snapshot = await getDocs(q);
     return snapshot.docs.map((d) => normalizeInventoryMovement(d.data(), d.id));
   } catch (err: any) {
+    if (isMissingInventoryIndexError(err)) {
+      missingInventoryIndexes.add(indexKey);
+    }
     console.warn('[InventoryService] Error consultando Kardex (posible índice requerido):', err?.message);
-    // Fallback sin orderBy en caso de índice compuesto ausente
     try {
-      const coll = collection(db, INVENTORY_MOVEMENTS_COLLECTION);
-      const constraints: any[] = [
-        where('accountId', '==', accountId),
-      ];
-      if (branchId && branchId !== 'all') {
-        constraints.push(where('branchId', '==', branchId));
-      }
-      if (productId) constraints.push(where('productId', '==', productId));
-
-      const fallbackQuery = query(coll, ...constraints, firestoreLimit(limitCount));
-      const snap = await getDocs(fallbackQuery);
-      const items = snap.docs.map((d) => normalizeInventoryMovement(d.data(), d.id));
-
-      items.sort((a: any, b: any) => {
-        const tA = a.createdAt?.seconds ? a.createdAt.seconds * 1000 : Number(a.createdAt) || a.date || 0;
-        const tB = b.createdAt?.seconds ? b.createdAt.seconds * 1000 : Number(b.createdAt) || b.date || 0;
-        return tB - tA;
-      });
-
-      return items;
+      return await runFallback();
     } catch (fallbackErr) {
       console.error('[InventoryService] Fallback de Kardex falló:', fallbackErr);
       return [];
@@ -1356,6 +1398,7 @@ export const createStockTransfer = async (
     tx.set(transferDocRef, cleanFirestoreData(transferPayload));
   });
 
+  sharedRequestCache.invalidatePrefix(`stock_transfers:${accountId}:`);
   return transferId;
 };
 
@@ -1384,6 +1427,7 @@ export const approveStockTransfer = async (
       updatedAt: serverTimestamp(),
     });
   });
+  sharedRequestCache.invalidatePrefix('stock_transfers:');
 };
 
 /** Marca el despacho físico de una transferencia aprobada. */
@@ -1403,6 +1447,7 @@ export const sendStockTransfer = async (
       sentAt: serverTimestamp(), shippedAt: serverTimestamp(), updatedAt: serverTimestamp(),
     });
   });
+  sharedRequestCache.invalidatePrefix('stock_transfers:');
 };
 
 /**
@@ -1506,6 +1551,7 @@ export const cancelStockTransfer = async (
       updatedAt: serverTimestamp(),
     });
   });
+  sharedRequestCache.invalidatePrefix('stock_transfers:');
 };
 
 export const rejectStockTransfer = (
@@ -1530,20 +1576,6 @@ export const completeStockTransfer = async (
   }
 
   const transferRef = doc(db, TRANSFERS_COLLECTION, transferId);
-  const initialSnap = await getDoc(transferRef);
-  if (!initialSnap.exists()) {
-    throw new Error(`La transferencia "${transferId}" no existe.`);
-  }
-
-  const initialData = initialSnap.data();
-  if (initialData.status === 'completed') {
-    throw new Error('La transferencia ya ha sido completada previamente.');
-  }
-
-  // Si está en 'pending', firestore.rules exige que pase a 'approved' primero
-  if (initialData.status === 'pending') {
-    throw new Error('La transferencia debe aprobarse antes de recibirla.');
-  }
 
   await runTransaction(db, async (tx) => {
     const tSnap = await tx.get(transferRef);
@@ -1554,6 +1586,10 @@ export const completeStockTransfer = async (
     const tData = tSnap.data();
     if (tData.status === 'completed') {
       throw new Error('La transferencia ya ha sido completada.');
+    }
+
+    if (tData.status === 'pending') {
+      throw new Error('La transferencia debe aprobarse antes de recibirla.');
     }
 
     if (tData.status !== 'approved' && tData.status !== 'in_transit') {
@@ -1765,6 +1801,7 @@ export const completeStockTransfer = async (
       updatedAt: serverTimestamp(),
     });
   });
+  sharedRequestCache.invalidatePrefix('stock_transfers:');
 };
 
 /**
@@ -1773,103 +1810,113 @@ export const completeStockTransfer = async (
 export const getStockTransfers = async (
   accountId: string,
   branchId?: string,
-  status?: string
+  status?: string,
+  options?: { forceRefresh?: boolean }
 ): Promise<StockTransfer[]> => {
+  if (!accountId) return [];
+  const cacheKey = `stock_transfers:${accountId}:${branchId || 'all'}:${status || 'all'}`;
   try {
-    const coll = collection(db, TRANSFERS_COLLECTION);
-    const constraints: any[] = [where('accountId', '==', accountId)];
+    return await sharedRequestCache.getOrLoad(
+      cacheKey,
+      45_000,
+      async () => {
+        const coll = collection(db, TRANSFERS_COLLECTION);
+        const constraints: any[] = [where('accountId', '==', accountId)];
 
-    if (status) {
-      constraints.push(where('status', '==', status));
-    }
+        if (status) {
+          constraints.push(where('status', '==', status));
+        }
 
-    let snapshot;
-    try {
-      const q = query(
-        coll,
-        ...constraints,
-        orderBy('createdAt', 'desc'),
-        firestoreLimit(100)
-      );
-      snapshot = await getDocs(q);
-    } catch (err: any) {
-      const code = String(err?.code || '').toLowerCase();
-      const msg = String(err?.message || '').toLowerCase();
-      const isIndexError =
-        code === 'failed-precondition' ||
-        msg.includes('requires an index') ||
-        msg.includes('failed-precondition');
-      if (!isIndexError) throw err;
-      console.warn('[InventoryService] Índice faltante en getStockTransfers, usando fallback sin orderBy:', err?.message || err);
-      const fallbackQ = query(coll, ...constraints, firestoreLimit(100));
-      snapshot = await getDocs(fallbackQ);
-    }
+        const indexKey = `transfers:${status ? 'status' : 'all'}`;
+        let snapshot;
+        if (missingInventoryIndexes.has(indexKey)) {
+          snapshot = await getDocs(query(coll, ...constraints, firestoreLimit(100)));
+        } else {
+          try {
+            const q = query(
+              coll,
+              ...constraints,
+              orderBy('createdAt', 'desc'),
+              firestoreLimit(100)
+            );
+            snapshot = await getDocs(q);
+          } catch (err: any) {
+            if (!isMissingInventoryIndexError(err)) throw err;
+            missingInventoryIndexes.add(indexKey);
+            console.warn('[InventoryService] Índice faltante en getStockTransfers, usando fallback sin orderBy:', err?.message || err);
+            const fallbackQ = query(coll, ...constraints, firestoreLimit(100));
+            snapshot = await getDocs(fallbackQ);
+          }
+        }
 
-    let transfers: StockTransfer[] = snapshot.docs.map((d) => {
-      const data = d.data();
-      const srcId = data.sourceBranchId || data.fromBranchId || '';
-      const destId = data.destinationBranchId || data.toBranchId || '';
-      const srcName = data.sourceBranchName || data.fromBranchName || '';
-      const destName = data.destinationBranchName || data.toBranchName || '';
+        let transfers: StockTransfer[] = snapshot.docs.map((d) => {
+          const data = d.data();
+          const srcId = data.sourceBranchId || data.fromBranchId || '';
+          const destId = data.destinationBranchId || data.toBranchId || '';
+          const srcName = data.sourceBranchName || data.fromBranchName || '';
+          const destName = data.destinationBranchName || data.toBranchName || '';
 
-      const rawItems: any[] = data.items || data.products || [];
-      const normalizedItems: TransferItem[] = rawItems.map((it: any) => ({
-        productId: it.productId,
-        productName: it.productName || it.name || 'Producto',
-        sku: it.sku || '',
-        quantity: Number(it.quantity) || 0,
-        ...(it.variantId ? { variantId: it.variantId, variantName: it.variantName || '' } : {}),
-      }));
+          const rawItems: any[] = data.items || data.products || [];
+          const normalizedItems: TransferItem[] = rawItems.map((it: any) => ({
+            productId: it.productId,
+            productName: it.productName || it.name || 'Producto',
+            sku: it.sku || '',
+            quantity: Number(it.quantity) || 0,
+            ...(it.variantId ? { variantId: it.variantId, variantName: it.variantName || '' } : {}),
+          }));
 
-      const normalizedProducts = rawItems.map((it: any) => ({
-        productId: it.productId,
-        name: it.productName || it.name || 'Producto',
-        productName: it.productName || it.name || 'Producto',
-        sku: it.sku || '',
-        quantity: Number(it.quantity) || 0,
-        ...(it.variantId ? { variantId: it.variantId, variantName: it.variantName || '' } : {}),
-      }));
+          const normalizedProducts = rawItems.map((it: any) => ({
+            productId: it.productId,
+            name: it.productName || it.name || 'Producto',
+            productName: it.productName || it.name || 'Producto',
+            sku: it.sku || '',
+            quantity: Number(it.quantity) || 0,
+            ...(it.variantId ? { variantId: it.variantId, variantName: it.variantName || '' } : {}),
+          }));
 
-      return {
-        id: d.id,
-        transferNumber: data.transferNumber || `TRF-${d.id.slice(-4).toUpperCase()}`,
-        ...data,
-        sourceBranchId: srcId,
-        destinationBranchId: destId,
-        fromBranchId: srcId,
-        toBranchId: destId,
-        sourceBranchName: srcName,
-        destinationBranchName: destName,
-        fromBranchName: srcName,
-        toBranchName: destName,
-        items: normalizedItems,
-        products: normalizedProducts,
-      } as StockTransfer;
-    });
+          return {
+            id: d.id,
+            transferNumber: data.transferNumber || `TRF-${d.id.slice(-4).toUpperCase()}`,
+            ...data,
+            sourceBranchId: srcId,
+            destinationBranchId: destId,
+            fromBranchId: srcId,
+            toBranchId: destId,
+            sourceBranchName: srcName,
+            destinationBranchName: destName,
+            fromBranchName: srcName,
+            toBranchName: destName,
+            items: normalizedItems,
+            products: normalizedProducts,
+          } as StockTransfer;
+        });
 
-    if (branchId && branchId !== 'all') {
-      transfers = transfers.filter(
-        (t) =>
-          t.sourceBranchId === branchId ||
-          t.destinationBranchId === branchId ||
-          t.fromBranchId === branchId ||
-          t.toBranchId === branchId
-      );
-    }
+        if (branchId && branchId !== 'all') {
+          transfers = transfers.filter(
+            (t) =>
+              t.sourceBranchId === branchId ||
+              t.destinationBranchId === branchId ||
+              t.fromBranchId === branchId ||
+              t.toBranchId === branchId
+          );
+        }
 
-    // Ordenar descendente por fecha
-    transfers.sort((a, b) => {
-      const getTimestamp = (obj: any) => {
-        const t = obj?.requestedAt || obj?.sentAt || obj?.createdAt;
-        if (!t) return 0;
-        if (typeof t === 'object' && 'seconds' in t) return t.seconds * 1000;
-        if (t instanceof Date) return t.getTime();
-        return Number(t) || 0;
-      };
-      return getTimestamp(b) - getTimestamp(a);
-    });
+        // Ordenar descendente por fecha
+        transfers.sort((a, b) => {
+          const getTimestamp = (obj: any) => {
+            const t = obj?.requestedAt || obj?.sentAt || obj?.createdAt;
+            if (!t) return 0;
+            if (typeof t === 'object' && 'seconds' in t) return t.seconds * 1000;
+            if (t instanceof Date) return t.getTime();
+            return Number(t) || 0;
+          };
+          return getTimestamp(b) - getTimestamp(a);
+        });
 
-    return transfers;
+        return transfers;
+      },
+      { forceRefresh: options?.forceRefresh }
+    );
   } catch (err) {
     console.error('[InventoryService] Error obteniendo transferencias:', err);
     return [];

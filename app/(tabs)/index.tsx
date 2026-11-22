@@ -88,11 +88,13 @@ const PosProductCard = React.memo<PosProductCardProps>(
 
     return (
       <TouchableOpacity
-        style={styles.productCard}
+        style={[styles.productCard, isOutOfStock && styles.productCardDisabled]}
         onPress={handlePress}
+        disabled={isOutOfStock}
         accessibilityRole="button"
+        accessibilityState={{ disabled: isOutOfStock }}
         accessibilityLabel={`Agregar ${item.name}, ${formattedPrice}${isOutOfStock ? ', agotado' : `, stock ${stock}`}`}
-        activeOpacity={0.7}
+        activeOpacity={isOutOfStock ? 1 : 0.7}
       >
         <View style={styles.productInfo}>
           <Text style={styles.productName} numberOfLines={1}>
@@ -131,8 +133,8 @@ const PosProductCard = React.memo<PosProductCardProps>(
 
         <View style={styles.productPriceCol}>
           <Text style={styles.productPrice}>{formattedPrice}</Text>
-          <View style={styles.addPlusBtn}>
-            <Plus size={16} color={ui.onPrimary} />
+          <View style={[styles.addPlusBtn, isOutOfStock && styles.addPlusBtnDisabled]}>
+            <Plus size={16} color={isOutOfStock ? ui.textMuted : ui.onPrimary} />
           </View>
         </View>
       </TouchableOpacity>
@@ -462,8 +464,8 @@ export default function PosCounterScreen() {
   const handleSelectSize = useCallback((s: string) => setSelectedSize(s), []);
   const handleClearSize = useCallback(() => setSelectedSize('Todas'), []);
 
-  const posFilterGroups: FilterGroup[] = useMemo(
-    () => [
+  const posFilterGroups: FilterGroup[] = useMemo(() => {
+    const groups: FilterGroup[] = [
       {
         id: 'category',
         label: 'Categorías',
@@ -473,40 +475,45 @@ export default function PosCounterScreen() {
         onClear: handleClearCategory,
         icon: 'category',
       },
-      {
-        id: 'brand',
-        label: 'Marcas',
-        selectedValue: selectedBrand,
-        options: brandOptions,
-        onSelect: handleSelectBrand,
-        onClear: handleClearBrand,
-        icon: 'brand' as const,
-      },
-      {
-        id: 'size',
-        label: 'Medidas',
-        selectedValue: selectedSize,
-        options: sizeOptions,
-        onSelect: handleSelectSize,
-        onClear: handleClearSize,
-        icon: 'size' as const,
-      },
-    ],
-    [
-      selectedCategory,
-      categoryListWithCounts,
-      handleSelectCategory,
-      handleClearCategory,
-      selectedBrand,
-      brandOptions,
-      handleSelectBrand,
-      handleClearBrand,
-      selectedSize,
-      sizeOptions,
-      handleSelectSize,
-      handleClearSize,
-    ]
-  );
+    ];
+    if (enableCatalogFilters) {
+      groups.push(
+        {
+          id: 'brand',
+          label: 'Marcas',
+          selectedValue: selectedBrand,
+          options: brandOptions,
+          onSelect: handleSelectBrand,
+          onClear: handleClearBrand,
+          icon: 'brand' as const,
+        },
+        {
+          id: 'size',
+          label: 'Medidas',
+          selectedValue: selectedSize,
+          options: sizeOptions,
+          onSelect: handleSelectSize,
+          onClear: handleClearSize,
+          icon: 'size' as const,
+        }
+      );
+    }
+    return groups;
+  }, [
+    enableCatalogFilters,
+    selectedCategory,
+    categoryListWithCounts,
+    handleSelectCategory,
+    handleClearCategory,
+    selectedBrand,
+    brandOptions,
+    handleSelectBrand,
+    handleClearBrand,
+    selectedSize,
+    sizeOptions,
+    handleSelectSize,
+    handleClearSize,
+  ]);
 
   const handleOpenPausedModal = useCallback(() => setPausedModalOpen(true), []);
   const handleClosePausedModal = useCallback(() => setPausedModalOpen(false), []);
@@ -518,6 +525,9 @@ export default function PosCounterScreen() {
   // Selección manual de producto desde el catálogo
   const handleProductSelect = useCallback(
     (product: Product) => {
+      if (getProductStock(product) <= 0) {
+        return;
+      }
       const hasPresentations =
         Array.isArray(product.presentations) && product.presentations.length > 0;
       const hasVariants = Array.isArray(product.variants) && product.variants.length > 0;
@@ -536,7 +546,7 @@ export default function PosCounterScreen() {
         addItem(product, { quantity: 1 });
       }
     },
-    [addItem]
+    [addItem, getProductStock]
   );
 
   const keyExtractor = useCallback((item: Product) => item.id, []);
@@ -606,7 +616,7 @@ export default function PosCounterScreen() {
         quantity: opts.quantity,
       });
     },
-    [addItem]
+    [addItem, getProductStock]
   );
   const handleCloseWeightModal = useCallback(() => setWeightModalProduct(null), []);
   const handleConfirmWeightModal = useCallback(
@@ -619,7 +629,7 @@ export default function PosCounterScreen() {
         isWeightBased: true,
       });
     },
-    [addItem]
+    [addItem, getProductStock]
   );
   const handleCloseCompanionScanner = useCallback(() => setCompanionScannerOpen(false), []);
   const handleCloseQuotesModal = useCallback(() => setQuotesModalOpen(false), []);
@@ -1091,6 +1101,12 @@ const styles = StyleSheet.create({
     backgroundColor: ui.primary,
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  addPlusBtnDisabled: {
+    backgroundColor: ui.border,
+  },
+  productCardDisabled: {
+    opacity: 0.72,
   },
   quickSaleToast: {
     position: 'absolute',

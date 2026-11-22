@@ -426,8 +426,99 @@ export const saveCustomer = async (
     await updateDoc(docRef, payload);
   }
 
-  sharedRequestCache.invalidatePrefix(`customers:${customer.accountId}:`);
+  sharedRequestCache.invalidatePrefix(`customers:${customer.accountId}`);
   return customerId;
+};
+
+const GENERIC_CUSTOMER_NAMES = new Set([
+  'público general',
+  'publico general',
+  'cliente varios',
+  'clientes varios',
+]);
+
+/**
+ * Sincroniza el teléfono/WhatsApp (y dirección si falta) de un cliente tras una venta o reserva.
+ * Si el cliente ya existe en `customers`, actualiza su teléfono cuando cambia; si es nuevo y tiene
+ * nombre real, lo registra en el directorio para futuras ventas y reservas.
+ */
+export const syncCustomerContactInfo = async (params: {
+  accountId: string;
+  customerId?: string;
+  name?: string;
+  documentNumber?: string;
+  dni?: string;
+  ruc?: string;
+  phone?: string;
+  address?: string;
+}): Promise<string | null> => {
+  const accountId = params.accountId?.trim();
+  const cleanPhone = params.phone?.trim() || '';
+  if (!accountId || !cleanPhone) return null;
+
+  const cleanName = params.name?.trim() || '';
+  const cleanDni = params.dni?.trim().replace(/\D/g, '') || '';
+  const cleanRuc = params.ruc?.trim().replace(/\D/g, '') || '';
+  const cleanDoc = params.documentNumber?.trim() || cleanRuc || cleanDni || '';
+  const isGenericName = !cleanName || GENERIC_CUSTOMER_NAMES.has(cleanName.toLowerCase());
+
+  if (!params.customerId && isGenericName && !cleanDoc) {
+    return null;
+  }
+
+  try {
+    const existingList = await getCustomers(accountId);
+    const normalizedName = cleanName.toLowerCase();
+
+    const matched =
+      (params.customerId ? existingList.find((c) => c.id === params.customerId) : undefined) ||
+      (cleanDoc
+        ? existingList.find((c) => {
+            const cDoc = ((c as any).documentNumber || c.dni || c.ruc || '').trim();
+            return cDoc === cleanDoc;
+          })
+        : undefined) ||
+      (!isGenericName
+        ? existingList.find((c) => (c.name || '').trim().toLowerCase() === normalizedName)
+        : undefined);
+
+    if (matched) {
+      const prevPhone = (matched.phone || (matched as any).whatsapp || '').trim();
+      const prevAddress = (matched.address || '').trim();
+      const nextAddress = params.address?.trim() || '';
+      const updates: Record<string, any> = {};
+      if (prevPhone !== cleanPhone) {
+        updates.phone = cleanPhone;
+      }
+      if (nextAddress && !prevAddress) {
+        updates.address = nextAddress;
+      }
+      if (Object.keys(updates).length > 0) {
+        updates.updatedAt = serverTimestamp();
+        await updateDoc(doc(db, CUSTOMERS_COLLECTION, matched.id), updates);
+        sharedRequestCache.invalidatePrefix(`customers:${accountId}`);
+      }
+      return matched.id;
+    }
+
+    if (isGenericName) return null;
+
+    const newId = await saveCustomer({
+      accountId,
+      name: cleanName,
+      documentNumber: cleanDoc || undefined,
+      documentType: cleanRuc ? 'RUC' : 'DNI',
+      dni: cleanDni || undefined,
+      ruc: cleanRuc || undefined,
+      phone: cleanPhone,
+      address: params.address?.trim() || undefined,
+    } as any);
+    sharedRequestCache.invalidatePrefix(`customers:${accountId}`);
+    return newId;
+  } catch (err) {
+    console.warn('[CRMService] No se pudo sincronizar teléfono del cliente:', err);
+    return null;
+  }
 };
 
 /**
@@ -2142,6 +2233,7 @@ export const askVentyAI = async (
 export default {
   getCustomers,
   saveCustomer,
+  syncCustomerContactInfo,
   registerFiadoPayment,
   getCustomerFiadoHistory,
   returnFiadoMerchandise,

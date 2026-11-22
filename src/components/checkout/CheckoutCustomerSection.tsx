@@ -276,7 +276,7 @@ export const CheckoutCustomerSection = React.memo<CheckoutCustomerSectionProps>(
         const name = (c.name || '').toLowerCase();
         const dni = (c.dni || '').toLowerCase();
         const ruc = (c.ruc || '').toLowerCase();
-        const phone = (c.phone || '').toLowerCase();
+        const phone = (c.phone || (c as any).whatsapp || '').toLowerCase();
         return name.includes(q) || dni.includes(q) || ruc.includes(q) || phone.includes(q);
       })
       .slice(0, 12);
@@ -320,7 +320,7 @@ export const CheckoutCustomerSection = React.memo<CheckoutCustomerSectionProps>(
       }
     }
     setCustomerAddress(c.address || '');
-    setCustomerPhone(c.phone || '');
+    setCustomerPhone((c.phone || (c as any).whatsapp || '').trim());
     setCustomerSearchQuery('');
     onCloseCustomerPicker();
     setDocSearchSuccess(`Cliente: ${c.name}`);

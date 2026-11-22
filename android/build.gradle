@@ -24,9 +24,6 @@ buildscript {
 apply plugin: "com.facebook.react.rootproject"
 
 allprojects {
-    configurations.all {
-        exclude group: 'com.github.bumptech.glide', module: 'avif-integration'
-    }
     repositories {
         maven {
             // All of React Native (JS, Obj-C sources, Android binaries) is installed from npm

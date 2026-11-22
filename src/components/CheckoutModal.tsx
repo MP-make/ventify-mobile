@@ -42,7 +42,7 @@ import {
   SaleSellerOption,
 } from '@/services/sale-service';
 import { enqueueOfflineSale } from '@/services/offline-sync-service';
-import { getCustomers } from '@/services/crm-operations-service';
+import { getCustomers, syncCustomerContactInfo } from '@/services/crm-operations-service';
 import { createQuote } from '@/services/enterprise-ops-service';
 import { presentationFactor } from '@/lib/presentation-parity';
 import {
@@ -1215,6 +1215,31 @@ const CheckoutModalContent: React.FC<CheckoutModalProps> = React.memo(({
       checkoutOperationId.current = null;
       setIsSuccessView(true);
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+
+      if (accountId && resolvedCustomerPhone) {
+        void syncCustomerContactInfo({
+          accountId,
+          customerId: selectedCustomer?.id,
+          name: resolvedCustomerName,
+          documentNumber:
+            (docType === 'factura' || boletaUsesRuc ? cleanRuc : cleanDni) || undefined,
+          dni: cleanDni || undefined,
+          ruc: cleanRuc || undefined,
+          phone: resolvedCustomerPhone,
+          address: resolvedCustomerAddress,
+        }).then((savedCustomerId) => {
+          if (!savedCustomerId) return;
+          setCustomersList((prev) => {
+            const idx = prev.findIndex((c) => c.id === savedCustomerId);
+            if (idx >= 0) {
+              const next = [...prev];
+              next[idx] = { ...next[idx], phone: resolvedCustomerPhone };
+              return next;
+            }
+            return prev;
+          });
+        });
+      }
 
       // Diferir limpieza de carrito al siguiente frame para no colisionar con el render del ticket y QR
       requestAnimationFrame(() => {

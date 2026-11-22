@@ -594,8 +594,8 @@ export default function CatalogInventoryScreen() {
   const handleSelectSize = useCallback((s: string) => setSelectedSize(s), []);
   const handleClearSize = useCallback(() => setSelectedSize('Todas'), []);
 
-  const catalogFilterGroups: FilterGroup[] = useMemo(
-    () => [
+  const catalogFilterGroups: FilterGroup[] = useMemo(() => {
+    const groups: FilterGroup[] = [
       {
         id: 'category',
         label: 'Categorías',
@@ -605,40 +605,45 @@ export default function CatalogInventoryScreen() {
         onClear: handleClearCategory,
         icon: 'category',
       },
-      {
-        id: 'brand',
-        label: 'Marcas',
-        selectedValue: selectedBrand,
-        options: brandOptions,
-        onSelect: handleSelectBrand,
-        onClear: handleClearBrand,
-        icon: 'brand' as const,
-      },
-      {
-        id: 'size',
-        label: 'Medidas',
-        selectedValue: selectedSize,
-        options: sizeOptions,
-        onSelect: handleSelectSize,
-        onClear: handleClearSize,
-        icon: 'size' as const,
-      },
-    ],
-    [
-      selectedCategory,
-      categoryListWithCounts,
-      handleSelectCategory,
-      handleClearCategory,
-      selectedBrand,
-      brandOptions,
-      handleSelectBrand,
-      handleClearBrand,
-      selectedSize,
-      sizeOptions,
-      handleSelectSize,
-      handleClearSize,
-    ]
-  );
+    ];
+    if (showAttributes) {
+      groups.push(
+        {
+          id: 'brand',
+          label: 'Marcas',
+          selectedValue: selectedBrand,
+          options: brandOptions,
+          onSelect: handleSelectBrand,
+          onClear: handleClearBrand,
+          icon: 'brand' as const,
+        },
+        {
+          id: 'size',
+          label: 'Medidas',
+          selectedValue: selectedSize,
+          options: sizeOptions,
+          onSelect: handleSelectSize,
+          onClear: handleClearSize,
+          icon: 'size' as const,
+        }
+      );
+    }
+    return groups;
+  }, [
+    showAttributes,
+    selectedCategory,
+    categoryListWithCounts,
+    handleSelectCategory,
+    handleClearCategory,
+    selectedBrand,
+    brandOptions,
+    handleSelectBrand,
+    handleClearBrand,
+    selectedSize,
+    sizeOptions,
+    handleSelectSize,
+    handleClearSize,
+  ]);
 
   // Modal de Producto (Crear / Editar)
   const [productModalOpen, setProductModalOpen] = useState(false);

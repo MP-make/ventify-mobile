@@ -10,7 +10,6 @@ module.exports = function (api) {
     presets: ['babel-preset-expo'],
     plugins: [
       ...(isProd ? ['transform-remove-console'] : []),
-      './plugins/babel-plugin-lucide-direct-imports',
     ],
   };
 };

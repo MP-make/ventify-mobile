@@ -176,13 +176,44 @@ function SessionWorkspace() {
   );
 }
 
+class RootErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  { error: Error | null }
+> {
+  state: { error: Error | null } = { error: null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+
+  componentDidCatch() {
+    SplashScreen.hideAsync().catch(() => {});
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <View style={styles.loadingContainer}>
+          <Text style={styles.brandSubtitle}>No se pudo iniciar Ventify POS</Text>
+          <Text style={[styles.brandSubtitle, { fontWeight: '400', textAlign: 'center', marginTop: 8 }]}>
+            {this.state.error.message || 'Error inesperado de arranque'}
+          </Text>
+        </View>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 export default function RootLayout() {
   return (
-    <SafeAreaProvider initialMetrics={initialWindowMetrics}>
-      <AuthProvider>
-        <SessionWorkspace />
-      </AuthProvider>
-    </SafeAreaProvider>
+    <RootErrorBoundary>
+      <SafeAreaProvider initialMetrics={initialWindowMetrics}>
+        <AuthProvider>
+          <SessionWorkspace />
+        </AuthProvider>
+      </SafeAreaProvider>
+    </RootErrorBoundary>
   );
 }
 

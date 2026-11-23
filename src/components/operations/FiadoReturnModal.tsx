@@ -15,6 +15,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
 import { X } from 'lucide-react-native';
 import { formatPEN, ui } from '@/lib/theme';
+import { assertOnlineForWrite } from '@/lib/online-guard';
 import { returnFiadoMerchandise, type OpenFiado } from '@/services/crm-operations-service';
 import { operationsStyles as styles } from './operationsStyles';
 import type { OperationsUserProfileRef, OperationsUserRef } from './types';
@@ -103,6 +104,7 @@ export const FiadoReturnModal = React.memo<FiadoReturnModalProps>(({
 
     setIsSubmittingFiadoReturn(true);
     try {
+      await assertOnlineForWrite('registrar una devolución de fiado');
       const res = await returnFiadoMerchandise({
         accountId,
         reservationId: fiado.id,

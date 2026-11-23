@@ -61,7 +61,13 @@ import {
 } from '@/lib/role-permissions';
 import { cartStorageKeys } from '@/lib/cart-scope';
 import { cartKVStorage, catalogKVStorage, metaKVStorage } from '@/lib/native-kv-storage';
-import { productCatalogCacheKey } from '@/lib/product-catalog-cache';
+import {
+  productCatalogCacheKey,
+  productCatalogDeltaKey,
+} from '@/lib/product-catalog-cache';
+import { offlineSyncService } from '@/services/offline-sync-service';
+import { offlineInventoryService } from '@/services/offline-inventory-service';
+import { offlineCashService } from '@/services/offline-cash-service';
 import {
   PIN_MIN_LENGTH,
   createStoredPinRecord,
@@ -852,11 +858,46 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         const settingsKey = `${SETTINGS_CACHE_PREFIX}${accountToClear}`;
         metaKeysToRemove.add(settingsKey);
         asyncKeysToRemove.add(settingsKey);
+        catalogKeysToRemove.push(productCatalogDeltaKey(accountToClear));
       }
       if (uidToClear && accountToClear) {
         const planKey = `${PLAN_CACHE_PREFIX}${uidToClear}:${accountToClear}`;
         metaKeysToRemove.add(planKey);
         asyncKeysToRemove.add(planKey);
+      }
+
+      try {
+        if (typeof metaKVStorage.getAllKeys === 'function') {
+          const metaKeys = await metaKVStorage.getAllKeys();
+          for (const key of metaKeys) {
+            if (
+              key.startsWith(PLAN_CACHE_PREFIX) ||
+              key.startsWith(USER_PROFILE_CACHE_PREFIX) ||
+              key.startsWith(SETTINGS_CACHE_PREFIX) ||
+              key.startsWith(CASH_SESSION_CACHE_PREFIX)
+            ) {
+              metaKeysToRemove.add(key);
+            }
+          }
+        }
+      } catch {
+        // Ignore MMKV key enumeration failure
+      }
+
+      try {
+        if (typeof catalogKVStorage.getAllKeys === 'function') {
+          const catKeys = await catalogKVStorage.getAllKeys();
+          for (const key of catKeys) {
+            if (
+              key.startsWith('@ventify_catalog_delta_v1:') ||
+              key.startsWith('@ventify_product_catalog:')
+            ) {
+              catalogKeysToRemove.push(key);
+            }
+          }
+        }
+      } catch {
+        // Ignore MMKV catalog key enumeration failure
       }
 
       try {
@@ -1908,6 +1949,15 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     void refreshAccess();
     const foreground = AppState.addEventListener('change', (state) => {
       if (state === 'active') {
+        void NetInfo.fetch()
+          .then((netState) => {
+            const online = Boolean(
+              netState.isConnected && netState.isInternetReachable !== false
+            );
+            isOnlineRef.current = online;
+            setIsOnline(online);
+          })
+          .catch(() => {});
         const now = Date.now();
         setAccessClock((prevClock) => {
           const prevReason = accessBlockReason(
@@ -2081,6 +2131,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const accountToClear = accountId ?? lastSessionRef.current.accountId;
     setLoading(true);
     try {
+      offlineSyncService.cancelPendingWork();
+      offlineInventoryService.cancelPendingWork();
+      offlineCashService.cancelPendingWork();
       await signOut(auth);
       lastSessionRef.current = { uid: null, accountId: null };
       identityRef.current = ':';
@@ -2093,6 +2146,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       lastWrittenProfileRef.current = null;
       lastWrittenAccountIdRef.current = null;
       lastWrittenBranchIdRef.current = null;
+      storedPinRawRef.current = null;
+      pinMetaLoadedRef.current = false;
+      setHasConfiguredPin(false);
       setUser(null);
       setUserProfile(null);
       setAccountId(null);
@@ -2111,7 +2167,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setPinAttemptState(resetAttempts);
       await Promise.all([
         removeMetaItem(STORAGE_PIN_ATTEMPTS_KEY),
+        removeMetaItem(SECURE_PIN_KEY),
         AsyncStorage.removeItem(STORAGE_PIN_ATTEMPTS_KEY).catch(() => {}),
+        AsyncStorage.removeItem(SECURE_PIN_KEY).catch(() => {}),
+        SecureStore.deleteItemAsync(SECURE_PIN_KEY).catch(() => {}),
       ]);
       await clearSessionCaches(uidToClear, accountToClear);
     } finally {

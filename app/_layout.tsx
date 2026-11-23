@@ -73,6 +73,7 @@ const RootNavigationLayout = React.memo(function RootNavigationLayout() {
         <Stack.Screen name="facturacion" options={{ headerShown: false }} />
         <Stack.Screen name="branches" options={{ headerShown: false }} />
         <Stack.Screen name="notifications" options={{ headerShown: false }} />
+        <Stack.Screen name="suppliers" options={{ headerShown: false }} />
       </Stack>
 
       <GlobalPinLockGate />

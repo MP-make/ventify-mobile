@@ -9,6 +9,7 @@ import {
 } from 'react-native';
 import { CheckCircle2, Coins } from 'lucide-react-native';
 import { formatPEN, ui } from '@/lib/theme';
+import { assertOnlineForWrite } from '@/lib/online-guard';
 import { openCashSession } from '@/services/cash-register-service';
 import { operationsStyles as styles } from './operationsStyles';
 import type { OperationsUserProfileRef, OperationsUserRef } from './types';
@@ -49,6 +50,7 @@ export const OpenCashCard = React.memo<OpenCashCardProps>(({
 
     setIsOpeningSession(true);
     try {
+      await assertOnlineForWrite('abrir una sesión de caja');
       await openCashSession({
         accountId,
         branchId,

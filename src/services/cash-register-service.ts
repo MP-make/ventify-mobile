@@ -471,6 +471,7 @@ export interface RegisterCashMovementParams {
   userId: string;
   userName: string;
   userRole?: string;
+  offlineId?: string;
 }
 
 export interface AuthorizeExpenseParams {
@@ -888,6 +889,7 @@ export const registerCashMovement = async (
     userId,
     userName,
     userRole,
+    offlineId,
   } = params;
 
   if (!sessionId || !accountId || !branchId) {
@@ -913,14 +915,23 @@ export const registerCashMovement = async (
     (type === 'income' ? 'manual_income' : expenseCategoryId || 'manual_expense');
 
   const sessionRef = doc(db, CASH_SESSIONS_COLLECTION, sessionId);
-  const movementRef = doc(collection(db, CASH_MOVEMENTS_COLLECTION));
+  const movementRef = offlineId
+    ? doc(db, CASH_MOVEMENTS_COLLECTION, offlineId)
+    : doc(collection(db, CASH_MOVEMENTS_COLLECTION));
   const movementId = movementRef.id;
 
   const normalizedAmount = Math.round(amount * 100) / 100;
   const signedAmount = type === 'expense' ? -normalizedAmount : normalizedAmount;
 
   await runTransaction(db, async (tx) => {
-    const sessionSnap = await tx.get(sessionRef);
+    const [sessionSnap, existingMovSnap] = offlineId
+      ? await Promise.all([tx.get(sessionRef), tx.get(movementRef)])
+      : [await tx.get(sessionRef), null];
+
+    if (existingMovSnap?.exists()) {
+      return;
+    }
+
     if (!sessionSnap.exists()) {
       throw new Error(`La sesión de caja "${sessionId}" no existe.`);
     }
@@ -958,6 +969,7 @@ export const registerCashMovement = async (
       createdBy: userId,
       createdByName: userName,
       createdAt: serverTimestamp(),
+      ...(offlineId ? { offlineId } : {}),
     };
     if (type === 'expense' && expenseCategoryId) {
       movementPayload.expenseCategoryId = expenseCategoryId;

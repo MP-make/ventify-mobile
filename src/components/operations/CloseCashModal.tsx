@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -13,6 +13,7 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Check, CheckCircle2, Lock, Printer, X } from 'lucide-react-native';
 import { formatPEN, ui } from '@/lib/theme';
+import { checkIsOnlineLive } from '@/lib/online-guard';
 import { closeCashSession } from '@/services/cash-register-service';
 import { processOfflineQueue } from '@/services/offline-sync-service';
 import {
@@ -31,10 +32,12 @@ export interface CloseCashModalProps {
   activeCashSession: { id?: string; sessionId?: string } | null;
   expectedCashAmount: number;
   offlinePendingCount: number;
+  quarantinedCount?: number;
   isOnline: boolean;
   isSupervisor: boolean;
   user: OperationsUserRef | null;
   userProfile?: OperationsUserProfileRef | null;
+  onSyncNow?: () => Promise<any>;
   onSyncedOffline: () => void;
   onClosed: (report: any) => void;
 }
@@ -47,24 +50,30 @@ export const CloseCashModal = React.memo<CloseCashModalProps>(({
   activeCashSession,
   expectedCashAmount,
   offlinePendingCount,
+  quarantinedCount = 0,
   isOnline,
   isSupervisor,
   user,
   userProfile,
+  onSyncNow,
   onSyncedOffline,
   onClosed,
 }) => {
   const [countedAmountInput, setCountedAmountInput] = useState<string>('');
   const [closeNotesInput, setCloseNotesInput] = useState<string>('');
   const [isClosingSession, setIsClosingSession] = useState<boolean>(false);
+  const wasVisibleRef = useRef<boolean>(false);
 
   useEffect(() => {
-    if (visible) {
+    if (visible && !wasVisibleRef.current) {
+      wasVisibleRef.current = true;
       setCountedAmountInput(
         isSupervisor && activeCashSession ? String(expectedCashAmount) : ''
       );
       setCloseNotesInput('');
       setIsClosingSession(false);
+    } else if (!visible) {
+      wasVisibleRef.current = false;
     }
   }, [visible, isSupervisor, activeCashSession, expectedCashAmount]);
 
@@ -75,22 +84,43 @@ export const CloseCashModal = React.memo<CloseCashModalProps>(({
   }, [expectedCashAmount, countedAmountInput]);
 
   const handleCloseCash = useCallback(async () => {
+    const online = await checkIsOnlineLive(isOnline);
+    if (!online) {
+      Alert.alert(
+        'Sin Conexión',
+        'Conéctate a internet para sincronizar operaciones pendientes y realizar el Cierre Z de caja.'
+      );
+      return;
+    }
+
+    if (quarantinedCount > 0) {
+      Alert.alert(
+        'Operaciones en Cuarentena',
+        `Tienes ${quarantinedCount} venta(s) offline en cuarentena que requieren revisión en Ajustes → Impresora y Modo Offline antes de cerrar caja.`
+      );
+      return;
+    }
+
     if (offlinePendingCount > 0) {
-      const message = `Tienes ${offlinePendingCount} venta(s) offline pendientes de sincronizar en este turno. Sincronízalas antes de cerrar caja para que el arqueo Z sea exacto.`;
-      if (isOnline && accountId) {
-        Alert.alert('Ventas Offline Pendientes', message, [
+      const message = `Tienes ${offlinePendingCount} operación(es) offline pendiente(s) de sincronizar en este turno. Sincronízalas antes de cerrar caja para que el arqueo Z sea exacto.`;
+      if (accountId) {
+        Alert.alert('Operaciones Offline Pendientes', message, [
           { text: 'Cancelar', style: 'cancel' },
           {
             text: 'Sincronizar ahora',
             onPress: async () => {
               setIsClosingSession(true);
               try {
-                await processOfflineQueue(accountId);
+                if (onSyncNow) {
+                  await onSyncNow();
+                } else {
+                  await processOfflineQueue({ accountId, force: true });
+                }
                 onSyncedOffline();
               } catch (err: any) {
                 Alert.alert(
                   'Error de sincronización',
-                  err?.message || 'No se pudieron sincronizar las ventas pendientes.'
+                  err?.message || 'No se pudieron sincronizar las operaciones pendientes.'
                 );
               } finally {
                 setIsClosingSession(false);
@@ -99,7 +129,7 @@ export const CloseCashModal = React.memo<CloseCashModalProps>(({
           },
         ]);
       } else {
-        Alert.alert('Ventas Offline Pendientes', message);
+        Alert.alert('Operaciones Offline Pendientes', message);
       }
       return;
     }
@@ -138,8 +168,10 @@ export const CloseCashModal = React.memo<CloseCashModalProps>(({
     }
   }, [
     offlinePendingCount,
+    quarantinedCount,
     isOnline,
     accountId,
+    onSyncNow,
     onSyncedOffline,
     countedAmountInput,
     activeCashSession,

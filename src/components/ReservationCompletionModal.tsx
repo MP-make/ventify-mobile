@@ -16,6 +16,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { useAuthSession } from '@/context/AuthContext';
 import { useBusinessSettings, useCashSession } from '@/context/SettingsContext';
 import { ui, formatPEN } from '@/lib/theme';
+import { assertOnlineForWrite } from '@/lib/online-guard';
 import { tryResolveCheckoutPayment } from '@/lib/checkout-payment';
 import { getAvailableSaleSellers, type SaleSellerOption } from '@/services/sale-service';
 import { completeOrCancelReservation, type ReservationOrder } from '@/services/crm-operations-service';
@@ -155,6 +156,7 @@ const ReservationCompletionModalContent: React.FC<{
 
     setBusy(true);
     try {
+      await assertOnlineForWrite('completar la entrega de una reserva');
       const seller = sellers.find((entry) => entry.id === sellerId);
       let sunatNote: string | null = null;
       await completeOrCancelReservation(

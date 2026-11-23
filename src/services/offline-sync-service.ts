@@ -11,6 +11,8 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo, { NetInfoState } from '@react-native-community/netinfo';
 import { db, auth } from '@/lib/firebase';
 import { sharedRequestCache } from '@/lib/request-cache';
+import { withTimeout } from '@/lib/online-guard';
+import type { AuthoritativeProductStockPatch } from '@/lib/offline-stock-helpers';
 import { collection, query, where, limit, getDocs, getDoc, doc } from 'firebase/firestore';
 import {
   createSaleTransaction,
@@ -74,12 +76,24 @@ export interface SyncProcessResult {
 }
 
 export interface OfflineQueueChangeEvent {
-  type: 'enqueued' | 'synced' | 'updated' | 'quarantined_changed';
+  type: 'enqueued' | 'synced' | 'item_synced' | 'updated' | 'quarantined_changed';
   queueCount: number;
   count?: number;
   items?: PendingOfflineSale[];
   successful?: number;
   quarantined?: number;
+  offlineId?: string;
+  syncedOfflineIds?: string[];
+  updatedProductStocks?: AuthoritativeProductStockPatch[];
+  quarantinedCount?: number;
+}
+
+export interface OfflineItemSyncedEvent {
+  offlineId: string;
+  affectedProductIds: string[];
+  updatedProductStocks: AuthoritativeProductStockPatch[];
+  items: PendingOfflineSale[];
+  queueCount: number;
 }
 
 export const offlineSaleBelongsToIdentity = (
@@ -145,11 +159,44 @@ export const classifySyncError = (
   const sanitizedReason = sanitizeErrorMessage(error);
   const lower = sanitizedReason.toLowerCase();
 
+  // Problemas transitorios de red (evaluar antes que "disponible" para no confundir "servicio no disponible")
+  if (
+    lower.includes('network') ||
+    lower.includes('fetch') ||
+    lower.includes('timeout') ||
+    lower.includes('abort') ||
+    lower.includes('unavailable') ||
+    lower.includes('deadline-exceeded') ||
+    lower.includes('offline') ||
+    lower.includes('could not reach') ||
+    lower.includes('connection') ||
+    lower.includes('socket') ||
+    lower.includes('dns') ||
+    lower.includes('timed out') ||
+    lower.includes('tiempo de espera') ||
+    lower.includes('sin conexión') ||
+    lower.includes('network-request-failed') ||
+    lower.includes('econnreset') ||
+    lower.includes('etimedout') ||
+    lower.includes('servicio no disponible') ||
+    lower.includes('temporalmente no disponible') ||
+    lower.includes('red no disponible') ||
+    lower.includes('servidor no disponible')
+  ) {
+    return {
+      category: 'network_error',
+      retriable: true,
+      sanitizedReason,
+    };
+  }
+
   // Stock insuficiente o inexistente
   if (
     lower.includes('stock insuficiente') ||
     lower.includes('insufficient stock') ||
-    lower.includes('disponible') ||
+    lower.includes('stock disponible') ||
+    lower.includes('disponible:') ||
+    lower.includes('sin stock') ||
     lower.includes('no existe en el catálogo')
   ) {
     return {
@@ -211,27 +258,7 @@ export const classifySyncError = (
     };
   }
 
-  // Problemas transitorios de red
-  if (
-    lower.includes('network') ||
-    lower.includes('fetch') ||
-    lower.includes('timeout') ||
-    lower.includes('abort') ||
-    lower.includes('unavailable') ||
-    lower.includes('failed-precondition') ||
-    lower.includes('deadline-exceeded') ||
-    lower.includes('offline') ||
-    lower.includes('could not reach') ||
-    lower.includes('connection') ||
-    lower.includes('socket') ||
-    lower.includes('dns') ||
-    lower.includes('timed out') ||
-    lower.includes('tiempo de espera') ||
-    lower.includes('sin conexión') ||
-    lower.includes('network-request-failed') ||
-    lower.includes('econnreset') ||
-    lower.includes('etimedout')
-  ) {
+  if (lower.includes('failed-precondition')) {
     return {
       category: 'network_error',
       retriable: true,
@@ -278,6 +305,9 @@ class OfflineSyncService {
   private static readonly REACHABILITY_BACKOFF_STEPS_MS = [5_000, 15_000, 30_000, 60_000] as const;
 
   private isProcessingInMemory = false;
+  private lockAcquiredAt = 0;
+  private activeSyncPromise: Promise<SyncProcessResult> | null = null;
+  private resyncRequested = false;
   private netInfoUnsubscribe: (() => void) | null = null;
   private networkSyncTimer: ReturnType<typeof setTimeout> | null = null;
   private retryWakeupTimer: ReturnType<typeof setTimeout> | null = null;
@@ -285,30 +315,34 @@ class OfflineSyncService {
   private queueCache: PendingOfflineSale[] | null = null;
   private reachabilityBackoffIndex = 0;
   private listeners = new Set<(event: OfflineQueueChangeEvent) => void>();
+  private itemSyncedListeners = new Set<(event: OfflineItemSyncedEvent) => void>();
 
   public resetQueueCache(): void {
     this.queueCache = null;
     this.reachabilityBackoffIndex = 0;
   }
 
+  public cancelPendingWork(): void {
+    this.resyncRequested = false;
+    this.clearNetworkSyncTimer();
+    this.clearRetryWakeupTimer();
+  }
+
   private async loadQueueLocked(): Promise<PendingOfflineSale[]> {
     if (this.queueCache !== null) {
       return [...this.queueCache];
     }
-    try {
-      const raw = await AsyncStorage.getItem(OFFLINE_QUEUE_STORAGE_KEY);
-      if (!raw) {
-        this.queueCache = [];
-        return [];
-      }
-      const parsed = JSON.parse(raw);
-      const normalized = Array.isArray(parsed) ? parsed : [];
-      this.queueCache = normalized;
-      return [...normalized];
-    } catch (err) {
-      console.error('[OfflineSync] Error al leer cola offline:', err);
+    const raw = await AsyncStorage.getItem(OFFLINE_QUEUE_STORAGE_KEY);
+    if (!raw) {
+      this.queueCache = [];
       return [];
     }
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      throw new Error('Formato inválido en cola offline almacenada.');
+    }
+    this.queueCache = parsed;
+    return [...parsed];
   }
 
   private async writeQueueLocked(nextQueue: PendingOfflineSale[]): Promise<PendingOfflineSale[]> {
@@ -327,12 +361,31 @@ class OfflineSyncService {
     };
   }
 
+  public subscribeItemSynced(
+    listener: (event: OfflineItemSyncedEvent) => void
+  ): () => void {
+    this.itemSyncedListeners.add(listener);
+    return () => {
+      this.itemSyncedListeners.delete(listener);
+    };
+  }
+
   private emitQueueChange(event: OfflineQueueChangeEvent): void {
     for (const listener of Array.from(this.listeners)) {
       try {
         listener(event);
       } catch (err) {
         console.warn('[OfflineSync] Queue change listener error:', err);
+      }
+    }
+  }
+
+  private emitItemSynced(event: OfflineItemSyncedEvent): void {
+    for (const listener of Array.from(this.itemSyncedListeners)) {
+      try {
+        listener(event);
+      } catch (err) {
+        console.warn('[OfflineSync] Item synced listener error:', err);
       }
     }
   }
@@ -362,8 +415,14 @@ class OfflineSyncService {
     salePayload: CreateSaleTransactionParams
   ): Promise<PendingOfflineSale> {
     const offlineId = salePayload.offlineId || this.generateOfflineId();
-    const { skipOfflineDedup: _omit, ...sanitizedPayload } =
-      salePayload as CreateSaleTransactionParams & { skipOfflineDedup?: unknown };
+    const {
+      skipOfflineDedup: _omitDedup,
+      onSunatResult: _omitSunatCb,
+      ...sanitizedPayload
+    } = salePayload as CreateSaleTransactionParams & {
+      skipOfflineDedup?: unknown;
+      onSunatResult?: unknown;
+    };
     const enrichedPayload: CreateSaleTransactionParams = {
       ...(sanitizedPayload as CreateSaleTransactionParams),
       offlineId,
@@ -381,12 +440,14 @@ class OfflineSyncService {
     try {
       const updatedQueue = await this.runWithQueueMutex(async () => {
         const currentQueue = await this.loadQueueLocked();
-        // Evitar duplicados por offlineId
         const filtered = currentQueue.filter((q) => q.offlineId !== offlineId);
         filtered.push(pendingItem);
 
         return await this.writeQueueLocked(filtered);
       });
+      if (this.activeSyncPromise) {
+        this.resyncRequested = true;
+      }
       this.emitQueueChange({
         type: 'enqueued',
         queueCount: updatedQueue.length,
@@ -408,7 +469,51 @@ class OfflineSyncService {
     if (this.queueCache !== null) {
       return [...this.queueCache];
     }
-    return this.runWithQueueMutex(() => this.loadQueueLocked());
+    try {
+      return await this.runWithQueueMutex(() => this.loadQueueLocked());
+    } catch (err) {
+      console.error('[OfflineSync] Error al leer cola offline:', err);
+      return [];
+    }
+  }
+
+  public async getOfflineQueueForIdentity(
+    userId: string,
+    accountId: string
+  ): Promise<PendingOfflineSale[]> {
+    const queue = await this.getOfflineQueue();
+    return queue.filter((item) =>
+      offlineSaleBelongsToIdentity(item.salePayload, userId, accountId)
+    );
+  }
+
+  /**
+   * Cancela y elimina una venta offline aún no sincronizada de la cola activa
+   */
+  public async cancelPendingOfflineSale(offlineId: string): Promise<boolean> {
+    if (!offlineId) return false;
+    try {
+      const result = await this.runWithQueueMutex(async () => {
+        const currentQueue = await this.loadQueueLocked();
+        const filtered = currentQueue.filter((q) => q.offlineId !== offlineId);
+        if (filtered.length === currentQueue.length) {
+          return { removed: false, items: currentQueue };
+        }
+        const persisted = await this.writeQueueLocked(filtered);
+        return { removed: true, items: persisted };
+      });
+      if (!result.removed) return false;
+      this.emitQueueChange({
+        type: 'updated',
+        queueCount: result.items.length,
+        count: result.items.length,
+        items: result.items,
+      });
+      return true;
+    } catch (err) {
+      console.error('[OfflineSync] Error cancelando venta offline pendiente:', err);
+      return false;
+    }
   }
 
   /**
@@ -426,10 +531,23 @@ class OfflineSyncService {
     }
   }
 
+  public async getQuarantinedSalesForIdentity(
+    userId: string,
+    accountId: string
+  ): Promise<QuarantinedOfflineSale[]> {
+    const all = await this.getQuarantinedSales();
+    return all.filter((item) =>
+      offlineSaleBelongsToIdentity(item.salePayload, userId, accountId)
+    );
+  }
+
   /**
    * Mueve una venta de cuarentena de regreso a la cola activa para reintento manual
    */
-  public async retryQuarantinedSale(offlineId: string): Promise<boolean> {
+  public async retryQuarantinedSale(
+    offlineId: string,
+    options?: { newSessionId?: string; accountId?: string }
+  ): Promise<boolean> {
     try {
       const result = await this.runWithQueueMutex(async () => {
         const quarantined = await this.getQuarantinedSales();
@@ -437,19 +555,16 @@ class OfflineSyncService {
 
         if (!target) {
           console.warn(`[OfflineSync] No se encontró la venta ${offlineId} en cuarentena.`);
-          return { moved: false, items: [] as PendingOfflineSale[] };
+          return { moved: false, items: [] as PendingOfflineSale[], accountId: undefined as string | undefined };
         }
 
-        // Remover de cuarentena
-        const remainingQuarantine = quarantined.filter((q) => q.offlineId !== offlineId);
-        await AsyncStorage.setItem(
-          QUARANTINED_STORAGE_KEY,
-          JSON.stringify(remainingQuarantine)
-        );
+        const updatedPayload: CreateSaleTransactionParams = options?.newSessionId
+          ? { ...target.salePayload, sessionId: options.newSessionId }
+          : target.salePayload;
 
-        // Re-encolar con retryCount y nextRetryAt reseteados
         const resetItem: PendingOfflineSale = {
           ...target,
+          salePayload: updatedPayload,
           retryCount: 0,
           nextRetryAt: undefined,
           status: 'pending_offline',
@@ -457,14 +572,30 @@ class OfflineSyncService {
           failureCategory: undefined,
         };
 
+        // Escritura atómica segura: escribir cola activa PRIMERO, luego remover de cuarentena
         const queue = await this.loadQueueLocked();
         const filteredQueue = queue.filter((q) => q.offlineId !== offlineId);
         filteredQueue.push(resetItem);
         const persisted = await this.writeQueueLocked(filteredQueue);
-        return { moved: true, items: persisted };
+
+        const remainingQuarantine = quarantined.filter((q) => q.offlineId !== offlineId);
+        await AsyncStorage.setItem(
+          QUARANTINED_STORAGE_KEY,
+          JSON.stringify(remainingQuarantine)
+        );
+
+        return {
+          moved: true,
+          items: persisted,
+          accountId: options?.accountId || updatedPayload.accountId,
+        };
       });
 
       if (!result.moved) return false;
+
+      if (this.activeSyncPromise) {
+        this.resyncRequested = true;
+      }
 
       this.emitQueueChange({
         type: 'quarantined_changed',
@@ -473,10 +604,9 @@ class OfflineSyncService {
         items: result.items,
       });
 
-      // Disparar procesamiento si hay internet
       const net = await NetInfo.fetch();
       if (net.isConnected && net.isInternetReachable !== false) {
-        this.processOfflineQueue().catch((e) =>
+        this.processOfflineQueue({ accountId: result.accountId, force: true }).catch((e) =>
           console.warn('[OfflineSync] Error in background retry trigger:', e)
         );
       }
@@ -515,8 +645,14 @@ class OfflineSyncService {
   /**
    * Procesa la cola de ventas offline pendientes con candado de sincronización y deduplicación
    */
-  public async processOfflineQueue(accountIdOverride?: string): Promise<SyncProcessResult> {
-    const summary: SyncProcessResult = {
+  public async processOfflineQueue(
+    accountIdOrOpts?: string | { accountId?: string; force?: boolean }
+  ): Promise<SyncProcessResult> {
+    const accountIdOverride =
+      typeof accountIdOrOpts === 'string' ? accountIdOrOpts : accountIdOrOpts?.accountId;
+    const force = typeof accountIdOrOpts === 'object' && accountIdOrOpts?.force === true;
+
+    const emptySummary: SyncProcessResult = {
       total: 0,
       processed: 0,
       successful: 0,
@@ -525,312 +661,410 @@ class OfflineSyncService {
       errors: [],
     };
 
-    if (this.isProcessingInMemory) {
-      console.log('[OfflineSync] Candado de sincronización ocupado por otro proceso.');
-      return summary;
-    }
-
-    // 0. Verificar cola local PRIMERO antes de consultar NetInfo, claims o Firestore
-    const initialQueue = await this.getOfflineQueue();
-    if (initialQueue.length === 0) {
-      this.reachabilityBackoffIndex = 0;
-      this.clearRetryWakeupTimer();
-      return summary;
-    }
-
-    // 1. Verificar estado de red
-    const netState = await NetInfo.fetch();
-    if (!netState.isConnected || netState.isInternetReachable === false) {
-      if (netState.isConnected && netState.isInternetReachable === false) {
-        const steps = OfflineSyncService.REACHABILITY_BACKOFF_STEPS_MS;
-        const delay = steps[Math.min(this.reachabilityBackoffIndex, steps.length - 1)];
-        this.reachabilityBackoffIndex = Math.min(this.reachabilityBackoffIndex + 1, steps.length - 1);
-        this.scheduleRetryWakeup(delay, accountIdOverride);
+    if (this.activeSyncPromise) {
+      if (Date.now() - this.lockAcquiredAt > SYNC_LOCK_TTL_MS) {
+        this.isProcessingInMemory = false;
+        this.activeSyncPromise = null;
       } else {
+        if (force) {
+          this.resyncRequested = true;
+        }
+        return this.activeSyncPromise;
+      }
+    }
+
+    if (this.isProcessingInMemory) {
+      if (Date.now() - this.lockAcquiredAt > SYNC_LOCK_TTL_MS) {
+        this.isProcessingInMemory = false;
+      } else {
+        console.log('[OfflineSync] Candado de sincronización ocupado por otro proceso.');
+        return emptySummary;
+      }
+    }
+
+    const executeSync = async (): Promise<SyncProcessResult> => {
+      const summary: SyncProcessResult = {
+        total: 0,
+        processed: 0,
+        successful: 0,
+        quarantined: 0,
+        retried: 0,
+        errors: [],
+      };
+
+      // 0. Verificar cola local PRIMERO antes de consultar NetInfo, claims o Firestore
+      const initialQueue = await this.getOfflineQueue();
+      if (initialQueue.length === 0) {
         this.reachabilityBackoffIndex = 0;
         this.clearRetryWakeupTimer();
-      }
-      console.log('[OfflineSync] Sin conexión a internet. Omitiendo sincronización.');
-      return summary;
-    }
-    this.reachabilityBackoffIndex = 0;
-
-    // 2. Control de concurrencia con Mutex Lock exclusivo en memoria
-    const lockAcquired = await this.acquireLock();
-    if (!lockAcquired) {
-      console.log('[OfflineSync] Candado de sincronización ocupado por otro proceso.');
-      return summary;
-    }
-
-    let emittedEvent: OfflineQueueChangeEvent | null = null;
-
-    try {
-      const queue = await this.runWithQueueMutex(() => this.loadQueueLocked());
-      summary.total = queue.length;
-
-      if (queue.length === 0) {
-        this.clearRetryWakeupTimer();
         return summary;
       }
 
-      const checkNow = Date.now();
-      const hasDueItems = queue.some(
-        (item) => typeof item.nextRetryAt !== 'number' || checkNow >= item.nextRetryAt
-      );
-      if (!hasDueItems) {
-        const futureRetryTimes = queue
-          .map((item) => item.nextRetryAt)
-          .filter((t): t is number => typeof t === 'number' && t > checkNow);
-        if (futureRetryTimes.length > 0) {
-          const earliestNextRetryAt = Math.min(...futureRetryTimes);
-          const delay = Math.max(1_500, Math.min(60_000, earliestNextRetryAt - checkNow));
+      // 1. Verificar estado de red
+      const netState = await NetInfo.fetch();
+      if (!netState.isConnected || netState.isInternetReachable === false) {
+        if (netState.isConnected && netState.isInternetReachable === false) {
+          const steps = OfflineSyncService.REACHABILITY_BACKOFF_STEPS_MS;
+          const delay = steps[Math.min(this.reachabilityBackoffIndex, steps.length - 1)];
+          this.reachabilityBackoffIndex = Math.min(this.reachabilityBackoffIndex + 1, steps.length - 1);
           this.scheduleRetryWakeup(delay, accountIdOverride);
+        } else {
+          this.reachabilityBackoffIndex = 0;
+          this.clearRetryWakeupTimer();
         }
+        console.log('[OfflineSync] Sin conexión a internet. Omitiendo sincronización.');
+        return summary;
+      }
+      this.reachabilityBackoffIndex = 0;
+
+      // 2. Control de concurrencia con Mutex Lock exclusivo en memoria
+      const lockAcquired = await this.acquireLock();
+      if (!lockAcquired) {
+        console.log('[OfflineSync] Candado de sincronización ocupado por otro proceso.');
         return summary;
       }
 
-      const currentUser = auth.currentUser;
-      if (!currentUser) return summary;
+      let emittedEvent: OfflineQueueChangeEvent | null = null;
+      const accumulatedStockPatches: AuthoritativeProductStockPatch[] = [];
+      const syncedOfflineIds: string[] = [];
 
-      let currentAccountId = accountIdOverride || '';
-      if (!currentAccountId) {
-        let claimAccountId: string | null = null;
-        try {
-          const tokenResult = await currentUser.getIdTokenResult();
-          if (auth.currentUser?.uid !== currentUser.uid) return summary;
-          claimAccountId = typeof tokenResult.claims.accountId === 'string'
-            ? tokenResult.claims.accountId
-            : null;
-        } catch {
-          // Match AuthContext: an unavailable claims read may still resolve from profile/ownership.
+      try {
+        const queue = await this.runWithQueueMutex(() => this.loadQueueLocked());
+        summary.total = queue.length;
+
+        if (queue.length === 0) {
+          this.clearRetryWakeupTimer();
+          return summary;
         }
-        let profileAccountId: string | null = null;
-        if (!claimAccountId) {
-          profileAccountId = await sharedRequestCache.getOrLoad(
-            `user_account:${currentUser.uid}`,
-            120_000,
-            async () => {
-              const userSnapshot = await getDoc(doc(db, 'users', currentUser.uid));
-              return userSnapshot.exists() && typeof userSnapshot.data()?.accountId === 'string'
-                ? String(userSnapshot.data()?.accountId)
-                : null;
-            },
-            { cacheNullish: false }
+
+        const checkNow = Date.now();
+        const hasDueItems =
+          force ||
+          queue.some(
+            (item) => typeof item.nextRetryAt !== 'number' || checkNow >= item.nextRetryAt
           );
-          if (auth.currentUser?.uid !== currentUser.uid) return summary;
+        if (!hasDueItems) {
+          const futureRetryTimes = queue
+            .map((item) => item.nextRetryAt)
+            .filter((t): t is number => typeof t === 'number' && t > checkNow);
+          if (futureRetryTimes.length > 0) {
+            const earliestNextRetryAt = Math.min(...futureRetryTimes);
+            const delay = Math.max(1_500, Math.min(60_000, earliestNextRetryAt - checkNow));
+            this.scheduleRetryWakeup(delay, accountIdOverride);
+          }
+          return summary;
         }
-        let ownedAccountId: string | null = null;
-        if (!profileAccountId && !claimAccountId) {
-          const ownedAccounts = await getDocs(query(
-            collection(db, 'accounts'),
-            where('ownerId', '==', currentUser.uid),
-            limit(1),
-          ));
-          if (ownedAccounts.docs[0]) ownedAccountId = ownedAccounts.docs[0].id;
-        }
-        if (auth.currentUser?.uid !== currentUser.uid) return summary;
-        currentAccountId = resolveOfflineSyncAccountId(claimAccountId, profileAccountId, ownedAccountId) || '';
-      }
-      if (!currentAccountId) return summary;
 
-      console.log(`[OfflineSync] Procesando ${queue.length} ventas offline pendientes...`);
+        const currentUser = auth.currentUser;
+        if (!currentUser) return summary;
 
-      const completedTimestamps = new Map<string, number>();
-      const retriedByOfflineId = new Map<string, PendingOfflineSale>();
-      const quarantinedToAdd: QuarantinedOfflineSale[] = [];
-
-      for (const item of queue) {
-        if (!offlineSaleBelongsToIdentity(item.salePayload, currentUser.uid, currentAccountId)) {
-          continue;
-        }
-        if (typeof item.nextRetryAt === 'number' && Date.now() < item.nextRetryAt) {
-          continue;
-        }
-        summary.processed++;
-
-        try {
-          // A. DEDUPLICACIÓN EN FIRESTORE
-          // Verifica si la venta ya fue registrada previamente en el servidor
-          let alreadySynced = false;
-          let dedupConfirmedNoDuplicate = false;
+        let currentAccountId = accountIdOverride || '';
+        if (!currentAccountId) {
+          let claimAccountId: string | null = null;
           try {
-            const existingQ = query(
-              collection(db, 'sales'),
-              where('accountId', '==', item.salePayload.accountId),
-              where('offlineId', '==', item.offlineId),
-              limit(1)
-            );
-            const existingSnap = await getDocs(existingQ);
-
-            if (!existingSnap.empty) {
-              console.log(
-                `[OfflineSync] Venta ${item.offlineId} ya existe en Firestore (id: ${existingSnap.docs[0].id}). Marcada como exitosa.`
+            const tokenResult = await currentUser.getIdTokenResult();
+            if (auth.currentUser?.uid !== currentUser.uid) return summary;
+            claimAccountId = typeof tokenResult.claims.accountId === 'string'
+              ? tokenResult.claims.accountId
+              : null;
+          } catch {
+            // Unavailable claims read may still resolve from profile/ownership.
+          }
+          let profileAccountId: string | null = null;
+          if (!claimAccountId) {
+            try {
+              profileAccountId = await sharedRequestCache.getOrLoad(
+                `user_account:${currentUser.uid}`,
+                120_000,
+                async () => {
+                  const userSnapshot = await getDoc(doc(db, 'users', currentUser.uid));
+                  return userSnapshot.exists() && typeof userSnapshot.data()?.accountId === 'string'
+                    ? String(userSnapshot.data()?.accountId)
+                    : null;
+                },
+                { cacheNullish: false }
               );
-              completedTimestamps.set(item.offlineId, item.timestamp);
-              summary.successful++;
-              alreadySynced = true;
-            } else {
-              dedupConfirmedNoDuplicate = true;
+            } catch {
+              profileAccountId = null;
             }
-          } catch (dedupErr) {
-            console.warn(
-              `[OfflineSync] Pre-check de deduplicación falló para ${item.offlineId}; continuando con createSaleTransaction:`,
-              sanitizeErrorMessage(dedupErr)
-            );
+            if (auth.currentUser?.uid !== currentUser.uid) return summary;
+          }
+          let ownedAccountId: string | null = null;
+          if (!profileAccountId && !claimAccountId) {
+            try {
+              const ownedAccounts = await getDocs(query(
+                collection(db, 'accounts'),
+                where('ownerId', '==', currentUser.uid),
+                limit(1),
+              ));
+              if (ownedAccounts.docs[0]) ownedAccountId = ownedAccounts.docs[0].id;
+            } catch {
+              ownedAccountId = null;
+            }
+          }
+          if (auth.currentUser?.uid !== currentUser.uid) return summary;
+          currentAccountId = resolveOfflineSyncAccountId(claimAccountId, profileAccountId, ownedAccountId) || '';
+        }
+        if (!currentAccountId) return summary;
+
+        console.log(`[OfflineSync] Procesando ${queue.length} ventas offline pendientes...`);
+
+        let latestQueueSnapshot: PendingOfflineSale[] = queue;
+
+        for (const item of queue) {
+          // Verificar sesión activa en cada iteración para nunca cuarentenar ventas tras logout
+          if (auth.currentUser?.uid !== currentUser.uid) {
+            console.warn('[OfflineSync] Usuario cambió o cerró sesión durante sincronización; abortando lote.');
+            break;
           }
 
-          if (alreadySynced) {
-            continue; // Se descarta de la cola activa
+          if (!offlineSaleBelongsToIdentity(item.salePayload, currentUser.uid, currentAccountId)) {
+            continue;
           }
-
-          // B. EJECUTAR TRANSACCIÓN ATÓMICA DE VENTA (omitir dedup duplicada cuando pre-check ya la confirmó)
-          const rawPayload = item.salePayload as CreateSaleTransactionParams & {
-            skipOfflineDedup?: unknown;
-          };
-          let payloadToSync: CreateSaleTransactionParams;
-          if (dedupConfirmedNoDuplicate) {
-            payloadToSync = {
-              ...(rawPayload as CreateSaleTransactionParams),
-              skipOfflineDedup: true,
-            };
-          } else if ('skipOfflineDedup' in rawPayload) {
-            const { skipOfflineDedup: _omit, ...rest } = rawPayload;
-            payloadToSync = rest as CreateSaleTransactionParams;
-          } else {
-            payloadToSync = item.salePayload;
+          if (!force && typeof item.nextRetryAt === 'number' && Date.now() < item.nextRetryAt) {
+            continue;
           }
-          await createSaleTransaction(payloadToSync);
+          summary.processed++;
 
-          console.log(`[OfflineSync] Venta sincronizada con éxito: ${item.offlineId}`);
-          completedTimestamps.set(item.offlineId, item.timestamp);
-          summary.successful++;
-        } catch (itemErr: any) {
-          const classified = classifySyncError(itemErr);
-          const currentRetries = (item.retryCount || 0) + 1;
-
-          console.warn(
-            `[OfflineSync] Error en venta ${item.offlineId} (intento ${currentRetries}/${MAX_OFFLINE_RETRIES}):`,
-            classified.sanitizedReason
+          const affectedProductIds = Array.from(
+            new Set(
+              (Array.isArray(item.salePayload?.items) ? item.salePayload.items : [])
+                .map((it: any) => String(it?.productId || '').split('_')[0])
+                .filter(Boolean)
+            )
           );
 
-          summary.errors.push({
-            offlineId: item.offlineId,
-            reason: classified.sanitizedReason,
-          });
+          try {
+            // A. DEDUPLICACIÓN EN FIRESTORE
+            let alreadySynced = false;
+            let dedupConfirmedNoDuplicate = false;
+            try {
+              const existingQ = query(
+                collection(db, 'sales'),
+                where('accountId', '==', item.salePayload.accountId),
+                where('offlineId', '==', item.offlineId),
+                limit(1)
+              );
+              const existingSnap = await withTimeout(
+                getDocs(existingQ),
+                15_000,
+                'Tiempo de espera agotado al verificar duplicado offline.'
+              );
 
-          // Si el error no es reintentable (conflicto de stock, precio, etc.) o excedió el límite de reintentos
-          if (!classified.retriable || currentRetries >= MAX_OFFLINE_RETRIES) {
-            console.error(
-              `[OfflineSync] Moviendo venta ${item.offlineId} a CUARENTENA (${classified.category}): ${classified.sanitizedReason}`
+              if (!existingSnap.empty) {
+                console.log(
+                  `[OfflineSync] Venta ${item.offlineId} ya existe en Firestore (id: ${existingSnap.docs[0].id}). Marcada como exitosa.`
+                );
+                alreadySynced = true;
+              } else {
+                dedupConfirmedNoDuplicate = true;
+              }
+            } catch (dedupErr) {
+              console.warn(
+                `[OfflineSync] Pre-check de deduplicación falló para ${item.offlineId}; continuando con createSaleTransaction:`,
+                sanitizeErrorMessage(dedupErr)
+              );
+            }
+
+            let txResult: CreateSaleTransactionResult | null = null;
+            if (!alreadySynced) {
+              const rawPayload = item.salePayload as CreateSaleTransactionParams & {
+                skipOfflineDedup?: unknown;
+              };
+              let payloadToSync: CreateSaleTransactionParams;
+              if (dedupConfirmedNoDuplicate) {
+                payloadToSync = {
+                  ...(rawPayload as CreateSaleTransactionParams),
+                  skipOfflineDedup: true,
+                };
+              } else if ('skipOfflineDedup' in rawPayload) {
+                const { skipOfflineDedup: _omit, ...rest } = rawPayload;
+                payloadToSync = rest as CreateSaleTransactionParams;
+              } else {
+                payloadToSync = item.salePayload;
+              }
+
+              const runCreateSale = () =>
+                withTimeout(
+                  createSaleTransaction(payloadToSync),
+                  30_000,
+                  'Tiempo de espera agotado al sincronizar venta.'
+                );
+
+              try {
+                txResult = await runCreateSale();
+              } catch (firstErr: any) {
+                const lowerMsg = String(firstErr?.message || firstErr?.code || '').toLowerCase();
+                if (lowerMsg.includes('unauthenticated') && typeof currentUser.getIdToken === 'function') {
+                  try {
+                    await currentUser.getIdToken(true);
+                    txResult = await runCreateSale();
+                  } catch (retryAuthErr) {
+                    throw retryAuthErr;
+                  }
+                } else {
+                  throw firstErr;
+                }
+              }
+            }
+
+            // Checkpoint por ítem inmediatamente después del éxito
+            latestQueueSnapshot = await this.runWithQueueMutex(async () => {
+              const latestQueue = await this.loadQueueLocked();
+              const remaining = latestQueue.filter(
+                (q) => !(q.offlineId === item.offlineId && q.timestamp <= item.timestamp)
+              );
+              return await this.writeQueueLocked(remaining);
+            });
+
+            const itemStockPatches = Array.isArray(txResult?.updatedProductStocks)
+              ? txResult.updatedProductStocks
+              : [];
+            if (itemStockPatches.length > 0) {
+              accumulatedStockPatches.push(...itemStockPatches);
+            }
+            syncedOfflineIds.push(item.offlineId);
+            summary.successful++;
+
+            this.emitItemSynced({
+              offlineId: item.offlineId,
+              affectedProductIds,
+              updatedProductStocks: itemStockPatches,
+              items: latestQueueSnapshot,
+              queueCount: latestQueueSnapshot.length,
+            });
+            console.log(`[OfflineSync] Venta sincronizada con éxito: ${item.offlineId}`);
+          } catch (itemErr: any) {
+            if (auth.currentUser?.uid !== currentUser.uid) {
+              console.warn('[OfflineSync] Error causado por cierre de sesión; preservando venta en cola.');
+              break;
+            }
+
+            const classified = classifySyncError(itemErr);
+            const currentRetries = (item.retryCount || 0) + 1;
+
+            console.warn(
+              `[OfflineSync] Error en venta ${item.offlineId} (intento ${currentRetries}/${MAX_OFFLINE_RETRIES}):`,
+              classified.sanitizedReason
             );
 
-            quarantinedToAdd.push({
-              ...item,
-              status: 'quarantined',
-              retryCount: currentRetries,
-              nextRetryAt: undefined,
-              quarantinedAt: Date.now(),
-              lastErrorReason: classified.sanitizedReason,
-              failureCategory: classified.category,
+            summary.errors.push({
+              offlineId: item.offlineId,
+              reason: classified.sanitizedReason,
             });
-            completedTimestamps.set(item.offlineId, item.timestamp);
-            summary.quarantined++;
-          } else {
-            // Reintento diferido con backoff exponencial
-            const backoffMs = Math.min(
-              RETRY_BACKOFF_MAX_MS,
-              RETRY_BACKOFF_BASE_MS * Math.pow(3, item.retryCount || 0)
-            );
-            retriedByOfflineId.set(item.offlineId, {
-              ...item,
-              retryCount: currentRetries,
-              nextRetryAt: Date.now() + backoffMs,
-              lastErrorReason: classified.sanitizedReason,
-              failureCategory: classified.category,
-            });
-            summary.retried++;
+
+            if (!classified.retriable || currentRetries >= MAX_OFFLINE_RETRIES) {
+              console.error(
+                `[OfflineSync] Moviendo venta ${item.offlineId} a CUARENTENA (${classified.category}): ${classified.sanitizedReason}`
+              );
+              const quarantinedEntry: QuarantinedOfflineSale = {
+                ...item,
+                status: 'quarantined',
+                retryCount: currentRetries,
+                nextRetryAt: undefined,
+                quarantinedAt: Date.now(),
+                lastErrorReason: classified.sanitizedReason,
+                failureCategory: classified.category,
+              };
+
+              // Orden atómico seguro: escribir cuarentena PRIMERO, luego remover de cola activa
+              latestQueueSnapshot = await this.runWithQueueMutex(async () => {
+                const existingQuarantine = await this.getQuarantinedSales();
+                const combined = deduplicateAndCapQuarantine([
+                  ...existingQuarantine,
+                  quarantinedEntry,
+                ]);
+                await AsyncStorage.setItem(QUARANTINED_STORAGE_KEY, JSON.stringify(combined));
+
+                const latestQueue = await this.loadQueueLocked();
+                const remaining = latestQueue.filter(
+                  (q) => !(q.offlineId === item.offlineId && q.timestamp <= item.timestamp)
+                );
+                return await this.writeQueueLocked(remaining);
+              });
+              summary.quarantined++;
+            } else {
+              const backoffMs = Math.min(
+                RETRY_BACKOFF_MAX_MS,
+                RETRY_BACKOFF_BASE_MS * Math.pow(3, item.retryCount || 0)
+              );
+              const retriedItem: PendingOfflineSale = {
+                ...item,
+                retryCount: currentRetries,
+                nextRetryAt: Date.now() + backoffMs,
+                lastErrorReason: classified.sanitizedReason,
+                failureCategory: classified.category,
+              };
+
+              latestQueueSnapshot = await this.runWithQueueMutex(async () => {
+                const latestQueue = await this.loadQueueLocked();
+                const updated = latestQueue.map((q) =>
+                  q.offlineId === item.offlineId && q.timestamp <= item.timestamp
+                    ? retriedItem
+                    : q
+                );
+                return await this.writeQueueLocked(updated);
+              });
+              summary.retried++;
+            }
           }
         }
+
+        const remainingCount = latestQueueSnapshot.length;
+        const nowAfter = Date.now();
+        const pendingRetryTimes = latestQueueSnapshot
+          .map((item) => item.nextRetryAt)
+          .filter((t): t is number => typeof t === 'number' && t > nowAfter);
+        if (pendingRetryTimes.length > 0) {
+          const earliestNextRetryAt = Math.min(...pendingRetryTimes);
+          const delay = Math.max(1_500, Math.min(60_000, earliestNextRetryAt - nowAfter));
+          this.scheduleRetryWakeup(delay, accountIdOverride);
+        } else if (remainingCount === 0) {
+          this.clearRetryWakeupTimer();
+        }
+
+        if (summary.processed > 0 || summary.successful > 0 || summary.quarantined > 0) {
+          emittedEvent = {
+            type:
+              summary.successful > 0
+                ? 'synced'
+                : summary.quarantined > 0
+                ? 'quarantined_changed'
+                : 'updated',
+            queueCount: remainingCount,
+            count: remainingCount,
+            items: latestQueueSnapshot,
+            successful: summary.successful,
+            quarantined: summary.quarantined,
+            syncedOfflineIds,
+            updatedProductStocks: accumulatedStockPatches,
+          };
+        }
+
+        console.log(
+          `[OfflineSync] Sincronización completada. Éxitos: ${summary.successful}, Cuarentena: ${summary.quarantined}, Pendientes: ${remainingCount}`
+        );
+        return summary;
+      } finally {
+        await this.releaseLock();
+        if (emittedEvent) {
+          this.emitQueueChange(emittedEvent);
+        }
       }
+    };
 
-      let remainingCount = queue.length;
-      let nextQueueSnapshot: PendingOfflineSale[] = queue;
-      if (summary.processed > 0) {
-        nextQueueSnapshot = await this.runWithQueueMutex(async () => {
-          const latestQueue = await this.loadQueueLocked();
-          const nextQueue: PendingOfflineSale[] = [];
-
-          for (const latestItem of latestQueue) {
-            const removedTs = completedTimestamps.get(latestItem.offlineId);
-            if (removedTs !== undefined && latestItem.timestamp <= removedTs) {
-              continue;
-            }
-
-            const retriedItem = retriedByOfflineId.get(latestItem.offlineId);
-            if (retriedItem && latestItem.timestamp <= retriedItem.timestamp) {
-              nextQueue.push(retriedItem);
-              continue;
-            }
-
-            nextQueue.push(latestItem);
-          }
-
-          // Guardar cola activa actualizada y refrescar cache en memoria
-          const persisted = await this.writeQueueLocked(nextQueue);
-
-          // Guardar cuarentena acumulada (deduplicada y acotada a 100 entradas)
-          if (quarantinedToAdd.length > 0) {
-            const existingQuarantine = await this.getQuarantinedSales();
-            const combined = deduplicateAndCapQuarantine([
-              ...existingQuarantine,
-              ...quarantinedToAdd,
-            ]);
-            await AsyncStorage.setItem(QUARANTINED_STORAGE_KEY, JSON.stringify(combined));
-          }
-
-          return persisted;
-        });
-        remainingCount = nextQueueSnapshot.length;
+    const syncPromise = executeSync().finally(() => {
+      if (this.activeSyncPromise === syncPromise) {
+        this.activeSyncPromise = null;
       }
-
-      const nowAfter = Date.now();
-      const pendingRetryTimes = nextQueueSnapshot
-        .map((item) => item.nextRetryAt)
-        .filter((t): t is number => typeof t === 'number' && t > nowAfter);
-      if (pendingRetryTimes.length > 0) {
-        const earliestNextRetryAt = Math.min(...pendingRetryTimes);
-        const delay = Math.max(1_500, Math.min(60_000, earliestNextRetryAt - nowAfter));
-        this.scheduleRetryWakeup(delay, accountIdOverride);
-      } else if (remainingCount === 0) {
-        this.clearRetryWakeupTimer();
+      if (this.resyncRequested) {
+        this.resyncRequested = false;
+        void this.processOfflineQueue({ accountId: accountIdOverride, force: true });
       }
+    });
 
-      if (summary.processed > 0 || summary.successful > 0 || summary.quarantined > 0) {
-        emittedEvent = {
-          type:
-            summary.successful > 0
-              ? 'synced'
-              : summary.quarantined > 0
-              ? 'quarantined_changed'
-              : 'updated',
-          queueCount: remainingCount,
-          count: remainingCount,
-          items: nextQueueSnapshot,
-          successful: summary.successful,
-          quarantined: summary.quarantined,
-        };
-      }
-
-      console.log(
-        `[OfflineSync] Sincronización completada. Éxitos: ${summary.successful}, Cuarentena: ${summary.quarantined}, Pendientes: ${remainingCount}`
-      );
-      return summary;
-    } finally {
-      await this.releaseLock();
-      if (emittedEvent) {
-        this.emitQueueChange(emittedEvent);
-      }
-    }
+    this.activeSyncPromise = syncPromise;
+    return syncPromise;
   }
 
   private clearNetworkSyncTimer(): void {
@@ -910,14 +1144,18 @@ class OfflineSyncService {
 
   private async acquireLock(): Promise<boolean> {
     if (this.isProcessingInMemory) {
-      return false;
+      if (Date.now() - this.lockAcquiredAt <= SYNC_LOCK_TTL_MS) {
+        return false;
+      }
     }
     this.isProcessingInMemory = true;
+    this.lockAcquiredAt = Date.now();
     return true;
   }
 
   private async releaseLock(): Promise<void> {
     this.isProcessingInMemory = false;
+    this.lockAcquiredAt = 0;
   }
 }
 
@@ -927,17 +1165,29 @@ export const offlineSyncService = new OfflineSyncService();
 export const enqueueOfflineSale = (payload: CreateSaleTransactionParams) =>
   offlineSyncService.enqueueOfflineSale(payload);
 
-export const processOfflineQueue = (accountIdOverride?: string) =>
-  offlineSyncService.processOfflineQueue(accountIdOverride);
+export const processOfflineQueue = (
+  accountIdOrOpts?: string | { accountId?: string; force?: boolean }
+) => offlineSyncService.processOfflineQueue(accountIdOrOpts);
 
 export const getOfflineQueue = () =>
   offlineSyncService.getOfflineQueue();
 
+export const getOfflineQueueForIdentity = (userId: string, accountId: string) =>
+  offlineSyncService.getOfflineQueueForIdentity(userId, accountId);
+
+export const cancelPendingOfflineSale = (offlineId: string) =>
+  offlineSyncService.cancelPendingOfflineSale(offlineId);
+
 export const getQuarantinedSales = () =>
   offlineSyncService.getQuarantinedSales();
 
-export const retryQuarantinedSale = (offlineId: string) =>
-  offlineSyncService.retryQuarantinedSale(offlineId);
+export const getQuarantinedSalesForIdentity = (userId: string, accountId: string) =>
+  offlineSyncService.getQuarantinedSalesForIdentity(userId, accountId);
+
+export const retryQuarantinedSale = (
+  offlineId: string,
+  options?: { newSessionId?: string; accountId?: string }
+) => offlineSyncService.retryQuarantinedSale(offlineId, options);
 
 export const removeQuarantinedSale = (offlineId: string) =>
   offlineSyncService.removeQuarantinedSale(offlineId);
@@ -948,3 +1198,7 @@ export const initOfflineSyncListener = () =>
 export const subscribeOfflineQueueChanges = (
   listener: (event: OfflineQueueChangeEvent) => void
 ): (() => void) => offlineSyncService.subscribeQueueChanges(listener);
+
+export const subscribeOfflineItemSynced = (
+  listener: (event: OfflineItemSyncedEvent) => void
+): (() => void) => offlineSyncService.subscribeItemSynced(listener);

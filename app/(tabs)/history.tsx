@@ -26,6 +26,7 @@ import {
   CheckCircle2,
   FileText,
   X,
+  AlertTriangle,
 } from 'lucide-react-native';
 import * as Haptics from 'expo-haptics';
 import { type Href, useRouter } from 'expo-router';
@@ -79,6 +80,8 @@ import { FinancialPnlModal } from '@/components/FinancialPnlModal';
 import { ReservationReceiptModal } from '@/components/ReservationReceiptModal';
 import { ReservationCancellationModal } from '@/components/ReservationCancellationModal';
 import { mergeSalesWithOfflinePending } from '@/lib/offline-sales-helpers';
+import { assertOnlineForWrite } from '@/lib/online-guard';
+import { cancelPendingOfflineSale } from '@/services/offline-sync-service';
 
 import { historyStyles as styles } from '@/components/history/historyStyles';
 import {
@@ -129,7 +132,13 @@ export default function HistoryScreen() {
     emitterInfo,
   } = useBusinessSettings();
   const { activeCashSession, refreshCashStatus } = useCashSession();
-  const { pendingOfflineSales, offlineQueueCount } = useOfflineStatus();
+  const {
+    pendingOfflineSales,
+    offlineQueueCount,
+    quarantinedCount,
+    lastSyncSuccessAt,
+    refreshOfflineCount,
+  } = useOfflineStatus();
 
   const isOnlineRef = useRef(isOnline);
   isOnlineRef.current = isOnline;
@@ -321,6 +330,7 @@ export default function HistoryScreen() {
 
     setIsCompletingPayment(true);
     try {
+      await assertOnlineForWrite('cobrar y entregar una reserva', isOnlineRef.current);
       const sessId = activeCashSession?.sessionId || activeCashSession?.id;
       await completeOrCancelReservation(
         {
@@ -379,6 +389,7 @@ export default function HistoryScreen() {
             text: 'Confirmar Entrega',
             onPress: async () => {
               try {
+                await assertOnlineForWrite('confirmar la entrega de una reserva', isOnlineRef.current);
                 const totalVal = Number(res.total || 0);
                 const depositVal = Number(res.depositAmount || 0);
                 const sessId = activeCashSession?.sessionId || activeCashSession?.id;
@@ -447,6 +458,7 @@ export default function HistoryScreen() {
     const totalVal = Number(res.total || 0);
     const depositVal = Number(res.depositAmount || 0);
     try {
+      await assertOnlineForWrite('cancelar una reserva', isOnlineRef.current);
       await completeOrCancelReservation(
         {
           id: res.id,
@@ -496,10 +508,17 @@ export default function HistoryScreen() {
         salesCursorRef.current = null;
         return;
       }
+      if (!isOnlineRef.current) {
+        if (reset) {
+          setLoadingSales(false);
+        } else {
+          setLoadingMoreSales(false);
+        }
+        return;
+      }
       if (reset) {
         salesGenerationRef.current += 1;
         salesScopeRef.current = salesScope;
-        lastFetchedScopeRef.current = salesScope;
         salesCursorRef.current = null;
         setLoadingSales(isOnlineRef.current);
       } else {
@@ -534,6 +553,9 @@ export default function HistoryScreen() {
         });
         salesCursorRef.current = snapshot.docs.at(-1) || null;
         setSalesHasMore(snapshot.docs.length === 100);
+        if (reset && isOnlineRef.current) {
+          lastFetchedScopeRef.current = requestScope;
+        }
       } catch (err: any) {
         if (generation !== salesGenerationRef.current || requestScope !== salesScopeRef.current) return;
         console.warn('Error cargando página de ventas:', err);
@@ -556,31 +578,44 @@ export default function HistoryScreen() {
 
   const prevOfflineQueueCountRef = useRef(offlineQueueCount);
   const pendingSyncRefreshRef = useRef(false);
+  const lastHandledSyncAtRef = useRef<number | null>(lastSyncSuccessAt);
 
   useEffect(() => {
     if (prevOfflineQueueCountRef.current > offlineQueueCount) {
       pendingSyncRefreshRef.current = true;
     }
     prevOfflineQueueCountRef.current = offlineQueueCount;
+    if (lastSyncSuccessAt && lastSyncSuccessAt !== lastHandledSyncAtRef.current) {
+      lastHandledSyncAtRef.current = lastSyncSuccessAt;
+      pendingSyncRefreshRef.current = true;
+    }
     if (pendingSyncRefreshRef.current && isOnline && isFocused) {
       pendingSyncRefreshRef.current = false;
       void fetchSalesPage(true);
     }
-  }, [offlineQueueCount, isOnline, isFocused, fetchSalesPage]);
+  }, [offlineQueueCount, lastSyncSuccessAt, isOnline, isFocused, fetchSalesPage]);
 
   useEffect(() => {
     if (!isFocused) return;
+    if (!isOnline) {
+      setLoadingSales(false);
+      return;
+    }
     if (lastFetchedScopeRef.current === salesScope) return;
     setSalesHasMore(false);
     const task = InteractionManager.runAfterInteractions(() => {
       void fetchSalesPage(true);
     });
     return () => task.cancel();
-  }, [isFocused, salesScope, fetchSalesPage]);
+  }, [isFocused, isOnline, salesScope, fetchSalesPage]);
 
   // Escuchar Reservas de la Sucursal
   useEffect(() => {
     if (!accountId || !isFocused || activeTab !== 'reservations') return;
+    if (!isOnline) {
+      setLoadingReservations(false);
+      return;
+    }
     setLoadingReservations(true);
 
     let cancelled = false;
@@ -648,7 +683,7 @@ export default function HistoryScreen() {
       task.cancel();
       if (unsubscribeActive) unsubscribeActive();
     };
-  }, [accountId, branchId, isFocused, activeTab]);
+  }, [accountId, branchId, isFocused, activeTab, isOnline]);
 
   // ============================================================================
   // FUSIÓN CON VENTAS OFFLINE PENDIENTES (focus-gated)
@@ -808,6 +843,7 @@ export default function HistoryScreen() {
       }
       setLoadingSunatAction(true);
       try {
+        await assertOnlineForWrite('emitir el comprobante en SUNAT', isOnlineRef.current);
         const customerPayload =
           docType === '01'
             ? {
@@ -847,6 +883,7 @@ export default function HistoryScreen() {
       if (!accountId) return;
       setLoadingSunatAction(true);
       try {
+        await assertOnlineForWrite('consultar comprobantes en SUNAT', isOnlineRef.current);
         const saleDateMs = toEpochMillis(sale.date || (sale as any).createdAt);
         const nowMs = Date.now();
         const fromMs = saleDateMs > 0 ? saleDateMs - 3 * 86_400_000 : nowMs - 30 * 86_400_000;
@@ -901,6 +938,7 @@ export default function HistoryScreen() {
       if (!accountId) return;
       setLoadingSunatAction(true);
       try {
+        await assertOnlineForWrite('consultar o reintentar en SUNAT', isOnlineRef.current);
         const existing = await refreshSelectedSaleSunat(sale);
         if (!existing) {
           await handleEmitMissingSunat(sale);
@@ -947,6 +985,7 @@ export default function HistoryScreen() {
 
     setIsCancelling(true);
     try {
+      await assertOnlineForWrite('anular una venta', isOnlineRef.current);
       await cancelSaleWithReversal(
         selectedSale.id,
         cancelReason.trim(),
@@ -963,6 +1002,7 @@ export default function HistoryScreen() {
       setSaleDetailModalVisible(false);
       setCancelReason('');
       setSelectedSale(null);
+      void fetchSalesPage(true);
       void refreshCashStatus();
 
       Alert.alert(
@@ -995,6 +1035,7 @@ export default function HistoryScreen() {
     }, 0);
     setIsRefunding(true);
     try {
+      await assertOnlineForWrite('registrar una devolución', isOnlineRef.current);
       const sessionId = activeCashSession?.sessionId || activeCashSession?.id;
       if (!sessionId) throw new Error('Abre una caja antes de registrar una devolución.');
       const refundBranchId = selectedSale.branchId || branchId;
@@ -1159,7 +1200,34 @@ export default function HistoryScreen() {
 
       {/* SUB-MÓDULO 1: HISTORIAL DE VENTAS Y SUNAT */}
       {activeTab === 'sales' && (
-        <HistorySalesTab
+        <>
+          {quarantinedCount > 0 && (
+            <TouchableOpacity
+              onPress={() => router.push('/(tabs)/settings')}
+              activeOpacity={0.8}
+              style={{
+                flexDirection: 'row',
+                alignItems: 'center',
+                gap: 8,
+                marginHorizontal: 14,
+                marginTop: 8,
+                paddingHorizontal: 12,
+                paddingVertical: 10,
+                borderRadius: 10,
+                backgroundColor: ui.dangerSoft,
+                borderWidth: 1,
+                borderColor: ui.danger,
+              }}
+              accessibilityRole="button"
+              accessibilityLabel="Revisar ventas offline en cuarentena en Ajustes"
+            >
+              <AlertTriangle size={16} color={ui.danger} />
+              <Text style={{ flex: 1, fontSize: 12.5, fontWeight: '700', color: ui.danger }}>
+                {quarantinedCount} {quarantinedCount === 1 ? 'venta offline en cuarentena' : 'ventas offline en cuarentena'} — Toca para revisar en Ajustes
+              </Text>
+            </TouchableOpacity>
+          )}
+          <HistorySalesTab
           isFocused={isFocused}
           isOnline={isOnline}
           mergedSales={mergedSales}
@@ -1180,6 +1248,7 @@ export default function HistoryScreen() {
           onSelectSale={handleSelectSale}
           onLoadMoreSales={handleLoadMoreSales}
         />
+        </>
       )}
 
       {/* SUB-MÓDULO 2: RESERVAS Y STOCK APARTADO */}
@@ -1635,6 +1704,39 @@ export default function HistoryScreen() {
                         </Text>
                       </TouchableOpacity>
                     )}
+
+                  {detailMeta.isOfflinePending && (
+                    <TouchableOpacity
+                      style={[styles.cancelSaleBtn, { marginTop: 8 }]}
+                      onPress={() => {
+                        const targetOfflineId =
+                          (selectedSale as any).offlineId || selectedSale.id;
+                        if (!targetOfflineId) return;
+                        Alert.alert(
+                          'Descartar venta offline',
+                          'Esta venta aún no se ha subido al servidor. Al descartarla se eliminará de la cola pendiente y se restaurará el stock local. ¿Continuar?',
+                          [
+                            { text: 'Volver', style: 'cancel' },
+                            {
+                              text: 'Descartar',
+                              style: 'destructive',
+                              onPress: async () => {
+                                await cancelPendingOfflineSale(targetOfflineId);
+                                void refreshOfflineCount();
+                                setSaleDetailModalVisible(false);
+                                setSelectedSale(null);
+                              },
+                            },
+                          ]
+                        );
+                      }}
+                      accessibilityRole="button"
+                      accessibilityLabel="Descartar venta offline pendiente"
+                    >
+                      <Trash2 size={18} color={ui.danger} />
+                      <Text style={styles.cancelSaleText}>Descartar venta offline</Text>
+                    </TouchableOpacity>
+                  )}
                 </>
               )}
             </View>

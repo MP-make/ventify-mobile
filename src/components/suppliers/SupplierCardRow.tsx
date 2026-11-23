@@ -31,8 +31,8 @@ export const SupplierCardRow: React.FC<SupplierCardRowProps> = React.memo(({
   onWhatsApp,
   onEmail,
 }) => {
-  const hasPhone = Boolean(supplier.phone?.trim());
-  const hasEmail = Boolean(supplier.email?.trim());
+  const hasPhone = Boolean(String(supplier.phone ?? '').trim());
+  const hasEmail = Boolean(String(supplier.email ?? '').trim());
 
   return (
     <View style={styles.supplierCard}>

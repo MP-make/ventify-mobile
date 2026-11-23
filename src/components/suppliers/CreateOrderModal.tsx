@@ -30,6 +30,7 @@ import { useDebouncedValue } from '@/hooks/use-debounced-value';
 import { filterCatalogIndex } from '@/lib/catalog-filters';
 import { getAllPresentations } from '@/lib/product-search';
 import { formatPEN, ui } from '@/lib/theme';
+import { assertOnlineForWrite } from '@/lib/online-guard';
 import {
   SuppliersPOService,
   Supplier,
@@ -277,6 +278,7 @@ export const CreateOrderModal: React.FC<CreateOrderModalProps> = React.memo(({
 
     setIsCreatingOrder(true);
     try {
+      await assertOnlineForWrite('registrar una orden de compra');
       await SuppliersPOService.createPurchaseOrder({
         accountId,
         branchId,

@@ -14,9 +14,11 @@ import {
 import { X, Check } from 'lucide-react-native';
 import * as Haptics from 'expo-haptics';
 import { useAuthSession } from '@/context/AuthContext';
-import { useBusinessSettings } from '@/context/SettingsContext';
+import { useBusinessSettings, useOfflineStatus } from '@/context/SettingsContext';
 import { useProductsActions } from '@/context/ProductsContext';
 import { usePermissions } from '@/hooks/usePermissions';
+import { checkIsOnlineLive } from '@/lib/online-guard';
+import { enqueueOfflineStockAdjust } from '@/services/offline-inventory-service';
 import {
   adjustProductStock,
   getVariantBranchStock,
@@ -50,7 +52,8 @@ export const QuickStockAdjustModal: React.FC<QuickStockAdjustModalProps> = React
   ({ visible, product, onClose, onStockAdjusted }) => {
     const { accountId, branchId, user, userProfile } = useAuthSession();
     const { activeBranchName } = useBusinessSettings();
-    const { getProductStock } = useProductsActions();
+    const { isOnline: settingsIsOnline } = useOfflineStatus();
+    const { getProductStock, applyAuthoritativeStockUpdates } = useProductsActions();
     const { canManageInventoryAdjustments } = usePermissions();
 
     const [adjustVariantId, setAdjustVariantId] = useState<string | null>(null);
@@ -118,27 +121,64 @@ export const QuickStockAdjustModal: React.FC<QuickStockAdjustModalProps> = React
 
       try {
         setIsAdjustingStock(true);
-        await adjustProductStock({
+        const targetLabel = selectedVariant
+          ? `${product.name} (${selectedVariant.name})`
+          : product.name;
+        const operatorProfile = {
+          uid: user?.uid || 'user_pos',
+          displayName: userProfile?.displayName || user?.displayName || user?.email || 'Cajero',
+          email: user?.email || '',
+          role: userProfile?.role,
+        };
+
+        const online = await checkIsOnlineLive(settingsIsOnline);
+        if (!online) {
+          await enqueueOfflineStockAdjust({
+            accountId,
+            userId: operatorProfile.uid,
+            branchId,
+            branchName: activeBranchName || 'Sucursal Principal',
+            productId: product.id,
+            productName: product.name,
+            productSku: product.sku,
+            variantId: selectedVariant?.id,
+            variantName: selectedVariant?.name,
+            mode: adjustMode,
+            amount,
+            expectedBeforeStock: currentStock,
+            reason: adjustReason,
+            notes: adjustNotes.trim() || undefined,
+            userProfile: operatorProfile,
+          });
+          Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+          Alert.alert(
+            'Ajuste Guardado Offline',
+            `${targetLabel}: ${currentStock} ➔ ${targetStock} unidades (se sincronizará al volver la conexión).`
+          );
+          onStockAdjusted?.();
+          onClose();
+          return;
+        }
+
+        const res = await adjustProductStock({
           product,
           branchId,
           branchName: activeBranchName || 'Sucursal Principal',
           newStock: targetStock,
+          mode: adjustMode,
+          deltaAmount: adjustMode === 'set' ? undefined : amount,
           reason: adjustReason,
           notes: adjustNotes.trim(),
           variantId: selectedVariant?.id,
           variantName: selectedVariant?.name,
-          userProfile: {
-            uid: user?.uid || 'user_pos',
-            displayName: userProfile?.displayName || user?.displayName || user?.email || 'Cajero',
-            email: user?.email || '',
-            role: userProfile?.role,
-          },
+          userProfile: operatorProfile,
         });
 
+        if (res?.updatedProductStock) {
+          applyAuthoritativeStockUpdates([res.updatedProductStock]);
+        }
+
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-        const targetLabel = selectedVariant
-          ? `${product.name} (${selectedVariant.name})`
-          : product.name;
         Alert.alert(
           'Stock Actualizado',
           `${targetLabel}: ${currentStock} ➔ ${targetStock} unidades.`
@@ -161,12 +201,14 @@ export const QuickStockAdjustModal: React.FC<QuickStockAdjustModalProps> = React
       adjustNotes,
       adjustReason,
       adjustVariantId,
+      applyAuthoritativeStockUpdates,
       branchId,
       canManageInventoryAdjustments,
       getProductStock,
       onClose,
       onStockAdjusted,
       product,
+      settingsIsOnline,
       user?.displayName,
       user?.email,
       user?.uid,

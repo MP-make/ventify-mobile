@@ -21,8 +21,9 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { ui } from '@/lib/theme';
 import { SectionHeading } from '@/components/ui';
 import { useAuthSession } from '@/context/AuthContext';
-import { useBusinessSettings } from '@/context/SettingsContext';
+import { useBusinessSettings, useOfflineStatus } from '@/context/SettingsContext';
 import { usePermissions } from '@/hooks/usePermissions';
+import { checkIsOnlineLive } from '@/lib/online-guard';
 import { normalizePresentation } from '@/lib/presentation-parity';
 import type { BranchPriceConfig, PriceTier, ProductAttribute, ProductVariant } from '@/types';
 import {
@@ -86,6 +87,7 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
   const { accountId: authAccountId } = useAuthSession();
   const effectiveAccountId = accountIdProp || authAccountId || '';
   const { branches, posSettings } = useBusinessSettings();
+  const { isOnline: settingsIsOnline } = useOfflineStatus();
   const { canManageProducts, canViewMargins } = usePermissions();
   const enableCatalogFilters = !!posSettings?.enableCatalogFilters;
   const compactLayout = windowWidth < 380;
@@ -579,6 +581,12 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
       }
 
       if (localIndices.length > 0) {
+        const online = await checkIsOnlineLive(settingsIsOnline);
+        if (!online) {
+          throw new Error(
+            'Sin conexión a internet. Quita las imágenes nuevas o conéctate para subir fotos del producto.'
+          );
+        }
         let completedUploads = 0;
         let nextPtr = 0;
         const workerCount = Math.min(3, localIndices.length);

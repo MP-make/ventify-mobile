@@ -104,7 +104,15 @@ export default function OperationsScreen() {
   const { isOnline } = useNetworkStatus();
   const { businessSettings, activeBranch, branches } = useBusinessSettings();
   const { isCashOpen, activeCashSession, refreshCashStatus } = useCashSession();
-  const { pendingOfflineSales } = useOfflineStatus();
+  const {
+    pendingOfflineSales,
+    pendingCashMovements,
+    quarantinedCount,
+    lastSyncSuccessAt,
+    triggerManualSync,
+  } = useOfflineStatus();
+  const isOnlineRef = useRef(isOnline);
+  isOnlineRef.current = isOnline;
 
   const {
     canManageUsers,
@@ -298,7 +306,7 @@ export default function OperationsScreen() {
       loadedMovementsSessionRef.current !== currentSessionId;
     if (isDifferentSession) {
       setMovements([]);
-      setLoadingMovements(true);
+      setLoadingMovements(isOnline);
     }
 
     let cancelled = false;
@@ -326,7 +334,7 @@ export default function OperationsScreen() {
         unsubscribeFn();
       }
     };
-  }, [currentSessionId, accountId, isCashOpen, isFocused, activeTab]);
+  }, [currentSessionId, accountId, isCashOpen, isFocused, activeTab, isOnline]);
 
   // ============================================================================
   // EFECTO: VENTAS DEL TURNO EN VIVO (STALE-WHILE-REVALIDATE EN FOCO)
@@ -334,6 +342,7 @@ export default function OperationsScreen() {
   useEffect(() => {
     if (!isOnline) {
       setLoadingSessionSales(false);
+      setLoadingMovements(false);
     }
   }, [isOnline]);
 
@@ -417,6 +426,60 @@ export default function OperationsScreen() {
     }
     return ids;
   }, [sessionSales]);
+
+  const syncedMovementOfflineIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const mov of movements) {
+      if (mov?.id) ids.add(String(mov.id));
+      if ((mov as any)?.offlineId) ids.add(String((mov as any).offlineId));
+    }
+    return ids;
+  }, [movements]);
+
+  const scopedOfflineCashMovements = useMemo(() => {
+    if (!accountId || !user?.uid) return [];
+    const effectiveBranch = branchId || 'main';
+    return (pendingCashMovements || []).filter(
+      (m) =>
+        m.accountId === accountId &&
+        m.userId === user.uid &&
+        (!m.branchId || m.branchId === effectiveBranch) &&
+        (!currentSessionId || m.sessionId === currentSessionId) &&
+        !syncedMovementOfflineIds.has(m.offlineId)
+    );
+  }, [pendingCashMovements, accountId, user?.uid, branchId, currentSessionId, syncedMovementOfflineIds]);
+
+  const offlineManualCashNet = useMemo(() => {
+    let net = 0;
+    for (const m of scopedOfflineCashMovements) {
+      const amt = Math.abs(Number(m.amount) || 0);
+      net += m.type === 'income' ? amt : -amt;
+    }
+    return Math.round(net * 100) / 100;
+  }, [scopedOfflineCashMovements]);
+
+  const mergedMovements = useMemo<CashMovement[]>(() => {
+    if (scopedOfflineCashMovements.length === 0) return movements;
+    const pendingRows: CashMovement[] = scopedOfflineCashMovements.map((m) => ({
+      id: m.offlineId,
+      sessionId: m.sessionId,
+      accountId: m.accountId,
+      branchId: m.branchId,
+      type: m.type,
+      amount: m.amount,
+      category: m.category || (m.type === 'income' ? 'manual_income' : 'other'),
+      expenseCategoryId: m.expenseCategoryId as any,
+      receiptType: m.receiptType as any,
+      receiptNumber: m.receiptNumber,
+      description: m.description,
+      reason: m.reason || m.description,
+      createdBy: m.userId,
+      createdByName: m.userName,
+      createdAt: m.timestamp,
+      isOfflinePending: true as any,
+    }));
+    return [...pendingRows, ...movements];
+  }, [scopedOfflineCashMovements, movements]);
 
   const cashScopeKey = `${accountId || ''}:${branchId || ''}:${
     currentSessionId || ''
@@ -505,14 +568,22 @@ export default function OperationsScreen() {
 
     if (sessionSales.length > 0) {
       for (const sale of mergedSessionSales) {
-        if (sale.status === 'cancelled') continue;
-        const total = sale.total || 0;
+        if (
+          sale.status === 'cancelled' ||
+          sale.isDeposit ||
+          sale.isReturn ||
+          sale.type === 'deposit' ||
+          sale.type === 'return'
+        ) {
+          continue;
+        }
+        const total = Number(sale.chargedAmount ?? sale.total ?? 0);
         const pMethod = (sale.paymentMethod || '').toLowerCase();
 
         if (Array.isArray(sale.payments) && sale.payments.length > 0) {
           for (const split of sale.payments) {
             const cat = (split.category || '').toLowerCase();
-            const amt = split.amount || 0;
+            const amt = Number(split.chargedAmount ?? split.amount ?? 0);
             const provider = (split.digitalProvider || '').toLowerCase();
 
             if (cat === 'cash') {
@@ -652,7 +723,10 @@ export default function OperationsScreen() {
     }
     const next =
       Math.round(
-        ((activeCashSession?.expectedAmount ?? 0) + offlineCashDelta.cash) * 100
+        ((activeCashSession?.expectedAmount ?? 0) +
+          offlineCashDelta.cash +
+          offlineManualCashNet) *
+          100
       ) / 100;
     lastExpectedCashRef.current = { scope: cashScopeKey, value: next };
     return next;
@@ -661,11 +735,13 @@ export default function OperationsScreen() {
     cashScopeKey,
     activeCashSession?.expectedAmount,
     offlineCashDelta.cash,
+    offlineManualCashNet,
   ]);
 
   // ============================================================================
   // CARGA DE CLIENTES Y RESERVAS
   // ============================================================================
+  const wasOpsOfflineRef = useRef(!isOnline);
   useEffect(() => {
     hasLoadedCustomersRef.current = null;
   }, [accountId]);
@@ -674,13 +750,24 @@ export default function OperationsScreen() {
     hasLoadedReservationsRef.current = null;
   }, [accountId, branchId]);
 
+  useEffect(() => {
+    const cameBackOnline = wasOpsOfflineRef.current && isOnline;
+    wasOpsOfflineRef.current = !isOnline;
+    if (isOnline && (cameBackOnline || lastSyncSuccessAt)) {
+      hasLoadedCustomersRef.current = null;
+      hasLoadedReservationsRef.current = null;
+    }
+  }, [isOnline, lastSyncSuccessAt]);
+
   const loadCustomersData = useCallback(async () => {
     if (!accountId) return;
-    hasLoadedCustomersRef.current = accountId;
     setLoadingCustomers(true);
     try {
       const data = await getCustomers(accountId);
       setCustomers(data);
+      if (isOnlineRef.current) {
+        hasLoadedCustomersRef.current = accountId;
+      }
     } catch (err) {
       hasLoadedCustomersRef.current = null;
       console.error('Error cargando clientes:', err);
@@ -696,16 +783,22 @@ export default function OperationsScreen() {
       void loadCustomersData();
     });
     return () => task.cancel();
-  }, [isFocused, activeTab, accountId, loadCustomersData]);
+  }, [isFocused, activeTab, accountId, isOnline, lastSyncSuccessAt, loadCustomersData]);
 
   const loadReservationsData = useCallback(async () => {
     if (!accountId || !branchId) return;
+    if (!isOnlineRef.current) {
+      setLoadingReservations(false);
+      return;
+    }
     const scopeKey = `${accountId}:${branchId}`;
-    hasLoadedReservationsRef.current = scopeKey;
     setLoadingReservations(true);
     try {
       const data = await getReservationsAndOrders(accountId, branchId);
       setReservations(data);
+      if (isOnlineRef.current) {
+        hasLoadedReservationsRef.current = scopeKey;
+      }
     } catch (err) {
       hasLoadedReservationsRef.current = null;
       console.error('Error cargando pedidos y reservas:', err);
@@ -722,7 +815,7 @@ export default function OperationsScreen() {
       void loadReservationsData();
     });
     return () => task.cancel();
-  }, [isFocused, activeTab, accountId, branchId, loadReservationsData]);
+  }, [isFocused, activeTab, accountId, branchId, isOnline, lastSyncSuccessAt, loadReservationsData]);
 
   // ============================================================================
   // DETALLE CLIENTE (EVITA DOBLE ESCANEO DE `reservations` PASANDO knownFiadoIds)
@@ -1251,7 +1344,7 @@ export default function OperationsScreen() {
           activeBranch={activeBranch}
           branches={branches}
           activeCashSession={activeCashSession}
-          movements={movements}
+          movements={mergedMovements}
           loadingMovements={loadingMovements}
           sessionSalesLength={sessionSales.length}
           mergedSessionSales={mergedSessionSales}
@@ -1335,11 +1428,13 @@ export default function OperationsScreen() {
         branchId={branchId}
         activeCashSession={activeCashSession}
         expectedCashAmount={expectedCashAmount}
-        offlinePendingCount={offlineCashDelta.count}
+        offlinePendingCount={offlineCashDelta.count + scopedOfflineCashMovements.length}
+        quarantinedCount={quarantinedCount}
         isOnline={isOnline}
         isSupervisor={isSupervisor}
         user={user}
         userProfile={userProfile}
+        onSyncNow={() => triggerManualSync(true)}
         onSyncedOffline={refreshCashStatus}
         onClosed={handleCashClosed}
       />

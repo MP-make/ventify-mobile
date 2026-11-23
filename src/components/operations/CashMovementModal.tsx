@@ -27,6 +27,9 @@ import {
   type ExpenseReceiptType,
 } from '@/services/cash-register-service';
 import { getTeamMembers, type TeamMember } from '@/services/enterprise-ops-service';
+import { useOfflineStatus } from '@/context/SettingsContext';
+import { assertOnlineForWrite, checkIsOnlineLive } from '@/lib/online-guard';
+import { enqueueOfflineCashMovement } from '@/services/offline-cash-service';
 import { operationsStyles as styles } from './operationsStyles';
 import type { OperationsUserProfileRef, OperationsUserRef } from './types';
 
@@ -74,6 +77,7 @@ export const CashMovementModal = React.memo<CashMovementModalProps>(({
   isCashier,
   onSuccess,
 }) => {
+  const { isOnline } = useOfflineStatus();
   const [movementType, setMovementType] = useState<CashMovementType>(initialType);
   const [movementAmount, setMovementAmount] = useState<string>('');
   const [movementReason, setMovementReason] = useState<string>('');
@@ -205,10 +209,19 @@ export const CashMovementModal = React.memo<CashMovementModalProps>(({
 
     const effectiveLimit = activeCashSession?.cashierExpenseLimit ?? accountExpenseLimit;
     const effectiveRole = isCashier ? 'cashier' : role || undefined;
+    const online = await checkIsOnlineLive(isOnline);
+
     if (
       isExpense &&
       cashierNeedsPinAuthorization(effectiveRole, -amt, { cashierExpenseLimit: effectiveLimit })
     ) {
+      if (!online) {
+        Alert.alert(
+          'Sin Conexión',
+          'Los egresos que requieren PIN de autorización solo pueden registrarse con internet.'
+        );
+        return;
+      }
       setPendingPinExpense({
         sessionId: sessId,
         amount: amt,
@@ -226,8 +239,46 @@ export const CashMovementModal = React.memo<CashMovementModalProps>(({
       return;
     }
 
+    if (isAdvance && !online) {
+      Alert.alert('Sin Conexión', 'Los adelantos a trabajadores requieren conexión a internet.');
+      return;
+    }
+
     setIsSavingMovement(true);
     try {
+      if (!online) {
+        await enqueueOfflineCashMovement({
+          accountId,
+          userId: user.uid,
+          userName: userProfile?.displayName || user.email || 'Operador',
+          userRole: effectiveRole,
+          branchId,
+          sessionId: sessId,
+          type: movementType,
+          amount: amt,
+          category: isExpense ? movementCategory : 'manual_income',
+          description: movementReason.trim(),
+          reason: movementReason.trim(),
+          expenseCategoryId: isExpense ? (movementCategory as ExpenseCategoryId) : undefined,
+          receiptType: isExpense ? movementReceiptType : undefined,
+          receiptNumber:
+            isExpense && movementReceiptType !== 'ninguno' && movementReceiptNumber.trim()
+              ? movementReceiptNumber.trim()
+              : undefined,
+        });
+
+        resetMovementForm(movementType);
+        onClose();
+        onSuccess();
+        Alert.alert(
+          'Movimiento Guardado Offline',
+          `El ${
+            movementType === 'income' ? 'ingreso' : 'egreso'
+          } de ${formatPEN(amt)} quedó guardado localmente y se sincronizará al volver la conexión.`
+        );
+        return;
+      }
+
       await registerCashMovement({
         accountId,
         branchId,
@@ -279,6 +330,7 @@ export const CashMovementModal = React.memo<CashMovementModalProps>(({
     accountExpenseLimit,
     isCashier,
     role,
+    isOnline,
     resetMovementForm,
     onClose,
     onSuccess,
@@ -295,6 +347,7 @@ export const CashMovementModal = React.memo<CashMovementModalProps>(({
     setIsAuthorizingPin(true);
     setPinError('');
     try {
+      await assertOnlineForWrite('autorizar egresos con PIN', isOnline);
       await authorizeCashExpenseViaPin({
         sessionId: pendingPinExpense.sessionId,
         amount: pendingPinExpense.amount,
@@ -323,7 +376,7 @@ export const CashMovementModal = React.memo<CashMovementModalProps>(({
     } finally {
       setIsAuthorizingPin(false);
     }
-  }, [pendingPinExpense, pinInput, movementType, resetMovementForm, onClose, onSuccess]);
+  }, [pendingPinExpense, pinInput, isOnline, movementType, resetMovementForm, onClose, onSuccess]);
 
   const handleCloseMovement = useCallback(() => {
     if (!isSavingMovement) onClose();

@@ -34,11 +34,19 @@ import { Image } from 'expo-image';
 
 import { useProducts } from '@/context/ProductsContext';
 import { useAuthSession, usePlanAccess } from '@/context/AuthContext';
-import { useBusinessSettings } from '@/context/SettingsContext';
+import { useBusinessSettings, useOfflineStatus } from '@/context/SettingsContext';
 import { usePermissions } from '@/hooks/usePermissions';
+import { checkIsOnlineLive, assertOnlineForWrite } from '@/lib/online-guard';
+import {
+  generateOfflineProductId,
+  enqueueOfflineProductCreate,
+  enqueueOfflineProductUpdate,
+  enqueueOfflineStockAdjust,
+} from '@/services/offline-inventory-service';
 import { formatPEN, formatDatePE, ui } from '@/lib/theme';
 import { SectionHeading } from '@/components/ui';
 import {
+  adjustProductStock,
   getProductKardex,
   getStockTransfers,
   approveStockTransfer,
@@ -70,7 +78,7 @@ import { useDebouncedValue } from '@/hooks/use-debounced-value';
 import { catalogSizeInput } from '@/lib/product-attributes';
 import type { Product, ProductAttribute } from '@/types';
 
-type ActiveTab = 'inventory' | 'kardex' | 'transfers';
+type ActiveTab = 'inventory' | 'kardex' | 'transfers' | 'purchases';
 type StockStatusFilter = 'all' | 'low' | 'out';
 
 const SUBTAB_FETCH_TTL_MS = 45_000;
@@ -526,14 +534,15 @@ export default function CatalogInventoryScreen() {
     getProductStock,
     upsertProduct,
     upsertProductsBatch,
+    applyAuthoritativeStockUpdates,
     validateProductCreation,
   } = useProducts();
-  const { branches, invoicingEnabled, posSettings } = useBusinessSettings();
+  const { branches, activeBranchName, invoicingEnabled, posSettings } = useBusinessSettings();
+  const { isOnline, pendingInventoryOps, lastSyncSuccessAt } = useOfflineStatus();
   const showAttributes = !!posSettings?.enableCatalogFilters;
 
   // Sub-pestaña activa
   const [activeTab, setActiveTab] = useState<ActiveTab>('inventory');
-  const [suppliersModalOpen, setSuppliersModalOpen] = useState(false);
   const [valuationExpanded, setValuationExpanded] = useState(true);
 
   // Filtros de Inventario
@@ -649,6 +658,14 @@ export default function CatalogInventoryScreen() {
 
   const handleCloudSearch = useCallback(async () => {
     if (!accountId || !searchQuery.trim() || isCloudSearching) return;
+    const online = await checkIsOnlineLive(isOnline);
+    if (!online) {
+      Alert.alert(
+        'Sin Conexión',
+        'La búsqueda en la nube requiere conexión a internet.'
+      );
+      return;
+    }
     setIsCloudSearching(true);
     try {
       const qText = searchQuery.trim();
@@ -714,7 +731,7 @@ export default function CatalogInventoryScreen() {
     } finally {
       setIsCloudSearching(false);
     }
-  }, [accountId, searchQuery, isCloudSearching, upsertProductsBatch]);
+  }, [accountId, isOnline, searchQuery, isCloudSearching, upsertProductsBatch]);
 
   // Modal de Ajuste Rápido de Stock (estado de formulario aislado en QuickStockAdjustModal)
   const [stockModalOpen, setStockModalOpen] = useState(false);
@@ -812,6 +829,10 @@ export default function CatalogInventoryScreen() {
   const loadKardex = useCallback(
     async (productIdOverride?: string | null, force = false) => {
       if (!accountId || !branchId) return;
+      if (!isOnline) {
+        setKardexLoading(false);
+        return;
+      }
       const effectiveProductId =
         productIdOverride !== undefined ? productIdOverride : kardexSelectedProductIdRef.current;
       const scopeKey = `${accountId}:${branchId}:${effectiveProductId || ''}`;
@@ -849,24 +870,60 @@ export default function CatalogInventoryScreen() {
         }
       }
     },
-    [accountId, branchId]
+    [accountId, branchId, isOnline]
   );
 
   const displayedKardexList = useMemo(() => {
-    if (kardexSelectedProductId || !debouncedKardexSearch.trim()) return kardexList;
+    const activeBranchKey = branchId || 'main';
+    const pendingRows = (pendingInventoryOps || [])
+      .filter(
+        (op): op is Extract<typeof op, { type: 'stock_adjust' }> =>
+          op.type === 'stock_adjust' &&
+          (!op.branchId || op.branchId === activeBranchKey) &&
+          (!kardexSelectedProductId || op.productId === kardexSelectedProductId)
+      )
+      .map((op) => {
+        const afterStock =
+          op.mode === 'add'
+            ? op.expectedBeforeStock + op.amount
+            : op.mode === 'subtract'
+            ? Math.max(0, op.expectedBeforeStock - op.amount)
+            : op.amount;
+        const delta = Math.round((afterStock - op.expectedBeforeStock) * 10000) / 10000;
+        return {
+          id: op.offlineOpId,
+          productId: op.productId,
+          productName: op.variantName ? `${op.productName} (${op.variantName})` : op.productName,
+          productSku: op.productSku || '',
+          type: delta < 0 ? 'out' : delta > 0 ? 'add' : 'edit',
+          quantityChanged: delta,
+          quantityBefore: op.expectedBeforeStock,
+          quantityAfter: afterStock,
+          reason: `${op.reason || 'Ajuste'} (Pendiente offline)`,
+          userName: op.userProfile?.displayName || 'Offline',
+          createdAt: op.timestamp,
+        };
+      });
+
+    const merged = [...pendingRows, ...kardexList];
+    if (kardexSelectedProductId || !debouncedKardexSearch.trim()) return merged;
     const term = debouncedKardexSearch.trim().toLowerCase();
-    return kardexList.filter(
+    return merged.filter(
       (item) =>
         String(item.productName || '').toLowerCase().includes(term) ||
         String(item.productSku || '').toLowerCase().includes(term) ||
         String(item.referenceNumber || '').toLowerCase().includes(term)
     );
-  }, [kardexList, kardexSelectedProductId, debouncedKardexSearch]);
+  }, [kardexList, pendingInventoryOps, branchId, kardexSelectedProductId, debouncedKardexSearch]);
 
   // Carga de Transferencias con TTL de 45s y stale-while-revalidate
   const loadTransfers = useCallback(
     async (force = false) => {
       if (!accountId) return;
+      if (!isOnline) {
+        setTransfersLoading(false);
+        return;
+      }
       const scopeKey = `${accountId}:${branchId}`;
 
       if (!force && lastTransfersFetchRef.current) {
@@ -896,7 +953,7 @@ export default function CatalogInventoryScreen() {
         }
       }
     },
-    [accountId, branchId]
+    [accountId, branchId, isOnline]
   );
 
   const handleEmitDespatchGuide = useCallback(
@@ -904,6 +961,7 @@ export default function CatalogInventoryScreen() {
       if (!accountId || !transfer.id) return;
       setIsEmittingGuideId(transfer.id);
       try {
+        await assertOnlineForWrite('emitir Guía de Remisión', isOnline);
         const res = await emitTransferDespatchGuide(accountId, transfer.id);
         await loadTransfers(true);
         const docLabel = res?.einvoice?.documentNumber || res?.einvoice?.id || 'Guía 09';
@@ -917,7 +975,7 @@ export default function CatalogInventoryScreen() {
         setIsEmittingGuideId(null);
       }
     },
-    [accountId, loadTransfers]
+    [accountId, isOnline, loadTransfers]
   );
 
   const runTransferAction = useCallback(
@@ -925,6 +983,14 @@ export default function CatalogInventoryScreen() {
       transfer: StockTransfer,
       action: 'approve' | 'reject' | 'cancel' | 'send' | 'receive'
     ) => {
+      const online = await checkIsOnlineLive(isOnline);
+      if (!online) {
+        Alert.alert(
+          'Sin Conexión',
+          'Las transferencias entre sucursales requieren conexión a internet.'
+        );
+        return;
+      }
       const sourceId = transfer.sourceBranchId || (transfer as any).fromBranchId;
       const destinationId = transfer.destinationBranchId || (transfer as any).toBranchId;
       const allowed =
@@ -970,6 +1036,7 @@ export default function CatalogInventoryScreen() {
             onPress: async () => {
               setTransferActionId(transfer.id || null);
               try {
+                await assertOnlineForWrite('gestionar transferencias', isOnline);
                 if (action === 'approve') await approveStockTransfer(transfer.id!, profile);
                 if (action === 'reject') await rejectStockTransfer(transfer.id!, profile);
                 if (action === 'cancel') await cancelStockTransfer(transfer.id!, profile);
@@ -1011,6 +1078,7 @@ export default function CatalogInventoryScreen() {
       canManageTransfers,
       canRequestTransfer,
       canAccessBranch,
+      isOnline,
       loadTransfers,
       user,
       userProfile,
@@ -1018,6 +1086,14 @@ export default function CatalogInventoryScreen() {
       handleEmitDespatchGuide,
     ]
   );
+
+  React.useEffect(() => {
+    if (!isFocused || !isOnline || !lastSyncSuccessAt) return;
+    lastKardexFetchRef.current = null;
+    if (activeTab === 'kardex') {
+      void loadKardex(undefined, true);
+    }
+  }, [lastSyncSuccessAt, isOnline, isFocused, activeTab, loadKardex]);
 
   useFocusEffect(
     useCallback(() => {
@@ -1073,12 +1149,12 @@ export default function CatalogInventoryScreen() {
     setProductModalOpen(false);
   }, []);
 
-  const handleOpenSuppliersModal = useCallback(() => {
-    setSuppliersModalOpen(true);
+  const handleSelectPurchasesTab = useCallback(() => {
+    setActiveTab('purchases');
   }, []);
 
-  const handleCloseSuppliersModal = useCallback(() => {
-    setSuppliersModalOpen(false);
+  const handleBackToInventoryTab = useCallback(() => {
+    setActiveTab('inventory');
   }, []);
 
   const handleOpenCatalogScanner = useCallback(() => {
@@ -1236,11 +1312,18 @@ export default function CatalogInventoryScreen() {
         }
       }
 
+      const online = await checkIsOnlineLive(isOnline);
+
       const rawGallery = Array.isArray(formData.galleryImages)
         ? formData.galleryImages
         : formData.imageUrl
         ? [formData.imageUrl]
         : [];
+      if (rawGallery.some((uri) => isLocalFileUri(uri)) && !online) {
+        throw new Error(
+          'Sin conexión a internet. Quita las imágenes nuevas o conéctate para subir fotos.'
+        );
+      }
       const uploadedGallery: string[] = [];
       for (const uri of rawGallery) {
         if (isLocalFileUri(uri)) {
@@ -1306,12 +1389,135 @@ export default function CatalogInventoryScreen() {
         accountId,
       };
 
-      const savedId = await saveProduct(productPayload, !formData.id, {
+      const activeBranchKey = branchId || 'main';
+      const hasVariants = Array.isArray(formData.variants) && formData.variants.length > 0;
+      const prevBranchStock = editingProduct
+        ? typeof editingProduct.stock === 'object' && editingProduct.stock !== null
+          ? Number((editingProduct.stock as Record<string, number>)[activeBranchKey] ?? 0)
+          : Number(editingProduct.stock ?? 0)
+        : 0;
+      const nextBranchStock = Number(stockMap[activeBranchKey] ?? formData.stock ?? 0);
+      const branchStockChanged = Boolean(
+        formData.id &&
+          editingProduct &&
+          !hasVariants &&
+          Math.abs(nextBranchStock - prevBranchStock) > 0.0001
+      );
+      const operatorProfile = {
         uid: user?.uid || 'user_pos',
         displayName:
           userProfile?.displayName || user?.displayName || user?.email || 'Administrador',
         email: user?.email || '',
-      });
+      };
+
+      if (!online) {
+        const resolvedId = formData.id || generateOfflineProductId();
+        const offlineProduct: Product = {
+          ...(editingProduct || {}),
+          id: resolvedId,
+          name: formData.name,
+          category: formData.category,
+          barcode: formData.barcode,
+          barcodes: formData.barcodes || [],
+          sku: formData.sku,
+          brand: formData.brand,
+          sizeLabel: formData.sizeLabel,
+          sizes: formData.sizes || [],
+          unitOfMeasure: formData.unitOfMeasure as any,
+          allowDecimals: Boolean(formData.allowDecimals),
+          taxExemptionCode: formData.taxExemptionCode || '10',
+          price: formData.price,
+          suggestedPrice: formData.price,
+          minSalePrice: formData.minSalePrice,
+          costPrice: formData.cost,
+          stock: stockMap,
+          minStock: formData.minStock,
+          presentations: formData.presentations as any,
+          variants: formData.variants || [],
+          priceTiers: formData.priceTiers || [],
+          branchPrices: formData.branchPrices || {},
+          attributes: normalizedAttributes,
+          imageUrl: resolvedImageUrl,
+          thumbUrl: resolvedImageUrl,
+          galleryImages: safeGallery,
+          accountId,
+          active: true,
+          branchIds: Object.keys(stockMap),
+        };
+
+        if (!formData.id) {
+          await enqueueOfflineProductCreate({
+            accountId,
+            userId: operatorProfile.uid,
+            branchId: activeBranchKey,
+            productId: resolvedId,
+            productData: { ...productPayload, id: resolvedId },
+            previewProduct: offlineProduct,
+            userProfile: operatorProfile,
+          });
+          lastKardexFetchRef.current = null;
+          setSearchQuery(formData.name);
+          Alert.alert(
+            'Producto Guardado Offline',
+            'El producto quedó guardado localmente y se sincronizará al volver la conexión.'
+          );
+          return;
+        }
+
+        await enqueueOfflineProductUpdate({
+          accountId,
+          userId: operatorProfile.uid,
+          branchId: activeBranchKey,
+          productId: formData.id,
+          productData: productPayload,
+          previewPatch: offlineProduct,
+          userProfile: operatorProfile,
+        });
+
+        if (branchStockChanged) {
+          await enqueueOfflineStockAdjust({
+            accountId,
+            userId: operatorProfile.uid,
+            branchId: activeBranchKey,
+            branchName: activeBranchName || 'Sucursal Principal',
+            productId: formData.id,
+            productName: formData.name,
+            productSku: formData.sku,
+            mode: 'set',
+            amount: nextBranchStock,
+            expectedBeforeStock: prevBranchStock,
+            reason: 'Edición de producto (offline)',
+            userProfile: operatorProfile,
+          });
+        }
+
+        lastKardexFetchRef.current = null;
+        setSearchQuery(formData.name);
+        Alert.alert(
+          'Cambios Guardados Offline',
+          'La actualización del producto quedó guardada y se sincronizará al volver la conexión.'
+        );
+        return;
+      }
+
+      let savedId = formData.id;
+      let adjResultStock: any = null;
+      if (branchStockChanged && editingProduct) {
+        savedId = await saveProduct(productPayload, false, operatorProfile, {
+          skipStockField: true,
+        });
+        const adjRes = await adjustProductStock({
+          product: editingProduct,
+          branchId: activeBranchKey,
+          branchName: activeBranchName || 'Sucursal Principal',
+          newStock: nextBranchStock,
+          reason: 'Edición de producto',
+          userProfile: operatorProfile,
+        });
+        adjResultStock = adjRes?.updatedProductStock || null;
+      } else {
+        savedId = await saveProduct(productPayload, !formData.id, operatorProfile);
+      }
 
       const fullProduct: Product = {
         ...(editingProduct || {}),
@@ -1348,6 +1554,9 @@ export default function CatalogInventoryScreen() {
 
       lastKardexFetchRef.current = null;
       upsertProduct(fullProduct);
+      if (adjResultStock) {
+        applyAuthoritativeStockUpdates([adjResultStock]);
+      }
       if (!formData.id) {
         void refreshAccess?.().catch(() => {});
       }
@@ -1355,10 +1564,13 @@ export default function CatalogInventoryScreen() {
     },
     [
       accountId,
+      activeBranchName,
+      applyAuthoritativeStockUpdates,
       branchId,
       branches,
       canManageProducts,
       editingProduct,
+      isOnline,
       refreshAccess,
       upsertProduct,
       user?.displayName,
@@ -1433,14 +1645,18 @@ export default function CatalogInventoryScreen() {
 
           {(canManageInventoryAdjustments || hasPermission('access_suppliers')) && (
             <TouchableOpacity
-              style={styles.tabBtn}
-              onPress={handleOpenSuppliersModal}
+              style={[styles.tabBtn, activeTab === 'purchases' && styles.tabBtnActive]}
+              onPress={handleSelectPurchasesTab}
               activeOpacity={0.7}
-              accessibilityRole="button"
-              accessibilityLabel="Abrir compras a proveedores"
+              accessibilityRole="tab"
+              accessibilityState={{ selected: activeTab === 'purchases' }}
+              accessibilityLabel="Compras a proveedores"
             >
-              <Truck size={16} color={ui.primary} />
-              <Text style={[styles.tabBtnText, { color: ui.primary }]} numberOfLines={1}>
+              <Truck size={15} color={activeTab === 'purchases' ? ui.primary : ui.textSecondary} />
+              <Text
+                style={[styles.tabBtnText, activeTab === 'purchases' && styles.tabBtnTextActive]}
+                numberOfLines={1}
+              >
                 Compras
               </Text>
             </TouchableOpacity>
@@ -1941,6 +2157,18 @@ export default function CatalogInventoryScreen() {
         </View>
       ) : null}
 
+      {/* PESTAÑA 4: COMPRAS Y PROVEEDORES */}
+      {activeTab === 'purchases' ? (
+        <View style={{ flex: 1 }}>
+          <SuppliersPurchaseModal
+            visible
+            embedded
+            onClose={handleBackToInventoryTab}
+            onStockUpdated={handleStockAdjusted}
+          />
+        </View>
+      ) : null}
+
       {/* MODAL 1: AJUSTE RÁPIDO DE STOCK (AISLADO) */}
       {stockModalOpen && (
         <QuickStockAdjustModal
@@ -1968,14 +2196,6 @@ export default function CatalogInventoryScreen() {
           onClose={handleCloseProductModal}
           onSave={handleSaveProduct}
           branchId={branchId}
-        />
-      )}
-
-      {/* MODAL 4: PROVEEDORES Y ÓRDENES DE COMPRA */}
-      {suppliersModalOpen && (
-        <SuppliersPurchaseModal
-          visible={suppliersModalOpen}
-          onClose={handleCloseSuppliersModal}
         />
       )}
 
@@ -2104,12 +2324,13 @@ const styles = StyleSheet.create({
   },
   tabBtn: {
     flex: 1,
+    minWidth: 0,
     minHeight: 42,
-    paddingHorizontal: 4,
+    paddingHorizontal: 3,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 4,
+    gap: 3,
     borderRadius: 9,
   },
   tabBtnActive: {
@@ -2121,9 +2342,10 @@ const styles = StyleSheet.create({
     elevation: 2,
   },
   tabBtnText: {
-    fontSize: 11.5,
+    fontSize: 11,
     fontWeight: '600',
     color: ui.textSecondary,
+    flexShrink: 1,
   },
   tabBtnTextActive: {
     color: ui.primary,

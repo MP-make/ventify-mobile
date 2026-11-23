@@ -28,6 +28,7 @@ import { isValidDNI } from '@/lib/invoicing/types';
 import { parseNormalizedDecimal } from '@/lib/product-search';
 import { reservationCartLines } from '@/lib/presentation-parity';
 import { formatPEN, ui } from '@/lib/theme';
+import { assertOnlineForWrite } from '@/lib/online-guard';
 import type { Customer } from '@/types';
 import { posStyles as styles } from './posStyles';
 
@@ -216,6 +217,7 @@ export const PosReservationModal: React.FC<PosReservationModalProps> = React.mem
 
       try {
         if (!accountId || !branchId) throw new Error('No se pudo determinar la cuenta y sucursal.');
+        await assertOnlineForWrite('registrar una reserva');
         setIsSavingRes(true);
         const days = parseInt(resDays, 10) || 7;
         const pickupDate = new Date();

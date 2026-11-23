@@ -17,6 +17,7 @@ import { X, Check } from 'lucide-react-native';
 import { useAuthSession } from '@/context/AuthContext';
 import { useBusinessSettings } from '@/context/SettingsContext';
 import { ui } from '@/lib/theme';
+import { assertOnlineForWrite } from '@/lib/online-guard';
 import {
   SuppliersPOService,
   PurchaseOrder,
@@ -99,6 +100,7 @@ export const ReceiveOrderModal: React.FC<ReceiveOrderModalProps> = React.memo(({
     setIsSubmitting(true);
     onReceivingStateChange(order.id);
     try {
+      await assertOnlineForWrite('recibir una orden de compra');
       const result = await SuppliersPOService.receivePurchaseOrder(
         order,
         userProfile,

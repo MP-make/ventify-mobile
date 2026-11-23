@@ -1,8 +1,7 @@
-import { Platform, StyleSheet } from 'react-native';
-import type { ContentStyle } from '@shopify/flash-list';
+import { Platform, StyleSheet, type ViewStyle } from 'react-native';
 import { ui } from '@/lib/theme';
 
-export const LIST_CONTENT_STYLE: ContentStyle = {
+export const LIST_CONTENT_STYLE: ViewStyle = {
   paddingHorizontal: 20,
   paddingBottom: 12,
 };
@@ -181,7 +180,7 @@ export const suppliersStyles = StyleSheet.create({
     height: 34,
     alignItems: 'center',
     justifyContent: 'center',
-    paddingHorizontal: 4,
+    paddingHorizontal: 2,
     borderRadius: 17,
     backgroundColor: ui.surfaceMuted,
     borderWidth: 1,
@@ -192,7 +191,7 @@ export const suppliersStyles = StyleSheet.create({
     borderColor: ui.primary,
   },
   filterChipText: {
-    fontSize: 11,
+    fontSize: 10.5,
     fontWeight: '600',
     color: ui.textSecondary,
   },
@@ -208,6 +207,7 @@ export const suppliersStyles = StyleSheet.create({
     borderWidth: 1,
     borderColor: ui.border,
     shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
     shadowOpacity: 0.04,
     shadowRadius: 4,
     elevation: 1,

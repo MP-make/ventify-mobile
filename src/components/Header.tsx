@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { View, Text, TouchableOpacity, Modal, ScrollView, StyleSheet } from 'react-native';
+import { View, Text, TouchableOpacity, Modal, ScrollView, StyleSheet, ActivityIndicator } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { Store, ChevronDown, Bell, WifiOff, CloudOff, Check, X, MapPin, LayoutGrid } from 'lucide-react-native';
+import { Store, ChevronDown, Bell, WifiOff, CloudOff, Check, X, MapPin, LayoutGrid, AlertTriangle, RefreshCw } from 'lucide-react-native';
 import { useRouter, type Href } from 'expo-router';
 import { useAuthSession } from '@/context/AuthContext';
 import {
@@ -117,10 +117,11 @@ const BranchOptionRow = React.memo<BranchOptionRowProps>(
 
 export const Header: React.FC<HeaderProps> = React.memo(({ title, showBranchSelector = true }) => {
   const insets = useSafeAreaInsets();
+  const router = useRouter();
   const { accountId, branchId, setActiveBranchId, allBranchesAccess, role } = useAuthSession();
   const { businessName, activeBranchName, branches } = useBusinessSettings();
   const { isCashOpen } = useCashSession();
-  const { isOnline, offlineQueueCount } = useOfflineStatus();
+  const { isOnline, offlineQueueCount, quarantinedCount, isSyncingOffline, triggerManualSync } = useOfflineStatus();
   const [branchModalVisible, setBranchModalVisible] = useState(false);
   const [launcherVisible, setLauncherVisible] = useState(false);
 
@@ -210,10 +211,51 @@ export const Header: React.FC<HeaderProps> = React.memo(({ title, showBranchSele
           </View>
         </View>
 
+        {quarantinedCount > 0 ? (
+          <TouchableOpacity
+            onPress={() => router.push('/(tabs)/settings' as Href)}
+            activeOpacity={0.8}
+            style={[styles.notice, { backgroundColor: ui.dangerSoft }]}
+            accessibilityRole="button"
+            accessibilityLabel="Revisar ventas en cuarentena en Ajustes"
+          >
+            <AlertTriangle size={13} color={ui.danger} />
+            <Text style={[styles.noticeText, { color: ui.danger, fontWeight: '700' }]}>
+              {quarantinedCount} {quarantinedCount === 1 ? 'venta en cuarentena' : 'ventas en cuarentena'} — Toca para revisar
+            </Text>
+          </TouchableOpacity>
+        ) : null}
+
         {!isOnline ? (
-          <View style={styles.notice}><WifiOff size={13} color={ui.warning} /><Text style={styles.noticeText}>Sin conexión{offlineQueueCount > 0 ? ` · ${offlineQueueCount} pendientes de sincronizar` : ''}</Text></View>
+          <View style={styles.notice}>
+            <WifiOff size={13} color={ui.warning} />
+            <Text style={styles.noticeText}>
+              Sin conexión{offlineQueueCount > 0 ? ` · ${offlineQueueCount} pendientes de sincronizar` : ''}
+            </Text>
+          </View>
         ) : offlineQueueCount > 0 ? (
-          <View style={styles.notice}><CloudOff size={13} color={ui.warning} /><Text style={styles.noticeText}>{offlineQueueCount} pendientes de sincronizar</Text></View>
+          <View style={styles.notice}>
+            <CloudOff size={13} color={ui.warning} />
+            <Text style={styles.noticeText}>
+              {offlineQueueCount} {offlineQueueCount === 1 ? 'pendiente de sincronizar' : 'pendientes de sincronizar'}
+            </Text>
+            <TouchableOpacity
+              onPress={() => void triggerManualSync(true)}
+              disabled={isSyncingOffline}
+              style={styles.syncChipBtn}
+              accessibilityRole="button"
+              accessibilityLabel="Sincronizar operaciones pendientes ahora"
+            >
+              {isSyncingOffline ? (
+                <ActivityIndicator size={11} color={ui.onPrimary} />
+              ) : (
+                <RefreshCw size={11} color={ui.onPrimary} />
+              )}
+              <Text style={styles.syncChipText}>
+                {isSyncingOffline ? 'Sincronizando...' : 'Sincronizar'}
+              </Text>
+            </TouchableOpacity>
+          </View>
         ) : null}
       </View>
 
@@ -274,6 +316,8 @@ const styles = StyleSheet.create({
   cashTextClosed: { color: ui.textSecondary },
   notice: { flexDirection: 'row', alignItems: 'center', gap: 6, backgroundColor: ui.warningSoft, padding: 6, borderRadius: 7, marginTop: 4 },
   noticeText: { flex: 1, color: ui.warning, fontSize: 11 },
+  syncChipBtn: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: ui.warning, paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6 },
+  syncChipText: { color: ui.onPrimary, fontSize: 10.5, fontWeight: '700' },
   overlay: { flex: 1, backgroundColor: 'rgba(17,28,49,0.40)', justifyContent: 'flex-end' },
   sheet: { backgroundColor: ui.surface, padding: 20, borderTopLeftRadius: 24, borderTopRightRadius: 24, maxHeight: '80%', width: '100%', maxWidth: 640, alignSelf: 'center' },
   sheetHeader: { flexDirection: 'row', alignItems: 'center', gap: 12, marginBottom: 16 },

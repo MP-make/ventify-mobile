@@ -333,9 +333,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: 2,
   },
   logoCircleContainer: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
+    width: 60,
+    height: 60,
+    borderRadius: 30,
     overflow: 'hidden',
     backgroundColor: '#FFFFFF',
     borderWidth: 1.5,
@@ -349,9 +349,9 @@ const styles = StyleSheet.create({
     shadowRadius: 2,
   },
   logoCircularImage: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
+    width: 54,
+    height: 54,
+    borderRadius: 27,
   },
   headerTextGroup: {
     flex: 1,
@@ -364,9 +364,9 @@ const styles = StyleSheet.create({
     gap: 6,
   },
   brandWordmark: {
-    fontSize: 22,
+    fontSize: 29,
     fontWeight: '800',
-    letterSpacing: -0.8,
+    letterSpacing: -0.9,
     color: ui.text,
   },
   brandDot: {

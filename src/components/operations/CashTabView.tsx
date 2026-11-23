@@ -139,6 +139,7 @@ const SalePaymentBadges = React.memo(({ sale }: { sale: any }) => {
 const CashMovementRow = React.memo(({ movement }: { movement: CashMovement }) => {
   const numericAmt = Number(movement.amount) || 0;
   const isIncome = movement.type ? movement.type === 'income' : numericAmt >= 0;
+  const isOfflinePending = Boolean((movement as any).isOfflinePending);
   const catLabel = expenseCategoryLabel(movement.expenseCategoryId, movement.category);
   const hasReceipt = Boolean(movement.receiptType && movement.receiptType !== 'ninguno');
   return (
@@ -156,9 +157,16 @@ const CashMovementRow = React.memo(({ movement }: { movement: CashMovement }) =>
         )}
       </View>
       <View style={{ flex: 1, marginLeft: 12 }}>
-        <Text style={styles.movementTitle}>
-          {movement.reason || movement.description || 'Movimiento de caja'}
-        </Text>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+          <Text style={styles.movementTitle}>
+            {movement.reason || movement.description || 'Movimiento de caja'}
+          </Text>
+          {isOfflinePending && (
+            <View style={[styles.methodBadgePill, { backgroundColor: ui.warningSoft }]}>
+              <Text style={[styles.methodBadgeText, { color: ui.warning }]}>Pendiente offline</Text>
+            </View>
+          )}
+        </View>
         <Text style={styles.movementSub}>
           {formatDatePE(movement.createdAt)} • {catLabel} • {movement.createdByName || 'Operador'}
           {hasReceipt

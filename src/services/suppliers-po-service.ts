@@ -469,20 +469,22 @@ export const deriveBranchIds = (
 // MAPEOS DE DOCUMENTOS FIRESTORE
 // ============================================================================
 
+const safeStr = (v: unknown, fallback = ''): string => (v == null ? fallback : String(v));
+
 export const supplierFromDoc = (docSnap: QueryDocumentSnapshot<DocumentData>): Supplier => {
   const data = docSnap.data();
   return {
     id: docSnap.id,
-    accountId: data.accountId || '',
-    name: data.name || '',
-    taxId: data.taxId || '',
-    contactName: data.contactName || '',
-    phone: data.phone || '',
-    email: data.email || '',
-    address: data.address || '',
-    category: data.category || 'General',
-    notes: data.notes || '',
-    paymentTerms: data.paymentTerms || 'Contado',
+    accountId: safeStr(data.accountId),
+    name: safeStr(data.name),
+    taxId: safeStr(data.taxId),
+    contactName: safeStr(data.contactName),
+    phone: safeStr(data.phone),
+    email: safeStr(data.email),
+    address: safeStr(data.address),
+    category: safeStr(data.category, 'General') || 'General',
+    notes: safeStr(data.notes),
+    paymentTerms: safeStr(data.paymentTerms, 'Contado') || 'Contado',
     active: data.active !== false,
     createdAt: data.createdAt instanceof Timestamp ? data.createdAt.toDate() : data.createdAt,
     updatedAt: data.updatedAt instanceof Timestamp ? data.updatedAt.toDate() : data.updatedAt,
@@ -493,25 +495,34 @@ export const purchaseOrderFromDoc = (docSnap: QueryDocumentSnapshot<DocumentData
   const data = docSnap.data();
   return {
     id: docSnap.id,
-    accountId: data.accountId || '',
-    branchId: data.branchId || 'main',
-    branchName: data.branchName || 'Principal',
-    orderNumber: data.orderNumber || docSnap.id.substring(0, 8).toUpperCase(),
-    supplierId: data.supplierId || '',
-    supplierName: data.supplierName || 'Proveedor',
+    accountId: safeStr(data.accountId),
+    branchId: safeStr(data.branchId, 'main') || 'main',
+    branchName: safeStr(data.branchName, 'Principal') || 'Principal',
+    orderNumber: safeStr(data.orderNumber) || docSnap.id.substring(0, 8).toUpperCase(),
+    supplierId: safeStr(data.supplierId),
+    supplierName: safeStr(data.supplierName, 'Proveedor') || 'Proveedor',
     status: (data.status as PurchaseOrderStatus) || 'pending',
     items: Array.isArray(data.items) ? data.items : [],
     subtotal: Number(data.subtotal) || 0,
     tax: Number(data.tax) || 0,
-    totalCost: Number(data.totalCost) || Number(data.subtotal) || 0,
+    totalCost:
+      Number(data.totalCost) ||
+      Number(data.totalAmount) ||
+      Number(data.total) ||
+      Number(data.subtotal) ||
+      0,
     expectedDate: data.expectedDate instanceof Timestamp ? data.expectedDate.toDate() : data.expectedDate,
     receivedDate: data.receivedDate instanceof Timestamp ? data.receivedDate.toDate() : data.receivedDate,
     receivedAt: data.receivedAt instanceof Timestamp ? data.receivedAt.toDate() : data.receivedAt,
-    receivedBy: data.receivedBy,
-    receivedByName: data.receivedByName,
-    notes: data.notes || '',
-    createdBy: data.createdBy,
-    createdByName: data.createdByName,
+    partialReceivedAt:
+      data.partialReceivedAt instanceof Timestamp
+        ? data.partialReceivedAt.toDate()
+        : data.partialReceivedAt,
+    receivedBy: data.receivedBy != null ? String(data.receivedBy) : undefined,
+    receivedByName: data.receivedByName != null ? String(data.receivedByName) : undefined,
+    notes: safeStr(data.notes),
+    createdBy: data.createdBy != null ? String(data.createdBy) : undefined,
+    createdByName: data.createdByName != null ? String(data.createdByName) : undefined,
     createdAt: data.createdAt instanceof Timestamp ? data.createdAt.toDate() : data.createdAt,
     updatedAt: data.updatedAt instanceof Timestamp ? data.updatedAt.toDate() : data.updatedAt,
   };
@@ -565,28 +576,39 @@ export const subscribeSuppliers = (
   }
 
   return createAppStateManagedSubscription(() => {
-    const suppliersColl = collection(db, SUPPLIERS_COLLECTION);
-    const constraints: any[] = [where('accountId', '==', accountId)];
+    try {
+      const suppliersColl = collection(db, SUPPLIERS_COLLECTION);
+      const constraints: any[] = [where('accountId', '==', accountId)];
 
-    if (onlyActive) {
-      constraints.push(where('active', '==', true));
-    }
-    constraints.push(firestoreLimit(300));
-
-    const q = query(suppliersColl, ...constraints);
-
-    return onSnapshot(
-      q,
-      (snapshot) => {
-        const list = snapshot.docs.map(supplierFromDoc);
-        list.sort((a, b) => a.name.localeCompare(b.name, 'es', { sensitivity: 'base' }));
-        callback(list);
-      },
-      (err) => {
-        console.warn('[suppliers-po-service] Error en suscripción a proveedores:', err);
-        callback([]);
+      if (onlyActive) {
+        constraints.push(where('active', '==', true));
       }
-    );
+      constraints.push(firestoreLimit(300));
+
+      const q = query(suppliersColl, ...constraints);
+
+      return onSnapshot(
+        q,
+        (snapshot) => {
+          try {
+            const list = snapshot.docs.map(supplierFromDoc);
+            list.sort((a, b) => a.name.localeCompare(b.name, 'es', { sensitivity: 'base' }));
+            callback(list);
+          } catch (err) {
+            console.warn('[suppliers-po-service] Error procesando snapshot de proveedores:', err);
+            callback([]);
+          }
+        },
+        (err) => {
+          console.warn('[suppliers-po-service] Error en suscripción a proveedores:', err);
+          callback([]);
+        }
+      );
+    } catch (err) {
+      console.warn('[suppliers-po-service] Error iniciando suscripción a proveedores:', err);
+      callback([]);
+      return () => {};
+    }
   });
 };
 
@@ -807,19 +829,24 @@ export const subscribePurchaseOrders = (
   }
 
   const handleSnapshot = (snapshot: any) => {
-    let orders: PurchaseOrder[] = snapshot.docs.map(purchaseOrderFromDoc);
+    try {
+      let orders: PurchaseOrder[] = snapshot.docs.map(purchaseOrderFromDoc);
 
-    if (branchId && branchId !== 'all') {
-      orders = orders.filter((o) => !o.branchId || o.branchId === branchId);
+      if (branchId && branchId !== 'all') {
+        orders = orders.filter((o) => !o.branchId || o.branchId === branchId);
+      }
+
+      orders.sort((a, b) => {
+        const tA = a.createdAt instanceof Date ? a.createdAt.getTime() : Number(a.createdAt) || 0;
+        const tB = b.createdAt instanceof Date ? b.createdAt.getTime() : Number(b.createdAt) || 0;
+        return tB - tA;
+      });
+
+      callback(orders);
+    } catch (err) {
+      console.warn('[suppliers-po-service] Error procesando snapshot de purchase_orders:', err);
+      callback([]);
     }
-
-    orders.sort((a, b) => {
-      const tA = a.createdAt instanceof Date ? a.createdAt.getTime() : Number(a.createdAt) || 0;
-      const tB = b.createdAt instanceof Date ? b.createdAt.getTime() : Number(b.createdAt) || 0;
-      return tB - tA;
-    });
-
-    callback(orders);
   };
 
   return createAppStateManagedSubscription(() => {
@@ -847,7 +874,8 @@ export const subscribePurchaseOrders = (
         return;
       }
 
-      const unsub = onSnapshot(
+      let unsub: (() => void) | null = null;
+      unsub = onSnapshot(
         q,
         handleSnapshot,
         (err) => {

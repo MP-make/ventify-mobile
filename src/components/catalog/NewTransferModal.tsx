@@ -23,9 +23,10 @@ import {
 } from 'lucide-react-native';
 import * as Haptics from 'expo-haptics';
 import { useAuthSession } from '@/context/AuthContext';
-import { useBusinessSettings } from '@/context/SettingsContext';
+import { useBusinessSettings, useOfflineStatus } from '@/context/SettingsContext';
 import { useProducts } from '@/context/ProductsContext';
 import { usePermissions } from '@/hooks/usePermissions';
+import { assertOnlineForWrite } from '@/lib/online-guard';
 import { useDebouncedValue } from '@/hooks/use-debounced-value';
 import { filterCatalogIndex } from '@/lib/catalog-filters';
 import { getAvailableStock } from '@/lib/product-search';
@@ -116,6 +117,7 @@ export const NewTransferModal: React.FC<NewTransferModalProps> = React.memo(
   ({ visible, onClose, onTransferCreated }) => {
     const { accountId, branchId, user, userProfile } = useAuthSession();
     const { branches, activeBranchName } = useBusinessSettings();
+    const { isOnline } = useOfflineStatus();
     const { catalogIndex, getProductById, findByBarcode } = useProducts();
     const { canRequestTransfer } = usePermissions();
 
@@ -424,6 +426,7 @@ export const NewTransferModal: React.FC<NewTransferModalProps> = React.memo(
 
       try {
         setIsCreatingTransfer(true);
+        await assertOnlineForWrite('crear una transferencia de stock', isOnline);
         await createStockTransfer({
           accountId,
           fromBranchId: effectiveDraftSourceId,
@@ -462,6 +465,7 @@ export const NewTransferModal: React.FC<NewTransferModalProps> = React.memo(
       destinationBranchId,
       effectiveDraftSourceId,
       getProductById,
+      isOnline,
       onClose,
       onTransferCreated,
       transferItems,

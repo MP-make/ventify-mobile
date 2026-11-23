@@ -15,8 +15,11 @@ import {
   Modal,
   Alert,
   ActivityIndicator,
+  FlatList,
+  Platform,
+  StyleSheet,
+  type ListRenderItem,
 } from 'react-native';
-import { FlashList, type ListRenderItem } from '@shopify/flash-list';
 import * as Linking from 'expo-linking';
 import * as Haptics from 'expo-haptics';
 import {
@@ -30,10 +33,13 @@ import {
   Boxes,
   ClipboardList,
   Contact,
+  WifiOff,
 } from 'lucide-react-native';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { useAuthSession } from '@/context/AuthContext';
+import { useOfflineStatus } from '@/context/SettingsContext';
+import { assertOnlineForWrite, checkIsOnlineLive } from '@/lib/online-guard';
 import { useDebouncedValue } from '@/hooks/use-debounced-value';
 import { formatPEN, ui } from '@/lib/theme';
 import { BrandLogo } from '@/components/ui';
@@ -65,7 +71,93 @@ export interface SuppliersPurchaseModalProps {
   onClose: () => void;
   onStockUpdated?: () => void;
   initialTab?: 'orders' | 'suppliers';
+  asScreen?: boolean;
+  embedded?: boolean;
 }
+
+class SuppliersErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  { error: Error | null }
+> {
+  state: { error: Error | null } = { error: null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+
+  handleRetry = () => {
+    this.setState({ error: null });
+  };
+
+  render() {
+    if (this.state.error) {
+      return (
+        <View style={fallbackStyles.container}>
+          <View style={fallbackStyles.card}>
+            <Text style={fallbackStyles.title}>No se pudo mostrar Compras y proveedores</Text>
+            <Text style={fallbackStyles.message}>
+              {this.state.error.message || 'Ocurrió un error inesperado al cargar esta vista.'}
+            </Text>
+            <TouchableOpacity
+              style={fallbackStyles.retryBtn}
+              onPress={this.handleRetry}
+              activeOpacity={0.8}
+              accessibilityRole="button"
+              accessibilityLabel="Reintentar cargar Compras y proveedores"
+            >
+              <Text style={fallbackStyles.retryBtnText}>Reintentar</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+const fallbackStyles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: ui.background,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 24,
+  },
+  card: {
+    width: '100%',
+    maxWidth: 360,
+    backgroundColor: ui.surface,
+    borderRadius: 14,
+    padding: 20,
+    borderWidth: 1,
+    borderColor: ui.border,
+    alignItems: 'center',
+    gap: 10,
+  },
+  title: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: ui.text,
+    textAlign: 'center',
+  },
+  message: {
+    fontSize: 13,
+    color: ui.textSecondary,
+    textAlign: 'center',
+  },
+  retryBtn: {
+    marginTop: 6,
+    backgroundColor: ui.primary,
+    paddingHorizontal: 18,
+    paddingVertical: 10,
+    borderRadius: 10,
+  },
+  retryBtnText: {
+    color: ui.surface,
+    fontSize: 13,
+    fontWeight: '700',
+  },
+});
 
 const ORDER_STATUS_FILTERS = [
   { id: 'all', label: 'Todas' },
@@ -87,9 +179,12 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
   onClose,
   onStockUpdated,
   initialTab = 'orders',
+  asScreen = false,
+  embedded = false,
 }) => {
   const insets = useSafeAreaInsets();
   const { accountId, userProfile } = useAuthSession();
+  const { isOnline } = useOfflineStatus();
 
   // --------------------------------------------------------------------------
   // ESTADOS PRINCIPALES: PESTAÑAS Y LISTADOS
@@ -124,24 +219,13 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
     visible: boolean;
     editingSupplier: Supplier | null;
   }>({ visible: false, editingSupplier: null });
-  const [modalReady, setModalReady] = useState<boolean>(false);
 
-  // Sincronizar pestaña inicial si cambia desde props y forzar re-sync de layout en Android Fabric
+  // Sincronizar pestaña inicial si cambia desde props
   useEffect(() => {
-    if (!visible) {
-      setModalReady(false);
-      return;
+    if (visible) {
+      setActiveTab(initialTab);
     }
-    setActiveTab(initialTab);
-    const frame = requestAnimationFrame(() => {
-      setModalReady(true);
-    });
-    return () => cancelAnimationFrame(frame);
   }, [visible, initialTab]);
-
-  const handleModalShow = useCallback(() => {
-    setModalReady(true);
-  }, []);
 
   // --------------------------------------------------------------------------
   // CARGA Y SUSCRIPCIÓN EN TIEMPO REAL
@@ -151,6 +235,13 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
     if (!visible || !accountId) {
       setPurchaseOrders([]);
       setSuppliers([]);
+      setOrdersLoading(false);
+      setSuppliersLoading(false);
+      return () => {
+        isCurrentAccount = false;
+      };
+    }
+    if (!isOnline) {
       setOrdersLoading(false);
       setSuppliersLoading(false);
       return () => {
@@ -185,7 +276,7 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
       unsubscribeOrders();
       unsubscribeSuppliers();
     };
-  }, [visible, accountId]);
+  }, [visible, accountId, isOnline]);
 
   // KPIs de órdenes de compra
   const orderStats = useMemo(() => {
@@ -206,9 +297,9 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
       if (!matchesStatus) return false;
       if (!query) return true;
 
-      const numMatch = (order.orderNumber || '').toLowerCase().includes(query);
-      const supMatch = (order.supplierName || '').toLowerCase().includes(query);
-      const notesMatch = (order.notes || '').toLowerCase().includes(query);
+      const numMatch = String(order.orderNumber ?? '').toLowerCase().includes(query);
+      const supMatch = String(order.supplierName ?? '').toLowerCase().includes(query);
+      const notesMatch = String(order.notes ?? '').toLowerCase().includes(query);
 
       return numMatch || supMatch || notesMatch;
     });
@@ -219,11 +310,11 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
     const query = debouncedSupplierSearch.toLowerCase().trim();
     if (!query) return suppliers;
     return suppliers.filter((s) => {
-      const nameMatch = (s.name || '').toLowerCase().includes(query);
-      const rucMatch = (s.taxId || '').toLowerCase().includes(query);
-      const contactMatch = (s.contactName || '').toLowerCase().includes(query);
-      const catMatch = (s.category || '').toLowerCase().includes(query);
-      const phoneMatch = (s.phone || '').toLowerCase().includes(query);
+      const nameMatch = String(s.name ?? '').toLowerCase().includes(query);
+      const rucMatch = String(s.taxId ?? '').toLowerCase().includes(query);
+      const contactMatch = String(s.contactName ?? '').toLowerCase().includes(query);
+      const catMatch = String(s.category ?? '').toLowerCase().includes(query);
+      const phoneMatch = String(s.phone ?? '').toLowerCase().includes(query);
       return nameMatch || rucMatch || contactMatch || catMatch || phoneMatch;
     });
   }, [suppliers, debouncedSupplierSearch]);
@@ -235,10 +326,17 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
     setExpandedOrderId((prev) => (prev === orderId ? null : orderId));
   }, []);
 
-  const handleReceiveOrder = useCallback((order: PurchaseOrder) => {
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    setReceiveModalOrder(order);
-  }, []);
+  const handleReceiveOrder = useCallback(
+    async (order: PurchaseOrder) => {
+      if (!(await checkIsOnlineLive(isOnline))) {
+        Alert.alert('Sin Conexión', 'Recibir órdenes de compra requiere conexión a internet.');
+        return;
+      }
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+      setReceiveModalOrder(order);
+    },
+    [isOnline]
+  );
 
   const handleReceiptSuccess = useCallback(
     (order: PurchaseOrder, result: ReceivePurchaseOrderResult) => {
@@ -291,20 +389,31 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
   // --------------------------------------------------------------------------
   // ACCIONES SOBRE SUB-MODALES
   // --------------------------------------------------------------------------
-  const handleOpenCreateOrderModal = useCallback(() => {
+  const handleOpenCreateOrderModal = useCallback(async () => {
+    if (!(await checkIsOnlineLive(isOnline))) {
+      Alert.alert('Sin Conexión', 'Crear órdenes de compra requiere conexión a internet.');
+      return;
+    }
     setCreateOrderModalVisible(true);
-  }, []);
+  }, [isOnline]);
 
   const handleCloseCreateOrderModal = useCallback(() => {
     setCreateOrderModalVisible(false);
   }, []);
 
-  const handleOpenSupplierForm = useCallback((supplierToEdit?: Supplier) => {
-    setSupplierFormState({
-      visible: true,
-      editingSupplier: supplierToEdit ?? null,
-    });
-  }, []);
+  const handleOpenSupplierForm = useCallback(
+    async (supplierToEdit?: Supplier) => {
+      if (!(await checkIsOnlineLive(isOnline))) {
+        Alert.alert('Sin Conexión', 'Crear o editar proveedores requiere conexión a internet.');
+        return;
+      }
+      setSupplierFormState({
+        visible: true,
+        editingSupplier: supplierToEdit ?? null,
+      });
+    },
+    [isOnline]
+  );
 
   const handleCloseSupplierForm = useCallback(() => {
     setSupplierFormState({ visible: false, editingSupplier: null });
@@ -343,6 +452,7 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
           style: 'destructive',
           onPress: async () => {
             try {
+              await assertOnlineForWrite('desactivar proveedor', isOnline);
               await SuppliersPOService.deleteSupplier(supplier.id);
               Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
               Alert.alert('Proveedor Desactivado', 'El proveedor ha sido dado de baja.');
@@ -353,7 +463,7 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
         },
       ]
     );
-  }, []);
+  }, [isOnline]);
 
   const handleCallSupplier = useCallback((phone?: string) => {
     if (!phone) return;
@@ -384,7 +494,7 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
   }, []);
 
   // --------------------------------------------------------------------------
-  // FLASHLIST RENDERERS & EXTRADATA
+  // FLATLIST RENDERERS & EXTRADATA
   // --------------------------------------------------------------------------
   const ordersExtraData = useMemo<OrdersExtraData>(
     () => ({ expandedOrderId, isReceivingId }),
@@ -392,20 +502,23 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
   );
 
   const renderOrderItem = useCallback<ListRenderItem<PurchaseOrder>>(
-    ({ item: order, extraData }) => {
-      const ctx = extraData as OrdersExtraData | undefined;
-      return (
-        <OrderCardRow
-          order={order}
-          isExpanded={ctx?.expandedOrderId === order.id}
-          isReceiving={ctx?.isReceivingId === order.id}
-          onToggleExpand={handleToggleExpandOrder}
-          onReceiveOrder={handleReceiveOrder}
-          onCancelOrder={handleCancelOrder}
-        />
-      );
-    },
-    [handleToggleExpandOrder, handleReceiveOrder, handleCancelOrder]
+    ({ item: order }) => (
+      <OrderCardRow
+        order={order}
+        isExpanded={expandedOrderId === order.id}
+        isReceiving={isReceivingId === order.id}
+        onToggleExpand={handleToggleExpandOrder}
+        onReceiveOrder={handleReceiveOrder}
+        onCancelOrder={handleCancelOrder}
+      />
+    ),
+    [
+      expandedOrderId,
+      isReceivingId,
+      handleToggleExpandOrder,
+      handleReceiveOrder,
+      handleCancelOrder,
+    ]
   );
 
   const renderSupplierItem = useCallback<ListRenderItem<Supplier>>(
@@ -430,35 +543,30 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
 
   if (!visible) return null;
 
-  return (
-    <Modal
-      visible={visible}
-      animationType="slide"
-      transparent
-      statusBarTranslucent
-      onShow={handleModalShow}
-      onRequestClose={onClose}
-    >
-      <View style={[styles.safeArea, { paddingTop: insets.top, paddingBottom: insets.bottom }]}>
-        {/* ENCABEZADO PRINCIPAL */}
-        <View style={styles.header}>
-          <View style={styles.headerTitleRow}>
-            <BrandLogo size={34} wordmark={false} />
-            <View>
-              <Text style={styles.headerTitle}>Compras y proveedores</Text>
-              <Text style={styles.headerSubtitle}>Gestión de abastecimiento</Text>
-            </View>
-          </View>
-          <TouchableOpacity
-            style={styles.closeButton}
-            onPress={onClose}
-            activeOpacity={0.7}
-            accessibilityRole="button"
-            accessibilityLabel="Cerrar compras y proveedores"
-          >
-            <X size={20} color={ui.textSecondary} />
-          </TouchableOpacity>
+  const headerElement = !embedded ? (
+    <View style={styles.header}>
+      <View style={styles.headerTitleRow}>
+        <BrandLogo size={34} wordmark={false} />
+        <View style={{ flex: 1, minWidth: 0 }}>
+          <Text style={styles.headerTitle}>Compras y proveedores</Text>
+          <Text style={styles.headerSubtitle}>Gestión de abastecimiento</Text>
         </View>
+      </View>
+      <TouchableOpacity
+        style={styles.closeButton}
+        onPress={onClose}
+        activeOpacity={0.7}
+        accessibilityRole="button"
+        accessibilityLabel="Cerrar compras y proveedores"
+      >
+        <X size={20} color={ui.textSecondary} />
+      </TouchableOpacity>
+    </View>
+  ) : null;
+
+  const bodyContent = (
+    <>
+      {headerElement}
 
         {/* SELECTOR DE PESTAÑAS */}
         <View style={styles.tabsBar}>
@@ -498,6 +606,25 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
 
         {/* CONTENIDO SEGÚN LA PESTAÑA SELECCIONADA */}
         <View style={{ flex: 1 }}>
+          {!isOnline && (
+            <View
+              style={{
+                flexDirection: 'row',
+                alignItems: 'center',
+                gap: 8,
+                backgroundColor: ui.warningSoft,
+                borderBottomWidth: 1,
+                borderBottomColor: ui.warning,
+                paddingHorizontal: 14,
+                paddingVertical: 9,
+              }}
+            >
+              <WifiOff size={14} color={ui.warning} />
+              <Text style={{ flex: 1, fontSize: 12, fontWeight: '600', color: ui.warning }}>
+                Sin conexión · Compras y proveedores requieren internet para consultar o registrar cambios.
+              </Text>
+            </View>
+          )}
           {activeTab === 'orders' ? (
             <View style={styles.tabContentContainer}>
               <Text style={styles.sectionSubOnly}>Abastecimiento y seguimiento de recepción.</Text>
@@ -546,7 +673,7 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
                     placeholderTextColor={ui.textMuted}
                     value={orderSearchQuery}
                     onChangeText={setOrderSearchQuery}
-                    clearButtonMode="while-editing"
+                    clearButtonMode={Platform.OS === 'ios' ? 'while-editing' : undefined}
                   />
                 </View>
                 <TouchableOpacity
@@ -572,8 +699,7 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
                       <Text
                         style={[styles.filterChipText, isSelected && styles.filterChipTextActive]}
                         numberOfLines={1}
-                        adjustsFontSizeToFit
-                        minimumFontScale={0.78}
+                        ellipsizeMode="tail"
                       >
                         {chip.label}
                       </Text>
@@ -582,8 +708,8 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
                 })}
               </View>
 
-              {/* LISTADO VIRTUALIZADO DE ÓRDENES */}
-              {!modalReady || (ordersLoading && purchaseOrders.length === 0) ? (
+              {/* LISTADO DE ÓRDENES */}
+              {ordersLoading && purchaseOrders.length === 0 ? (
                 <View style={styles.centerContainer}>
                   <ActivityIndicator size="large" color={ui.primary} />
                   <Text style={styles.loadingText}>Cargando órdenes de compra...</Text>
@@ -608,14 +734,17 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
                   )}
                 </View>
               ) : (
-                <FlashList
+                <FlatList
                   data={filteredOrders}
                   keyExtractor={keyExtractorById}
                   renderItem={renderOrderItem}
                   extraData={ordersExtraData}
-                  estimatedItemSize={210}
                   contentContainerStyle={LIST_CONTENT_STYLE}
                   showsVerticalScrollIndicator={false}
+                  keyboardShouldPersistTaps="handled"
+                  initialNumToRender={10}
+                  maxToRenderPerBatch={10}
+                  windowSize={7}
                 />
               )}
             </View>
@@ -633,7 +762,7 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
                     placeholderTextColor={ui.textMuted}
                     value={supplierSearchQuery}
                     onChangeText={setSupplierSearchQuery}
-                    clearButtonMode="while-editing"
+                    clearButtonMode={Platform.OS === 'ios' ? 'while-editing' : undefined}
                   />
                 </View>
                 <TouchableOpacity
@@ -646,8 +775,8 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
                 </TouchableOpacity>
               </View>
 
-              {/* LISTADO VIRTUALIZADO DE PROVEEDORES */}
-              {!modalReady || (suppliersLoading && suppliers.length === 0) ? (
+              {/* LISTADO DE PROVEEDORES */}
+              {suppliersLoading && suppliers.length === 0 ? (
                 <View style={styles.centerContainer}>
                   <ActivityIndicator size="large" color={ui.primary} />
                   <Text style={styles.loadingText}>Cargando proveedores...</Text>
@@ -672,13 +801,16 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
                   )}
                 </View>
               ) : (
-                <FlashList
+                <FlatList
                   data={filteredSuppliers}
                   keyExtractor={keyExtractorById}
                   renderItem={renderSupplierItem}
-                  estimatedItemSize={220}
                   contentContainerStyle={LIST_CONTENT_STYLE}
                   showsVerticalScrollIndicator={false}
+                  keyboardShouldPersistTaps="handled"
+                  initialNumToRender={10}
+                  maxToRenderPerBatch={10}
+                  windowSize={7}
                 />
               )}
             </View>
@@ -723,7 +855,40 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
             onApplied={handleAppliedPriceSuggestions}
           />
         )}
-      </View>
+    </>
+  );
+
+  if (embedded) {
+    return (
+      <SuppliersErrorBoundary>
+        <View style={styles.safeArea}>{bodyContent}</View>
+      </SuppliersErrorBoundary>
+    );
+  }
+
+  if (asScreen) {
+    return (
+      <SuppliersErrorBoundary>
+        <SafeAreaView style={styles.safeArea} edges={['top', 'bottom']}>
+          {bodyContent}
+        </SafeAreaView>
+      </SuppliersErrorBoundary>
+    );
+  }
+
+  return (
+    <Modal
+      visible={visible}
+      animationType="slide"
+      transparent
+      statusBarTranslucent
+      onRequestClose={onClose}
+    >
+      <SuppliersErrorBoundary>
+        <View style={[styles.safeArea, { paddingTop: insets.top, paddingBottom: insets.bottom }]}>
+          {bodyContent}
+        </View>
+      </SuppliersErrorBoundary>
     </Modal>
   );
 });

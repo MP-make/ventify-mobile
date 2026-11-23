@@ -26,7 +26,9 @@ import { SectionHeading } from '@/components/ui';
 import { getAllPresentations, getBranchPricingConfig } from '@/lib/product-search';
 import { presentationFactor } from '@/lib/presentation-parity';
 import { useAuthSession } from '@/context/AuthContext';
+import { useCart } from '@/context/CartContext';
 import { useBusinessSettings } from '@/context/SettingsContext';
+import { getCartReservedUnitsForProduct, round4 } from '@/lib/offline-stock-helpers';
 import {
   getVariantBranchStock,
   resolvePresentationVariantPrice,
@@ -58,6 +60,7 @@ const PresentationVariantModalContent: React.FC<
 }) => {
   const insets = useSafeAreaInsets();
   const { branchId } = useAuthSession();
+  const { items: cartItems } = useCart();
   const { posSettings } = useBusinessSettings();
   const effectiveBranchId = branchId || 'main';
   const enableMinSalePrice = posSettings?.enableMinSalePrice !== false;
@@ -163,25 +166,50 @@ const PresentationVariantModalContent: React.FC<
       Array.isArray(product.variants) && product.variants.length > 0
         ? product.variants.map((v) => ({
             variant: v,
-            stock: getVariantBranchStock(v, effectiveBranchId),
+            stock: Math.max(
+              0,
+              round4(
+                getVariantBranchStock(v, effectiveBranchId) -
+                  getCartReservedUnitsForProduct(cartItems, product.id, v.id)
+              )
+            ),
           }))
         : [],
-    [product, effectiveBranchId]
+    [product, effectiveBranchId, cartItems]
   );
 
   const lineTotal = Math.round(unitPrice * quantity * 100) / 100;
 
-  // Validar disponibilidad real considerando stock reservado y stock específico de la variante
-  const { productAvailable, variantStock, effectiveAvailable, maxUnits } = useMemo(
-    () =>
-      resolvePresentationVariantStock({
-        product,
-        branchId: effectiveBranchId,
-        presentation: selectedPresentation,
-        variant: selectedVariant,
-      }),
-    [product, effectiveBranchId, selectedPresentation, selectedVariant]
-  );
+  // Validar disponibilidad real considerando stock reservado, variantes y unidades ya en el carrito
+  const { productAvailable, variantStock, effectiveAvailable, maxUnits } = useMemo(() => {
+    const raw = resolvePresentationVariantStock({
+      product,
+      branchId: effectiveBranchId,
+      presentation: selectedPresentation,
+      variant: selectedVariant,
+    });
+    const cartReservedTotal = getCartReservedUnitsForProduct(cartItems, product.id);
+    const cartReservedVariant = selectedVariant
+      ? getCartReservedUnitsForProduct(cartItems, product.id, selectedVariant.id)
+      : 0;
+    const remProductAvailable = Math.max(0, round4(raw.productAvailable - cartReservedTotal));
+    const remVariantAvailable =
+      selectedVariant && raw.variantStock !== null
+        ? Math.max(0, round4(raw.variantStock - cartReservedVariant))
+        : null;
+    const adjustedAvailable =
+      remVariantAvailable !== null
+        ? Math.min(remProductAvailable, remVariantAvailable)
+        : remProductAvailable;
+    const adjustedMaxUnits =
+      factor > 0 ? Math.max(0, Math.floor((adjustedAvailable + 0.00001) / factor)) : 0;
+    return {
+      productAvailable: remProductAvailable,
+      variantStock: remVariantAvailable,
+      effectiveAvailable: adjustedAvailable,
+      maxUnits: adjustedMaxUnits,
+    };
+  }, [product, effectiveBranchId, selectedPresentation, selectedVariant, cartItems, factor]);
 
   const requiredUnits = Math.round(quantity * factor * 10000) / 10000;
   const isStockInsufficient = effectiveAvailable <= 0 || requiredUnits > effectiveAvailable;

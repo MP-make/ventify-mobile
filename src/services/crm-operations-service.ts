@@ -79,6 +79,10 @@ import { apiRequest } from '@/lib/api-client';
 import { cleanFirestoreData } from '@/lib/firebase-utils';
 import { sharedRequestCache } from '@/lib/request-cache';
 import { deriveBranchIds, deriveLowStockBranches } from '@/lib/product-branch-ids';
+import { metaKVStorage } from '@/lib/native-kv-storage';
+import { assertOnlineForWrite, checkIsOnlineLive } from '@/lib/online-guard';
+
+const CUSTOMERS_KV_CACHE_PREFIX = 'ventify_customers_cache_v1:';
 
 const CRM_CUSTOMERS_CACHE_TTL_MS = 60_000;
 const missingCrmIndexes = new Set<string>();
@@ -334,30 +338,52 @@ export const getCustomers = async (
 ): Promise<Customer[]> => {
   if (!accountId) return [];
 
+  const kvKey = `${CUSTOMERS_KV_CACHE_PREFIX}${accountId}`;
+  const readCachedCustomers = async (): Promise<Customer[]> => {
+    try {
+      const raw = await metaKVStorage.getItem(kvKey);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  };
+
   try {
     const cacheKey = `customers:${accountId}:${maxResults}`;
-    let customers = await sharedRequestCache.getOrLoad(
-      cacheKey,
-      CRM_CUSTOMERS_CACHE_TTL_MS,
-      async () => {
-        const coll = collection(db, CUSTOMERS_COLLECTION);
-        const q = query(coll, where('accountId', '==', accountId), ...applyLimit(maxResults));
-        const snapshot = await getDocs(q);
+    const online = await checkIsOnlineLive(true);
+    let customers: Customer[];
 
-        const list: Customer[] = snapshot.docs.map((d) => {
-          const data = d.data();
-          return {
-            id: d.id,
-            name: data.name || '',
-            totalPurchases: data.totalPurchases || 0,
-            totalSpent: data.totalSpent || 0,
-            ...data,
-          } as Customer;
-        });
-        list.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
-        return list;
-      }
-    );
+    if (!online) {
+      customers = await readCachedCustomers();
+    } else {
+      customers = await sharedRequestCache.getOrLoad(
+        cacheKey,
+        CRM_CUSTOMERS_CACHE_TTL_MS,
+        async () => {
+          const coll = collection(db, CUSTOMERS_COLLECTION);
+          const q = query(coll, where('accountId', '==', accountId), ...applyLimit(maxResults));
+          const snapshot = await getDocs(q);
+
+          const list: Customer[] = snapshot.docs.map((d) => {
+            const data = d.data();
+            return {
+              id: d.id,
+              name: data.name || '',
+              totalPurchases: data.totalPurchases || 0,
+              totalSpent: data.totalSpent || 0,
+              ...data,
+            } as Customer;
+          });
+          list.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+          if (list.length > 0 || (snapshot as any).metadata?.fromCache !== true) {
+            void metaKVStorage.setItem(kvKey, JSON.stringify(list));
+          }
+          return list;
+        }
+      );
+    }
 
     if (searchTerm && searchTerm.trim().length > 0) {
       const term = searchTerm.toLowerCase().trim();
@@ -374,7 +400,7 @@ export const getCustomers = async (
     return customers;
   } catch (err) {
     console.error('[CRMService] Error obteniendo clientes:', err);
-    return [];
+    return readCachedCustomers();
   }
 };
 
@@ -384,6 +410,7 @@ export const getCustomers = async (
 export const saveCustomer = async (
   customer: Partial<CustomerData> & { accountId: string; name: string }
 ): Promise<string> => {
+  await assertOnlineForWrite('guardar un cliente');
   if (!customer.name || customer.name.trim().length === 0) {
     throw new Error('El nombre o razón social del cliente es obligatorio.');
   }

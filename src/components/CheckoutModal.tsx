@@ -45,6 +45,13 @@ import { enqueueOfflineSale } from '@/services/offline-sync-service';
 import { getCustomers, syncCustomerContactInfo } from '@/services/crm-operations-service';
 import { createQuote } from '@/services/enterprise-ops-service';
 import { presentationFactor } from '@/lib/presentation-parity';
+import { useProductsActions } from '@/context/ProductsContext';
+import { checkIsOnlineLive, withTimeout } from '@/lib/online-guard';
+import {
+  createProductLookup,
+  isLikelyNetworkError,
+  validateCartStockForCheckout,
+} from '@/lib/offline-stock-helpers';
 import {
   tryResolveCheckoutPayment,
   type CheckoutPaymentSplitInput,
@@ -230,8 +237,9 @@ const CheckoutModalContent: React.FC<CheckoutModalProps> = React.memo(({
     configurationError,
     refreshConfiguration,
   } = useBusinessSettings();
-  const { activeCashSession } = useCashSession();
+  const { activeCashSession, refreshCashStatus } = useCashSession();
   const { isOnline: settingsIsOnline, refreshOfflineCount } = useOfflineStatus();
+  const { getProductById, applyAuthoritativeStockUpdates } = useProductsActions();
 
   const resolvedBranch = branch || activeBranch || null;
   const safeTotal = totalAmount ?? total ?? 0;
@@ -471,6 +479,7 @@ const CheckoutModalContent: React.FC<CheckoutModalProps> = React.memo(({
   const [showSellerOptions, setShowSellerOptions] = useState(false);
   const [sellerLoadError, setSellerLoadError] = useState<string | null>(null);
   const checkoutOperationId = useRef<string | null>(null);
+  const attemptCountRef = useRef<number>(0);
   const activeSaleTokenRef = useRef<string | null>(null);
   const wasVisibleRef = useRef(false);
   const [isSuccessView, setIsSuccessView] = useState(false);
@@ -545,6 +554,8 @@ const CheckoutModalContent: React.FC<CheckoutModalProps> = React.memo(({
       documentSelectionLockedRef.current = false;
       setIsSuccessView(false);
       setSaleResult(null);
+      checkoutOperationId.current = null;
+      attemptCountRef.current = 0;
       activeSaleTokenRef.current = null;
       cashReceivedRef.current = safeTotal;
       setCashSyncSignal((prev) => ({ value: safeTotal, seq: prev.seq + 1 }));
@@ -591,6 +602,8 @@ const CheckoutModalContent: React.FC<CheckoutModalProps> = React.memo(({
       setDocType(nextDoc);
     } else if (!visible) {
       wasVisibleRef.current = false;
+      checkoutOperationId.current = null;
+      attemptCountRef.current = 0;
     }
   }, [
     visible,
@@ -793,13 +806,17 @@ const CheckoutModalContent: React.FC<CheckoutModalProps> = React.memo(({
     try {
       setIsSubmitting(true);
       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-      checkoutOperationId.current ||= `mobile_${Date.now()}_${Math.random()
-        .toString(36)
-        .slice(2, 10)}`;
+      if (!checkoutOperationId.current) {
+        checkoutOperationId.current = `mobile_${Date.now()}_${Math.random()
+          .toString(36)
+          .slice(2, 10)}`;
+        attemptCountRef.current = 0;
+      }
+      attemptCountRef.current += 1;
       const saleToken = checkoutOperationId.current;
       activeSaleTokenRef.current = saleToken;
 
-      const isOnline = settingsIsOnline;
+      const isOnline = await checkIsOnlineLive(settingsIsOnline);
       const cartItemsSnapshot = items.map((i) => ({ ...i }));
       const saleTimestamp = Date.now();
       const currCustomer = customerFormRef.current;
@@ -1069,7 +1086,7 @@ const CheckoutModalContent: React.FC<CheckoutModalProps> = React.memo(({
         sessionId: activeCashSession?.sessionId || activeCashSession?.id,
         saleDate: saleTimestamp,
         offlineId: saleToken,
-        skipOfflineDedup: isOnline,
+        skipOfflineDedup: isOnline && attemptCountRef.current === 1,
         enableSellerAttribution: sellerAttributionEnabled,
         sourceSaleRequestId: saleRequestId || undefined,
         sourceQuoteId: sourceQuoteId || undefined,
@@ -1127,17 +1144,28 @@ const CheckoutModalContent: React.FC<CheckoutModalProps> = React.memo(({
         },
       };
 
-      let result: any;
-      if (isOnline) {
-        result = await createSaleTransaction(salePayload);
-      } else {
+      const queueSaleOffline = async () => {
         if (saleRequestId || sourceQuoteId) {
           throw new Error('Conéctate a internet para confirmar la conversión de forma segura.');
         }
+        if (paymentCategory === 'fiado' || paymentCategory === 'credits') {
+          throw new Error(
+            'Las ventas al fiado o con créditos requieren internet. Usa otro método de pago o conéctate.'
+          );
+        }
+        const stockCheck = validateCartStockForCheckout(
+          salePayload.items as any[],
+          createProductLookup(getProductById),
+          branchId || 'main'
+        );
+        if (!stockCheck.ok) {
+          throw new Error(stockCheck.error || 'Stock insuficiente para completar la venta.');
+        }
+        salePayload.skipOfflineDedup = false;
         const queuedItem = await enqueueOfflineSale(salePayload);
         void refreshOfflineCount();
         const offId = typeof queuedItem === 'string' ? queuedItem : queuedItem.offlineId;
-        result = {
+        return {
           saleId: offId,
           saleNumber: Math.floor(100000 + Math.random() * 900000),
           correlative: `OFF-${offId.slice(-6).toUpperCase()}`,
@@ -1147,6 +1175,39 @@ const CheckoutModalContent: React.FC<CheckoutModalProps> = React.memo(({
           sunatStatus: 'pending',
           isOffline: true,
         };
+      };
+
+      let result: any;
+      if (isOnline) {
+        try {
+          result = await withTimeout(
+            createSaleTransaction(salePayload),
+            30_000,
+            'Tiempo de espera agotado al conectar con el servidor.'
+          );
+          if (Array.isArray(result?.updatedProductStocks) && result.updatedProductStocks.length > 0) {
+            applyAuthoritativeStockUpdates(result.updatedProductStocks);
+          }
+          refreshCashStatus();
+        } catch (txErr) {
+          const canFallbackOffline =
+            isLikelyNetworkError(txErr) &&
+            !saleRequestId &&
+            !sourceQuoteId &&
+            paymentCategory !== 'fiado' &&
+            paymentCategory !== 'credits' &&
+            !posSettings?.enableSellerAttribution;
+          if (!canFallbackOffline) {
+            throw txErr;
+          }
+          const stillOnline = await checkIsOnlineLive(false);
+          if (stillOnline) {
+            throw txErr;
+          }
+          result = await queueSaleOffline();
+        }
+      } else {
+        result = await queueSaleOffline();
       }
 
       const finalDocNumber =
@@ -1154,11 +1215,12 @@ const CheckoutModalContent: React.FC<CheckoutModalProps> = React.memo(({
         result.documentNumber ||
         result.correlative ||
         `#${result.saleNumber || '0001'}`;
-      const resolvedSunatStatus = !isOnline
-        ? 'pending'
-        : latestSunatRes?.status ||
-          result.sunatStatus ||
-          (docType === 'boleta' || docType === 'factura' ? 'pending' : 'not_applicable');
+      const resolvedSunatStatus =
+        !isOnline || Boolean(result.isOffline)
+          ? 'pending'
+          : latestSunatRes?.status ||
+            result.sunatStatus ||
+            (docType === 'boleta' || docType === 'factura' ? 'pending' : 'not_applicable');
 
       const saleSnapshot: any = {
         id: result.saleId || saleToken,
@@ -1213,10 +1275,11 @@ const CheckoutModalContent: React.FC<CheckoutModalProps> = React.memo(({
 
       setSaleResult(fullResult);
       checkoutOperationId.current = null;
+      attemptCountRef.current = 0;
       setIsSuccessView(true);
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
 
-      if (accountId && resolvedCustomerPhone) {
+      if (isOnline && !result.isOffline && accountId && resolvedCustomerPhone) {
         void syncCustomerContactInfo({
           accountId,
           customerId: selectedCustomer?.id,

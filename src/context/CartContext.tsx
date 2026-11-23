@@ -7,7 +7,8 @@ import React, {
   useMemo,
   useRef,
 } from 'react';
-import { InteractionManager } from 'react-native';
+import { Alert, InteractionManager } from 'react-native';
+import { validateCartStockForCheckout } from '@/lib/offline-stock-helpers';
 import { cartKVStorage } from '@/lib/native-kv-storage';
 import * as Haptics from 'expo-haptics';
 import {
@@ -644,6 +645,28 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
         ? `${product.id}_${presentationKey}_${variantKey}_gift`
         : `${product.id}_${presentationKey}_${variantKey}`;
 
+      // Bloquear si se supera el stock disponible (incluye ventas offline pendientes ya proyectadas)
+      const stockCheck = validateCartStockForCheckout(
+        [
+          ...itemsRef.current,
+          {
+            productId: product.id,
+            quantity: quantityToAdd,
+            presentationQty: presentationFactor(presentation),
+            variantId: variant?.id,
+            variantName: variant?.name,
+            stockBranchId: activeBranch,
+          },
+        ],
+        new Map([[product.id, product]]),
+        activeBranch
+      );
+      if (!stockCheck.ok) {
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning).catch(() => {});
+        Alert.alert('Stock insuficiente', stockCheck.error || 'No hay stock suficiente.');
+        return;
+      }
+
       setItems((prevItems) => {
         const existingIndex = prevItems.findIndex((i) => i.id === cartItemId);
 
@@ -761,6 +784,22 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // 5. Actualizar cantidad de un ítem existente
   const updateQuantity = useCallback(
     (cartItemId: string, newQty: number) => {
+      const currentTarget = itemsRef.current.find((i) => i.id === cartItemId);
+      if (currentTarget?.product && newQty > currentTarget.quantity) {
+        const hypothetical = itemsRef.current.map((i) =>
+          i.id === cartItemId ? { ...i, quantity: newQty } : i
+        );
+        const check = validateCartStockForCheckout(
+          hypothetical,
+          new Map([[currentTarget.product.id, currentTarget.product]]),
+          currentTarget.stockBranchId || branchId || 'main'
+        );
+        if (!check.ok) {
+          Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning).catch(() => {});
+          Alert.alert('Stock insuficiente', check.error || 'No hay stock suficiente.');
+          return;
+        }
+      }
       setItems((prevItems) => {
         if (newQty <= 0) {
           return prevItems.filter((i) => i.id !== cartItemId);

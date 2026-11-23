@@ -36,10 +36,25 @@ import {
 import {
   processOfflineQueue,
   getOfflineQueue,
+  getQuarantinedSalesForIdentity,
   subscribeOfflineQueueChanges,
   offlineSaleBelongsToIdentity,
   type PendingOfflineSale,
+  type QuarantinedOfflineSale,
 } from '@/services/offline-sync-service';
+import {
+  getOfflineInventoryQueueForIdentity,
+  processOfflineInventoryQueue,
+  subscribeOfflineInventoryChanges,
+} from '@/services/offline-inventory-service';
+import {
+  getOfflineCashQueueForIdentity,
+  processOfflineCashQueue,
+  subscribeOfflineCashChanges,
+  type PendingOfflineCashMovement,
+} from '@/services/offline-cash-service';
+import type { OfflineInventoryOperation } from '@/lib/offline-stock-helpers';
+import { assertOnlineForWrite, checkIsOnlineLive } from '@/lib/online-guard';
 
 export const SETTINGS_CACHE_PREFIX = '@ventify_settings_cache_v1:';
 export const CASH_SESSION_CACHE_PREFIX = '@ventify_cash_session_cache_v1:';
@@ -324,7 +339,19 @@ export interface OfflineStatusContextType {
   isOnline: boolean;
   offlineQueueCount: number;
   pendingOfflineSales: PendingOfflineSale[];
+  pendingInventoryOps: OfflineInventoryOperation[];
+  pendingCashMovements: PendingOfflineCashMovement[];
+  quarantinedSales: QuarantinedOfflineSale[];
+  quarantinedCount: number;
+  isSyncingOffline: boolean;
+  lastSyncSuccessAt: number | null;
   refreshOfflineCount: () => Promise<number>;
+  triggerManualSync: (force?: boolean) => Promise<{
+    total: number;
+    successful: number;
+    quarantined: number;
+    retried: number;
+  }>;
 }
 
 export interface SettingsContextType
@@ -372,7 +399,14 @@ const DEFAULT_OFFLINE_STATUS_CONTEXT: OfflineStatusContextType = {
   isOnline: true,
   offlineQueueCount: 0,
   pendingOfflineSales: [],
+  pendingInventoryOps: [],
+  pendingCashMovements: [],
+  quarantinedSales: [],
+  quarantinedCount: 0,
+  isSyncingOffline: false,
+  lastSyncSuccessAt: null,
   refreshOfflineCount: async () => 0,
+  triggerManualSync: async () => ({ total: 0, successful: 0, quarantined: 0, retried: 0 }),
 };
 
 const BusinessSettingsContext = createContext<BusinessSettingsContextType>(
@@ -567,8 +601,23 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       ? initialCached.allPaymentMethods
       : DEFAULT_PAYMENT_METHODS
   );
-  const [offlineQueueCount, setOfflineQueueCount] = useState<number>(0);
   const [pendingOfflineSales, setPendingOfflineSales] = useState<PendingOfflineSale[]>([]);
+  const [pendingInventoryOps, setPendingInventoryOps] = useState<OfflineInventoryOperation[]>([]);
+  const [pendingCashMovements, setPendingCashMovements] = useState<PendingOfflineCashMovement[]>(
+    []
+  );
+  const [quarantinedSales, setQuarantinedSales] = useState<QuarantinedOfflineSale[]>([]);
+  const [isSyncingOffline, setIsSyncingOffline] = useState<boolean>(false);
+  const [lastSyncSuccessAt, setLastSyncSuccessAt] = useState<number | null>(null);
+  const offlineQueueCount =
+    pendingOfflineSales.length + pendingInventoryOps.length + pendingCashMovements.length;
+  const quarantinedCount = quarantinedSales.length;
+  const fullSyncPromiseRef = useRef<Promise<{
+    total: number;
+    successful: number;
+    quarantined: number;
+    retried: number;
+  }> | null>(null);
   const branchIdRef = useRef(branchId);
   branchIdRef.current = branchId;
   const accountIdRef = useRef<string | null>(accountId);
@@ -648,9 +697,20 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
   useEffect(() => {
     return () => {
+      const pendingAcct = pendingPersistAccountRef.current;
       clearPendingSettingsPersist();
+      if (
+        pendingAcct &&
+        hydratedSettingsAccountRef.current === pendingAcct &&
+        settingsCacheSnapshotRef.current?.accountId === pendingAcct
+      ) {
+        void safeStorageSet(
+          `${SETTINGS_CACHE_PREFIX}${pendingAcct}`,
+          JSON.stringify(settingsCacheSnapshotRef.current.data)
+        );
+      }
     };
-  }, [clearPendingSettingsPersist]);
+  }, [clearPendingSettingsPersist, safeStorageSet]);
 
   const persistSettingsSnapshot = useCallback(
     (targetAccountId: string, patch: Partial<CachedAccountSettings>) => {
@@ -739,23 +799,108 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         }
         return scoped;
       });
-      setOfflineQueueCount((prev) => (prev === scoped.length ? prev : scoped.length));
       return scoped.length;
     },
     []
   );
 
-  // 1. Refrescar el contador y detalle de ventas offline en cola local
+  // 1. Refrescar el contador y detalle de colas offline (ventas + inventario + caja + cuarentena)
   const refreshOfflineCount = useCallback(async (): Promise<number> => {
     try {
-      const queue = await getOfflineQueue();
-      return applyOfflineQueueItems(queue, user?.uid, accountId);
+      const uid = user?.uid || '';
+      const accId = accountId || '';
+      const [salesQueue, invQueue, cashQueue, quarSales] = await Promise.all([
+        getOfflineQueue(),
+        uid && accId ? getOfflineInventoryQueueForIdentity(uid, accId) : Promise.resolve([]),
+        uid && accId ? getOfflineCashQueueForIdentity(uid, accId) : Promise.resolve([]),
+        uid && accId ? getQuarantinedSalesForIdentity(uid, accId) : Promise.resolve([]),
+      ]);
+      const salesCount = applyOfflineQueueItems(salesQueue, user?.uid, accountId);
+      setPendingInventoryOps(invQueue);
+      setPendingCashMovements(cashQueue);
+      setQuarantinedSales(quarSales);
+      return salesCount + invQueue.length + cashQueue.length;
     } catch {
       return 0;
     }
   }, [accountId, user?.uid, applyOfflineQueueItems]);
   const refreshOfflineCountRef = useRef(refreshOfflineCount);
   refreshOfflineCountRef.current = refreshOfflineCount;
+
+  const runFullOfflineSync = useCallback(
+    async (
+      targetAccountId: string,
+      force = false
+    ): Promise<{ total: number; successful: number; quarantined: number; retried: number }> => {
+      if (!targetAccountId) {
+        return { total: 0, successful: 0, quarantined: 0, retried: 0 };
+      }
+      if (fullSyncPromiseRef.current) {
+        return fullSyncPromiseRef.current;
+      }
+
+      const execute = (async () => {
+        setIsSyncingOffline(true);
+        try {
+          const online = await checkIsOnlineLive(isOnlineRef.current);
+          if (!online) {
+            return { total: 0, successful: 0, quarantined: 0, retried: 0 };
+          }
+          // Orden estricto: 1) Inventario (productos/stock) -> 2) Ventas -> 3) Movimientos de caja
+          const invRes = await processOfflineInventoryQueue({
+            accountId: targetAccountId,
+            force,
+          });
+          const salesRes = await processOfflineQueue({
+            accountId: targetAccountId,
+            force,
+          });
+          const cashRes = await processOfflineCashQueue({
+            accountId: targetAccountId,
+            force,
+          });
+
+          const total = invRes.total + salesRes.total + cashRes.total;
+          const successful = invRes.successful + salesRes.successful + cashRes.successful;
+          const quarantined = invRes.quarantined + salesRes.quarantined;
+          const retried = invRes.retried + salesRes.retried + cashRes.failed;
+
+          if (successful > 0) {
+            setLastSyncSuccessAt(Date.now());
+          }
+          await refreshOfflineCountRef.current();
+          if (salesRes.successful > 0 || cashRes.successful > 0) {
+            refreshCashStatusRef.current();
+          }
+
+          return { total, successful, quarantined, retried };
+        } finally {
+          setIsSyncingOffline(false);
+        }
+      })().finally(() => {
+        if (fullSyncPromiseRef.current === execute) {
+          fullSyncPromiseRef.current = null;
+        }
+      });
+
+      fullSyncPromiseRef.current = execute;
+      return execute;
+    },
+    []
+  );
+  const runFullOfflineSyncRef = useRef(runFullOfflineSync);
+  runFullOfflineSyncRef.current = runFullOfflineSync;
+
+  const triggerManualSync = useCallback(
+    async (force = true) => {
+      const targetAccount = accountIdRef.current;
+      if (!targetAccount) {
+        return { total: 0, successful: 0, quarantined: 0, retried: 0 };
+      }
+      return runFullOfflineSyncRef.current(targetAccount, force);
+    },
+    []
+  );
 
   // 1.5. Hidratar ajustes cacheados para arranque en frío offline
   useEffect(() => {
@@ -971,8 +1116,18 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         void refreshOfflineCountRef.current();
       }
       if (event.type === 'synced' && (event.successful || 0) > 0) {
+        setLastSyncSuccessAt(Date.now());
         refreshCashStatusRef.current();
+        void refreshOfflineCountRef.current();
       }
+    });
+    const unsubscribeInvQueue = subscribeOfflineInventoryChanges(() => {
+      if (!isMounted) return;
+      void refreshOfflineCountRef.current();
+    });
+    const unsubscribeCashQueue = subscribeOfflineCashChanges(() => {
+      if (!isMounted) return;
+      void refreshOfflineCountRef.current();
     });
 
     const appStateSubscription =
@@ -983,7 +1138,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
             if (!isOnlineRef.current || !activeAccountId) return;
             void refreshOfflineCountRef.current().then((count) => {
               if (isMounted && isOnlineRef.current && count > 0) {
-                processOfflineQueue(activeAccountId).catch((err) => {
+                runFullOfflineSyncRef.current(activeAccountId).catch((err) => {
                   console.warn(
                     '[SettingsContext] Error sincronizando cola offline al volver a primer plano:',
                     err
@@ -997,6 +1152,8 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     return () => {
       isMounted = false;
       unsubscribeQueue();
+      unsubscribeInvQueue();
+      unsubscribeCashQueue();
       appStateSubscription?.remove?.();
     };
   }, [applyOfflineQueueItems]);
@@ -1007,9 +1164,10 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
     const triggerSync = (targetAccountId: string) => {
-      processOfflineQueue(targetAccountId)
+      runFullOfflineSyncRef
+        .current(targetAccountId)
         .then((result) => {
-          if (isMounted && (result?.processed || 0) === 0) {
+          if (isMounted && (result?.total || 0) === 0) {
             void refreshOfflineCount();
           }
         })
@@ -1890,10 +2048,74 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     };
   }, [accountId, branchId, user?.uid, checkActiveSession, safeStorageGet, safeStorageRemove]);
 
+  // 5.1 Listener en tiempo real al documento activo de caja para mantener expectedAmount/totales actualizados
+  const activeSessionIdForListener = isCashOpen ? activeCashSession?.id || null : null;
+  useEffect(() => {
+    if (!accountId || !user?.uid || !isCashOpen || !activeSessionIdForListener || !isOnline) {
+      return;
+    }
+
+    let isSubscribed = true;
+    const effectiveBranchForCash = branchId || 'main';
+    const cashKey = getCashSessionCacheKey(accountId, effectiveBranchForCash, user.uid);
+    const pointerId = `active_${accountId}_${effectiveBranchForCash}_${user.uid}`;
+
+    const unsubSession = onSnapshot(
+      doc(db, 'cash_register_sessions', activeSessionIdForListener),
+      (snap) => {
+        if (!isSubscribed) return;
+        if (!snap.exists()) {
+          if (snap.metadata?.fromCache === false || (isOnlineRef.current && snap.metadata?.fromCache !== true)) {
+            void checkActiveSession(null, { skipPointerGet: true });
+          }
+          return;
+        }
+        const data = snap.data() as Record<string, any>;
+        if (data?.status === 'closed') {
+          if (snap.metadata?.fromCache === false || (isOnlineRef.current && snap.metadata?.fromCache !== true)) {
+            void checkActiveSession(null, { skipPointerGet: true });
+          }
+          return;
+        }
+        const prevSession = activeCashSessionRef.current;
+        const nextSession: ActiveCashSessionData = {
+          id: activeSessionIdForListener,
+          sessionId: activeSessionIdForListener,
+          pointerId,
+          branchId: data.branchId || effectiveBranchForCash,
+          accountId,
+          status: 'open',
+          initialAmount: Number(data.initialAmount ?? prevSession?.initialAmount ?? 0),
+          openTime: Number(data.openTime ?? data.openedAt ?? prevSession?.openTime ?? Date.now()),
+          startedBy: data.startedBy || user.uid,
+          startedByName: data.startedByName || displayNameRef.current || '',
+          cashSales: Number(data.cashSales ?? 0),
+          totalSales: Number(data.totalSales ?? 0),
+          expectedAmount: Number(data.expectedAmount ?? data.initialAmount ?? 0),
+          isOpen: true,
+          ...data,
+        };
+        activeCashSessionRef.current = nextSession;
+        hydratedCashSessionRef.current = { key: cashKey, session: nextSession };
+        setActiveCashSession((prev) => (isStructurallyEqual(prev, nextSession) ? prev : nextSession));
+        void safeStorageSet(cashKey, JSON.stringify(nextSession));
+      },
+      (err) => {
+        console.warn('[SettingsContext] active session listener note:', err);
+      }
+    );
+
+    return () => {
+      isSubscribed = false;
+      unsubSession();
+    };
+  }, [accountId, branchId, user?.uid, isCashOpen, activeSessionIdForListener, isOnline, checkActiveSession, safeStorageSet]);
+
   // 6. Actualizar datos de configuración de empresa
   const updateBusinessSettings = useCallback(
     async (patch: Partial<BusinessSettings>) => {
       if (!accountId) return;
+      await assertOnlineForWrite('guardar los datos de empresa', isOnlineRef.current);
       const cleanPatch = Object.fromEntries(
         Object.entries(patch).filter(([_, v]) => v !== undefined)
       );
@@ -1914,6 +2136,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const updatePosSettings = useCallback(
     async (patch: Partial<PosSettings>) => {
       if (!accountId) return;
+      await assertOnlineForWrite('guardar la configuración del POS', isOnlineRef.current);
       const cleanPatch = Object.fromEntries(
         Object.entries(patch).filter(([_, v]) => v !== undefined)
       );
@@ -1934,6 +2157,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const togglePaymentMethod = useCallback(
     async (methodId: string, enabled: boolean) => {
       if (!accountId) return;
+      await assertOnlineForWrite('cambiar métodos de pago', isOnlineRef.current);
       const updated = allPaymentMethodsRef.current.map((m) =>
         m.id === methodId ? { ...m, enabled } : m
       );
@@ -2076,9 +2300,28 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       isOnline,
       offlineQueueCount,
       pendingOfflineSales,
+      pendingInventoryOps,
+      pendingCashMovements,
+      quarantinedSales,
+      quarantinedCount,
+      isSyncingOffline,
+      lastSyncSuccessAt,
       refreshOfflineCount,
+      triggerManualSync,
     }),
-    [isOnline, offlineQueueCount, pendingOfflineSales, refreshOfflineCount]
+    [
+      isOnline,
+      offlineQueueCount,
+      pendingOfflineSales,
+      pendingInventoryOps,
+      pendingCashMovements,
+      quarantinedSales,
+      quarantinedCount,
+      isSyncingOffline,
+      lastSyncSuccessAt,
+      refreshOfflineCount,
+      triggerManualSync,
+    ]
   );
 
   const contextValue = useMemo<SettingsContextType>(

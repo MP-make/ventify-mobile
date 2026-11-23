@@ -54,9 +54,10 @@ import * as Haptics from 'expo-haptics';
 
 import { db } from '@/lib/firebase';
 import { useAuthSession } from '@/context/AuthContext';
-import { useBusinessSettings } from '@/context/SettingsContext';
+import { useBusinessSettings, useOfflineStatus } from '@/context/SettingsContext';
 import { useCartActions } from '@/context/CartContext';
 import { useProductsActions } from '@/context/ProductsContext';
+import { assertOnlineForWrite } from '@/lib/online-guard';
 import { useDebouncedValue } from '@/hooks/use-debounced-value';
 import { parseNormalizedDecimal } from '@/lib/product-search';
 import { ui, formatPEN, formatDatePE } from '@/lib/theme';
@@ -202,6 +203,7 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
 
   const { accountId, branchId, userProfile } = useAuthSession();
   const { businessSettings } = useBusinessSettings();
+  const { isOnline } = useOfflineStatus();
   const { getProductById } = useProductsActions();
   const { clearCart, addItem, setCustomer, setNotes, setSourceQuoteId, setSaleRequestId, setDiscount, setShippingAmount } = useCartActions();
 
@@ -227,6 +229,10 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
   // 1. Suscripción en tiempo real a las cotizaciones
   useEffect(() => {
     if (!isVisible || !accountId) return;
+    if (!isOnline) {
+      setLoading(false);
+      return;
+    }
 
     setLoading(true);
     const unsubscribe = subscribeToQuotes(
@@ -252,7 +258,7 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
     return () => {
       unsubscribe();
     };
-  }, [isVisible, accountId, branchId]);
+  }, [isVisible, accountId, branchId, isOnline]);
 
   // 2. Filtrar cotizaciones por texto y estado (sin clonar quotes innecesariamente)
   const filteredQuotes = useMemo(() => {
@@ -498,6 +504,7 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
 
     try {
       setIsProcessing(true);
+      await assertOnlineForWrite('editar una cotización', isOnline);
       await updateDoc(doc(db, 'quotes', selectedQuote.id), {
         items: sanitizedItems,
         subtotal,
@@ -539,7 +546,7 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
     } finally {
       setIsProcessing(false);
     }
-  }, [selectedQuote, editItems, editDraftTotals, editNotesText]);
+  }, [selectedQuote, editItems, editDraftTotals, editNotesText, isOnline]);
 
   // 4. ACCIÓN: Compartir Cotización PDF por WhatsApp
   const handleShareQuoteWhatsApp = useCallback(
@@ -727,6 +734,7 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
     async (quoteId: string, newStatus: 'accepted' | 'rejected') => {
       try {
         setIsProcessing(true);
+        await assertOnlineForWrite('actualizar el estado de una cotización', isOnline);
         Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
         await updateQuoteStatus(quoteId, newStatus);
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
@@ -736,7 +744,7 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
         setIsProcessing(false);
       }
     },
-    []
+    [isOnline]
   );
 
   // 6. ACCIÓN: Eliminar Cotización
@@ -752,6 +760,7 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
           onPress: async () => {
             try {
               setIsProcessing(true);
+              await assertOnlineForWrite('eliminar una cotización', isOnline);
               Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy).catch(() => {});
               await deleteQuote(quote.id);
               setSelectedQuote(null);
@@ -765,12 +774,12 @@ export const QuotesManagerModal: React.FC<QuotesManagerModalProps> = React.memo(
         },
       ]
     );
-  }, []);
+  }, [isOnline]);
 
   const handleSelectQuote = useCallback((quote: Quote) => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
     setSelectedQuote(quote);
-  }, []);
+  }, [isOnline]);
 
   const renderQuoteItem = useCallback(
     ({ item }: { item: Quote }) => (

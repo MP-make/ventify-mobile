@@ -1,8 +1,9 @@
 import React, { useEffect, useState } from 'react';
-import { ActivityIndicator, KeyboardAvoidingView, Modal, Platform, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { ActivityIndicator, Alert, KeyboardAvoidingView, Modal, Platform, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { X } from 'lucide-react-native';
 import { ui, theme, formatPEN } from '@/lib/theme';
+import { assertOnlineForWrite } from '@/lib/online-guard';
 
 type CancellationItem = { id: string; type: 'reservation' | 'order'; customerName?: string; customer?: { name?: string }; depositAmount?: number };
 type RefundChoice = { refundMethod?: string; refundPercent?: number };
@@ -49,7 +50,10 @@ const ReservationCancellationModalContent: React.FC<
     if (method && (!validPercent || !sessionId)) return;
     setBusy(true);
     try {
+      await assertOnlineForWrite('cancelar la reserva o pedido');
       await onConfirm(method ? { refundMethod: method, refundPercent: parsedPercent } : {});
+    } catch (err: any) {
+      Alert.alert('No se pudo cancelar', err?.message || 'Inténtalo de nuevo.');
     } finally {
       setBusy(false);
     }

@@ -27,6 +27,7 @@ import {
 } from '@/context/AuthContext';
 import {
   useBusinessSettings,
+  useCashSession,
   useOfflineStatus,
 } from '@/context/SettingsContext';
 import { usePermissions } from '@/hooks/usePermissions';
@@ -97,7 +98,8 @@ export default function SettingsScreen() {
     updateBusinessData,
     updatePosSettings,
   } = useBusinessSettings();
-  const { isOnline, offlineQueueCount, refreshOfflineCount } = useOfflineStatus();
+  const { activeCashSession } = useCashSession();
+  const { isOnline, offlineQueueCount, quarantinedCount, refreshOfflineCount } = useOfflineStatus();
 
   const { canManageSettings, hasAllBranchesAccess } = usePermissions();
 
@@ -146,21 +148,24 @@ export default function SettingsScreen() {
   }, []);
 
   const handleLogoutPress = useCallback(() => {
-    Alert.alert(
-      '¿Cerrar Sesión?',
-      'Se cerrará la sesión de este terminal móvil. ¿Deseas continuar?',
-      [
-        { text: 'Cancelar', style: 'cancel' },
-        {
-          text: 'Cerrar Sesión',
-          style: 'destructive',
-          onPress: async () => {
-            await logout();
-          },
+    const hasPendingOffline = offlineQueueCount > 0 || quarantinedCount > 0;
+    const message = hasPendingOffline
+      ? `Tienes ${offlineQueueCount} operación(es) offline pendiente(s)${
+          quarantinedCount > 0 ? ` y ${quarantinedCount} en cuarentena` : ''
+        }. Quedarán guardadas localmente para este usuario hasta que vuelvas a iniciar sesión con internet. ¿Deseas cerrar sesión de todas formas?`
+      : 'Se cerrará la sesión de este terminal móvil. ¿Deseas continuar?';
+
+    Alert.alert('¿Cerrar Sesión?', message, [
+      { text: 'Cancelar', style: 'cancel' },
+      {
+        text: 'Cerrar Sesión',
+        style: 'destructive',
+        onPress: async () => {
+          await logout();
         },
-      ]
-    );
-  }, [logout]);
+      },
+    ]);
+  }, [logout, offlineQueueCount, quarantinedCount]);
 
   const scrollContentStyle = useMemo(
     () => ({ paddingBottom: Math.max(insets.bottom, 24) + 12 }),
@@ -223,6 +228,15 @@ export default function SettingsScreen() {
                 {tab.key === 'alertas' && unreadNotifCount > 0 ? (
                   <View style={[styles.tabBadgeDot, isActive && styles.tabBadgeDotActive]} />
                 ) : null}
+                {tab.key === 'impresora' && (quarantinedCount > 0 || offlineQueueCount > 0) ? (
+                  <View
+                    style={[
+                      styles.tabBadgeDot,
+                      isActive && styles.tabBadgeDotActive,
+                      { backgroundColor: quarantinedCount > 0 ? ui.danger : ui.warning },
+                    ]}
+                  />
+                ) : null}
               </TouchableOpacity>
             );
           })}
@@ -277,6 +291,8 @@ export default function SettingsScreen() {
           {activeTab === 'impresora' && (
             <PrinterOfflineSettingsTab
               accountId={accountId}
+              userId={user?.uid || null}
+              activeCashSessionId={activeCashSession?.sessionId || activeCashSession?.id || null}
               isFocused={isFocused}
               isActiveTab={activeTab === 'impresora'}
               isOnline={isOnline}

@@ -16,6 +16,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { X, Check } from 'lucide-react-native';
 import { useProductsActions } from '@/context/ProductsContext';
 import { formatPEN, ui } from '@/lib/theme';
+import { assertOnlineForWrite } from '@/lib/online-guard';
 import {
   ReceivedProductCostChange,
   BatchProductSuggestedPriceUpdate,
@@ -95,6 +96,7 @@ export const PriceSuggestionModal: React.FC<PriceSuggestionModalProps> = React.m
 
     setIsApplyingPriceSuggestions(true);
     try {
+      await assertOnlineForWrite('actualizar precios sugeridos');
       const batchUpdates: BatchProductSuggestedPriceUpdate[] = [];
       const localUpdatedProducts: Product[] = [];
 

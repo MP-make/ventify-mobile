@@ -41,6 +41,8 @@ import {
 import { cleanFirestoreData } from '@/lib/firebase-utils';
 import { apiRequest } from '@/lib/api-client';
 import { sharedRequestCache } from '@/lib/request-cache';
+import { withTimeout } from '@/lib/online-guard';
+import type { AuthoritativeProductStockPatch } from '@/lib/offline-stock-helpers';
 import {
   findProductByBarcode,
   getAvailableStock,
@@ -106,6 +108,9 @@ export interface AdjustStockParams {
   reason: 'adjustment' | 'damage' | 'loss' | 'count_audit' | 'restock' | 'return' | string;
   notes?: string;
   userProfile: UserProfileInfo;
+  offlineId?: string;
+  mode?: 'add' | 'subtract' | 'set';
+  deltaAmount?: number;
 }
 
 export interface AdjustStockResult {
@@ -115,6 +120,7 @@ export interface AdjustStockResult {
   before: Record<string, number>;
   after: Record<string, number>;
   variantId?: string;
+  updatedProductStock?: AuthoritativeProductStockPatch;
 }
 
 export interface TransferItem {
@@ -680,6 +686,12 @@ export const uploadProductImageToStorage = async (
  * Crea o actualiza un producto en el catálogo `products` y registra
  * los movimientos iniciales en el Kardex si es un producto nuevo con stock.
  */
+export interface SaveProductOptions {
+  preallocatedId?: string;
+  offlineId?: string;
+  skipStockField?: boolean;
+}
+
 export const saveProduct = async (
   productData: Partial<Product> & {
     id?: string;
@@ -710,7 +722,8 @@ export const saveProduct = async (
     barcodes?: string[];
   },
   isNew: boolean,
-  userProfile: UserProfileInfo
+  userProfile: UserProfileInfo,
+  options: SaveProductOptions = {}
 ): Promise<string> => {
   if (!productData.name || productData.name.trim().length === 0) {
     throw new Error('El nombre del producto es obligatorio.');
@@ -733,7 +746,7 @@ export const saveProduct = async (
     throw new Error('Las imágenes de variantes deben subirse a Firebase Storage antes de guardar.');
   }
 
-  const creating = isNew || !productData.id;
+  const creating = isNew || !productData.id || Boolean(options.preallocatedId);
   const existingRef = !creating && productData.id
     ? doc(db, PRODUCTS_COLLECTION, productData.id)
     : null;
@@ -757,12 +770,21 @@ export const saveProduct = async (
     ...productData,
     name: productData.name.trim(),
     sku: productData.sku ? productData.sku.trim() : (existingData.sku || `SKU-${Date.now().toString().slice(-6)}`),
-    stock: stockMap,
-    branchIds,
-    lowStockBranches,
+    ...(options.skipStockField && !creating
+      ? {}
+      : {
+          stock: stockMap,
+          branchIds,
+          lowStockBranches,
+        }),
     minStock,
     updatedAt: serverTimestamp(),
   };
+  if (options.skipStockField && !creating) {
+    delete payload.stock;
+    delete payload.branchIds;
+    delete payload.lowStockBranches;
+  }
 
   if (creating || productData.costPrice !== undefined) {
     payload.costPrice = typeof productData.costPrice === 'number' ? roundToCents(productData.costPrice) : 0;
@@ -828,10 +850,10 @@ export const saveProduct = async (
   });
 
   const productsColl = collection(db, PRODUCTS_COLLECTION);
-  let productId = productData.id;
+  let productId = options.preallocatedId || productData.id;
 
-  if (isNew || !productId) {
-    const newDocRef = doc(productsColl);
+  if (creating) {
+    const newDocRef = productId ? doc(productsColl, productId) : doc(productsColl);
     productId = newDocRef.id;
     payload.id = productId;
     payload.createdAt = serverTimestamp();
@@ -864,6 +886,7 @@ export const saveProduct = async (
             quantity: qty,
             reason: 'initial_stock',
             notes: 'Inventario inicial al crear producto',
+            ...(options.offlineId ? { offlineId: options.offlineId } : {}),
             createdAt: serverTimestamp(),
             date: Date.now(),
           });
@@ -880,14 +903,18 @@ export const saveProduct = async (
         if (writeBatchFn) {
           const batch = writeBatchFn(db);
           for (const [branchId, qty] of initialMovements) {
-            const mvRef = doc(collection(db, INVENTORY_MOVEMENTS_COLLECTION));
+            const mvRef = options.offlineId
+              ? doc(db, INVENTORY_MOVEMENTS_COLLECTION, `${options.offlineId}_init_${branchId}`)
+              : doc(collection(db, INVENTORY_MOVEMENTS_COLLECTION));
             batch.set(mvRef, buildInitialMovement(branchId, qty));
           }
           await batch.commit();
         } else {
           await Promise.all(
             initialMovements.map(async ([branchId, qty]) => {
-              const mvRef = doc(collection(db, INVENTORY_MOVEMENTS_COLLECTION));
+              const mvRef = options.offlineId
+                ? doc(db, INVENTORY_MOVEMENTS_COLLECTION, `${options.offlineId}_init_${branchId}`)
+                : doc(collection(db, INVENTORY_MOVEMENTS_COLLECTION));
               await setDoc(mvRef, buildInitialMovement(branchId, qty));
             })
           );
@@ -901,7 +928,7 @@ export const saveProduct = async (
   }
 
   sharedRequestCache.invalidatePrefix(`barcode_remote:${productData.accountId}:`);
-  return productId;
+  return productId as string;
 };
 
 /**
@@ -977,7 +1004,20 @@ export const findByBarcodeRemote = async (
 export const adjustProductStock = async (
   params: AdjustStockParams
 ): Promise<AdjustStockResult> => {
-  const { product, branchId, branchName, newStock, variantId, variantName, reason, notes, userProfile } = params;
+  const {
+    product,
+    branchId,
+    branchName,
+    newStock,
+    variantId,
+    variantName,
+    reason,
+    notes,
+    userProfile,
+    offlineId,
+    mode,
+    deltaAmount,
+  } = params;
 
   if (!product.id || !branchId) {
     throw new Error('Parámetros de producto y sucursal requeridos para ajuste de stock.');
@@ -988,6 +1028,9 @@ export const adjustProductStock = async (
   }
 
   const productRef = doc(db, PRODUCTS_COLLECTION, product.id);
+  const movementRef = offlineId
+    ? doc(db, INVENTORY_MOVEMENTS_COLLECTION, offlineId)
+    : doc(collection(db, INVENTORY_MOVEMENTS_COLLECTION));
   const normalizedNewStock = Math.round(newStock * 10000) / 10000;
 
   let resultSnapshot: AdjustStockResult = {
@@ -999,8 +1042,21 @@ export const adjustProductStock = async (
     variantId,
   };
 
+  const resolveTargetQty = (prevQty: number): number => {
+    if (mode === 'add' && typeof deltaAmount === 'number' && Number.isFinite(deltaAmount)) {
+      return Math.max(0, Math.round((prevQty + deltaAmount) * 10000) / 10000);
+    }
+    if (mode === 'subtract' && typeof deltaAmount === 'number' && Number.isFinite(deltaAmount)) {
+      return Math.max(0, Math.round((prevQty - deltaAmount) * 10000) / 10000);
+    }
+    return normalizedNewStock;
+  };
+
   await runTransaction(db, async (tx) => {
-    const productSnap = await tx.get(productRef);
+    const [productSnap, existingMovSnap] = offlineId
+      ? await Promise.all([tx.get(productRef), tx.get(movementRef)])
+      : [await tx.get(productRef), null];
+
     if (!productSnap.exists()) {
       throw new Error(`El producto con ID ${product.id} no existe.`);
     }
@@ -1008,9 +1064,43 @@ export const adjustProductStock = async (
     const pData = productSnap.data();
     const beforeStockSnapshot: Record<string, number> = { ...(pData.stock || {}) };
     const currentStockMap: Record<string, number> = { ...beforeStockSnapshot };
+    const existingBranchIds = deriveBranchIds(currentStockMap, pData.branchIds || [branchId]);
+    const existingLowStock = calculateLowStockBranches(
+      currentStockMap,
+      pData.reservedStock || {},
+      pData.minStock ?? product.minStock ?? LOW_STOCK_THRESHOLD
+    );
+
+    if (existingMovSnap?.exists()) {
+      const movData = existingMovSnap.data() || {};
+      const currentQty = variantId
+        ? getVariantBranchStock(
+            (Array.isArray(pData.variants) ? pData.variants : []).find((v: any) => v.id === variantId),
+            branchId
+          )
+        : Number(currentStockMap[branchId]) || 0;
+      resultSnapshot = {
+        previousStock: Number(movData.previousStock ?? movData.quantityBefore ?? currentQty),
+        newStock: Number(movData.newStock ?? movData.quantityAfter ?? currentQty),
+        diff: Number(movData.quantityChanged ?? 0),
+        before: beforeStockSnapshot,
+        after: beforeStockSnapshot,
+        variantId,
+        updatedProductStock: {
+          productId: product.id,
+          stock: currentStockMap,
+          branchIds: existingBranchIds,
+          lowStockBranches: existingLowStock,
+          ...(Array.isArray(pData.variants) ? { variants: pData.variants } : {}),
+          ...(pData.reservedStock ? { reservedStock: pData.reservedStock } : {}),
+        },
+      };
+      return;
+    }
 
     let previousQty = Number(currentStockMap[branchId]) || 0;
-    let diff = Math.round((normalizedNewStock - previousQty) * 10000) / 10000;
+    let targetQty = resolveTargetQty(previousQty);
+    let diff = Math.round((targetQty - previousQty) * 10000) / 10000;
     let updatedVariants: any[] | undefined;
 
     if (variantId) {
@@ -1021,16 +1111,25 @@ export const adjustProductStock = async (
       }
 
       previousQty = getVariantBranchStock(targetVariant, branchId);
-      diff = Math.round((normalizedNewStock - previousQty) * 10000) / 10000;
+      targetQty = resolveTargetQty(previousQty);
+      diff = Math.round((targetQty - previousQty) * 10000) / 10000;
 
       if (diff === 0) {
         resultSnapshot = {
           previousStock: previousQty,
-          newStock: normalizedNewStock,
+          newStock: targetQty,
           diff: 0,
           before: beforeStockSnapshot,
           after: beforeStockSnapshot,
           variantId,
+          updatedProductStock: {
+            productId: product.id,
+            stock: beforeStockSnapshot,
+            branchIds: existingBranchIds,
+            lowStockBranches: existingLowStock,
+            variants: variantsList,
+            ...(pData.reservedStock ? { reservedStock: pData.reservedStock } : {}),
+          },
         };
         return;
       }
@@ -1042,13 +1141,13 @@ export const adjustProductStock = async (
             ...v,
             stock: {
               ...v.stock,
-              [branchId]: normalizedNewStock,
+              [branchId]: targetQty,
             },
           };
         }
         return {
           ...v,
-          stock: { [branchId]: normalizedNewStock },
+          stock: { [branchId]: targetQty },
         };
       });
 
@@ -1061,14 +1160,22 @@ export const adjustProductStock = async (
       if (diff === 0) {
         resultSnapshot = {
           previousStock: previousQty,
-          newStock: normalizedNewStock,
+          newStock: targetQty,
           diff: 0,
           before: beforeStockSnapshot,
           after: beforeStockSnapshot,
+          updatedProductStock: {
+            productId: product.id,
+            stock: beforeStockSnapshot,
+            branchIds: existingBranchIds,
+            lowStockBranches: existingLowStock,
+            ...(Array.isArray(pData.variants) ? { variants: pData.variants } : {}),
+            ...(pData.reservedStock ? { reservedStock: pData.reservedStock } : {}),
+          },
         };
         return;
       }
-      currentStockMap[branchId] = normalizedNewStock;
+      currentStockMap[branchId] = targetQty;
     }
 
     const lowStockBranches = calculateLowStockBranches(
@@ -1090,7 +1197,6 @@ export const adjustProductStock = async (
     tx.update(productRef, productUpdate);
 
     // 2. Registrar movimiento en Kardex con campos Web canónicos y alias Mobile
-    const movementRef = doc(collection(db, INVENTORY_MOVEMENTS_COLLECTION));
     tx.set(movementRef, cleanFirestoreData({
       accountId: product.accountId || pData.accountId,
       branchId,
@@ -1102,7 +1208,7 @@ export const adjustProductStock = async (
       // Campos canónicos Web
       movementType: diff > 0 ? 'add' : 'edit',
       quantityBefore: previousQty,
-      quantityAfter: normalizedNewStock,
+      quantityAfter: targetQty,
       quantityChanged: diff,
       userId: userProfile.uid,
       userName: userProfile.displayName || userProfile.email || 'Usuario',
@@ -1110,21 +1216,34 @@ export const adjustProductStock = async (
       // Campos alias Mobile
       type: diff > 0 ? 'in' : 'out',
       previousStock: previousQty,
-      newStock: normalizedNewStock,
+      newStock: targetQty,
       quantity: Math.abs(diff),
       reason: reason || 'adjustment',
       notes: notes || '',
+      ...(offlineId ? { offlineId } : {}),
       createdAt: serverTimestamp(),
       date: Date.now(),
     }));
 
     resultSnapshot = {
       previousStock: previousQty,
-      newStock: normalizedNewStock,
+      newStock: targetQty,
       diff,
       before: beforeStockSnapshot,
       after: { ...currentStockMap },
       variantId,
+      updatedProductStock: {
+        productId: product.id,
+        stock: { ...currentStockMap },
+        branchIds,
+        lowStockBranches,
+        ...(updatedVariants !== undefined
+          ? { variants: updatedVariants }
+          : Array.isArray(pData.variants)
+            ? { variants: pData.variants }
+            : {}),
+        ...(pData.reservedStock ? { reservedStock: pData.reservedStock } : {}),
+      },
     };
   });
 
@@ -1132,23 +1251,27 @@ export const adjustProductStock = async (
   if (resultSnapshot.diff !== 0 && ((userProfile as any)?.role === 'owner' || (userProfile as any)?.role === 'admin')) {
     try {
       const adjRef = doc(collection(db, INVENTORY_ADJUSTMENTS_COLLECTION));
-      await setDoc(adjRef, cleanFirestoreData({
-        accountId: product.accountId,
-        productId: product.id,
-        productName: product.name,
-        ...(variantId ? { variantId, variantName: variantName || '' } : {}),
-        before: resultSnapshot.before,
-        after: resultSnapshot.after,
-        mode: resultSnapshot.diff > 0 ? 'add' : 'edit',
-        reason: reason || 'adjustment',
-        notes: notes || '',
-        changedAt: Date.now(),
-        user: {
-          uid: userProfile.uid,
-          name: userProfile.displayName || userProfile.email || 'Usuario',
-          role: (userProfile as any)?.role || 'admin',
-        },
-      }));
+      await withTimeout(
+        setDoc(adjRef, cleanFirestoreData({
+          accountId: product.accountId,
+          productId: product.id,
+          productName: product.name,
+          ...(variantId ? { variantId, variantName: variantName || '' } : {}),
+          before: resultSnapshot.before,
+          after: resultSnapshot.after,
+          mode: resultSnapshot.diff > 0 ? 'add' : 'edit',
+          reason: reason || 'adjustment',
+          notes: notes || '',
+          changedAt: Date.now(),
+          user: {
+            uid: userProfile.uid,
+            name: userProfile.displayName || userProfile.email || 'Usuario',
+            role: (userProfile as any)?.role || 'admin',
+          },
+        })),
+        8_000,
+        'Tiempo de espera agotado al registrar auditoría de ajuste.'
+      );
     } catch (auditErr) {
       console.warn('[InventoryService] No se pudo registrar inventory_adjustments:', auditErr);
     }

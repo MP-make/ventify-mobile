@@ -11,9 +11,11 @@ import React, {
 import { AppState, InteractionManager } from 'react-native';
 import {
   collection,
+  doc,
   query,
   where,
   onSnapshot,
+  getDoc,
   getDocs,
   limit,
   Timestamp,
@@ -24,6 +26,21 @@ import { db } from '@/lib/firebase';
 import { apiRequest } from '@/lib/api-client';
 import { useAuthSession, useNetworkStatus, usePlanAccess } from './AuthContext';
 import { Product } from '@/types';
+import {
+  computeOfflineProductProjections,
+  type AuthoritativeProductStockPatch,
+  type OfflineInventoryOperation,
+} from '@/lib/offline-stock-helpers';
+import {
+  getOfflineQueue,
+  subscribeOfflineItemSynced,
+  subscribeOfflineQueueChanges,
+  type PendingOfflineSale,
+} from '@/services/offline-sync-service';
+import {
+  getOfflineInventoryQueue,
+  subscribeOfflineInventoryChanges,
+} from '@/services/offline-inventory-service';
 import {
   findProductByBarcode,
   getBranchStock,
@@ -98,6 +115,7 @@ export interface ProductsActionsContextType {
   refreshProducts: () => void;
   upsertProduct: (product: Product) => void;
   upsertProductsBatch: (items: Product[]) => void;
+  applyAuthoritativeStockUpdates: (patches: AuthoritativeProductStockPatch[]) => void;
   validateProductCreation: () => Promise<ProductPlanValidationResult>;
 }
 
@@ -503,6 +521,7 @@ const ProductsActionsContext = createContext<ProductsActionsContextType>({
   refreshProducts: () => {},
   upsertProduct: () => {},
   upsertProductsBatch: () => {},
+  applyAuthoritativeStockUpdates: () => {},
   validateProductCreation: async () => ({ allowed: true }),
 });
 
@@ -526,6 +545,7 @@ const ProductsContext = createContext<ProductsContextType>({
   refreshProducts: () => {},
   upsertProduct: () => {},
   upsertProductsBatch: () => {},
+  applyAuthoritativeStockUpdates: () => {},
   validateProductCreation: async () => ({ allowed: true }),
 });
 
@@ -577,7 +597,13 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   catalogCompleteRef.current = catalogComplete;
 
   const localRecentProductsRef = useRef<Map<string, Product>>(new Map());
+  const baseProductMapRef = useRef<Map<string, Product>>(new Map());
   const productMapRef = useRef<Map<string, Product>>(new Map());
+  const pendingOfflineSalesRef = useRef<PendingOfflineSale[]>([]);
+  const pendingInventoryOpsRef = useRef<OfflineInventoryOperation[]>([]);
+  const projectionMapRef = useRef<Map<string, Product>>(new Map());
+  const projectedCreatedIdsRef = useRef<Set<string>>(new Set());
+  const projectedAffectedIdsRef = useRef<Set<string>>(new Set());
   const barcodeIndexRef = useRef(new ProductCatalogIndex());
   const inventoryIndexRef = useRef(new ProductCatalogInventoryIndex(effectiveBranchId));
   const catalogFilterIndexRef = useRef(new MutableCatalogProductIndex());
@@ -593,6 +619,8 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const pendingDeltaDeletesRef = useRef<Set<string>>(new Set());
   const publishCatalogStateRef = useRef<(scopeKey: string) => void>(() => {});
   const scheduleDeltaFlushRef = useRef<() => void>(() => {});
+  const rebuildOfflineOverlayRef = useRef<() => void>(() => {});
+  const hydrateQueuesPromiseRef = useRef<Promise<void>>(Promise.resolve());
 
   // Account-scoped cache key so branch switches only recompute branch stock KPIs in memory
   const activeCacheKey =
@@ -649,6 +677,67 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     };
   }, [effectiveBranchId, activeCacheKey]);
 
+  const recomputeOfflineProjectionsSync = useCallback(() => {
+    const res = computeOfflineProductProjections(
+      baseProductMapRef.current,
+      pendingOfflineSalesRef.current,
+      pendingInventoryOpsRef.current,
+      effectiveBranchIdRef.current,
+      accountIdRef.current || undefined
+    );
+    projectionMapRef.current = res.overlayProducts;
+    projectedCreatedIdsRef.current = res.createdIds;
+    projectedAffectedIdsRef.current = res.affectedIds;
+    return res;
+  }, []);
+
+  const applyProjectedIdsToEffectiveRefs = useCallback(
+    (targetIds: Iterable<string>) => {
+      for (const productId of targetIds) {
+        const effective =
+          projectionMapRef.current.get(productId) ?? baseProductMapRef.current.get(productId);
+        if (!effective || isDeletedProduct(effective)) {
+          if (productMapRef.current.has(productId)) {
+            removeCatalogProduct(productMapRef.current, barcodeIndexRef.current, productId);
+          } else {
+            barcodeIndexRef.current.remove(productId);
+          }
+          inventoryIndexRef.current.remove(productId);
+          catalogFilterIndexRef.current.remove(productId);
+          continue;
+        }
+        getIndexedCatalogProduct(effective);
+        productMapRef.current.set(productId, effective);
+        barcodeIndexRef.current.upsert(effective);
+        inventoryIndexRef.current.upsert(effective);
+        if (effective.active === false) {
+          catalogFilterIndexRef.current.remove(productId);
+        } else {
+          catalogFilterIndexRef.current.upsert(effective);
+        }
+      }
+    },
+    []
+  );
+
+  const rebuildAndPublishOfflineOverlay = useCallback(() => {
+    const scopeKey = activeCacheKeyRef.current;
+    if (!scopeKey || activeScopeRef.current !== scopeKey) return;
+    const prevAffected = new Set(projectedAffectedIdsRef.current);
+    const res = recomputeOfflineProjectionsSync();
+    const unionIds = new Set<string>(prevAffected);
+    for (const id of res.affectedIds) unionIds.add(id);
+    if (unionIds.size === 0) return;
+
+    applyProjectedIdsToEffectiveRefs(unionIds);
+    publishCatalogStateRef.current(scopeKey);
+    if (catalogCompleteRef.current) {
+      setInventorySummary(inventoryIndexRef.current.snapshot());
+    }
+  }, [applyProjectedIdsToEffectiveRefs, recomputeOfflineProjectionsSync]);
+
+  rebuildOfflineOverlayRef.current = rebuildAndPublishOfflineOverlay;
+
   const upsertProductsBatch = useCallback((items: Product[]) => {
     if (!items || items.length === 0) return;
     const scopeKey = activeCacheKeyRef.current;
@@ -656,6 +745,7 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     if (!scopeKey || activeScopeRef.current !== scopeKey) return;
 
     let updatedCount = 0;
+    const touchedIds: string[] = [];
 
     for (let i = 0; i < items.length; i += 1) {
       const product = items[i];
@@ -664,38 +754,99 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
       if (isDeletedProduct(product)) {
         localRecentProductsRef.current.delete(product.id);
+        baseProductMapRef.current.delete(product.id);
         removeCatalogProduct(productMapRef.current, barcodeIndexRef.current, product.id);
         inventoryIndexRef.current.remove(product.id);
         catalogFilterIndexRef.current.remove(product.id);
         pendingDeltaUpsertsRef.current.delete(product.id);
         pendingDeltaDeletesRef.current.add(product.id);
         updatedCount += 1;
+        touchedIds.push(product.id);
         continue;
       }
 
       localRecentProductsRef.current.set(product.id, product);
-      getIndexedCatalogProduct(product);
-      productMapRef.current.set(product.id, product);
-      barcodeIndexRef.current.upsert(product);
-      inventoryIndexRef.current.upsert(product);
-      if (product.active === false) {
-        catalogFilterIndexRef.current.remove(product.id);
-      } else {
-        catalogFilterIndexRef.current.upsert(product);
-      }
+      baseProductMapRef.current.set(product.id, product);
       pendingDeltaDeletesRef.current.delete(product.id);
       pendingDeltaUpsertsRef.current.set(product.id, product);
       updatedCount += 1;
+      touchedIds.push(product.id);
     }
 
     if (updatedCount === 0) return;
 
+    if (
+      pendingOfflineSalesRef.current.length > 0 ||
+      pendingInventoryOpsRef.current.length > 0
+    ) {
+      recomputeOfflineProjectionsSync();
+    } else {
+      projectionMapRef.current.clear();
+      projectedCreatedIdsRef.current.clear();
+      projectedAffectedIdsRef.current.clear();
+    }
+
+    applyProjectedIdsToEffectiveRefs(touchedIds);
     publishCatalogStateRef.current(scopeKey);
     if (catalogCompleteRef.current) {
       setInventorySummary(inventoryIndexRef.current.snapshot());
       scheduleDeltaFlushRef.current();
     }
-  }, []);
+  }, [applyProjectedIdsToEffectiveRefs, recomputeOfflineProjectionsSync]);
+
+  const applyAuthoritativeStockUpdates = useCallback(
+    (patches: AuthoritativeProductStockPatch[]) => {
+      if (!patches || patches.length === 0) return;
+      const scopeKey = activeCacheKeyRef.current;
+      if (!scopeKey || activeScopeRef.current !== scopeKey) return;
+
+      const updatedBaseIds: string[] = [];
+      for (const patch of patches) {
+        if (!patch?.productId) continue;
+        const base =
+          baseProductMapRef.current.get(patch.productId) ??
+          productMapRef.current.get(patch.productId);
+        if (!base) continue;
+
+        const nextBase: Product = {
+          ...base,
+          stock: { ...patch.stock },
+          branchIds: [...patch.branchIds],
+          lowStockBranches: [...patch.lowStockBranches],
+          ...(patch.variants !== undefined ? { variants: patch.variants } : {}),
+          ...(patch.reservedStock !== undefined
+            ? { reservedStock: { ...patch.reservedStock } }
+            : {}),
+        };
+        baseProductMapRef.current.set(patch.productId, nextBase);
+        pendingDeltaDeletesRef.current.delete(patch.productId);
+        pendingDeltaUpsertsRef.current.set(patch.productId, nextBase);
+        updatedBaseIds.push(patch.productId);
+      }
+
+      if (updatedBaseIds.length === 0) return;
+
+      const prevAffected = new Set(projectedAffectedIdsRef.current);
+      if (
+        pendingOfflineSalesRef.current.length > 0 ||
+        pendingInventoryOpsRef.current.length > 0
+      ) {
+        recomputeOfflineProjectionsSync();
+      } else {
+        projectionMapRef.current.clear();
+        projectedCreatedIdsRef.current.clear();
+        projectedAffectedIdsRef.current.clear();
+      }
+      const unionIds = new Set<string>([...prevAffected, ...updatedBaseIds, ...projectedAffectedIdsRef.current]);
+      applyProjectedIdsToEffectiveRefs(unionIds);
+      publishCatalogStateRef.current(scopeKey);
+      if (catalogCompleteRef.current) {
+        setInventorySummary(inventoryIndexRef.current.snapshot());
+        scheduleDeltaFlushRef.current();
+      }
+    },
+    [applyProjectedIdsToEffectiveRefs, recomputeOfflineProjectionsSync]
+  );
 
   const upsertProduct = useCallback(
     (product: Product) => {
@@ -736,7 +887,11 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         suggestedPrice: baseSuggested,
         price: baseSuggested,
         minSalePrice: baseMin,
-        stock: isPlainRecord(data.stock) ? data.stock : {},
+        stock: isPlainRecord(data.stock)
+          ? data.stock
+          : typeof data.stock === 'number' && Number.isFinite(data.stock)
+            ? { [effectiveBranchIdRef.current || 'main']: data.stock }
+            : {},
         reservedStock: isPlainRecord(data.reservedStock) ? data.reservedStock : {},
         branchIds: Array.isArray(data.branchIds) ? data.branchIds : [],
         lowStockBranches: Array.isArray(data.lowStockBranches) ? data.lowStockBranches : [],
@@ -812,6 +967,111 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     [accountId]
   );
 
+  // Subscribe to offline sales & inventory queues so local stock stays reactive
+  // across offline sales, offline stock adjustments, and per-item reconnect sync.
+  useEffect(() => {
+    let mounted = true;
+
+    const refreshBaseProductsFromServer = async (productIds: string[]) => {
+      if (!mounted || !isOnlineRef.current || productIds.length === 0) return;
+      try {
+        const patches: AuthoritativeProductStockPatch[] = [];
+        const updatedProducts: Product[] = [];
+        await Promise.all(
+          productIds.slice(0, 20).map(async (pid) => {
+            try {
+              const snap = await getDoc(doc(db, 'products', pid));
+              if (!snap.exists()) return;
+              const mapped = mapSnapshotDoc(snap);
+              updatedProducts.push(mapped);
+              patches.push({
+                productId: mapped.id,
+                stock: mapped.stock || {},
+                branchIds: mapped.branchIds || [],
+                lowStockBranches: mapped.lowStockBranches || [],
+                ...(Array.isArray(mapped.variants) ? { variants: mapped.variants } : {}),
+                ...(mapped.reservedStock ? { reservedStock: mapped.reservedStock } : {}),
+              });
+            } catch {
+              // Ignore individual fetch errors; full listener or next refresh catches up
+            }
+          })
+        );
+        if (!mounted) return;
+        if (patches.length > 0) {
+          for (const prod of updatedProducts) {
+            baseProductMapRef.current.set(prod.id, prod);
+            pendingDeltaUpsertsRef.current.set(prod.id, prod);
+          }
+          rebuildOfflineOverlayRef.current();
+          if (catalogCompleteRef.current) {
+            scheduleDeltaFlushRef.current();
+          }
+        }
+      } catch {
+        // Ignore background refresh error
+      }
+    };
+
+    const unsubSalesQueue = subscribeOfflineQueueChanges((event) => {
+      if (!mounted) return;
+      if (Array.isArray(event.items)) {
+        pendingOfflineSalesRef.current = event.items;
+        rebuildOfflineOverlayRef.current();
+      } else {
+        void getOfflineQueue().then((items) => {
+          if (!mounted) return;
+          pendingOfflineSalesRef.current = items;
+          rebuildOfflineOverlayRef.current();
+        });
+      }
+    });
+
+    const unsubItemSynced = subscribeOfflineItemSynced((event) => {
+      if (!mounted) return;
+      pendingOfflineSalesRef.current = event.items;
+      if (event.updatedProductStocks.length > 0) {
+        applyAuthoritativeStockUpdates(event.updatedProductStocks);
+      } else {
+        rebuildOfflineOverlayRef.current();
+        if (event.affectedProductIds.length > 0) {
+          void refreshBaseProductsFromServer(event.affectedProductIds);
+        }
+      }
+    });
+
+    const unsubInventoryQueue = subscribeOfflineInventoryChanges((event) => {
+      if (!mounted) return;
+      if (Array.isArray(event.items)) {
+        pendingInventoryOpsRef.current = event.items;
+      }
+      if (event.type === 'item_synced') {
+        if (event.createdProduct) {
+          baseProductMapRef.current.set(event.createdProduct.id, event.createdProduct);
+          pendingDeltaDeletesRef.current.delete(event.createdProduct.id);
+          pendingDeltaUpsertsRef.current.set(event.createdProduct.id, event.createdProduct);
+          rebuildOfflineOverlayRef.current();
+          if (catalogCompleteRef.current) {
+            scheduleDeltaFlushRef.current();
+          }
+          return;
+        }
+        if (event.updatedProductStock) {
+          applyAuthoritativeStockUpdates([event.updatedProductStock]);
+          return;
+        }
+      }
+      rebuildOfflineOverlayRef.current();
+    });
+
+    return () => {
+      mounted = false;
+      unsubSalesQueue();
+      unsubItemSynced();
+      unsubInventoryQueue();
+    };
+  }, [applyAuthoritativeStockUpdates, mapSnapshotDoc]);
+
   // Hydrate MMKV cache concurrently with Firestore sync (delta when safe, full when required)
   useEffect(() => {
     const scopeKey = activeCacheKey;
@@ -823,7 +1083,11 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       activeScopeRef.current = null;
       authoritativeSnapshotReadyRef.current = false;
       barcodeIndexScopeRef.current = null;
+      baseProductMapRef.current.clear();
       productMapRef.current.clear();
+      projectionMapRef.current.clear();
+      projectedCreatedIdsRef.current.clear();
+      projectedAffectedIdsRef.current.clear();
       barcodeIndexRef.current.clear();
       inventoryIndexRef.current.clear();
       catalogFilterIndexRef.current.clear();
@@ -855,7 +1119,11 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     barcodeIndexScopeRef.current = scopeKey;
     authoritativeSnapshotReadyRef.current = false;
     if (scopeChanged) {
+      baseProductMapRef.current.clear();
       productMapRef.current.clear();
+      projectionMapRef.current.clear();
+      projectedCreatedIdsRef.current.clear();
+      projectedAffectedIdsRef.current.clear();
       barcodeIndexRef.current.clear();
       inventoryIndexRef.current = new ProductCatalogInventoryIndex(branchIdRef.current);
       catalogFilterIndexRef.current.clear();
@@ -878,6 +1146,16 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       setCategories(DEFAULT_CATEGORIES);
     }
     setRefreshing(true);
+
+    const queuesReadyPromise = Promise.all([
+      getOfflineQueue().catch(() => pendingOfflineSalesRef.current),
+      getOfflineInventoryQueue().catch(() => pendingInventoryOpsRef.current),
+    ]).then(([salesItems, invItems]) => {
+      if (!isCurrent()) return;
+      pendingOfflineSalesRef.current = salesItems;
+      pendingInventoryOpsRef.current = invItems;
+    });
+    hydrateQueuesPromiseRef.current = queuesReadyPromise;
 
     const nowMs = Date.now();
     const syncManifest = readProductCatalogManifestSync(scopeKey, catalogKVStorage);
@@ -970,8 +1248,8 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     };
 
     const removeProductFromRefs = (productId: string): boolean => {
-      const existed = productMapRef.current.has(productId);
-      if (existed) {
+      const existed = baseProductMapRef.current.delete(productId) || productMapRef.current.has(productId);
+      if (productMapRef.current.has(productId)) {
         removeCatalogProduct(productMapRef.current, barcodeIndexRef.current, productId);
       } else {
         barcodeIndexRef.current.remove(productId);
@@ -985,20 +1263,48 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       if (isDeletedProduct(product)) {
         return removeProductFromRefs(product.id);
       }
-      const existing = productMapRef.current.get(product.id);
-      if (existing && !productsDifferForCache(existing, product)) {
+      const existingBase = baseProductMapRef.current.get(product.id);
+      const baseChanged = !existingBase || productsDifferForCache(existingBase, product);
+      baseProductMapRef.current.set(product.id, product);
+
+      const effective = projectionMapRef.current.get(product.id) ?? product;
+      const existingEffective = productMapRef.current.get(product.id);
+      if (!baseChanged && existingEffective && !productsDifferForCache(existingEffective, effective)) {
         return false;
       }
-      getIndexedCatalogProduct(product);
-      productMapRef.current.set(product.id, product);
-      barcodeIndexRef.current.upsert(product);
-      inventoryIndexRef.current.upsert(product);
-      if (product.active === false) {
+      getIndexedCatalogProduct(effective);
+      productMapRef.current.set(product.id, effective);
+      barcodeIndexRef.current.upsert(effective);
+      inventoryIndexRef.current.upsert(effective);
+      if (effective.active === false) {
         catalogFilterIndexRef.current.remove(product.id);
       } else {
-        catalogFilterIndexRef.current.upsert(product);
+        catalogFilterIndexRef.current.upsert(effective);
       }
       return true;
+    };
+
+    const syncPendingOverlayToEffectiveRefs = () => {
+      if (
+        pendingOfflineSalesRef.current.length === 0 &&
+        pendingInventoryOpsRef.current.length === 0
+      ) {
+        if (projectedAffectedIdsRef.current.size > 0) {
+          const prev = new Set(projectedAffectedIdsRef.current);
+          projectionMapRef.current.clear();
+          projectedCreatedIdsRef.current.clear();
+          projectedAffectedIdsRef.current.clear();
+          applyProjectedIdsToEffectiveRefs(prev);
+        }
+        return;
+      }
+      const prevAffected = new Set(projectedAffectedIdsRef.current);
+      const res = recomputeOfflineProjectionsSync();
+      const unionIds = new Set<string>(prevAffected);
+      for (const id of res.affectedIds) unionIds.add(id);
+      if (unionIds.size > 0) {
+        applyProjectedIdsToEffectiveRefs(unionIds);
+      }
     };
 
     const runFullCompactionNow = (sourceProducts?: Product[]) => {
@@ -1014,7 +1320,7 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       pendingDeltaUpsertsRef.current.clear();
       pendingDeltaDeletesRef.current.clear();
 
-      const toPersist = sourceProducts || Array.from(productMapRef.current.values());
+      const toPersist = sourceProducts || Array.from(baseProductMapRef.current.values());
       const cacheGeneration = `${Date.now()}-${generation}-${Math.random().toString(36).slice(2, 8)}`;
       writeProductCatalogCache(catalogKVStorage, scopeKey, toPersist, {
         generation: cacheGeneration,
@@ -1022,7 +1328,7 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         trimAfterWrite: true,
         clearDelta: true,
         accountId,
-        lastSyncMs: lastSyncMsRef.current || Date.now(),
+        lastSyncMs: lastSyncMsRef.current || undefined,
         allDocsHaveUpdatedAt: allDocsHaveUpdatedAtRef.current,
       }).catch((cacheError) => {
         console.warn('[ProductsContext] Could not persist catalog cache:', cacheError);
@@ -1214,7 +1520,10 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
           await processCatalogIteratorInBatches(productMapRef.current.keys(), (batch) => {
             if (!isCurrent()) return;
             for (const productId of batch) {
-              if (!shouldRetainCatalogProduct(productId, serverIds, localRecentProductsRef.current)) {
+              if (
+                !projectedCreatedIdsRef.current.has(productId) &&
+                !shouldRetainCatalogProduct(productId, serverIds, localRecentProductsRef.current)
+              ) {
                 removeProductFromRefs(productId);
                 dirtyCount += 1;
               }
@@ -1234,6 +1543,7 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       }
 
       if (!isCurrent()) return;
+      syncPendingOverlayToEffectiveRefs();
 
       if (completesFirstSnapshot) {
         publishNow();
@@ -1329,6 +1639,7 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       }
 
       if (!isCurrent()) return;
+      syncPendingOverlayToEffectiveRefs();
       if (isServerAuthoritative) {
         lastSyncMsRef.current = Date.now();
         authoritativeSnapshotReadyRef.current = true;
@@ -1563,6 +1874,8 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         return;
       }
       try {
+        await hydrateQueuesPromiseRef.current;
+        if (!isCurrent()) return;
         const skipIntermediatePublish = Boolean(syncManifest && syncManifest.chunks <= 4);
         const cacheResult = await loadProductCatalogCache(catalogKVStorage, scopeKey, (chunk) => {
           if (!isCurrent() || (!isDeltaMode && serverSnapshotApplied)) return;
@@ -1570,6 +1883,7 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
             const cachedProduct = chunk[i];
             if (!cachedProduct || !cachedProduct.id) continue;
             if (isDeletedProduct(cachedProduct)) continue;
+            baseProductMapRef.current.set(cachedProduct.id, cachedProduct);
             productMapRef.current.set(cachedProduct.id, cachedProduct);
             getIndexedCatalogProduct(cachedProduct);
             barcodeIndexRef.current.upsert(cachedProduct);
@@ -1580,6 +1894,7 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
           }
           if (!skipIntermediatePublish && !cacheChunkPublished) {
             cacheChunkPublished = true;
+            syncPendingOverlayToEffectiveRefs();
             publishNow();
           }
         });
@@ -1595,6 +1910,7 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
           if (typeof cacheResult.allDocsHaveUpdatedAt === 'boolean') {
             allDocsHaveUpdatedAtRef.current = cacheResult.allDocsHaveUpdatedAt;
           }
+          syncPendingOverlayToEffectiveRefs();
           publishNow();
           setInventorySummary(inventoryIndexRef.current.snapshot());
           setCatalogComplete(true);
@@ -1602,10 +1918,12 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         } else {
           if (!cacheResult?.expired && productMapRef.current.size) {
             // A corrupt/incomplete cache must not leak partial stale data into an offline session.
+            baseProductMapRef.current.clear();
             productMapRef.current.clear();
             barcodeIndexRef.current.clear();
             inventoryIndexRef.current.clear();
             catalogFilterIndexRef.current.clear();
+            syncPendingOverlayToEffectiveRefs();
             publishNow();
           }
           if (isDeltaMode && isCurrent()) {
@@ -1618,10 +1936,12 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         }
       } catch (cacheError) {
         if (isCurrent() && scopeChanged) {
+          baseProductMapRef.current.clear();
           productMapRef.current.clear();
           barcodeIndexRef.current.clear();
           inventoryIndexRef.current.clear();
           catalogFilterIndexRef.current.clear();
+          syncPendingOverlayToEffectiveRefs();
           publishNow();
           if (isDeltaMode) {
             isDeltaMode = false;
@@ -1693,6 +2013,7 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
           ? barcodeIndexRef.current.get(code)
           : findProductByBarcode(Array.from(productMapRef.current.values()), code);
       if (localMatch) return localMatch;
+      if (!isOnlineRef.current) return null;
       if (
         catalogCompleteRef.current &&
         authoritativeSnapshotReadyRef.current &&
@@ -1833,6 +2154,7 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       refreshProducts,
       upsertProduct,
       upsertProductsBatch,
+      applyAuthoritativeStockUpdates,
       validateProductCreation,
     }),
     [
@@ -1844,6 +2166,7 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       refreshProducts,
       upsertProduct,
       upsertProductsBatch,
+      applyAuthoritativeStockUpdates,
       validateProductCreation,
     ]
   );
@@ -1869,6 +2192,7 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       refreshProducts,
       upsertProduct,
       upsertProductsBatch,
+      applyAuthoritativeStockUpdates,
       validateProductCreation,
     }),
     [
@@ -1891,6 +2215,7 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       refreshProducts,
       upsertProduct,
       upsertProductsBatch,
+      applyAuthoritativeStockUpdates,
       validateProductCreation,
     ]
   );

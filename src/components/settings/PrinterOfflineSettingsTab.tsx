@@ -28,12 +28,27 @@ import {
 } from 'lucide-react-native';
 
 import { SectionHeading } from '@/components/ui';
+import { useOfflineStatus } from '@/context/SettingsContext';
 import type { AccountTaxProfile } from '@/lib/invoicing/receipt-amounts';
+import type { OfflineInventoryOperation } from '@/lib/offline-stock-helpers';
 import { formatDatePE, formatPEN, ui } from '@/lib/theme';
 import {
-  getOfflineQueue,
-  getQuarantinedSales,
-  processOfflineQueue,
+  cancelPendingCashMovement,
+  getOfflineCashQueueForIdentity,
+  type PendingOfflineCashMovement,
+} from '@/services/offline-cash-service';
+import {
+  cancelPendingInventoryOp,
+  getOfflineInventoryQueueForIdentity,
+  getQuarantinedInventoryOpsForIdentity,
+  removeQuarantinedInventoryOp,
+  retryQuarantinedInventoryOp,
+  type QuarantinedInventoryOp,
+} from '@/services/offline-inventory-service';
+import {
+  cancelPendingOfflineSale,
+  getOfflineQueueForIdentity,
+  getQuarantinedSalesForIdentity,
   removeQuarantinedSale,
   retryQuarantinedSale,
   type PendingOfflineSale,
@@ -55,11 +70,16 @@ import type { Branch, BusinessSettings, PosSettings } from '@/types';
 import { settingsStyles as styles } from './settingsStyles';
 
 type OfflineModalRow =
-  | { kind: 'pending'; key: string; data: PendingOfflineSale }
-  | { kind: 'quarantined'; key: string; data: QuarantinedOfflineSale };
+  | { kind: 'pending_sale'; key: string; data: PendingOfflineSale }
+  | { kind: 'pending_inventory'; key: string; data: OfflineInventoryOperation }
+  | { kind: 'pending_cash'; key: string; data: PendingOfflineCashMovement }
+  | { kind: 'quarantined_sale'; key: string; data: QuarantinedOfflineSale }
+  | { kind: 'quarantined_inventory'; key: string; data: QuarantinedInventoryOp };
 
 export interface PrinterOfflineSettingsTabProps {
   accountId: string | null;
+  userId: string | null;
+  activeCashSessionId?: string | null;
   isFocused: boolean;
   isActiveTab: boolean;
   isOnline: boolean;
@@ -74,6 +94,8 @@ export interface PrinterOfflineSettingsTabProps {
 export const PrinterOfflineSettingsTab = React.memo<PrinterOfflineSettingsTabProps>(
   ({
     accountId,
+    userId,
+    activeCashSessionId,
     isFocused,
     isActiveTab,
     isOnline,
@@ -84,6 +106,7 @@ export const PrinterOfflineSettingsTab = React.memo<PrinterOfflineSettingsTabPro
     posSettings,
     taxProfile,
   }) => {
+    const { isSyncingOffline: contextSyncing, triggerManualSync } = useOfflineStatus();
     const [printerConfig, setPrinterConfig] = useState<PrinterConfig>(DEFAULT_PRINTER_CONFIG);
     const [scannedPrinters, setScannedPrinters] = useState<BluetoothPrinterDevice[]>([]);
     const [isScanningPrinters, setIsScanningPrinters] = useState(false);
@@ -92,8 +115,12 @@ export const PrinterOfflineSettingsTab = React.memo<PrinterOfflineSettingsTabPro
     const [btPermissionChecking, setBtPermissionChecking] = useState(false);
 
     const [offlineSales, setOfflineSales] = useState<PendingOfflineSale[]>([]);
+    const [pendingInvOps, setPendingInvOps] = useState<OfflineInventoryOperation[]>([]);
+    const [pendingCashOps, setPendingCashOps] = useState<PendingOfflineCashMovement[]>([]);
     const [quarantinedSales, setQuarantinedSales] = useState<QuarantinedOfflineSale[]>([]);
-    const [isSyncingOffline, setIsSyncingOffline] = useState(false);
+    const [quarantinedInvOps, setQuarantinedInvOps] = useState<QuarantinedInventoryOp[]>([]);
+    const [localSyncing, setLocalSyncing] = useState(false);
+    const isSyncingOffline = contextSyncing || localSyncing;
     const [offlineDetailsModalVisible, setOfflineDetailsModalVisible] = useState(false);
 
     useEffect(() => {
@@ -109,17 +136,31 @@ export const PrinterOfflineSettingsTab = React.memo<PrinterOfflineSettingsTabPro
     }, []);
 
     const loadOfflineData = useCallback(async () => {
+      if (!userId || !accountId) {
+        setOfflineSales([]);
+        setPendingInvOps([]);
+        setPendingCashOps([]);
+        setQuarantinedSales([]);
+        setQuarantinedInvOps([]);
+        return;
+      }
       try {
-        const [queue, quarantined] = await Promise.all([
-          getOfflineQueue(),
-          getQuarantinedSales(),
+        const [salesQ, salesQuar, invQ, invQuar, cashQ] = await Promise.all([
+          getOfflineQueueForIdentity(userId, accountId),
+          getQuarantinedSalesForIdentity(userId, accountId),
+          getOfflineInventoryQueueForIdentity(userId, accountId),
+          getQuarantinedInventoryOpsForIdentity(userId, accountId),
+          getOfflineCashQueueForIdentity(userId, accountId),
         ]);
-        setOfflineSales(queue);
-        setQuarantinedSales(quarantined);
+        setOfflineSales(salesQ);
+        setQuarantinedSales(salesQuar);
+        setPendingInvOps(invQ);
+        setQuarantinedInvOps(invQuar);
+        setPendingCashOps(cashQ);
       } catch (err) {
         console.error('Error cargando estado offline:', err);
       }
-    }, []);
+    }, [userId, accountId]);
 
     useEffect(() => {
       if (!isFocused || (!isActiveTab && !offlineDetailsModalVisible)) return;
@@ -256,39 +297,118 @@ export const PrinterOfflineSettingsTab = React.memo<PrinterOfflineSettingsTabPro
     };
 
     const handleForceSync = async () => {
-      setIsSyncingOffline(true);
+      setLocalSyncing(true);
       try {
-        const result = await processOfflineQueue(accountId || undefined);
+        const result = await triggerManualSync(true);
         await loadOfflineData();
         await refreshOfflineCount();
 
         if (result.total === 0) {
-          Alert.alert('Sincronización', 'No hay ventas pendientes en la cola.');
+          Alert.alert('Sincronización', 'No hay operaciones pendientes en las colas offline.');
         } else {
           Alert.alert(
             'Sincronización Completada',
-            `Procesadas: ${result.processed}/${result.total}\nExitosas: ${result.successful}\nEn cuarentena: ${result.quarantined}`
+            `Total procesado: ${result.total}\nExitosas: ${result.successful}\nReintentos pendientes: ${result.retried}\nEn cuarentena: ${result.quarantined}`
           );
         }
       } catch (err: any) {
-        Alert.alert('Error al Sincronizar', err?.message || 'Falló el proceso de cola offline.');
+        Alert.alert('Error al Sincronizar', err?.message || 'Falló el proceso de colas offline.');
       } finally {
-        setIsSyncingOffline(false);
+        setLocalSyncing(false);
       }
     };
 
+    const handleCancelPendingSale = useCallback(
+      (saleId: string) => {
+        Alert.alert(
+          'Descartar Venta Pendiente',
+          'Se eliminará la venta pendiente de la cola local y se restaurará el stock descontado localmente. ¿Continuar?',
+          [
+            { text: 'Volver', style: 'cancel' },
+            {
+              text: 'Descartar',
+              style: 'destructive',
+              onPress: async () => {
+                await cancelPendingOfflineSale(saleId);
+                await loadOfflineData();
+                await refreshOfflineCount();
+              },
+            },
+          ]
+        );
+      },
+      [loadOfflineData, refreshOfflineCount]
+    );
+
+    const handleCancelPendingInvOp = useCallback(
+      (opId: string) => {
+        Alert.alert(
+          'Descartar Operación de Inventario',
+          'Se eliminará esta operación pendiente de inventario.',
+          [
+            { text: 'Volver', style: 'cancel' },
+            {
+              text: 'Descartar',
+              style: 'destructive',
+              onPress: async () => {
+                await cancelPendingInventoryOp(opId);
+                await loadOfflineData();
+                await refreshOfflineCount();
+              },
+            },
+          ]
+        );
+      },
+      [loadOfflineData, refreshOfflineCount]
+    );
+
+    const handleCancelPendingCashOp = useCallback(
+      (cashId: string) => {
+        Alert.alert(
+          'Descartar Movimiento de Caja',
+          'Se eliminará este movimiento de caja pendiente.',
+          [
+            { text: 'Volver', style: 'cancel' },
+            {
+              text: 'Descartar',
+              style: 'destructive',
+              onPress: async () => {
+                await cancelPendingCashMovement(cashId);
+                await loadOfflineData();
+                await refreshOfflineCount();
+              },
+            },
+          ]
+        );
+      },
+      [loadOfflineData, refreshOfflineCount]
+    );
+
     const handleRetryQuarantined = useCallback(
-      async (saleId: string) => {
+      async (saleId: string, newSessionId?: string) => {
         try {
-          await retryQuarantinedSale(saleId);
+          await retryQuarantinedSale(
+            saleId,
+            newSessionId
+              ? { newSessionId, accountId: accountId || undefined }
+              : undefined
+          );
+          if (newSessionId && isOnline) {
+            await triggerManualSync(true);
+          }
           await loadOfflineData();
           await refreshOfflineCount();
-          Alert.alert('Reintento Encolado', 'La venta volvió a la cola de sincronización.');
+          Alert.alert(
+            newSessionId ? 'Reasignada y Reencolada' : 'Reintento Encolado',
+            newSessionId
+              ? 'La venta se vinculó a la caja abierta actual y volvió a la cola.'
+              : 'La venta volvió a la cola de sincronización.'
+          );
         } catch (err: any) {
           Alert.alert('Error', err?.message || 'No se pudo reencolar la venta.');
         }
       },
-      [loadOfflineData, refreshOfflineCount]
+      [accountId, isOnline, loadOfflineData, refreshOfflineCount, triggerManualSync]
     );
 
     const handleRemoveQuarantined = useCallback(
@@ -313,20 +433,71 @@ export const PrinterOfflineSettingsTab = React.memo<PrinterOfflineSettingsTabPro
       [loadOfflineData, refreshOfflineCount]
     );
 
+    const handleRetryQuarantinedInv = useCallback(
+      async (opId: string) => {
+        try {
+          await retryQuarantinedInventoryOp(opId);
+          await loadOfflineData();
+          await refreshOfflineCount();
+          Alert.alert('Reintento Encolado', 'La operación de inventario volvió a la cola.');
+        } catch (err: any) {
+          Alert.alert('Error', err?.message || 'No se pudo reencolar la operación.');
+        }
+      },
+      [loadOfflineData, refreshOfflineCount]
+    );
+
+    const handleRemoveQuarantinedInv = useCallback(
+      async (opId: string) => {
+        Alert.alert(
+          'Descartar Operación en Cuarentena',
+          'Se eliminará permanentemente esta operación de inventario.',
+          [
+            { text: 'Cancelar', style: 'cancel' },
+            {
+              text: 'Descartar',
+              style: 'destructive',
+              onPress: async () => {
+                await removeQuarantinedInventoryOp(opId);
+                await loadOfflineData();
+                await refreshOfflineCount();
+              },
+            },
+          ]
+        );
+      },
+      [loadOfflineData, refreshOfflineCount]
+    );
+
     const offlineModalRows = useMemo<OfflineModalRow[]>(
       () => [
+        ...pendingInvOps.map((data, idx) => ({
+          kind: 'pending_inventory' as const,
+          key: `pi_${data.offlineOpId || idx}`,
+          data,
+        })),
         ...offlineSales.map((data, idx) => ({
-          kind: 'pending' as const,
-          key: `p_${data.offlineId || data.id || idx}`,
+          kind: 'pending_sale' as const,
+          key: `ps_${data.offlineId || data.id || idx}`,
+          data,
+        })),
+        ...pendingCashOps.map((data, idx) => ({
+          kind: 'pending_cash' as const,
+          key: `pc_${data.offlineId || data.id || idx}`,
           data,
         })),
         ...quarantinedSales.map((data, idx) => ({
-          kind: 'quarantined' as const,
-          key: `q_${data.offlineId || data.id || idx}`,
+          kind: 'quarantined_sale' as const,
+          key: `qs_${data.offlineId || data.id || idx}`,
+          data,
+        })),
+        ...quarantinedInvOps.map((data, idx) => ({
+          kind: 'quarantined_inventory' as const,
+          key: `qi_${data.offlineOpId || idx}`,
           data,
         })),
       ],
-      [offlineSales, quarantinedSales]
+      [pendingInvOps, offlineSales, pendingCashOps, quarantinedSales, quarantinedInvOps]
     );
 
     const offlineRowKeyExtractor = useCallback((item: OfflineModalRow) => item.key, []);
@@ -334,7 +505,7 @@ export const PrinterOfflineSettingsTab = React.memo<PrinterOfflineSettingsTabPro
 
     const renderOfflineModalRow = useCallback(
       ({ item }: { item: OfflineModalRow }) => {
-        if (item.kind === 'pending') {
+        if (item.kind === 'pending_sale') {
           return (
             <View style={styles.offlineItemRow}>
               <View style={styles.flex1}>
@@ -345,9 +516,98 @@ export const PrinterOfflineSettingsTab = React.memo<PrinterOfflineSettingsTabPro
                   Intentos: {item.data.retryCount} · {formatDatePE(item.data.timestamp)}
                 </Text>
               </View>
+              <TouchableOpacity
+                onPress={() => handleCancelPendingSale(item.data.offlineId)}
+                style={[styles.secondaryOutlineBtn, { borderColor: ui.danger, paddingHorizontal: 10, paddingVertical: 6 }]}
+              >
+                <Trash2 size={13} color={ui.danger} />
+              </TouchableOpacity>
             </View>
           );
         }
+
+        if (item.kind === 'pending_inventory') {
+          const op = item.data;
+          const label =
+            op.type === 'product_create'
+              ? `Nuevo producto · ${op.previewProduct?.name || op.productId}`
+              : op.type === 'product_update'
+              ? `Edición de producto · ${op.previewPatch?.name || op.productId}`
+              : `Ajuste de stock · ${op.productName}`;
+          return (
+            <View style={styles.offlineItemRow}>
+              <View style={styles.flex1}>
+                <Text style={styles.deviceName}>{label}</Text>
+                <Text style={styles.deviceAddress}>
+                  Intentos: {op.retryCount || 0} · {formatDatePE(op.timestamp)}
+                </Text>
+              </View>
+              <TouchableOpacity
+                onPress={() => handleCancelPendingInvOp(op.offlineOpId)}
+                style={[styles.secondaryOutlineBtn, { borderColor: ui.danger, paddingHorizontal: 10, paddingVertical: 6 }]}
+              >
+                <Trash2 size={13} color={ui.danger} />
+              </TouchableOpacity>
+            </View>
+          );
+        }
+
+        if (item.kind === 'pending_cash') {
+          const mv = item.data;
+          return (
+            <View style={styles.offlineItemRow}>
+              <View style={styles.flex1}>
+                <Text style={styles.deviceName}>
+                  {mv.type === 'income' ? 'Ingreso caja' : 'Egreso caja'} · {formatPEN(mv.amount)}
+                </Text>
+                <Text style={styles.deviceAddress}>
+                  {mv.reason || mv.description} · {formatDatePE(mv.timestamp)}
+                </Text>
+              </View>
+              <TouchableOpacity
+                onPress={() => handleCancelPendingCashOp(mv.offlineId)}
+                style={[styles.secondaryOutlineBtn, { borderColor: ui.danger, paddingHorizontal: 10, paddingVertical: 6 }]}
+              >
+                <Trash2 size={13} color={ui.danger} />
+              </TouchableOpacity>
+            </View>
+          );
+        }
+
+        if (item.kind === 'quarantined_inventory') {
+          return (
+            <View style={styles.quarantineBox}>
+              <Text style={styles.quarantineTitle}>
+                Inventario en cuarentena ·{' '}
+                {item.data.type === 'stock_adjust' ? item.data.productName : item.data.productId}
+              </Text>
+              <Text style={styles.quarantineError} numberOfLines={2}>
+                {item.data.lastErrorReason || 'Error de sincronización'}
+              </Text>
+              <View style={styles.actionButtonGroup}>
+                <TouchableOpacity
+                  style={[styles.secondaryOutlineBtn, styles.flex1]}
+                  onPress={() => void handleRetryQuarantinedInv(item.data.offlineOpId)}
+                >
+                  <RefreshCw size={14} color={ui.primary} />
+                  <Text style={styles.secondaryOutlineBtnText}>Reintentar</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.secondaryOutlineBtn, styles.flex1, { borderColor: ui.danger }]}
+                  onPress={() => void handleRemoveQuarantinedInv(item.data.offlineOpId)}
+                >
+                  <Trash2 size={14} color={ui.danger} />
+                  <Text style={[styles.secondaryOutlineBtnText, { color: ui.danger }]}>
+                    Descartar
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          );
+        }
+
+        const canReassignSession =
+          item.data.failureCategory === 'cash_session_invalid' && Boolean(activeCashSessionId);
         return (
           <View style={styles.quarantineBox}>
             <Text style={styles.quarantineTitle}>
@@ -356,6 +616,17 @@ export const PrinterOfflineSettingsTab = React.memo<PrinterOfflineSettingsTabPro
             <Text style={styles.quarantineError} numberOfLines={2}>
               {item.data.lastErrorReason || 'Error de sincronización'}
             </Text>
+            {canReassignSession ? (
+              <TouchableOpacity
+                style={[styles.syncButton, { marginBottom: 8 }]}
+                onPress={() =>
+                  void handleRetryQuarantined(item.data.offlineId, activeCashSessionId || undefined)
+                }
+              >
+                <RefreshCw size={14} color={ui.onPrimary} />
+                <Text style={styles.syncButtonText}>Reasignar a caja abierta y reintentar</Text>
+              </TouchableOpacity>
+            ) : null}
             <View style={styles.actionButtonGroup}>
               <TouchableOpacity
                 style={[styles.secondaryOutlineBtn, styles.flex1]}
@@ -377,7 +648,16 @@ export const PrinterOfflineSettingsTab = React.memo<PrinterOfflineSettingsTabPro
           </View>
         );
       },
-      [handleRetryQuarantined, handleRemoveQuarantined]
+      [
+        activeCashSessionId,
+        handleCancelPendingCashOp,
+        handleCancelPendingInvOp,
+        handleCancelPendingSale,
+        handleRemoveQuarantined,
+        handleRemoveQuarantinedInv,
+        handleRetryQuarantined,
+        handleRetryQuarantinedInv,
+      ]
     );
 
     return (
@@ -594,12 +874,16 @@ export const PrinterOfflineSettingsTab = React.memo<PrinterOfflineSettingsTabPro
 
           <View style={styles.offlineStatsRow}>
             <View style={styles.offlineStatBox}>
-              <Text style={styles.statLabel}>Ventas en Cola</Text>
-              <Text style={[styles.statValue, { color: ui.primary }]}>{offlineSales.length}</Text>
+              <Text style={styles.statLabel}>En Cola ({offlineSales.length} vta · {pendingInvOps.length} inv · {pendingCashOps.length} caja)</Text>
+              <Text style={[styles.statValue, { color: ui.primary }]}>
+                {offlineSales.length + pendingInvOps.length + pendingCashOps.length}
+              </Text>
             </View>
             <View style={styles.offlineStatBox}>
               <Text style={styles.statLabel}>En Cuarentena</Text>
-              <Text style={[styles.statValue, { color: ui.danger }]}>{quarantinedSales.length}</Text>
+              <Text style={[styles.statValue, { color: ui.danger }]}>
+                {quarantinedSales.length + quarantinedInvOps.length}
+              </Text>
             </View>
           </View>
 
@@ -625,7 +909,7 @@ export const PrinterOfflineSettingsTab = React.memo<PrinterOfflineSettingsTabPro
             >
               <AlertTriangle size={16} color={ui.warning} />
               <Text style={[styles.secondaryOutlineBtnText, { color: ui.warning }]}>
-                Ver Detalle ({offlineSales.length + quarantinedSales.length})
+                Ver Detalle ({offlineModalRows.length})
               </Text>
             </TouchableOpacity>
           </View>
@@ -696,7 +980,7 @@ export const PrinterOfflineSettingsTab = React.memo<PrinterOfflineSettingsTabPro
                   <View style={styles.flex1}>
                     <Text style={styles.modalTitle}>Cola Offline y Cuarentena</Text>
                     <Text style={styles.modalSub}>
-                      Pendientes: {offlineSales.length} · Cuarentena: {quarantinedSales.length}
+                      Pendientes: {offlineSales.length + pendingInvOps.length + pendingCashOps.length} · Cuarentena: {quarantinedSales.length + quarantinedInvOps.length}
                     </Text>
                   </View>
                   <TouchableOpacity

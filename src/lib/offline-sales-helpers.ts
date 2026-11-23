@@ -192,7 +192,15 @@ export function matchesOfflineSaleScope(
     return false;
   }
 
-  if (scope.branchId && scope.branchId !== 'main' && payload.branchId !== scope.branchId) {
+  if (scope.branchId === 'main') {
+    if (
+      payload.branchId &&
+      payload.branchId !== 'main' &&
+      !String(payload.branchId).toLowerCase().includes('principal')
+    ) {
+      return false;
+    }
+  } else if (scope.branchId && payload.branchId !== scope.branchId) {
     return false;
   }
 
@@ -229,6 +237,19 @@ export function pendingOfflineSaleToSaleRecord(
   const creditAmount =
     p.creditAmount !== undefined ? Number(p.creditAmount) : round2(breakdown.credit);
 
+  const items = Array.isArray(p.items) ? p.items : [];
+  const computedTotalCost =
+    p.totalCost !== undefined
+      ? Number(p.totalCost)
+      : round2(
+          items.reduce((acc: number, it: any) => {
+            const qty = Number(it?.quantity || 0);
+            const factor = Number(it?.presentationQty || it?.conversionFactor || 1) || 1;
+            const cost = Number(it?.costPrice || 0);
+            return acc + cost * qty * factor;
+          }, 0)
+        );
+
   return {
     id: offlineId,
     offlineId,
@@ -241,6 +262,13 @@ export function pendingOfflineSaleToSaleRecord(
     total: Number(p.total || 0),
     subtotal: Number(p.subtotal ?? p.total ?? 0),
     tax: Number(p.tax ?? 0),
+    totalCost: computedTotalCost,
+    discountAmount: Number(p.discountAmount ?? 0),
+    shippingAmount: Number(p.shippingAmount ?? 0),
+    surchargeAmount: Number(p.surchargeAmount ?? 0),
+    chargedAmount: p.chargedAmount !== undefined ? Number(p.chargedAmount) : undefined,
+    cashReceived: p.cashReceived !== undefined ? Number(p.cashReceived) : undefined,
+    changeGiven: p.changeGiven !== undefined ? Number(p.changeGiven) : undefined,
     paymentMethod: p.paymentMethod,
     paymentMethodId: p.paymentMethodId,
     paymentMethodName: p.paymentMethodName,
@@ -254,12 +282,17 @@ export function pendingOfflineSaleToSaleRecord(
     customerName: p.customerName || p.customer?.name || 'Cliente Varios',
     customerDni: p.customerDni || p.customer?.dni,
     customerRuc: p.customerRuc || p.customer?.ruc,
+    customerPhone: p.customerPhone || p.customer?.phone,
+    customerAddress: p.customerAddress || p.customer?.address,
+    taxExemptionCode: p.taxExemptionCode,
+    isAmazonExempt: p.isAmazonExempt,
+    sellerName: p.sellerName,
     userId: p.userId,
     userName: p.userName || 'Cajero POS',
     accountId: p.accountId,
     branchId: p.branchId,
     sessionId: p.sessionId,
-    items: p.items || [],
+    items,
     status: 'pending_offline',
     sunatStatus: 'pending',
     isOfflinePending: true,

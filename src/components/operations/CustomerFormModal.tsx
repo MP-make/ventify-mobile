@@ -15,6 +15,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { X } from 'lucide-react-native';
 import { lookupDocument } from '@/lib/dni-ruc-service';
 import { ui } from '@/lib/theme';
+import { assertOnlineForWrite } from '@/lib/online-guard';
 import { saveCustomer } from '@/services/crm-operations-service';
 import { operationsStyles as styles } from './operationsStyles';
 
@@ -99,6 +100,7 @@ export const CustomerFormModal = React.memo<CustomerFormModalProps>(({
 
     setIsSavingCustomer(true);
     try {
+      await assertOnlineForWrite('guardar un cliente');
       await saveCustomer({
         accountId,
         name: customerName.trim(),

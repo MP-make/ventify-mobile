@@ -14,6 +14,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
 import { AlertTriangle, Check, X } from 'lucide-react-native';
 import { formatPEN, ui } from '@/lib/theme';
+import { assertOnlineForWrite } from '@/lib/online-guard';
 import { writeOffFiado, type OpenFiado } from '@/services/crm-operations-service';
 import { operationsStyles as styles } from './operationsStyles';
 import type { OperationsUserProfileRef, OperationsUserRef } from './types';
@@ -65,6 +66,7 @@ export const FiadoWriteOffModal = React.memo<FiadoWriteOffModalProps>(({
 
     setIsSubmittingWriteOff(true);
     try {
+      await assertOnlineForWrite('castigar una deuda');
       const res = await writeOffFiado({
         accountId,
         reservationId: fiado.id,

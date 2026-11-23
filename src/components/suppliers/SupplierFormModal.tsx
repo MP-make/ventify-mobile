@@ -17,6 +17,7 @@ import { X, Search, CheckCircle2, Check } from 'lucide-react-native';
 import { useAuthSession } from '@/context/AuthContext';
 import { lookupDocument, DocumentLookupResult } from '@/lib/dni-ruc-service';
 import { ui } from '@/lib/theme';
+import { assertOnlineForWrite } from '@/lib/online-guard';
 import { SuppliersPOService, Supplier } from '@/services/suppliers-po-service';
 import { suppliersStyles as styles } from './suppliersStyles';
 
@@ -95,6 +96,7 @@ export const SupplierFormModal: React.FC<SupplierFormModalProps> = React.memo(({
     setSunatStatusMessage(null);
 
     try {
+      await assertOnlineForWrite('consultar RUC en SUNAT');
       const result: DocumentLookupResult = await lookupDocument('ruc', cleanRuc);
 
       if (result && result.name) {
@@ -135,6 +137,7 @@ export const SupplierFormModal: React.FC<SupplierFormModalProps> = React.memo(({
 
     setIsSavingSupplier(true);
     try {
+      await assertOnlineForWrite('guardar un proveedor');
       await SuppliersPOService.saveSupplier({
         id: editingSupplier?.id,
         accountId,

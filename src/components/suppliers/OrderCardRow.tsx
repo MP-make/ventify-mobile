@@ -34,6 +34,7 @@ export const OrderCardRow: React.FC<OrderCardRowProps> = React.memo(({
   const isReceived = order.status === 'received';
   const isCancelled = order.status === 'cancelled';
   const canReceive = isPending || isPartial;
+  const items = Array.isArray(order.items) ? order.items.filter(Boolean) : [];
 
   return (
     <View style={styles.orderCard}>
@@ -81,7 +82,7 @@ export const OrderCardRow: React.FC<OrderCardRowProps> = React.memo(({
 
       <View style={styles.orderInfoRow}>
         <Text style={styles.orderItemsCount}>
-          {order.items.length} {order.items.length === 1 ? 'producto' : 'productos'}
+          {items.length} {items.length === 1 ? 'producto' : 'productos'}
         </Text>
         <Text style={styles.orderTotalText}>{formatPEN(order.totalCost)}</Text>
       </View>
@@ -110,7 +111,7 @@ export const OrderCardRow: React.FC<OrderCardRowProps> = React.memo(({
 
       {isExpanded && (
         <View style={styles.expandedItemsContainer}>
-          {order.items.map((it, idx) => {
+          {items.map((it, idx) => {
             const factor = resolvePackagingFactor(it.packagingFactor);
             const recQty = Number(it.receivedQuantity) || 0;
             return (
@@ -128,7 +129,7 @@ export const OrderCardRow: React.FC<OrderCardRowProps> = React.memo(({
             );
           })}
 
-          {(isReceived || isPartial) && order.receivedByName && (
+          {(isReceived || isPartial) && Boolean(order.receivedByName) && (
             <View style={styles.auditReceivedRow}>
               <CheckCircle2 size={14} color={ui.primary} />
               <Text style={styles.auditReceivedText}>

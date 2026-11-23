@@ -245,7 +245,7 @@ export function evaluateCachedPlanAccess<
   }
 
   const age = now - cached.cachedAt;
-  const within72h = age >= 0 && age < PLAN_CACHE_OFFLINE_TTL_MS;
+  const within72h = age >= -5 * 60_000 && age < PLAN_CACHE_OFFLINE_TTL_MS;
   const blockReason = accessBlockReason(
     { isActive: params.isActive, isSuperAdmin: params.isSuperAdmin },
     cached.subscription,

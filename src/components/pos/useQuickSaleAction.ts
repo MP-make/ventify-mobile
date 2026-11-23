@@ -16,6 +16,8 @@ import { resolveCheckoutPayment } from '@/lib/checkout-payment';
 import { cleanFirestoreData } from '@/lib/firebase-utils';
 import { presentationFactor } from '@/lib/presentation-parity';
 import { formatPEN } from '@/lib/theme';
+import { useProductsActions } from '@/context/ProductsContext';
+import { createProductLookup, validateCartStockForCheckout } from '@/lib/offline-stock-helpers';
 
 export interface QuickSaleBannerPayload {
   text: string;
@@ -36,8 +38,9 @@ export function useQuickSaleAction({
 }: UseQuickSaleActionParams) {
   const { accountId, branchId, user, userProfile } = useAuthSession();
   const { posSettings, paymentMethods, taxProfile } = useBusinessSettings();
-  const { activeCashSession } = useCashSession();
+  const { activeCashSession, refreshCashStatus } = useCashSession();
   const { isOnline: settingsIsOnline } = useOfflineStatus();
+  const { getProductById, applyAuthoritativeStockUpdates } = useProductsActions();
   const {
     items,
     customer,
@@ -231,10 +234,22 @@ export function useQuickSaleAction({
       let labelText = '';
       if (isOnline) {
         const result = await createSaleTransaction(salePayload);
+        if (Array.isArray(result?.updatedProductStocks) && result.updatedProductStocks.length > 0) {
+          applyAuthoritativeStockUpdates(result.updatedProductStocks);
+        }
+        refreshCashStatus();
         const corr = result?.correlative || `#${result?.saleNumber || ''}`;
         labelText = `Venta rápida ${corr} · ${formatPEN(safeTotal)}`;
       } else {
-        // enqueueOfflineSale emits queue change events handled by SettingsContext
+        const stockCheck = validateCartStockForCheckout(
+          saleItems as any[],
+          createProductLookup(getProductById),
+          branchId || 'main'
+        );
+        if (!stockCheck.ok) {
+          throw new Error(stockCheck.error || 'Stock insuficiente para completar la venta.');
+        }
+        // enqueueOfflineSale emits queue change events handled by SettingsContext/ProductsContext
         await enqueueOfflineSale(salePayload);
         labelText = `Venta rápida offline · ${formatPEN(safeTotal)}`;
       }
@@ -255,10 +270,12 @@ export function useQuickSaleAction({
   }, [
     accountId,
     activeCashSession,
+    applyAuthoritativeStockUpdates,
     branchId,
     clearCart,
     customer,
     discountAmount,
+    getProductById,
     invoiceIntent,
     items,
     onAfterSuccess,
@@ -266,6 +283,7 @@ export function useQuickSaleAction({
     onShowQuickSaleBanner,
     paymentMethods,
     posSettings,
+    refreshCashStatus,
     safeTotal,
     setCustomer,
     setInvoiceIntent,

@@ -54,6 +54,12 @@ vi.mock('@/services/sale-service', () => ({
   createSaleTransaction: (...args: unknown[]) => syncMocks.createSaleTransactionImpl(...args),
 }));
 
+vi.mock('@/services/inventory-kardex-service', () => ({
+  PRODUCTS_COLLECTION: 'products',
+  adjustProductStock: vi.fn(),
+  saveProduct: vi.fn(),
+}));
+
 import { shouldDeactivateUserOnMissingDoc } from '../access-policy';
 import { buildSaleQrContent } from '../invoicing/qr-content';
 import { generateQrMatrix, generateQrSvgData } from '../invoicing/qr-matrix';
@@ -65,19 +71,30 @@ import {
   pendingOfflineSaleToSaleRecord,
 } from '../offline-sales-helpers';
 import {
+  cancelPendingOfflineSale,
+  classifySyncError,
   enqueueOfflineSale,
   getOfflineQueue,
+  getQuarantinedSalesForIdentity,
   offlineSyncService,
   processOfflineQueue,
+  retryQuarantinedSale,
   subscribeOfflineQueueChanges,
   type OfflineQueueChangeEvent,
   type PendingOfflineSale,
 } from '@/services/offline-sync-service';
+import {
+  cancelPendingInventoryOp,
+  enqueueOfflineStockAdjust,
+  getOfflineInventoryQueueForIdentity,
+  offlineInventoryService,
+} from '@/services/offline-inventory-service';
 
 describe('offline auth policy, offline Caja/Ventas helpers, and offline sync regressions', () => {
   beforeEach(() => {
     syncMocks.storage.clear();
     offlineSyncService.resetQueueCache();
+    offlineInventoryService.resetQueueCache();
     syncMocks.netState = { isConnected: true, isInternetReachable: true };
     syncMocks.user = {
       uid: 'user-1',
@@ -430,6 +447,136 @@ describe('offline auth policy, offline Caja/Ventas helpers, and offline sync reg
       expect(syncMocks.createSaleTransactionImpl).toHaveBeenCalledTimes(1);
       expect((await getOfflineQueue()).length).toBe(0);
       expect(events.some((e) => e.type === 'synced' && e.successful === 1 && e.queueCount === 0)).toBe(true);
+    });
+
+    it('classifies transient unavailable errors as network_error instead of stock_rejected', () => {
+      expect(
+        classifySyncError(new Error('Servicio no disponible temporalmente, intenta de nuevo'))
+      ).toMatchObject({ category: 'network_error', retriable: true });
+      expect(classifySyncError(new Error('temporalmente no disponible'))).toMatchObject({
+        category: 'network_error',
+        retriable: true,
+      });
+      expect(
+        classifySyncError(new Error('Stock insuficiente para Polo. Stock disponible: 2, requerido: 5'))
+      ).toMatchObject({ category: 'stock_rejected', retriable: false });
+    });
+
+    it('bypasses nextRetryAt backoff when processOfflineQueue is called with force: true', async () => {
+      await enqueueOfflineSale({
+        accountId: 'acc-1',
+        branchId: 'b-1',
+        userId: 'user-1',
+        userName: 'Cajero',
+        sessionId: 'sess-1',
+        items: [{ productId: 'p1', name: 'Detergente', price: 63, quantity: 1 }],
+        paymentMethod: 'cash',
+        documentType: 'nota_venta',
+        total: 63,
+        offlineId: 'offline_force_backoff',
+      });
+
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      syncMocks.createSaleTransactionImpl.mockRejectedValueOnce(new Error('network timeout'));
+      const firstRun = await processOfflineQueue('acc-1');
+      expect(firstRun.retried).toBe(1);
+
+      // Without force, nextRetryAt defers processing
+      const skippedRun = await processOfflineQueue('acc-1');
+      expect(skippedRun.processed).toBe(0);
+
+      // With force: true, processes immediately despite future nextRetryAt
+      syncMocks.createSaleTransactionImpl.mockResolvedValueOnce({ saleId: 'srv-1' });
+      const forcedRun = await processOfflineQueue({ accountId: 'acc-1', force: true });
+      warnSpy.mockRestore();
+
+      expect(forcedRun.processed).toBe(1);
+      expect(forcedRun.successful).toBe(1);
+      expect(await getOfflineQueue()).toHaveLength(0);
+    });
+
+    it('cancels pending offline sale and notifies subscribers', async () => {
+      await enqueueOfflineSale({
+        accountId: 'acc-1',
+        branchId: 'b-1',
+        userId: 'user-1',
+        userName: 'Cajero',
+        items: [{ productId: 'p1', name: 'Item', price: 10, quantity: 1 }],
+        paymentMethod: 'cash',
+        documentType: 'nota_venta',
+        total: 10,
+        offlineId: 'offline_cancel_me',
+      });
+
+      const events: OfflineQueueChangeEvent[] = [];
+      const unsub = subscribeOfflineQueueChanges((ev) => events.push(ev));
+      const cancelled = await cancelPendingOfflineSale('offline_cancel_me');
+      unsub();
+
+      expect(cancelled).toBe(true);
+      expect(await getOfflineQueue()).toHaveLength(0);
+      expect(events.some((e) => e.queueCount === 0)).toBe(true);
+    });
+
+    it('reassigns sessionId when retryQuarantinedSale is called with newSessionId', async () => {
+      await enqueueOfflineSale({
+        accountId: 'acc-1',
+        branchId: 'b-1',
+        userId: 'user-1',
+        userName: 'Cajero',
+        sessionId: 'sess-closed',
+        items: [{ productId: 'p1', name: 'Item', price: 20, quantity: 1 }],
+        paymentMethod: 'cash',
+        documentType: 'nota_venta',
+        total: 20,
+        offlineId: 'offline_quarantine_sess',
+      });
+
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      syncMocks.createSaleTransactionImpl.mockRejectedValueOnce(
+        new Error('La sesión de caja ya se encuentra cerrada')
+      );
+      const runRes = await processOfflineQueue('acc-1');
+      warnSpy.mockRestore();
+      expect(runRes.quarantined).toBe(1);
+
+      const quar = await getQuarantinedSalesForIdentity('user-1', 'acc-1');
+      expect(quar).toHaveLength(1);
+      expect(quar[0].failureCategory).toBe('cash_session_invalid');
+
+      const requeued = await retryQuarantinedSale('offline_quarantine_sess', {
+        newSessionId: 'sess-new-open',
+        accountId: 'acc-1',
+      });
+      expect(requeued).toBe(true);
+
+      const queueAfter = await getOfflineQueue();
+      expect(queueAfter).toHaveLength(1);
+      expect(queueAfter[0].salePayload.sessionId).toBe('sess-new-open');
+      expect(await getQuarantinedSalesForIdentity('user-1', 'acc-1')).toHaveLength(0);
+    });
+
+    it('enqueues, scopes by identity, and cancels offline inventory operations', async () => {
+      const op = await enqueueOfflineStockAdjust({
+        accountId: 'acc-1',
+        userId: 'user-1',
+        branchId: 'b-1',
+        branchName: 'Principal',
+        productId: 'prod-1',
+        productName: 'Gaseosa',
+        mode: 'add',
+        amount: 5,
+        expectedBeforeStock: 10,
+        reason: 'Ingreso',
+      });
+
+      expect(await getOfflineInventoryQueueForIdentity('user-1', 'acc-1')).toHaveLength(1);
+      expect(await getOfflineInventoryQueueForIdentity('other-user', 'acc-1')).toHaveLength(0);
+      expect(op.type).toBe('stock_adjust');
+
+      const removed = await cancelPendingInventoryOp(op.offlineOpId);
+      expect(removed).toBe(true);
+      expect(await getOfflineInventoryQueueForIdentity('user-1', 'acc-1')).toHaveLength(0);
     });
   });
 });

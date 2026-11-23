@@ -11,6 +11,7 @@
 import { db, auth } from '@/lib/firebase';
 import type { Sale, CartItem, PaymentSplit } from '@/types';
 import type { DocumentType } from '@/lib/invoicing/types';
+import type { AuthoritativeProductStockPatch } from '@/lib/offline-stock-helpers';
 import {
   collection,
   doc,
@@ -250,6 +251,7 @@ export interface CreateSaleTransactionResult {
   };
   cdrDescription?: string | null;
   sunatHash?: string | null;
+  updatedProductStocks?: AuthoritativeProductStockPatch[];
 }
 
 export interface CancelSaleResult {
@@ -549,6 +551,7 @@ export const buildAttributedSalePayload = (
         : isPrepaidCreditMethod(params.paymentMethod)
           ? 'prepaid'
           : undefined,
+    offlineId: params.offlineId,
     date: params.saleDate,
   };
 };
@@ -1427,6 +1430,23 @@ export const createSaleTransaction = async (
       }
     }
 
+    const updatedProductStocks: AuthoritativeProductStockPatch[] = !isQuote
+      ? Array.from(productStockPlans.values()).map((plan) => {
+          const first = plan.entries[0];
+          const resolvedId = first.productRef.id || first.item.productId;
+          return {
+            productId: resolvedId,
+            stock: plan.update.stock as Record<string, number>,
+            branchIds: plan.update.branchIds as string[],
+            lowStockBranches: plan.update.lowStockBranches as string[],
+            ...(plan.update.variants !== undefined ? { variants: plan.update.variants } : {}),
+            ...(first.productData.reservedStock !== undefined
+              ? { reservedStock: first.productData.reservedStock }
+              : {}),
+          };
+        })
+      : [];
+
     return {
       saleId,
       saleNumber: nextNumber,
@@ -1437,6 +1457,7 @@ export const createSaleTransaction = async (
       sunatStatus: (isElectronic ? 'pending' : 'not_applicable') as CreateSaleTransactionResult['sunatStatus'],
       sessionId: resolvedSessionId,
       offlineId,
+      updatedProductStocks,
     };
   });
 

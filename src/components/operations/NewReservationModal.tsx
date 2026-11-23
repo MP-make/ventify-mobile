@@ -20,6 +20,7 @@ import { filterCatalogIndex } from '@/lib/catalog-filters';
 import { lookupDocument } from '@/lib/dni-ruc-service';
 import { isValidDNI } from '@/lib/invoicing/types';
 import { formatPEN, ui } from '@/lib/theme';
+import { assertOnlineForWrite } from '@/lib/online-guard';
 import {
   createReservationOrOrder,
   type ReservationOrderItem,
@@ -149,6 +150,7 @@ export const NewReservationModal = React.memo<NewReservationModalProps>(({
 
     setIsSavingReservation(true);
     try {
+      await assertOnlineForWrite('registrar una reserva o pedido');
       const sessId = activeCashSession?.sessionId || activeCashSession?.id;
       const reservationId = await createReservationOrOrder({
         accountId,

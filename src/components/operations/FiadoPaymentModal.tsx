@@ -14,6 +14,7 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { X } from 'lucide-react-native';
 import { formatPEN, ui } from '@/lib/theme';
+import { assertOnlineForWrite } from '@/lib/online-guard';
 import {
   getCustomerOpenFiados,
   registerFiadoPayment,
@@ -144,6 +145,7 @@ export const FiadoPaymentModal = React.memo<FiadoPaymentModalProps>(({
 
     setIsProcessingPayment(true);
     try {
+      await assertOnlineForWrite('registrar un abono de fiado');
       const sessId = activeCashSession?.sessionId || activeCashSession?.id;
       const paymentId = await registerFiadoPayment({
         accountId,

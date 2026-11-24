@@ -6,7 +6,7 @@ import { useRouter, type Href } from 'expo-router';
 import { useAuthSession } from '@/context/AuthContext';
 import {
   useBusinessSettings,
-  useCashSession,
+  useCashOpenStatus,
   useOfflineStatus,
 } from '@/context/SettingsContext';
 import { subscribeAccountNotifications } from '@/services/account-notifications-feed';
@@ -120,7 +120,7 @@ export const Header: React.FC<HeaderProps> = React.memo(({ title, showBranchSele
   const router = useRouter();
   const { accountId, branchId, setActiveBranchId, allBranchesAccess, role } = useAuthSession();
   const { businessName, activeBranchName, branches } = useBusinessSettings();
-  const { isCashOpen } = useCashSession();
+  const { isCashOpen } = useCashOpenStatus();
   const { isOnline, offlineQueueCount, quarantinedCount, isSyncingOffline, triggerManualSync } = useOfflineStatus();
   const [branchModalVisible, setBranchModalVisible] = useState(false);
   const [launcherVisible, setLauncherVisible] = useState(false);
@@ -151,6 +151,14 @@ export const Header: React.FC<HeaderProps> = React.memo(({ title, showBranchSele
   const handleCloseLauncher = useCallback(() => {
     setLauncherVisible(false);
   }, []);
+
+  const handleOpenSettings = useCallback(() => {
+    router.push('/(tabs)/settings' as Href);
+  }, [router]);
+
+  const handleManualSync = useCallback(() => {
+    void triggerManualSync(true);
+  }, [triggerManualSync]);
 
   const containerStyle = useMemo(
     () => [styles.container, { paddingTop: insets.top + 6 }],
@@ -213,14 +221,14 @@ export const Header: React.FC<HeaderProps> = React.memo(({ title, showBranchSele
 
         {quarantinedCount > 0 ? (
           <TouchableOpacity
-            onPress={() => router.push('/(tabs)/settings' as Href)}
+            onPress={handleOpenSettings}
             activeOpacity={0.8}
-            style={[styles.notice, { backgroundColor: ui.dangerSoft }]}
+            style={[styles.notice, styles.noticeQuarantined]}
             accessibilityRole="button"
             accessibilityLabel="Revisar ventas en cuarentena en Ajustes"
           >
             <AlertTriangle size={13} color={ui.danger} />
-            <Text style={[styles.noticeText, { color: ui.danger, fontWeight: '700' }]}>
+            <Text style={[styles.noticeText, styles.noticeTextQuarantined]}>
               {quarantinedCount} {quarantinedCount === 1 ? 'venta en cuarentena' : 'ventas en cuarentena'} — Toca para revisar
             </Text>
           </TouchableOpacity>
@@ -240,7 +248,7 @@ export const Header: React.FC<HeaderProps> = React.memo(({ title, showBranchSele
               {offlineQueueCount} {offlineQueueCount === 1 ? 'pendiente de sincronizar' : 'pendientes de sincronizar'}
             </Text>
             <TouchableOpacity
-              onPress={() => void triggerManualSync(true)}
+              onPress={handleManualSync}
               disabled={isSyncingOffline}
               style={styles.syncChipBtn}
               accessibilityRole="button"
@@ -315,7 +323,9 @@ const styles = StyleSheet.create({
   cashTextOpen: { color: ui.success },
   cashTextClosed: { color: ui.textSecondary },
   notice: { flexDirection: 'row', alignItems: 'center', gap: 6, backgroundColor: ui.warningSoft, padding: 6, borderRadius: 7, marginTop: 4 },
+  noticeQuarantined: { backgroundColor: ui.dangerSoft },
   noticeText: { flex: 1, color: ui.warning, fontSize: 11 },
+  noticeTextQuarantined: { color: ui.danger, fontWeight: '700' },
   syncChipBtn: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: ui.warning, paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6 },
   syncChipText: { color: ui.onPrimary, fontSize: 10.5, fontWeight: '700' },
   overlay: { flex: 1, backgroundColor: 'rgba(17,28,49,0.40)', justifyContent: 'flex-end' },

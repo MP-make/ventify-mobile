@@ -34,9 +34,10 @@ import { type Href, useRouter } from 'expo-router';
 import { useAuthSession, useNetworkStatus } from '@/context/AuthContext';
 import {
   useBusinessSettings,
-  useCashSession,
+  useCashOpenStatus,
   useOfflineStatus,
 } from '@/context/SettingsContext';
+import { useFocusMemo } from '@/hooks/use-focus-memo';
 import { usePermissions } from '@/hooks/usePermissions';
 import { ui, formatPEN, formatDatePE } from '@/lib/theme';
 import { apiRequest } from '@/lib/api-client';
@@ -98,6 +99,8 @@ import { HistoryReservationsTab } from '@/components/history/HistoryReservations
 import { HistoryAiChatTab } from '@/components/history/HistoryAiChatTab';
 
 let reservationsMissingCompositeIndex = false;
+const RESERVATIONS_BLUR_GRACE_MS = 30_000;
+const EMPTY_HISTORY_SALES: HistorySale[] = [];
 
 const isOfflinePendingSale = (sale: Sale | null | undefined): boolean =>
   Boolean(sale && ((sale as any).isOfflinePending || (sale as any).offlineQueued));
@@ -131,7 +134,7 @@ export default function HistoryScreen() {
     taxProfile,
     emitterInfo,
   } = useBusinessSettings();
-  const { activeCashSession, refreshCashStatus } = useCashSession();
+  const { activeCashSessionId, refreshCashStatus } = useCashOpenStatus();
   const {
     pendingOfflineSales,
     offlineQueueCount,
@@ -331,7 +334,7 @@ export default function HistoryScreen() {
     setIsCompletingPayment(true);
     try {
       await assertOnlineForWrite('cobrar y entregar una reserva', isOnlineRef.current);
-      const sessId = activeCashSession?.sessionId || activeCashSession?.id;
+      const sessId = activeCashSessionId || undefined;
       await completeOrCancelReservation(
         {
           id: reservationToPay.id,
@@ -392,7 +395,7 @@ export default function HistoryScreen() {
                 await assertOnlineForWrite('confirmar la entrega de una reserva', isOnlineRef.current);
                 const totalVal = Number(res.total || 0);
                 const depositVal = Number(res.depositAmount || 0);
-                const sessId = activeCashSession?.sessionId || activeCashSession?.id;
+                const sessId = activeCashSessionId || undefined;
                 await completeOrCancelReservation(
                   {
                     id: res.id,
@@ -432,8 +435,7 @@ export default function HistoryScreen() {
       );
     },
     [
-      activeCashSession?.sessionId,
-      activeCashSession?.id,
+      activeCashSessionId,
       accountId,
       branchId,
       user?.uid,
@@ -480,7 +482,7 @@ export default function HistoryScreen() {
           displayName: userProfile?.displayName || user?.email || 'Usuario',
           email: user?.email || '',
         },
-        { sessionId: activeCashSession?.sessionId || activeCashSession?.id, ...refund }
+        { sessionId: activeCashSessionId || undefined, ...refund }
       );
       setCancellationTarget(null);
       void refreshCashStatus();
@@ -609,17 +611,79 @@ export default function HistoryScreen() {
     return () => task.cancel();
   }, [isFocused, isOnline, salesScope, fetchSalesPage]);
 
-  // Escuchar Reservas de la Sucursal
+  // Escuchar Reservas de la Sucursal (con grace period de 30s en blur)
+  const reservationsUnsubRef = useRef<(() => void) | null>(null);
+  const reservationsScopeRef = useRef<string | null>(null);
+  const reservationsBlurTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reservationsTaskRef = useRef<{ cancel?: () => void } | null>(null);
+
+  const cleanupReservationsListener = useCallback(() => {
+    if (reservationsBlurTimerRef.current) {
+      clearTimeout(reservationsBlurTimerRef.current);
+      reservationsBlurTimerRef.current = null;
+    }
+    if (reservationsTaskRef.current) {
+      reservationsTaskRef.current.cancel?.();
+      reservationsTaskRef.current = null;
+    }
+    if (reservationsUnsubRef.current) {
+      reservationsUnsubRef.current();
+      reservationsUnsubRef.current = null;
+    }
+    reservationsScopeRef.current = null;
+  }, []);
+
   useEffect(() => {
-    if (!accountId || !isFocused || activeTab !== 'reservations') return;
     if (!isOnline) {
+      setLoadingReservations(false);
+    }
+  }, [isOnline]);
+
+  useEffect(() => {
+    if (!accountId) {
+      cleanupReservationsListener();
+      setReservations([]);
       setLoadingReservations(false);
       return;
     }
-    setLoadingReservations(true);
 
-    let cancelled = false;
-    let unsubscribeActive: (() => void) | null = null;
+    if (activeTab !== 'reservations') {
+      cleanupReservationsListener();
+      return;
+    }
+
+    const scope = `${accountId}:${branchId || ''}`;
+    if (reservationsScopeRef.current && reservationsScopeRef.current !== scope) {
+      cleanupReservationsListener();
+    }
+
+    if (!isFocused) {
+      if (
+        !reservationsBlurTimerRef.current &&
+        (reservationsUnsubRef.current || reservationsTaskRef.current)
+      ) {
+        reservationsBlurTimerRef.current = setTimeout(() => {
+          reservationsBlurTimerRef.current = null;
+          cleanupReservationsListener();
+        }, RESERVATIONS_BLUR_GRACE_MS);
+      }
+      return;
+    }
+
+    if (reservationsBlurTimerRef.current) {
+      clearTimeout(reservationsBlurTimerRef.current);
+      reservationsBlurTimerRef.current = null;
+    }
+
+    if (
+      reservationsScopeRef.current === scope &&
+      (reservationsUnsubRef.current || reservationsTaskRef.current)
+    ) {
+      return;
+    }
+
+    setLoadingReservations(isOnlineRef.current);
+    reservationsScopeRef.current = scope;
 
     const attachListener = (useOrderedQuery: boolean) => {
       const q = useOrderedQuery
@@ -637,10 +701,10 @@ export default function HistoryScreen() {
             limit(50)
           );
 
-      unsubscribeActive = onSnapshot(
+      reservationsUnsubRef.current = onSnapshot(
         q,
         (snapshot) => {
-          if (cancelled) return;
+          if (reservationsScopeRef.current !== scope) return;
           const list: any[] = [];
           snapshot.forEach((d) => {
             list.push({ id: d.id, ...d.data() });
@@ -656,12 +720,12 @@ export default function HistoryScreen() {
           setLoadingReservations(false);
         },
         (error: any) => {
-          if (cancelled) return;
+          if (reservationsScopeRef.current !== scope) return;
           if (useOrderedQuery && String(error?.code || '').includes('failed-precondition')) {
             reservationsMissingCompositeIndex = true;
-            if (unsubscribeActive) {
-              unsubscribeActive();
-              unsubscribeActive = null;
+            if (reservationsUnsubRef.current) {
+              reservationsUnsubRef.current();
+              reservationsUnsubRef.current = null;
             }
             attachListener(false);
             return;
@@ -672,33 +736,33 @@ export default function HistoryScreen() {
       );
     };
 
-    const task = InteractionManager.runAfterInteractions(() => {
-      if (!cancelled) {
-        attachListener(!reservationsMissingCompositeIndex);
-      }
+    reservationsTaskRef.current = InteractionManager.runAfterInteractions(() => {
+      if (reservationsScopeRef.current !== scope) return;
+      reservationsTaskRef.current = null;
+      attachListener(!reservationsMissingCompositeIndex);
     });
+  }, [accountId, branchId, isFocused, activeTab, cleanupReservationsListener]);
 
+  useEffect(() => {
     return () => {
-      cancelled = true;
-      task.cancel();
-      if (unsubscribeActive) unsubscribeActive();
+      cleanupReservationsListener();
     };
-  }, [accountId, branchId, isFocused, activeTab, isOnline]);
+  }, [cleanupReservationsListener]);
 
   // ============================================================================
   // FUSIÓN CON VENTAS OFFLINE PENDIENTES (focus-gated)
   // ============================================================================
-  const lastMergedSalesRef = useRef<HistorySale[]>([]);
-  const mergedSales = useMemo(() => {
-    if (!isFocused) return lastMergedSalesRef.current;
-    const next = mergeSalesWithOfflinePending(sales, pendingOfflineSales, {
-      accountId,
-      branchId,
-      userId: user?.uid || null,
-    }) as HistorySale[];
-    lastMergedSalesRef.current = next;
-    return next;
-  }, [isFocused, sales, pendingOfflineSales, accountId, branchId, user?.uid]);
+  const mergedSales = useFocusMemo<HistorySale[]>(
+    () =>
+      mergeSalesWithOfflinePending(sales, pendingOfflineSales, {
+        accountId,
+        branchId,
+        userId: user?.uid || null,
+      }) as HistorySale[],
+    [sales, pendingOfflineSales, accountId, branchId, user?.uid],
+    isFocused,
+    EMPTY_HISTORY_SALES
+  );
 
   // ============================================================================
   // ACCIONES DEL COMPROBANTE: REIMPRESIÓN, COMPARTIR Y ANULACIÓN
@@ -1036,7 +1100,7 @@ export default function HistoryScreen() {
     setIsRefunding(true);
     try {
       await assertOnlineForWrite('registrar una devolución', isOnlineRef.current);
-      const sessionId = activeCashSession?.sessionId || activeCashSession?.id;
+      const sessionId = activeCashSessionId;
       if (!sessionId) throw new Error('Abre una caja antes de registrar una devolución.');
       const refundBranchId = selectedSale.branchId || branchId;
       if (!accountId || !refundBranchId) {
@@ -2051,7 +2115,7 @@ export default function HistoryScreen() {
         <ReservationCancellationModal
           visible={Boolean(cancellationTarget)}
           item={cancellationTarget}
-          sessionId={activeCashSession?.sessionId || activeCashSession?.id}
+          sessionId={activeCashSessionId || undefined}
           onClose={() => setCancellationTarget(null)}
           onConfirm={confirmReservationCancellation}
         />

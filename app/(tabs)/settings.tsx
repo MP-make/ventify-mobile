@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
+  InteractionManager,
   KeyboardAvoidingView,
   Platform,
   ScrollView,
@@ -27,7 +28,7 @@ import {
 } from '@/context/AuthContext';
 import {
   useBusinessSettings,
-  useCashSession,
+  useCashOpenStatus,
   useOfflineStatus,
 } from '@/context/SettingsContext';
 import { usePermissions } from '@/hooks/usePermissions';
@@ -98,7 +99,7 @@ export default function SettingsScreen() {
     updateBusinessData,
     updatePosSettings,
   } = useBusinessSettings();
-  const { activeCashSession } = useCashSession();
+  const { activeCashSessionId } = useCashOpenStatus();
   const { isOnline, offlineQueueCount, quarantinedCount, refreshOfflineCount } = useOfflineStatus();
 
   const { canManageSettings, hasAllBranchesAccess } = usePermissions();
@@ -136,7 +137,12 @@ export default function SettingsScreen() {
 
   useEffect(() => {
     if (!isFocused) return;
-    void loadPlanStatus(false);
+    const handle = InteractionManager.runAfterInteractions(() => {
+      void loadPlanStatus(false);
+    });
+    return () => {
+      handle?.cancel?.();
+    };
   }, [isFocused, loadPlanStatus]);
 
   const handleManualRefreshPlan = useCallback(() => {
@@ -292,7 +298,7 @@ export default function SettingsScreen() {
             <PrinterOfflineSettingsTab
               accountId={accountId}
               userId={user?.uid || null}
-              activeCashSessionId={activeCashSession?.sessionId || activeCashSession?.id || null}
+              activeCashSessionId={activeCashSessionId}
               isFocused={isFocused}
               isActiveTab={activeTab === 'impresora'}
               isOnline={isOnline}

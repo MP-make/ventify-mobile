@@ -84,70 +84,70 @@ export const CloseCashModal = React.memo<CloseCashModalProps>(({
   }, [expectedCashAmount, countedAmountInput]);
 
   const handleCloseCash = useCallback(async () => {
-    const online = await checkIsOnlineLive(isOnline);
-    if (!online) {
-      Alert.alert(
-        'Sin Conexión',
-        'Conéctate a internet para sincronizar operaciones pendientes y realizar el Cierre Z de caja.'
-      );
-      return;
-    }
-
-    if (quarantinedCount > 0) {
-      Alert.alert(
-        'Operaciones en Cuarentena',
-        `Tienes ${quarantinedCount} venta(s) offline en cuarentena que requieren revisión en Ajustes → Impresora y Modo Offline antes de cerrar caja.`
-      );
-      return;
-    }
-
-    if (offlinePendingCount > 0) {
-      const message = `Tienes ${offlinePendingCount} operación(es) offline pendiente(s) de sincronizar en este turno. Sincronízalas antes de cerrar caja para que el arqueo Z sea exacto.`;
-      if (accountId) {
-        Alert.alert('Operaciones Offline Pendientes', message, [
-          { text: 'Cancelar', style: 'cancel' },
-          {
-            text: 'Sincronizar ahora',
-            onPress: async () => {
-              setIsClosingSession(true);
-              try {
-                if (onSyncNow) {
-                  await onSyncNow();
-                } else {
-                  await processOfflineQueue({ accountId, force: true });
-                }
-                onSyncedOffline();
-              } catch (err: any) {
-                Alert.alert(
-                  'Error de sincronización',
-                  err?.message || 'No se pudieron sincronizar las operaciones pendientes.'
-                );
-              } finally {
-                setIsClosingSession(false);
-              }
-            },
-          },
-        ]);
-      } else {
-        Alert.alert('Operaciones Offline Pendientes', message);
-      }
-      return;
-    }
-
-    const counted = parseFloat(countedAmountInput.replace(',', '.'));
-    if (isNaN(counted) || counted < 0) {
-      Alert.alert('Efectivo Recontado Inválido', 'Ingrese el dinero físico contado en la gaveta.');
-      return;
-    }
-
-    const sessId = activeCashSession?.sessionId || activeCashSession?.id;
-    if (!sessId || !accountId || !branchId || !user) {
-      Alert.alert('Error', 'No hay sesión activa para cerrar.');
-      return;
-    }
-
     setIsClosingSession(true);
     try {
+      const online = await checkIsOnlineLive(isOnline);
+      if (!online) {
+        Alert.alert(
+          'Sin Conexión',
+          'Conéctate a internet para sincronizar operaciones pendientes y realizar el Cierre Z de caja.'
+        );
+        return;
+      }
+
+      if (quarantinedCount > 0) {
+        Alert.alert(
+          'Operaciones en Cuarentena',
+          `Tienes ${quarantinedCount} venta(s) offline en cuarentena que requieren revisión en Ajustes → Impresora y Modo Offline antes de cerrar caja.`
+        );
+        return;
+      }
+
+      if (offlinePendingCount > 0) {
+        const message = `Tienes ${offlinePendingCount} operación(es) offline pendiente(s) de sincronizar en este turno. Sincronízalas antes de cerrar caja para que el arqueo Z sea exacto.`;
+        if (accountId) {
+          Alert.alert('Operaciones Offline Pendientes', message, [
+            { text: 'Cancelar', style: 'cancel' },
+            {
+              text: 'Sincronizar ahora',
+              onPress: async () => {
+                setIsClosingSession(true);
+                try {
+                  if (onSyncNow) {
+                    await onSyncNow();
+                  } else {
+                    await processOfflineQueue({ accountId, force: true });
+                  }
+                  onSyncedOffline();
+                } catch (err: any) {
+                  Alert.alert(
+                    'Error de sincronización',
+                    err?.message || 'No se pudieron sincronizar las operaciones pendientes.'
+                  );
+                } finally {
+                  setIsClosingSession(false);
+                }
+              },
+            },
+          ]);
+        } else {
+          Alert.alert('Operaciones Offline Pendientes', message);
+        }
+        return;
+      }
+
+      const counted = parseFloat(countedAmountInput.replace(',', '.'));
+      if (isNaN(counted) || counted < 0) {
+        Alert.alert('Efectivo Recontado Inválido', 'Ingrese el dinero físico contado en la gaveta.');
+        return;
+      }
+
+      const sessId = activeCashSession?.sessionId || activeCashSession?.id;
+      if (!sessId || !accountId || !branchId || !user) {
+        Alert.alert('Error', 'No hay sesión activa para cerrar.');
+        return;
+      }
+
       const result = await closeCashSession({
         sessionId: sessId,
         accountId,

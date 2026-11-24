@@ -1,4 +1,4 @@
-import React, { useState, useRef, useMemo, useCallback } from 'react';
+import React, { useState, useRef, useMemo, useCallback, useEffect } from 'react';
 import {
   View,
   Text,
@@ -8,13 +8,13 @@ import {
   StyleSheet,
   Alert,
   ActivityIndicator,
+  useWindowDimensions,
 } from 'react-native';
 import { FlashList } from '@shopify/flash-list';
 import {
   Package,
   Plus,
   Search,
-  Zap,
   X,
   ArrowRightLeft,
   History,
@@ -25,15 +25,22 @@ import {
   Barcode,
   ChevronDown,
   ChevronUp,
-  Edit3,
 } from 'lucide-react-native';
 import * as Haptics from 'expo-haptics';
 import { useFocusEffect } from 'expo-router';
 import { useIsFocused } from '@react-navigation/native';
 import { Image } from 'expo-image';
 
-import { useProducts } from '@/context/ProductsContext';
-import { useAuthSession, usePlanAccess } from '@/context/AuthContext';
+import {
+  useProductsCatalog,
+  useProductsStats,
+  useProductPlanLimit,
+} from '@/context/ProductsContext';
+import {
+  useAuthSession,
+  usePlanAccessActions,
+  useNetworkStatus,
+} from '@/context/AuthContext';
 import { useBusinessSettings, useOfflineStatus } from '@/context/SettingsContext';
 import { usePermissions } from '@/hooks/usePermissions';
 import { checkIsOnlineLive, assertOnlineForWrite } from '@/lib/online-guard';
@@ -62,21 +69,43 @@ import {
   uploadProductImageToStorage,
   type StockTransfer,
 } from '@/services/inventory-kardex-service';
-import { ProductFormModal, type ProductFormData } from '@/components/ProductFormModal';
+import type { ProductFormModal as ProductFormModalType, ProductFormData } from '@/components/ProductFormModal';
 import { collection, query, where, getDocs, limit as fsLimit } from 'firebase/firestore';
 import { db } from '@/lib/firebase';
-import { SuppliersPurchaseModal } from '@/components/SuppliersPurchaseModal';
+import type { SuppliersPurchaseModal as SuppliersPurchaseModalType } from '@/components/SuppliersPurchaseModal';
 import { InlineFilterBar, type FilterGroup, type FilterOption } from '@/components/InlineFilterBar';
-import { BarcodeScannerModal } from '@/components/BarcodeScannerModal';
-import { QuickStockAdjustModal } from '@/components/catalog/QuickStockAdjustModal';
-import { NewTransferModal } from '@/components/catalog/NewTransferModal';
+import type { BarcodeScannerModal as BarcodeScannerModalType } from '@/components/BarcodeScannerModal';
+import type { QuickStockAdjustModal as QuickStockAdjustModalType } from '@/components/catalog/QuickStockAdjustModal';
+import type { NewTransferModal as NewTransferModalType } from '@/components/catalog/NewTransferModal';
 import {
   filterCatalogIndex,
   getCatalogCategoryCounts,
+  type CatalogProductIndex,
 } from '@/lib/catalog-filters';
 import { useDebouncedValue } from '@/hooks/use-debounced-value';
+import { useFocusMemo } from '@/hooks/use-focus-memo';
 import { catalogSizeInput } from '@/lib/product-attributes';
 import type { Product, ProductAttribute } from '@/types';
+
+let cachedProductFormModal: typeof ProductFormModalType | null = null;
+const getProductFormModal = () =>
+  (cachedProductFormModal ??= (require('@/components/ProductFormModal') as typeof import('@/components/ProductFormModal')).ProductFormModal);
+
+let cachedSuppliersPurchaseModal: typeof SuppliersPurchaseModalType | null = null;
+const getSuppliersPurchaseModal = () =>
+  (cachedSuppliersPurchaseModal ??= (require('@/components/SuppliersPurchaseModal') as typeof import('@/components/SuppliersPurchaseModal')).SuppliersPurchaseModal);
+
+let cachedNewTransferModal: typeof NewTransferModalType | null = null;
+const getNewTransferModal = () =>
+  (cachedNewTransferModal ??= (require('@/components/catalog/NewTransferModal') as typeof import('@/components/catalog/NewTransferModal')).NewTransferModal);
+
+let cachedQuickStockAdjustModal: typeof QuickStockAdjustModalType | null = null;
+const getQuickStockAdjustModal = () =>
+  (cachedQuickStockAdjustModal ??= (require('@/components/catalog/QuickStockAdjustModal') as typeof import('@/components/catalog/QuickStockAdjustModal')).QuickStockAdjustModal);
+
+let cachedBarcodeScannerModal: typeof BarcodeScannerModalType | null = null;
+const getBarcodeScannerModal = () =>
+  (cachedBarcodeScannerModal ??= (require('@/components/BarcodeScannerModal') as typeof import('@/components/BarcodeScannerModal')).BarcodeScannerModal);
 
 type ActiveTab = 'inventory' | 'kardex' | 'transfers' | 'purchases';
 type StockStatusFilter = 'all' | 'low' | 'out';
@@ -124,10 +153,19 @@ const InventoryProductCard = React.memo<InventoryProductCardProps>(({
   const marginPct = cost > 0 ? ((price - cost) / cost) * 100 : 100;
   const brandLabel = showAttributes ? (item.brand || '').trim() : '';
   const sizeLabel = showAttributes ? catalogSizeInput(item).trim() : '';
+  const attrText =
+    brandLabel && sizeLabel
+      ? `Marca: ${brandLabel} · Medida: ${sizeLabel}`
+      : brandLabel
+      ? `Marca: ${brandLabel}`
+      : sizeLabel
+      ? `Medida: ${sizeLabel}`
+      : '';
   const imageSource = useMemo(() => {
     const uri = item.thumbUrl || item.imageUrl;
     return uri ? { uri } : null;
   }, [item.thumbUrl, item.imageUrl]);
+  const productInitial = item.name ? item.name.trim().charAt(0).toUpperCase() : 'P';
 
   return (
     <View style={styles.inventoryCard}>
@@ -140,9 +178,11 @@ const InventoryProductCard = React.memo<InventoryProductCardProps>(({
               contentFit="cover"
               cachePolicy="memory-disk"
               recyclingKey={item.id}
+              transition={0}
+              allowDownscaling
             />
           ) : (
-            <Package size={18} color={ui.primary} />
+            <Text style={styles.productMarkGlyph}>{productInitial}</Text>
           )}
         </View>
         <View style={styles.productIdentity}>
@@ -158,11 +198,9 @@ const InventoryProductCard = React.memo<InventoryProductCardProps>(({
               {item.sku || item.barcode || 'Sin SKU'}
             </Text>
           </View>
-          {brandLabel || sizeLabel ? (
+          {attrText ? (
             <Text style={styles.productAttrText} numberOfLines={1}>
-              {[brandLabel ? `Marca: ${brandLabel}` : '', sizeLabel ? `Medida: ${sizeLabel}` : '']
-                .filter(Boolean)
-                .join(' · ')}
+              {attrText}
             </Text>
           ) : null}
         </View>
@@ -218,7 +256,6 @@ const InventoryProductCard = React.memo<InventoryProductCardProps>(({
               accessibilityRole="button"
               accessibilityLabel={`Editar ${item.name}`}
             >
-              <Edit3 size={15} color={ui.primary} />
               <Text style={styles.actionBtnEditText}>Editar producto</Text>
             </TouchableOpacity>
           )}
@@ -230,7 +267,6 @@ const InventoryProductCard = React.memo<InventoryProductCardProps>(({
               accessibilityRole="button"
               accessibilityLabel={`Ajustar stock de ${item.name}`}
             >
-              <Zap size={15} color={ui.warning} />
               <Text style={styles.actionBtnStockText}>Ajustar stock</Text>
             </TouchableOpacity>
           )}
@@ -239,6 +275,221 @@ const InventoryProductCard = React.memo<InventoryProductCardProps>(({
     </View>
   );
 });
+
+const CatalogPlanLimitBanner = React.memo(() => {
+  const productPlanLimit = useProductPlanLimit();
+  if (!productPlanLimit || (!productPlanLimit.isAtLimit && !productPlanLimit.isNearLimit)) {
+    return null;
+  }
+  return (
+    <View
+      style={[
+        styles.planLimitBanner,
+        productPlanLimit.isAtLimit && styles.planLimitBannerFull,
+      ]}
+    >
+      <AlertTriangle
+        size={15}
+        color={productPlanLimit.isAtLimit ? ui.danger : ui.warning}
+      />
+      <Text
+        style={[
+          styles.planLimitText,
+          productPlanLimit.isAtLimit && styles.planLimitTextDanger,
+        ]}
+      >
+        {productPlanLimit.isAtLimit
+          ? `Límite del plan alcanzado (${productPlanLimit.current}/${productPlanLimit.max} productos). Mejora tu plan para crear más.`
+          : `Cerca del límite de tu plan: ${productPlanLimit.current}/${productPlanLimit.max} productos.`}
+      </Text>
+    </View>
+  );
+});
+
+interface CatalogInventorySummaryProps {
+  catalogComplete: boolean;
+  canViewMargins: boolean;
+  canManageProducts: boolean;
+  valuationExpanded: boolean;
+  onToggleValuation: () => void;
+  onOpenNewProduct: () => void;
+  isValidatingPlanLimit: boolean;
+  statusFilter: StockStatusFilter;
+  onChangeStatusFilter: (filter: StockStatusFilter) => void;
+}
+
+const CatalogInventorySummary = React.memo<CatalogInventorySummaryProps>(
+  ({
+    catalogComplete,
+    canViewMargins,
+    canManageProducts,
+    valuationExpanded,
+    onToggleValuation,
+    onOpenNewProduct,
+    isValidatingPlanLimit,
+    statusFilter,
+    onChangeStatusFilter,
+  }) => {
+    const { stats } = useProductsStats();
+
+    const handleFilterAll = useCallback(() => {
+      onChangeStatusFilter('all');
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    }, [onChangeStatusFilter]);
+
+    const handleFilterLow = useCallback(() => {
+      onChangeStatusFilter(statusFilter === 'low' ? 'all' : 'low');
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    }, [onChangeStatusFilter, statusFilter]);
+
+    const handleFilterOut = useCallback(() => {
+      onChangeStatusFilter(statusFilter === 'out' ? 'all' : 'out');
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    }, [onChangeStatusFilter, statusFilter]);
+
+    return (
+      <View style={styles.kpiContainer}>
+        <View style={styles.inventorySummary}>
+          <View style={styles.valuationHeaderRow}>
+            <TouchableOpacity
+              style={styles.valuationToggleBtn}
+              onPress={onToggleValuation}
+              activeOpacity={0.7}
+              accessibilityRole="button"
+              accessibilityLabel={
+                valuationExpanded
+                  ? 'Contraer resumen de inventario'
+                  : 'Expandir resumen de inventario'
+              }
+            >
+              <Text style={styles.valuationLabel}>
+                {canViewMargins ? 'Valor del inventario' : 'Resumen de inventario'}
+              </Text>
+              {valuationExpanded ? (
+                <ChevronUp size={16} color={ui.textSecondary} />
+              ) : (
+                <ChevronDown size={16} color={ui.textSecondary} />
+              )}
+            </TouchableOpacity>
+
+            {canManageProducts ? (
+              <TouchableOpacity
+                style={[styles.compactHeaderAction, isValidatingPlanLimit && { opacity: 0.7 }]}
+                onPress={onOpenNewProduct}
+                disabled={isValidatingPlanLimit}
+                accessibilityRole="button"
+                accessibilityLabel="Crear producto"
+              >
+                {isValidatingPlanLimit ? (
+                  <ActivityIndicator size="small" color={ui.onPrimary} />
+                ) : (
+                  <Plus size={14} color={ui.onPrimary} />
+                )}
+                <Text style={styles.compactHeaderActionText}>Nuevo producto</Text>
+              </TouchableOpacity>
+            ) : null}
+          </View>
+
+          {valuationExpanded && (
+            <>
+              {canViewMargins && (
+                <View style={styles.valuationRow}>
+                  <Text style={styles.valuationAmount}>
+                    {catalogComplete ? formatPEN(stats.valuation) : 'Sincronizando…'}
+                  </Text>
+                </View>
+              )}
+              <View style={styles.inventoryCounts}>
+                <TouchableOpacity
+                  style={[
+                    styles.kpiFilterPill,
+                    statusFilter === 'all' && styles.kpiFilterPillActive,
+                  ]}
+                  onPress={handleFilterAll}
+                  accessibilityRole="button"
+                  accessibilityLabel={
+                    catalogComplete
+                      ? `Todos los productos (${stats.totalProducts})`
+                      : 'Sincronizando catálogo'
+                  }
+                  disabled={!catalogComplete}
+                >
+                  <Text
+                    style={[
+                      styles.inventoryCount,
+                      statusFilter === 'all' && styles.kpiCountTextActive,
+                    ]}
+                  >
+                    <Text style={styles.inventoryCountValue}>
+                      {catalogComplete ? stats.totalProducts : '…'}
+                    </Text>{' '}
+                    productos
+                  </Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={[
+                    styles.kpiFilterPill,
+                    statusFilter === 'low' && styles.kpiFilterPillActiveWarning,
+                  ]}
+                  onPress={handleFilterLow}
+                  accessibilityRole="button"
+                  accessibilityLabel={
+                    catalogComplete
+                      ? `Stock bajo (${stats.lowStockCount})`
+                      : 'Sincronizando catálogo'
+                  }
+                  disabled={!catalogComplete}
+                >
+                  <Text
+                    style={[
+                      styles.inventoryCount,
+                      styles.kpiWarning,
+                      statusFilter === 'low' && styles.kpiCountTextActiveWarning,
+                    ]}
+                  >
+                    <Text style={styles.inventoryCountValue}>
+                      {catalogComplete ? stats.lowStockCount : '…'}
+                    </Text>{' '}
+                    stock bajo
+                  </Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={[
+                    styles.kpiFilterPill,
+                    statusFilter === 'out' && styles.kpiFilterPillActiveDanger,
+                  ]}
+                  onPress={handleFilterOut}
+                  accessibilityRole="button"
+                  accessibilityLabel={
+                    catalogComplete
+                      ? `Agotados (${stats.outOfStockCount})`
+                      : 'Sincronizando catálogo'
+                  }
+                  disabled={!catalogComplete}
+                >
+                  <Text
+                    style={[
+                      styles.inventoryCount,
+                      styles.kpiDanger,
+                      statusFilter === 'out' && styles.kpiCountTextActiveDanger,
+                    ]}
+                  >
+                    <Text style={styles.inventoryCountValue}>
+                      {catalogComplete ? stats.outOfStockCount : '…'}
+                    </Text>{' '}
+                    agotados
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            </>
+          )}
+        </View>
+      </View>
+    );
+  }
+);
 
 const KardexRow = React.memo<{ item: any }>(({ item }) => {
   const rawQty =
@@ -506,10 +757,283 @@ const TransferCard = React.memo<TransferCardProps>(({
   );
 });
 
+const kardexKeyExtractor = (item: any) =>
+  item.id ||
+  `${item.productId || 'kardex'}_${item.createdAt || ''}_${item.quantityChanged ?? item.quantity ?? ''}`;
+const getKardexItemType = () => 'kardex';
+const renderKardexItem = ({ item }: { item: any }) => <KardexRow item={item} />;
+
+interface KardexSubTabProps {
+  accountId: string | null;
+  branchId: string;
+  catalogIndex: CatalogProductIndex;
+  isActive: boolean;
+  lastKardexFetchRef: React.MutableRefObject<{ scopeKey: string; fetchedAt: number } | null>;
+  kardexListCacheRef: React.MutableRefObject<{ scopeKey: string; data: any[] } | null>;
+  lastKardexSyncAtRef: React.MutableRefObject<number | null>;
+}
+
+const KardexSubTab = React.memo<KardexSubTabProps>(
+  ({
+    accountId,
+    branchId,
+    catalogIndex,
+    isActive,
+    lastKardexFetchRef,
+    kardexListCacheRef,
+    lastKardexSyncAtRef,
+  }) => {
+    const { isOnline, pendingInventoryOps, lastSyncSuccessAt } = useOfflineStatus();
+    const [kardexList, setKardexList] = useState<any[]>(() => {
+      const cached = kardexListCacheRef.current;
+      return cached && cached.scopeKey === `${accountId}:${branchId}` ? cached.data : [];
+    });
+    const [kardexLoading, setKardexLoading] = useState(false);
+    const [kardexSearch, setKardexSearch] = useState('');
+    const [kardexSelectedProductId, setKardexSelectedProductId] = useState<string | null>(null);
+    const kardexSelectedProductIdRef = useRef<string | null>(null);
+    kardexSelectedProductIdRef.current = kardexSelectedProductId;
+    const debouncedKardexSearch = useDebouncedValue(kardexSearch, 150);
+    const kardexScopeRef = useRef<string>('');
+    const kardexRequestSeqRef = useRef<number>(0);
+
+    const filteredKardexProducts = useFocusMemo(
+      () =>
+        debouncedKardexSearch.trim()
+          ? filterCatalogIndex(catalogIndex, { query: debouncedKardexSearch, limit: 8 })
+          : EMPTY_PRODUCTS,
+      [catalogIndex, debouncedKardexSearch],
+      isActive,
+      EMPTY_PRODUCTS
+    );
+
+    const loadKardex = useCallback(
+      async (productIdOverride?: string | null, force = false) => {
+        if (!accountId || !branchId) return;
+        if (!isOnline) {
+          setKardexLoading(false);
+          return;
+        }
+        const effectiveProductId =
+          productIdOverride !== undefined ? productIdOverride : kardexSelectedProductIdRef.current;
+        const scopeKey = `${accountId}:${branchId}:${effectiveProductId || ''}`;
+        const baseScopeKey = `${accountId}:${branchId}`;
+
+        if (!force && lastKardexFetchRef.current) {
+          const { scopeKey: lastScope, fetchedAt } = lastKardexFetchRef.current;
+          if (lastScope === scopeKey && Date.now() - fetchedAt < SUBTAB_FETCH_TTL_MS) {
+            return;
+          }
+        }
+
+        if (kardexScopeRef.current && kardexScopeRef.current !== baseScopeKey) {
+          setKardexList([]);
+          kardexListCacheRef.current = null;
+        }
+        kardexScopeRef.current = baseScopeKey;
+
+        const reqId = ++kardexRequestSeqRef.current;
+        try {
+          setKardexLoading(true);
+          const data = await getProductKardex(
+            accountId,
+            branchId,
+            effectiveProductId || undefined,
+            60
+          );
+          if (kardexRequestSeqRef.current !== reqId) return;
+          const nextData = data || [];
+          setKardexList(nextData);
+          if (!effectiveProductId) {
+            kardexListCacheRef.current = { scopeKey: baseScopeKey, data: nextData };
+          }
+          lastKardexFetchRef.current = { scopeKey, fetchedAt: Date.now() };
+        } catch (err) {
+          console.error('[Catalog] Error cargando Kardex:', err);
+        } finally {
+          if (kardexRequestSeqRef.current === reqId) {
+            setKardexLoading(false);
+          }
+        }
+      },
+      [accountId, branchId, isOnline, lastKardexFetchRef, kardexListCacheRef]
+    );
+
+    useEffect(() => {
+      if (!isActive || !isOnline || !lastSyncSuccessAt) return;
+      if (lastKardexSyncAtRef.current === lastSyncSuccessAt) return;
+      lastKardexSyncAtRef.current = lastSyncSuccessAt;
+      lastKardexFetchRef.current = null;
+      void loadKardex(undefined, true);
+    }, [lastSyncSuccessAt, isOnline, isActive, loadKardex, lastKardexFetchRef, lastKardexSyncAtRef]);
+
+    useEffect(() => {
+      if (isActive) {
+        void loadKardex();
+      }
+    }, [isActive, loadKardex]);
+
+    const displayedKardexList = useMemo(() => {
+      const activeBranchKey = branchId || 'main';
+      const pendingRows = (pendingInventoryOps || [])
+        .filter(
+          (op): op is Extract<typeof op, { type: 'stock_adjust' }> =>
+            op.type === 'stock_adjust' &&
+            (!op.branchId || op.branchId === activeBranchKey) &&
+            (!kardexSelectedProductId || op.productId === kardexSelectedProductId)
+        )
+        .map((op) => {
+          const afterStock =
+            op.mode === 'add'
+              ? op.expectedBeforeStock + op.amount
+              : op.mode === 'subtract'
+              ? Math.max(0, op.expectedBeforeStock - op.amount)
+              : op.amount;
+          const delta = Math.round((afterStock - op.expectedBeforeStock) * 10000) / 10000;
+          return {
+            id: op.offlineOpId,
+            productId: op.productId,
+            productName: op.variantName ? `${op.productName} (${op.variantName})` : op.productName,
+            productSku: op.productSku || '',
+            type: delta < 0 ? 'out' : delta > 0 ? 'add' : 'edit',
+            quantityChanged: delta,
+            quantityBefore: op.expectedBeforeStock,
+            quantityAfter: afterStock,
+            reason: `${op.reason || 'Ajuste'} (Pendiente offline)`,
+            userName: op.userProfile?.displayName || 'Offline',
+            createdAt: op.timestamp,
+          };
+        });
+
+      const merged = [...pendingRows, ...kardexList];
+      if (kardexSelectedProductId || !debouncedKardexSearch.trim()) return merged;
+      const term = debouncedKardexSearch.trim().toLowerCase();
+      return merged.filter(
+        (item) =>
+          String(item.productName || '').toLowerCase().includes(term) ||
+          String(item.productSku || '').toLowerCase().includes(term) ||
+          String(item.referenceNumber || '').toLowerCase().includes(term)
+      );
+    }, [kardexList, pendingInventoryOps, branchId, kardexSelectedProductId, debouncedKardexSearch]);
+
+    const handleRefreshKardexPress = useCallback(() => {
+      void loadKardex(undefined, true);
+    }, [loadKardex]);
+
+    const handleSearchChange = useCallback(
+      (txt: string) => {
+        setKardexSearch(txt);
+        if (!txt.trim() && kardexSelectedProductIdRef.current) {
+          setKardexSelectedProductId(null);
+          void loadKardex(null, true);
+        }
+      },
+      [loadKardex]
+    );
+
+    const handleClearSearch = useCallback(() => {
+      setKardexSearch('');
+      setKardexSelectedProductId(null);
+      void loadKardex(null, true);
+    }, [loadKardex]);
+
+    return (
+      <View style={{ flex: 1, paddingHorizontal: 14 }}>
+        <View style={styles.kardexHeaderBar}>
+          <Text style={styles.kardexSubtitle} numberOfLines={1}>
+            Historial de entradas, ventas y ajustes
+          </Text>
+          <TouchableOpacity style={styles.refreshBtn} onPress={handleRefreshKardexPress}>
+            {kardexLoading && kardexList.length > 0 ? (
+              <ActivityIndicator size="small" color={ui.primary} />
+            ) : (
+              <RefreshCw size={14} color={ui.primary} />
+            )}
+            <Text style={styles.refreshBtnText}>Actualizar</Text>
+          </TouchableOpacity>
+        </View>
+
+        <View style={styles.kardexFilterBox}>
+          <View style={styles.kardexSearchBar}>
+            <Search size={15} color={ui.textSecondary} style={{ marginRight: 6 }} />
+            <TextInput
+              style={styles.transferSearchInput}
+              value={kardexSearch}
+              onChangeText={handleSearchChange}
+              placeholder="Filtrar Kardex por producto o SKU..."
+              placeholderTextColor={ui.textMuted}
+              autoCapitalize="none"
+            />
+            {kardexSearch || kardexSelectedProductId ? (
+              <TouchableOpacity onPress={handleClearSearch} hitSlop={6}>
+                <X size={14} color={ui.textSecondary} />
+              </TouchableOpacity>
+            ) : null}
+          </View>
+
+          {filteredKardexProducts.length > 0 && !kardexSelectedProductId && (
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={{ gap: 6, marginTop: 8 }}
+            >
+              {filteredKardexProducts.map((p) => (
+                <TouchableOpacity
+                  key={p.id}
+                  style={styles.kardexProductChip}
+                  onPress={() => {
+                    setKardexSelectedProductId(p.id);
+                    setKardexSearch(p.name);
+                    void loadKardex(p.id, true);
+                  }}
+                >
+                  <Text style={styles.kardexProductChipText} numberOfLines={1}>
+                    {p.name}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </ScrollView>
+          )}
+        </View>
+
+        {kardexLoading && kardexList.length === 0 ? (
+          <View style={styles.centerLoading}>
+            <ActivityIndicator size="large" color={ui.primary} />
+            <Text style={styles.centerLoadingText}>Consultando movimientos de stock...</Text>
+          </View>
+        ) : displayedKardexList.length === 0 ? (
+          <View style={styles.emptyView}>
+            <History size={40} color={ui.border} />
+            <Text style={styles.emptyViewTitle}>Sin movimientos registrados</Text>
+            <Text style={styles.emptyViewSubtitle}>
+              {kardexSelectedProductId
+                ? 'Este producto aún no tiene movimientos en la sucursal.'
+                : 'Los ingresos, ventas y transferencias aparecerán aquí en vivo.'}
+            </Text>
+          </View>
+        ) : (
+          <FlashList
+            data={displayedKardexList}
+            estimatedItemSize={88}
+            keyExtractor={kardexKeyExtractor}
+            getItemType={getKardexItemType}
+            contentContainerStyle={styles.listPaddingBottom}
+            renderItem={renderKardexItem}
+            refreshing={kardexLoading && kardexList.length > 0}
+            onRefresh={handleRefreshKardexPress}
+          />
+        )}
+      </View>
+    );
+  }
+);
+
 export default function CatalogInventoryScreen() {
   const isFocused = useIsFocused();
+  const { width: windowWidth, height: windowHeight } = useWindowDimensions();
   const { accountId, branchId, user, userProfile } = useAuthSession();
-  const { refreshAccess } = usePlanAccess();
+  const { refreshAccess } = usePlanAccessActions();
+  const { isOnline } = useNetworkStatus();
   const {
     canManageProducts,
     canManageInventoryAdjustments,
@@ -524,21 +1048,18 @@ export default function CatalogInventoryScreen() {
     products,
     catalogIndex,
     categories,
-    stats,
     loading: productsLoading,
     refreshing,
     catalogComplete,
     error: productsError,
-    productPlanLimit,
     refreshProducts,
     getProductStock,
     upsertProduct,
     upsertProductsBatch,
     applyAuthoritativeStockUpdates,
     validateProductCreation,
-  } = useProducts();
+  } = useProductsCatalog();
   const { branches, activeBranchName, invoicingEnabled, posSettings } = useBusinessSettings();
-  const { isOnline, pendingInventoryOps, lastSyncSuccessAt } = useOfflineStatus();
   const showAttributes = !!posSettings?.enableCatalogFilters;
 
   // Sub-pestaña activa
@@ -554,41 +1075,30 @@ export default function CatalogInventoryScreen() {
   const debouncedSearchQuery = useDebouncedValue(searchQuery, 150);
 
   // Focus-gated catalog filter memos (cached while screen is blurred)
-  const availableBrandsCacheRef = useRef<string[] | null>(null);
-  const availableBrands = useMemo(() => {
-    if (!isFocused && availableBrandsCacheRef.current !== null) {
-      return availableBrandsCacheRef.current;
-    }
-    if (!isFocused) return EMPTY_OPTIONS;
-    const next = ['Todas', ...catalogIndex.brands];
-    availableBrandsCacheRef.current = next;
-    return next;
-  }, [isFocused, catalogIndex]);
+  const availableBrands = useFocusMemo(
+    () => ['Todas', ...catalogIndex.brands],
+    [catalogIndex.brands],
+    isFocused,
+    EMPTY_OPTIONS
+  );
 
-  const availableSizesCacheRef = useRef<string[] | null>(null);
-  const availableSizes = useMemo(() => {
-    if (!isFocused && availableSizesCacheRef.current !== null) {
-      return availableSizesCacheRef.current;
-    }
-    if (!isFocused) return EMPTY_OPTIONS;
-    const next = ['Todas', ...catalogIndex.sizes];
-    availableSizesCacheRef.current = next;
-    return next;
-  }, [isFocused, catalogIndex]);
+  const availableSizes = useFocusMemo(
+    () => ['Todas', ...catalogIndex.sizes],
+    [catalogIndex.sizes],
+    isFocused,
+    EMPTY_OPTIONS
+  );
 
-  const categoryCountsCacheRef = useRef<FilterOption[] | null>(null);
-  const categoryListWithCounts = useMemo(() => {
-    if (!isFocused && categoryCountsCacheRef.current !== null) {
-      return categoryCountsCacheRef.current;
-    }
-    if (!isFocused) return EMPTY_CATEGORY_OPTIONS;
-    const next = getCatalogCategoryCounts(categories, catalogIndex).map((option) => ({
-      ...option,
-      count: catalogComplete ? option.count : undefined,
-    }));
-    categoryCountsCacheRef.current = next;
-    return next;
-  }, [isFocused, categories, catalogIndex, catalogComplete]);
+  const categoryListWithCounts = useFocusMemo(
+    () =>
+      getCatalogCategoryCounts(categories, catalogIndex).map((option) => ({
+        ...option,
+        count: catalogComplete ? option.count : undefined,
+      })),
+    [categories, catalogIndex.categoryCountsVersion, catalogComplete],
+    isFocused,
+    EMPTY_CATEGORY_OPTIONS
+  );
 
   const brandOptions = useMemo(() => availableBrands.map((b) => ({ name: b })), [availableBrands]);
   const sizeOptions = useMemo(() => availableSizes.map((s) => ({ name: s })), [availableSizes]);
@@ -738,17 +1248,10 @@ export default function CatalogInventoryScreen() {
   const [adjustingProduct, setAdjustingProduct] = useState<Product | null>(null);
   const [isValidatingPlanLimit, setIsValidatingPlanLimit] = useState(false);
 
-  // Sub-pestaña Kardex + TTL cache
-  const [kardexList, setKardexList] = useState<any[]>([]);
-  const [kardexLoading, setKardexLoading] = useState(false);
-  const [kardexSearch, setKardexSearch] = useState('');
-  const [kardexSelectedProductId, setKardexSelectedProductId] = useState<string | null>(null);
-  const kardexSelectedProductIdRef = useRef<string | null>(null);
-  kardexSelectedProductIdRef.current = kardexSelectedProductId;
-  const debouncedKardexSearch = useDebouncedValue(kardexSearch, 150);
+  // Kardex cache refs (state isolated in KardexSubTab)
   const lastKardexFetchRef = useRef<{ scopeKey: string; fetchedAt: number } | null>(null);
-  const kardexScopeRef = useRef<string>('');
-  const kardexRequestSeqRef = useRef<number>(0);
+  const kardexListCacheRef = useRef<{ scopeKey: string; data: any[] } | null>(null);
+  const lastKardexSyncAtRef = useRef<number | null>(null);
 
   // Sub-pestaña Transferencias + TTL cache
   const [transfersList, setTransfersList] = useState<StockTransfer[]>([]);
@@ -763,31 +1266,6 @@ export default function CatalogInventoryScreen() {
   // Escáner de código de barras en inventario
   const [catalogScannerOpen, setCatalogScannerOpen] = useState(false);
 
-  const filteredKardexProductsCacheRef = useRef<Product[] | null>(null);
-  const filteredKardexProducts = useMemo(() => {
-    if (!isFocused && filteredKardexProductsCacheRef.current !== null) {
-      return filteredKardexProductsCacheRef.current;
-    }
-    if (!isFocused || !debouncedKardexSearch.trim()) {
-      filteredKardexProductsCacheRef.current = EMPTY_PRODUCTS;
-      return EMPTY_PRODUCTS;
-    }
-    const next = filterCatalogIndex(catalogIndex, { query: debouncedKardexSearch, limit: 8 });
-    filteredKardexProductsCacheRef.current = next;
-    return next;
-  }, [isFocused, catalogIndex, debouncedKardexSearch]);
-
-  // Cálculo de Métricas KPI Superiores desde el índice incremental de ProductsContext
-  const kpis = useMemo(
-    () => ({
-      totalSkus: stats.totalProducts,
-      valuation: stats.valuation,
-      lowStockCount: stats.lowStockCount,
-      outOfStockCount: stats.outOfStockCount,
-    }),
-    [stats]
-  );
-
   // Evita 20k llamadas getProductStock(p) cuando statusFilter === 'all'
   const stockStatusPredicate = useMemo(() => {
     if (statusFilter === 'all') return undefined;
@@ -800,121 +1278,26 @@ export default function CatalogInventoryScreen() {
   }, [statusFilter, getProductStock]);
 
   // Filtrado de Inventario (focus-gated)
-  const filteredProductsCacheRef = useRef<Product[] | null>(null);
-  const filteredProducts = useMemo(() => {
-    if (!isFocused && filteredProductsCacheRef.current !== null) {
-      return filteredProductsCacheRef.current;
-    }
-    if (!isFocused) return EMPTY_PRODUCTS;
-    const next = filterCatalogIndex(catalogIndex, {
-      query: debouncedSearchQuery,
-      category: selectedCategory,
-      brand: selectedBrand,
-      size: selectedSize,
-      include: stockStatusPredicate,
-    });
-    filteredProductsCacheRef.current = next;
-    return next;
-  }, [
+  const filteredProducts = useFocusMemo(
+    () =>
+      filterCatalogIndex(catalogIndex, {
+        query: debouncedSearchQuery,
+        category: selectedCategory,
+        brand: selectedBrand,
+        size: selectedSize,
+        include: stockStatusPredicate,
+      }),
+    [
+      catalogIndex,
+      debouncedSearchQuery,
+      selectedCategory,
+      selectedBrand,
+      selectedSize,
+      stockStatusPredicate,
+    ],
     isFocused,
-    catalogIndex,
-    debouncedSearchQuery,
-    selectedCategory,
-    selectedBrand,
-    selectedSize,
-    stockStatusPredicate,
-  ]);
-
-  // Carga de Kardex con TTL de 45s y stale-while-revalidate
-  const loadKardex = useCallback(
-    async (productIdOverride?: string | null, force = false) => {
-      if (!accountId || !branchId) return;
-      if (!isOnline) {
-        setKardexLoading(false);
-        return;
-      }
-      const effectiveProductId =
-        productIdOverride !== undefined ? productIdOverride : kardexSelectedProductIdRef.current;
-      const scopeKey = `${accountId}:${branchId}:${effectiveProductId || ''}`;
-      const baseScopeKey = `${accountId}:${branchId}`;
-
-      if (!force && lastKardexFetchRef.current) {
-        const { scopeKey: lastScope, fetchedAt } = lastKardexFetchRef.current;
-        if (lastScope === scopeKey && Date.now() - fetchedAt < SUBTAB_FETCH_TTL_MS) {
-          return;
-        }
-      }
-
-      if (kardexScopeRef.current && kardexScopeRef.current !== baseScopeKey) {
-        setKardexList([]);
-      }
-      kardexScopeRef.current = baseScopeKey;
-
-      const reqId = ++kardexRequestSeqRef.current;
-      try {
-        setKardexLoading(true);
-        const data = await getProductKardex(
-          accountId,
-          branchId,
-          effectiveProductId || undefined,
-          60
-        );
-        if (kardexRequestSeqRef.current !== reqId) return;
-        setKardexList(data || []);
-        lastKardexFetchRef.current = { scopeKey, fetchedAt: Date.now() };
-      } catch (err) {
-        console.error('[Catalog] Error cargando Kardex:', err);
-      } finally {
-        if (kardexRequestSeqRef.current === reqId) {
-          setKardexLoading(false);
-        }
-      }
-    },
-    [accountId, branchId, isOnline]
+    EMPTY_PRODUCTS
   );
-
-  const displayedKardexList = useMemo(() => {
-    const activeBranchKey = branchId || 'main';
-    const pendingRows = (pendingInventoryOps || [])
-      .filter(
-        (op): op is Extract<typeof op, { type: 'stock_adjust' }> =>
-          op.type === 'stock_adjust' &&
-          (!op.branchId || op.branchId === activeBranchKey) &&
-          (!kardexSelectedProductId || op.productId === kardexSelectedProductId)
-      )
-      .map((op) => {
-        const afterStock =
-          op.mode === 'add'
-            ? op.expectedBeforeStock + op.amount
-            : op.mode === 'subtract'
-            ? Math.max(0, op.expectedBeforeStock - op.amount)
-            : op.amount;
-        const delta = Math.round((afterStock - op.expectedBeforeStock) * 10000) / 10000;
-        return {
-          id: op.offlineOpId,
-          productId: op.productId,
-          productName: op.variantName ? `${op.productName} (${op.variantName})` : op.productName,
-          productSku: op.productSku || '',
-          type: delta < 0 ? 'out' : delta > 0 ? 'add' : 'edit',
-          quantityChanged: delta,
-          quantityBefore: op.expectedBeforeStock,
-          quantityAfter: afterStock,
-          reason: `${op.reason || 'Ajuste'} (Pendiente offline)`,
-          userName: op.userProfile?.displayName || 'Offline',
-          createdAt: op.timestamp,
-        };
-      });
-
-    const merged = [...pendingRows, ...kardexList];
-    if (kardexSelectedProductId || !debouncedKardexSearch.trim()) return merged;
-    const term = debouncedKardexSearch.trim().toLowerCase();
-    return merged.filter(
-      (item) =>
-        String(item.productName || '').toLowerCase().includes(term) ||
-        String(item.productSku || '').toLowerCase().includes(term) ||
-        String(item.referenceNumber || '').toLowerCase().includes(term)
-    );
-  }, [kardexList, pendingInventoryOps, branchId, kardexSelectedProductId, debouncedKardexSearch]);
 
   // Carga de Transferencias con TTL de 45s y stale-while-revalidate
   const loadTransfers = useCallback(
@@ -1087,22 +1470,12 @@ export default function CatalogInventoryScreen() {
     ]
   );
 
-  React.useEffect(() => {
-    if (!isFocused || !isOnline || !lastSyncSuccessAt) return;
-    lastKardexFetchRef.current = null;
-    if (activeTab === 'kardex') {
-      void loadKardex(undefined, true);
-    }
-  }, [lastSyncSuccessAt, isOnline, isFocused, activeTab, loadKardex]);
-
   useFocusEffect(
     useCallback(() => {
-      if (activeTab === 'kardex') {
-        void loadKardex();
-      } else if (activeTab === 'transfers') {
+      if (activeTab === 'transfers') {
         void loadTransfers();
       }
-    }, [activeTab, loadKardex, loadTransfers])
+    }, [activeTab, loadTransfers])
   );
 
   // Abrir Modal de Ajuste de Stock
@@ -1185,13 +1558,17 @@ export default function CatalogInventoryScreen() {
     void loadTransfers(true);
   }, [loadTransfers]);
 
-  const handleRefreshKardexPress = useCallback(() => {
-    void loadKardex(undefined, true);
-  }, [loadKardex]);
-
   const handleRefreshTransfersPress = useCallback(() => {
     void loadTransfers(true);
   }, [loadTransfers]);
+
+  const handleToggleValuation = useCallback(() => {
+    setValuationExpanded((prev) => !prev);
+  }, []);
+
+  const handleChangeStatusFilter = useCallback((next: StockStatusFilter) => {
+    setStatusFilter(next);
+  }, []);
 
   const handleClearInventoryFilters = useCallback(() => {
     setSearchQuery('');
@@ -1226,22 +1603,106 @@ export default function CatalogInventoryScreen() {
   const catalogKeyExtractor = useCallback((item: Product) => item.id, []);
   const getCatalogItemType = useCallback(
     (item: Product) =>
-      `${item.thumbUrl || item.imageUrl ? 'img' : 'noimg'}_${
-        showAttributes && (item.brand || Boolean(item.sizes?.length || item.sizeLabel))
-          ? 'attr'
-          : 'plain'
-      }`,
+      showAttributes && Boolean((item.brand || '').trim() || catalogSizeInput(item).trim())
+        ? 'attr'
+        : 'plain',
     [showAttributes]
   );
-
-  const kardexKeyExtractor = useCallback(
-    (item: any) =>
-      item.id ||
-      `${item.productId || 'kardex'}_${item.createdAt || ''}_${item.quantityChanged ?? item.quantity ?? ''}`,
-    []
+  const hasInventoryActions = canManageProducts || canManageInventoryAdjustments;
+  const overrideCatalogItemLayout = useCallback(
+    (layout: { span?: number; size?: number }, item: Product) => {
+      const hasAttr =
+        showAttributes && Boolean((item.brand || '').trim() || catalogSizeInput(item).trim());
+      const base = 144;
+      const attr = hasAttr ? 18 : 0;
+      const actions = hasInventoryActions ? 52 : 0;
+      layout.size = base + attr + actions;
+    },
+    [showAttributes, hasInventoryActions]
   );
-  const getKardexItemType = useCallback(() => 'kardex', []);
-  const renderKardexItem = useCallback(({ item }: { item: any }) => <KardexRow item={item} />, []);
+  const estimatedCatalogListSize = useMemo(
+    () => ({
+      width: Math.max(windowWidth, 320),
+      height: Math.max(windowHeight - 300, 300),
+    }),
+    [windowWidth, windowHeight]
+  );
+  const catalogEmptyComponent = useMemo(
+    () => (
+      <View style={styles.emptyView}>
+        <View style={styles.emptyIconWrap}>
+          <Package size={26} color={ui.primary} />
+        </View>
+        <Text style={styles.emptyViewTitle}>
+          {products.length === 0 ? 'Aún no tienes productos' : 'No encontramos resultados'}
+        </Text>
+        <Text style={styles.emptyViewSubtitle}>
+          {products.length === 0
+            ? 'Agrega tu primer producto para empezar a controlar el inventario.'
+            : searchQuery.trim()
+            ? `Sin coincidencias para “${searchQuery.trim()}”. Prueba otro término o limpia los filtros.`
+            : 'Prueba otra categoría o estado de stock, o limpia los filtros.'}
+        </Text>
+        {products.length === 0 ? (
+          canManageProducts ? (
+            <TouchableOpacity
+              style={styles.emptyActionBtn}
+              onPress={handleOpenNewProduct}
+              disabled={isValidatingPlanLimit}
+              accessibilityRole="button"
+              accessibilityLabel="Agregar el primer producto"
+            >
+              <Plus size={17} color={ui.primary} />
+              <Text style={styles.emptyActionText}>Agregar producto</Text>
+            </TouchableOpacity>
+          ) : null
+        ) : (
+          <View style={styles.emptyActionsStack}>
+            {searchQuery.trim().length >= 2 ? (
+              <TouchableOpacity
+                style={[styles.emptyActionBtn, styles.emptyCloudSearchBtn]}
+                onPress={handleCloudSearch}
+                disabled={isCloudSearching}
+                accessibilityRole="button"
+                accessibilityLabel="Buscar en base de datos en la nube"
+              >
+                {isCloudSearching ? (
+                  <ActivityIndicator size="small" color={ui.primary} />
+                ) : (
+                  <Search size={16} color={ui.primary} />
+                )}
+                <Text style={styles.emptyActionText}>
+                  {isCloudSearching
+                    ? 'Consultando nube...'
+                    : 'Buscar en toda la base de datos'}
+                </Text>
+              </TouchableOpacity>
+            ) : null}
+
+            <TouchableOpacity
+              style={styles.emptyActionBtn}
+              onPress={handleClearInventoryFilters}
+              accessibilityRole="button"
+              accessibilityLabel="Limpiar búsqueda y filtros"
+            >
+              <X size={16} color={ui.primary} />
+              <Text style={styles.emptyActionText}>Limpiar filtros</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+      </View>
+    ),
+    [
+      products.length,
+      searchQuery,
+      canManageProducts,
+      handleOpenNewProduct,
+      isValidatingPlanLimit,
+      handleCloudSearch,
+      isCloudSearching,
+      handleClearInventoryFilters,
+    ]
+  );
 
   const transfersKeyExtractor = useCallback(
     (item: StockTransfer) => item.id || `trf_${item.transferNumber}`,
@@ -1664,435 +2125,124 @@ export default function CatalogInventoryScreen() {
         </View>
       </View>
 
-      {activeTab === 'inventory' &&
-      productPlanLimit &&
-      (productPlanLimit.isAtLimit || productPlanLimit.isNearLimit) ? (
-        <View
-          style={[
-            styles.planLimitBanner,
-            productPlanLimit.isAtLimit && styles.planLimitBannerFull,
-          ]}
-        >
-          <AlertTriangle
-            size={15}
-            color={productPlanLimit.isAtLimit ? ui.danger : ui.warning}
-          />
-          <Text
-            style={[styles.planLimitText, productPlanLimit.isAtLimit && { color: ui.danger }]}
-          >
-            {productPlanLimit.isAtLimit
-              ? `Límite del plan alcanzado (${productPlanLimit.current}/${productPlanLimit.max} productos). Mejora tu plan para crear más.`
-              : `Cerca del límite de tu plan: ${productPlanLimit.current}/${productPlanLimit.max} productos.`}
-          </Text>
-        </View>
-      ) : null}
+      {/* PESTAÑA 1: INVENTARIO (se mantiene montada para evitar remount/relayout de 8k items) */}
+      <View style={[styles.tabPanel, activeTab !== 'inventory' && styles.tabPanelHidden]}>
+        <CatalogPlanLimitBanner />
 
-      {activeTab === 'inventory' && (refreshing || productsError) ? (
-        <View style={styles.catalogSyncNotice}>
-          <View style={styles.catalogSyncCopy}>
-            {refreshing ? <ActivityIndicator size="small" color={ui.primary} /> : null}
-            <Text style={styles.catalogSyncText}>
-              {productsError || 'Sincronizando catálogo…'}
-            </Text>
-          </View>
-          {productsError ? (
-            <TouchableOpacity
-              onPress={refreshProducts}
-              accessibilityRole="button"
-              accessibilityLabel="Reintentar sincronización del catálogo"
-            >
-              <Text style={styles.catalogRetryText}>Reintentar</Text>
-            </TouchableOpacity>
-          ) : null}
-        </View>
-      ) : null}
-
-      {activeTab === 'inventory' && (
-        <View style={styles.kpiContainer}>
-          <View style={styles.inventorySummary}>
-            <View style={styles.valuationHeaderRow}>
-              <TouchableOpacity
-                style={styles.valuationToggleBtn}
-                onPress={() => setValuationExpanded((prev) => !prev)}
-                activeOpacity={0.7}
-                accessibilityRole="button"
-                accessibilityLabel={
-                  valuationExpanded
-                    ? 'Contraer resumen de inventario'
-                    : 'Expandir resumen de inventario'
-                }
-              >
-                <Text style={styles.valuationLabel}>
-                  {canViewMargins ? 'Valor del inventario' : 'Resumen de inventario'}
-                </Text>
-                {valuationExpanded ? (
-                  <ChevronUp size={16} color={ui.textSecondary} />
-                ) : (
-                  <ChevronDown size={16} color={ui.textSecondary} />
-                )}
-              </TouchableOpacity>
-
-              {canManageProducts ? (
-                <TouchableOpacity
-                  style={[styles.compactHeaderAction, isValidatingPlanLimit && { opacity: 0.7 }]}
-                  onPress={handleOpenNewProduct}
-                  disabled={isValidatingPlanLimit}
-                  accessibilityRole="button"
-                  accessibilityLabel="Crear producto"
-                >
-                  {isValidatingPlanLimit ? (
-                    <ActivityIndicator size="small" color={ui.onPrimary} />
-                  ) : (
-                    <Plus size={14} color={ui.onPrimary} />
-                  )}
-                  <Text style={styles.compactHeaderActionText}>Nuevo producto</Text>
-                </TouchableOpacity>
-              ) : null}
-            </View>
-
-            {valuationExpanded && (
-              <>
-                {canViewMargins && (
-                  <View style={styles.valuationRow}>
-                    <Text style={styles.valuationAmount}>
-                      {catalogComplete ? formatPEN(kpis.valuation) : 'Sincronizando…'}
-                    </Text>
-                  </View>
-                )}
-                <View style={styles.inventoryCounts}>
-                  <TouchableOpacity
-                    style={[
-                      styles.kpiFilterPill,
-                      statusFilter === 'all' && styles.kpiFilterPillActive,
-                    ]}
-                    onPress={() => {
-                      setStatusFilter('all');
-                      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-                    }}
-                    accessibilityRole="button"
-                    accessibilityLabel={
-                      catalogComplete
-                        ? `Todos los productos (${kpis.totalSkus})`
-                        : 'Sincronizando catálogo'
-                    }
-                    disabled={!catalogComplete}
-                  >
-                    <Text
-                      style={[
-                        styles.inventoryCount,
-                        statusFilter === 'all' && styles.kpiCountTextActive,
-                      ]}
-                    >
-                      <Text style={styles.inventoryCountValue}>
-                        {catalogComplete ? kpis.totalSkus : '…'}
-                      </Text>{' '}
-                      productos
-                    </Text>
-                  </TouchableOpacity>
-
-                  <TouchableOpacity
-                    style={[
-                      styles.kpiFilterPill,
-                      statusFilter === 'low' && styles.kpiFilterPillActiveWarning,
-                    ]}
-                    onPress={() => {
-                      setStatusFilter((prev) => (prev === 'low' ? 'all' : 'low'));
-                      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-                    }}
-                    accessibilityRole="button"
-                    accessibilityLabel={
-                      catalogComplete
-                        ? `Stock bajo (${kpis.lowStockCount})`
-                        : 'Sincronizando catálogo'
-                    }
-                    disabled={!catalogComplete}
-                  >
-                    <Text
-                      style={[
-                        styles.inventoryCount,
-                        styles.kpiWarning,
-                        statusFilter === 'low' && styles.kpiCountTextActiveWarning,
-                      ]}
-                    >
-                      <Text style={styles.inventoryCountValue}>
-                        {catalogComplete ? kpis.lowStockCount : '…'}
-                      </Text>{' '}
-                      stock bajo
-                    </Text>
-                  </TouchableOpacity>
-
-                  <TouchableOpacity
-                    style={[
-                      styles.kpiFilterPill,
-                      statusFilter === 'out' && styles.kpiFilterPillActiveDanger,
-                    ]}
-                    onPress={() => {
-                      setStatusFilter((prev) => (prev === 'out' ? 'all' : 'out'));
-                      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-                    }}
-                    accessibilityRole="button"
-                    accessibilityLabel={
-                      catalogComplete
-                        ? `Agotados (${kpis.outOfStockCount})`
-                        : 'Sincronizando catálogo'
-                    }
-                    disabled={!catalogComplete}
-                  >
-                    <Text
-                      style={[
-                        styles.inventoryCount,
-                        styles.kpiDanger,
-                        statusFilter === 'out' && styles.kpiCountTextActiveDanger,
-                      ]}
-                    >
-                      <Text style={styles.inventoryCountValue}>
-                        {catalogComplete ? kpis.outOfStockCount : '…'}
-                      </Text>{' '}
-                      agotados
-                    </Text>
-                  </TouchableOpacity>
-                </View>
-              </>
-            )}
-          </View>
-        </View>
-      )}
-
-      {/* PESTAÑA 1: INVENTARIO */}
-      {activeTab === 'inventory' ? (
-        <View style={{ flex: 1 }}>
-          <View style={styles.inventorySearchRow}>
-            <View style={styles.searchBarWrapper}>
-              <Search size={16} color={ui.textSecondary} style={{ marginRight: 6 }} />
-              <TextInput
-                style={styles.searchInput}
-                value={searchQuery}
-                onChangeText={setSearchQuery}
-                placeholder="Producto, SKU o código"
-                placeholderTextColor={ui.textMuted}
-                returnKeyType="search"
-                accessibilityLabel="Buscar productos por nombre, SKU o código de barras"
-              />
-              {searchQuery ? (
-                <TouchableOpacity
-                  onPress={() => setSearchQuery('')}
-                  style={styles.clearSearchBtn}
-                  accessibilityRole="button"
-                  accessibilityLabel="Borrar búsqueda"
-                  hitSlop={4}
-                >
-                  <X size={16} color={ui.textSecondary} />
-                </TouchableOpacity>
-              ) : null}
-            </View>
-
-            <View style={styles.inventoryCountBadge}>
-              <Text style={styles.inventoryCountNumber}>
-                {catalogComplete ? filteredProducts.length : '…'}
+        {refreshing || productsError ? (
+          <View style={styles.catalogSyncNotice}>
+            <View style={styles.catalogSyncCopy}>
+              {refreshing ? <ActivityIndicator size="small" color={ui.primary} /> : null}
+              <Text style={styles.catalogSyncText}>
+                {productsError || 'Sincronizando catálogo…'}
               </Text>
-              <Text style={styles.inventoryCountLabel}>prod.</Text>
             </View>
-
-            <TouchableOpacity
-              style={styles.inventoryScanBtn}
-              onPress={handleOpenCatalogScanner}
-              accessibilityRole="button"
-              accessibilityLabel="Escanear código de barras en inventario"
-              activeOpacity={0.7}
-            >
-              <Barcode size={20} color={ui.primary} />
-            </TouchableOpacity>
-          </View>
-
-          <InlineFilterBar groups={catalogFilterGroups} />
-
-          <View style={{ flex: 1, marginTop: 4 }}>
-            {productsLoading ? (
-              <View style={styles.centerLoading}>
-                <ActivityIndicator size="large" color={ui.primary} />
-                <Text style={styles.centerLoadingText}>Cargando inventario...</Text>
-              </View>
-            ) : filteredProducts.length === 0 ? (
-              <View style={styles.emptyView}>
-                <View style={styles.emptyIconWrap}>
-                  <Package size={26} color={ui.primary} />
-                </View>
-                <Text style={styles.emptyViewTitle}>
-                  {products.length === 0 ? 'Aún no tienes productos' : 'No encontramos resultados'}
-                </Text>
-                <Text style={styles.emptyViewSubtitle}>
-                  {products.length === 0
-                    ? 'Agrega tu primer producto para empezar a controlar el inventario.'
-                    : searchQuery.trim()
-                    ? `Sin coincidencias para “${searchQuery.trim()}”. Prueba otro término o limpia los filtros.`
-                    : 'Prueba otra categoría o estado de stock, o limpia los filtros.'}
-                </Text>
-                {products.length === 0 ? (
-                  canManageProducts ? (
-                    <TouchableOpacity
-                      style={styles.emptyActionBtn}
-                      onPress={handleOpenNewProduct}
-                      disabled={isValidatingPlanLimit}
-                      accessibilityRole="button"
-                      accessibilityLabel="Agregar el primer producto"
-                    >
-                      <Plus size={17} color={ui.primary} />
-                      <Text style={styles.emptyActionText}>Agregar producto</Text>
-                    </TouchableOpacity>
-                  ) : null
-                ) : (
-                  <View style={{ gap: 8, alignItems: 'center' }}>
-                    {searchQuery.trim().length >= 2 ? (
-                      <TouchableOpacity
-                        style={[
-                          styles.emptyActionBtn,
-                          { backgroundColor: ui.primarySoft, borderColor: ui.primary },
-                        ]}
-                        onPress={handleCloudSearch}
-                        disabled={isCloudSearching}
-                        accessibilityRole="button"
-                        accessibilityLabel="Buscar en base de datos en la nube"
-                      >
-                        {isCloudSearching ? (
-                          <ActivityIndicator size="small" color={ui.primary} />
-                        ) : (
-                          <Search size={16} color={ui.primary} />
-                        )}
-                        <Text style={[styles.emptyActionText, { color: ui.primary }]}>
-                          {isCloudSearching
-                            ? 'Consultando nube...'
-                            : 'Buscar en toda la base de datos'}
-                        </Text>
-                      </TouchableOpacity>
-                    ) : null}
-
-                    <TouchableOpacity
-                      style={styles.emptyActionBtn}
-                      onPress={handleClearInventoryFilters}
-                      accessibilityRole="button"
-                      accessibilityLabel="Limpiar búsqueda y filtros"
-                    >
-                      <X size={16} color={ui.primary} />
-                      <Text style={styles.emptyActionText}>Limpiar filtros</Text>
-                    </TouchableOpacity>
-                  </View>
-                )}
-              </View>
-            ) : (
-              <FlashList
-                data={filteredProducts}
-                estimatedItemSize={canManageProducts || canManageInventoryAdjustments ? 185 : 132}
-                keyExtractor={catalogKeyExtractor}
-                getItemType={getCatalogItemType}
-                contentContainerStyle={styles.catalogListContent}
-                renderItem={renderCatalogItem}
-              />
-            )}
-          </View>
-        </View>
-      ) : null}
-
-      {/* PESTAÑA 2: KARDEX (MOVIMIENTOS) */}
-      {activeTab === 'kardex' ? (
-        <View style={{ flex: 1, paddingHorizontal: 14 }}>
-          <View style={styles.kardexHeaderBar}>
-            <Text style={styles.kardexSubtitle} numberOfLines={1}>
-              Historial de entradas, ventas y ajustes
-            </Text>
-            <TouchableOpacity style={styles.refreshBtn} onPress={handleRefreshKardexPress}>
-              {kardexLoading && kardexList.length > 0 ? (
-                <ActivityIndicator size="small" color={ui.primary} />
-              ) : (
-                <RefreshCw size={14} color={ui.primary} />
-              )}
-              <Text style={styles.refreshBtnText}>Actualizar</Text>
-            </TouchableOpacity>
-          </View>
-
-          <View style={styles.kardexFilterBox}>
-            <View style={styles.kardexSearchBar}>
-              <Search size={15} color={ui.textSecondary} style={{ marginRight: 6 }} />
-              <TextInput
-                style={styles.transferSearchInput}
-                value={kardexSearch}
-                onChangeText={(txt) => {
-                  setKardexSearch(txt);
-                  if (!txt.trim() && kardexSelectedProductId) {
-                    setKardexSelectedProductId(null);
-                    void loadKardex(null, true);
-                  }
-                }}
-                placeholder="Filtrar Kardex por producto o SKU..."
-                placeholderTextColor={ui.textMuted}
-                autoCapitalize="none"
-              />
-              {kardexSearch || kardexSelectedProductId ? (
-                <TouchableOpacity
-                  onPress={() => {
-                    setKardexSearch('');
-                    setKardexSelectedProductId(null);
-                    void loadKardex(null, true);
-                  }}
-                  hitSlop={6}
-                >
-                  <X size={14} color={ui.textSecondary} />
-                </TouchableOpacity>
-              ) : null}
-            </View>
-
-            {filteredKardexProducts.length > 0 && !kardexSelectedProductId && (
-              <ScrollView
-                horizontal
-                showsHorizontalScrollIndicator={false}
-                contentContainerStyle={{ gap: 6, marginTop: 8 }}
+            {productsError ? (
+              <TouchableOpacity
+                onPress={refreshProducts}
+                accessibilityRole="button"
+                accessibilityLabel="Reintentar sincronización del catálogo"
               >
-                {filteredKardexProducts.map((p) => (
-                  <TouchableOpacity
-                    key={p.id}
-                    style={styles.kardexProductChip}
-                    onPress={() => {
-                      setKardexSelectedProductId(p.id);
-                      setKardexSearch(p.name);
-                      void loadKardex(p.id, true);
-                    }}
-                  >
-                    <Text style={styles.kardexProductChipText} numberOfLines={1}>
-                      {p.name}
-                    </Text>
-                  </TouchableOpacity>
-                ))}
-              </ScrollView>
-            )}
+                <Text style={styles.catalogRetryText}>Reintentar</Text>
+              </TouchableOpacity>
+            ) : null}
+          </View>
+        ) : null}
+
+        <CatalogInventorySummary
+          catalogComplete={catalogComplete}
+          canViewMargins={canViewMargins}
+          canManageProducts={canManageProducts}
+          valuationExpanded={valuationExpanded}
+          onToggleValuation={handleToggleValuation}
+          onOpenNewProduct={handleOpenNewProduct}
+          isValidatingPlanLimit={isValidatingPlanLimit}
+          statusFilter={statusFilter}
+          onChangeStatusFilter={handleChangeStatusFilter}
+        />
+
+        <View style={styles.inventorySearchRow}>
+          <View style={styles.searchBarWrapper}>
+            <Search size={16} color={ui.textSecondary} style={{ marginRight: 6 }} />
+            <TextInput
+              style={styles.searchInput}
+              value={searchQuery}
+              onChangeText={setSearchQuery}
+              placeholder="Producto, SKU o código"
+              placeholderTextColor={ui.textMuted}
+              returnKeyType="search"
+              accessibilityLabel="Buscar productos por nombre, SKU o código de barras"
+            />
+            {searchQuery ? (
+              <TouchableOpacity
+                onPress={() => setSearchQuery('')}
+                style={styles.clearSearchBtn}
+                accessibilityRole="button"
+                accessibilityLabel="Borrar búsqueda"
+                hitSlop={4}
+              >
+                <X size={16} color={ui.textSecondary} />
+              </TouchableOpacity>
+            ) : null}
           </View>
 
-          {kardexLoading && kardexList.length === 0 ? (
+          <View style={styles.inventoryCountBadge}>
+            <Text style={styles.inventoryCountNumber}>
+              {catalogComplete ? filteredProducts.length : '…'}
+            </Text>
+            <Text style={styles.inventoryCountLabel}>prod.</Text>
+          </View>
+
+          <TouchableOpacity
+            style={styles.inventoryScanBtn}
+            onPress={handleOpenCatalogScanner}
+            accessibilityRole="button"
+            accessibilityLabel="Escanear código de barras en inventario"
+            activeOpacity={0.7}
+          >
+            <Barcode size={20} color={ui.primary} />
+          </TouchableOpacity>
+        </View>
+
+        <InlineFilterBar groups={catalogFilterGroups} />
+
+        <View style={styles.inventoryListWrapper}>
+          {productsLoading ? (
             <View style={styles.centerLoading}>
               <ActivityIndicator size="large" color={ui.primary} />
-              <Text style={styles.centerLoadingText}>Consultando movimientos de stock...</Text>
-            </View>
-          ) : displayedKardexList.length === 0 ? (
-            <View style={styles.emptyView}>
-              <History size={40} color={ui.border} />
-              <Text style={styles.emptyViewTitle}>Sin movimientos registrados</Text>
-              <Text style={styles.emptyViewSubtitle}>
-                {kardexSelectedProductId
-                  ? 'Este producto aún no tiene movimientos en la sucursal.'
-                  : 'Los ingresos, ventas y transferencias aparecerán aquí en vivo.'}
-              </Text>
+              <Text style={styles.centerLoadingText}>Cargando inventario...</Text>
             </View>
           ) : (
             <FlashList
-              data={displayedKardexList}
-              estimatedItemSize={88}
-              keyExtractor={kardexKeyExtractor}
-              getItemType={getKardexItemType}
-              contentContainerStyle={styles.listPaddingBottom}
-              renderItem={renderKardexItem}
-              refreshing={kardexLoading && kardexList.length > 0}
-              onRefresh={handleRefreshKardexPress}
+              data={filteredProducts}
+              estimatedItemSize={
+                hasInventoryActions ? (showAttributes ? 214 : 196) : showAttributes ? 162 : 144
+              }
+              overrideItemLayout={overrideCatalogItemLayout}
+              estimatedListSize={estimatedCatalogListSize}
+              drawDistance={250}
+              extraData={branchId}
+              keyExtractor={catalogKeyExtractor}
+              getItemType={getCatalogItemType}
+              contentContainerStyle={styles.catalogListContent}
+              renderItem={renderCatalogItem}
+              ListEmptyComponent={filteredProducts.length === 0 ? catalogEmptyComponent : undefined}
             />
           )}
         </View>
+      </View>
+
+      {/* PESTAÑA 2: KARDEX (MOVIMIENTOS) */}
+      {activeTab === 'kardex' ? (
+        <KardexSubTab
+          accountId={accountId}
+          branchId={branchId}
+          catalogIndex={catalogIndex}
+          isActive={activeTab === 'kardex' && isFocused}
+          lastKardexFetchRef={lastKardexFetchRef}
+          kardexListCacheRef={kardexListCacheRef}
+          lastKardexSyncAtRef={lastKardexSyncAtRef}
+        />
       ) : null}
 
       {/* PESTAÑA 3: TRANSFERENCIAS ENTRE SUCURSALES */}
@@ -2158,56 +2308,77 @@ export default function CatalogInventoryScreen() {
       ) : null}
 
       {/* PESTAÑA 4: COMPRAS Y PROVEEDORES */}
-      {activeTab === 'purchases' ? (
-        <View style={{ flex: 1 }}>
-          <SuppliersPurchaseModal
-            visible
-            embedded
-            onClose={handleBackToInventoryTab}
-            onStockUpdated={handleStockAdjusted}
-          />
-        </View>
-      ) : null}
+      {activeTab === 'purchases'
+        ? (() => {
+            const SuppliersPurchaseModal = getSuppliersPurchaseModal();
+            return (
+              <View style={styles.tabPanel}>
+                <SuppliersPurchaseModal
+                  visible
+                  embedded
+                  onClose={handleBackToInventoryTab}
+                  onStockUpdated={handleStockAdjusted}
+                />
+              </View>
+            );
+          })()
+        : null}
 
       {/* MODAL 1: AJUSTE RÁPIDO DE STOCK (AISLADO) */}
-      {stockModalOpen && (
-        <QuickStockAdjustModal
-          visible={stockModalOpen}
-          product={adjustingProduct}
-          onClose={handleCloseStockModal}
-          onStockAdjusted={handleStockAdjusted}
-        />
-      )}
+      {stockModalOpen &&
+        (() => {
+          const QuickStockAdjustModal = getQuickStockAdjustModal();
+          return (
+            <QuickStockAdjustModal
+              visible={stockModalOpen}
+              product={adjustingProduct}
+              onClose={handleCloseStockModal}
+              onStockAdjusted={handleStockAdjusted}
+            />
+          );
+        })()}
 
       {/* MODAL 2: NUEVA TRANSFERENCIA MULTI-ÍTEM (AISLADO) */}
-      {newTransferModalOpen && (
-        <NewTransferModal
-          visible={newTransferModalOpen}
-          onClose={handleCloseNewTransferModal}
-          onTransferCreated={handleTransferCreated}
-        />
-      )}
+      {newTransferModalOpen &&
+        (() => {
+          const NewTransferModal = getNewTransferModal();
+          return (
+            <NewTransferModal
+              visible={newTransferModalOpen}
+              onClose={handleCloseNewTransferModal}
+              onTransferCreated={handleTransferCreated}
+            />
+          );
+        })()}
 
       {/* MODAL 3: CREAR / EDITAR PRODUCTO */}
-      {productModalOpen && (
-        <ProductFormModal
-          visible={productModalOpen}
-          product={editingProduct}
-          onClose={handleCloseProductModal}
-          onSave={handleSaveProduct}
-          branchId={branchId}
-        />
-      )}
+      {productModalOpen &&
+        (() => {
+          const ProductFormModal = getProductFormModal();
+          return (
+            <ProductFormModal
+              visible={productModalOpen}
+              product={editingProduct}
+              onClose={handleCloseProductModal}
+              onSave={handleSaveProduct}
+              branchId={branchId}
+            />
+          );
+        })()}
 
       {/* MODAL 5: ESCÁNER DE CÓDIGO DE BARRAS EN INVENTARIO */}
-      {catalogScannerOpen && (
-        <BarcodeScannerModal
-          visible={catalogScannerOpen}
-          onClose={handleCloseCatalogScanner}
-          onScan={handleCatalogScan}
-          title="Escanear en Inventario"
-        />
-      )}
+      {catalogScannerOpen &&
+        (() => {
+          const BarcodeScannerModal = getBarcodeScannerModal();
+          return (
+            <BarcodeScannerModal
+              visible={catalogScannerOpen}
+              onClose={handleCloseCatalogScanner}
+              onScan={handleCatalogScan}
+              title="Escanear en Inventario"
+            />
+          );
+        })()}
     </View>
   );
 }
@@ -2216,6 +2387,24 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: ui.background,
+  },
+  tabPanel: {
+    flex: 1,
+  },
+  tabPanelHidden: {
+    display: 'none',
+  },
+  inventoryListWrapper: {
+    flex: 1,
+    marginTop: 4,
+  },
+  emptyActionsStack: {
+    gap: 8,
+    alignItems: 'center',
+  },
+  emptyCloudSearchBtn: {
+    backgroundColor: ui.primarySoft,
+    borderColor: ui.primary,
   },
   kpiContainer: {
     paddingHorizontal: 14,
@@ -2494,12 +2683,17 @@ const styles = StyleSheet.create({
     gap: 10,
   },
   productMark: {
-    width: 40,
-    height: 40,
+    width: 44,
+    height: 44,
     borderRadius: 10,
     backgroundColor: ui.primarySoft,
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  productMarkGlyph: {
+    fontSize: 16,
+    fontWeight: '800',
+    color: ui.primary,
   },
   productIdentity: {
     flex: 1,
@@ -2858,9 +3052,9 @@ const styles = StyleSheet.create({
     paddingBottom: 30,
   },
   productThumbnail: {
-    width: 48,
-    height: 48,
-    borderRadius: 14,
+    width: 44,
+    height: 44,
+    borderRadius: 10,
   },
   planLimitBanner: {
     flexDirection: 'row',
@@ -2886,6 +3080,9 @@ const styles = StyleSheet.create({
     lineHeight: 16,
     fontWeight: '600',
     color: ui.warning,
+  },
+  planLimitTextDanger: {
+    color: ui.danger,
   },
   kardexFilterBox: {
     backgroundColor: ui.surface,

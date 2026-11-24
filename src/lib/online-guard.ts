@@ -11,8 +11,8 @@ export async function checkIsOnlineLive(fallbackOnline?: boolean): Promise<boole
     if (!netInfo || typeof netInfo.fetch !== 'function') {
       return fallbackOnline !== undefined ? Boolean(fallbackOnline) : true;
     }
-    const state = await netInfo.fetch();
-    return Boolean(state.isConnected && state.isInternetReachable !== false);
+    const state = await withTimeout<any>(netInfo.fetch(), 2500, 'netinfo_timeout');
+    return Boolean(state?.isConnected && state?.isInternetReachable !== false);
   } catch {
     return fallbackOnline !== undefined ? Boolean(fallbackOnline) : true;
   }

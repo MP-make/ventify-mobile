@@ -20,6 +20,7 @@ export interface CatalogProductIndex {
   uncategorizedCount: number;
   brands: string[];
   sizes: string[];
+  categoryCountsVersion?: number;
 }
 
 const indexedProductCache = new WeakMap<Product, IndexedCatalogProduct>();
@@ -158,6 +159,7 @@ export const buildCatalogProductIndex = (products: Product[]): CatalogProductInd
     uncategorizedCount,
     brands: [...brands.values()],
     sizes: [...sizes.values()],
+    categoryCountsVersion: 0,
   };
 };
 
@@ -187,6 +189,7 @@ export class MutableCatalogProductIndex {
   private readonly sizeCounts = new Map<string, { label: string; count: number }>();
   private brandsDirty = false;
   private sizesDirty = false;
+  private categoryCountsVersion = 0;
   private cachedBrands: string[] = [];
   private cachedSizes: string[] = [];
   private dirty = false;
@@ -194,6 +197,7 @@ export class MutableCatalogProductIndex {
 
   private addToCategoryBucket(entry: IndexedCatalogProduct): void {
     const id = entry.product.id;
+    this.categoryCountsVersion += 1;
     if (entry.category) {
       this.categoryCounts.set(entry.category, (this.categoryCounts.get(entry.category) || 0) + 1);
       let bucket = this.entriesByCategory.get(entry.normalizedCategory);
@@ -214,6 +218,7 @@ export class MutableCatalogProductIndex {
     const bucketIdx = this.catBucketIndexById.get(productId);
     this.catBucketIndexById.delete(productId);
     if (bucketIdx === undefined) return;
+    this.categoryCountsVersion += 1;
 
     if (entry.category) {
       const prevCount = this.categoryCounts.get(entry.category) || 0;
@@ -327,6 +332,7 @@ export class MutableCatalogProductIndex {
           }
         }
         if (oldEntry.category !== newEntry.category) {
+          this.categoryCountsVersion += 1;
           const prevCount = this.categoryCounts.get(oldEntry.category) || 0;
           if (prevCount <= 1) this.categoryCounts.delete(oldEntry.category);
           else this.categoryCounts.set(oldEntry.category, prevCount - 1);
@@ -398,6 +404,7 @@ export class MutableCatalogProductIndex {
     this.sizeCounts.clear();
     this.brandsDirty = false;
     this.sizesDirty = false;
+    this.categoryCountsVersion += 1;
     this.cachedBrands = [];
     this.cachedSizes = [];
     this.dirty = true;
@@ -440,6 +447,7 @@ export class MutableCatalogProductIndex {
       uncategorizedCount: this.uncategorizedCount,
       brands: this.cachedBrands,
       sizes: this.cachedSizes,
+      categoryCountsVersion: this.categoryCountsVersion,
     };
     this.dirty = false;
     return this.lastSnapshot;

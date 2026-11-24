@@ -335,6 +335,12 @@ export interface CashSessionContextType {
   refreshCashStatus: () => void;
 }
 
+export interface CashOpenStatusContextType {
+  isCashOpen: boolean;
+  activeCashSessionId: string | null;
+  refreshCashStatus: () => void;
+}
+
 export interface OfflineStatusContextType {
   isOnline: boolean;
   offlineQueueCount: number;
@@ -395,6 +401,12 @@ const DEFAULT_CASH_SESSION_CONTEXT: CashSessionContextType = {
   refreshCashStatus: () => {},
 };
 
+const DEFAULT_CASH_OPEN_STATUS_CONTEXT: CashOpenStatusContextType = {
+  isCashOpen: false,
+  activeCashSessionId: null,
+  refreshCashStatus: () => {},
+};
+
 const DEFAULT_OFFLINE_STATUS_CONTEXT: OfflineStatusContextType = {
   isOnline: true,
   offlineQueueCount: 0,
@@ -413,6 +425,9 @@ const BusinessSettingsContext = createContext<BusinessSettingsContextType>(
   DEFAULT_BUSINESS_SETTINGS_CONTEXT
 );
 const CashSessionContext = createContext<CashSessionContextType>(DEFAULT_CASH_SESSION_CONTEXT);
+const CashOpenStatusContext = createContext<CashOpenStatusContextType>(
+  DEFAULT_CASH_OPEN_STATUS_CONTEXT
+);
 const OfflineStatusContext = createContext<OfflineStatusContextType>(
   DEFAULT_OFFLINE_STATUS_CONTEXT
 );
@@ -816,9 +831,61 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         uid && accId ? getQuarantinedSalesForIdentity(uid, accId) : Promise.resolve([]),
       ]);
       const salesCount = applyOfflineQueueItems(salesQueue, user?.uid, accountId);
-      setPendingInventoryOps(invQueue);
-      setPendingCashMovements(cashQueue);
-      setQuarantinedSales(quarSales);
+      setPendingInventoryOps((prev) => {
+        if (prev.length === 0 && invQueue.length === 0) return prev;
+        if (
+          prev.length === invQueue.length &&
+          prev.every((p, idx) => {
+            const n = invQueue[idx];
+            return (
+              p.offlineOpId === n.offlineOpId &&
+              p.retryCount === n.retryCount &&
+              p.nextRetryAt === n.nextRetryAt &&
+              p.lastErrorReason === n.lastErrorReason &&
+              p.timestamp === n.timestamp
+            );
+          })
+        ) {
+          return prev;
+        }
+        return invQueue;
+      });
+      setPendingCashMovements((prev) => {
+        if (prev.length === 0 && cashQueue.length === 0) return prev;
+        if (
+          prev.length === cashQueue.length &&
+          prev.every((p, idx) => {
+            const n = cashQueue[idx];
+            return (
+              p.id === n.id &&
+              p.retryCount === n.retryCount &&
+              p.nextRetryAt === n.nextRetryAt &&
+              p.lastErrorReason === n.lastErrorReason &&
+              p.timestamp === n.timestamp
+            );
+          })
+        ) {
+          return prev;
+        }
+        return cashQueue;
+      });
+      setQuarantinedSales((prev) => {
+        if (prev.length === 0 && quarSales.length === 0) return prev;
+        if (
+          prev.length === quarSales.length &&
+          prev.every((p, idx) => {
+            const n = quarSales[idx];
+            return (
+              p.id === n.id &&
+              p.quarantinedAt === n.quarantinedAt &&
+              p.retryCount === n.retryCount
+            );
+          })
+        ) {
+          return prev;
+        }
+        return quarSales;
+      });
       return salesCount + invQueue.length + cashQueue.length;
     } catch {
       return 0;
@@ -1190,9 +1257,12 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         }
         reconnectTimer = setTimeout(() => {
           reconnectTimer = null;
-          if (isMounted && isOnlineRef.current) {
-            triggerSync(accountId);
-          }
+          if (!isMounted || !isOnlineRef.current) return;
+          void refreshOfflineCount().then((count) => {
+            if (isMounted && isOnlineRef.current && count > 0) {
+              triggerSync(accountId);
+            }
+          });
         }, 1_500);
       } else if (startupSyncAttemptedScopeRef.current !== currentScope || scopeChanged) {
         startupSyncAttemptedScopeRef.current = currentScope;
@@ -2051,7 +2121,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   // 5.1 Listener en tiempo real al documento activo de caja para mantener expectedAmount/totales actualizados
   const activeSessionIdForListener = isCashOpen ? activeCashSession?.id || null : null;
   useEffect(() => {
-    if (!accountId || !user?.uid || !isCashOpen || !activeSessionIdForListener || !isOnline) {
+    if (!accountId || !user?.uid || !isCashOpen || !activeSessionIdForListener) {
       return;
     }
 
@@ -2095,10 +2165,13 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
           isOpen: true,
           ...data,
         };
+        const changed = !isStructurallyEqual(prevSession, nextSession);
         activeCashSessionRef.current = nextSession;
         hydratedCashSessionRef.current = { key: cashKey, session: nextSession };
-        setActiveCashSession((prev) => (isStructurallyEqual(prev, nextSession) ? prev : nextSession));
-        void safeStorageSet(cashKey, JSON.stringify(nextSession));
+        if (changed) {
+          setActiveCashSession((prev) => (isStructurallyEqual(prev, nextSession) ? prev : nextSession));
+          void safeStorageSet(cashKey, JSON.stringify(nextSession));
+        }
       },
       (err) => {
         console.warn('[SettingsContext] active session listener note:', err);
@@ -2109,7 +2182,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       isSubscribed = false;
       unsubSession();
     };
-  }, [accountId, branchId, user?.uid, isCashOpen, activeSessionIdForListener, isOnline, checkActiveSession, safeStorageSet]);
+  }, [accountId, branchId, user?.uid, isCashOpen, activeSessionIdForListener, checkActiveSession, safeStorageSet]);
 
   // 6. Actualizar datos de configuración de empresa
   const updateBusinessSettings = useCallback(
@@ -2286,6 +2359,16 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     ]
   );
 
+  const activeCashSessionId = activeCashSession?.id || null;
+  const cashOpenStatusValue = useMemo<CashOpenStatusContextType>(
+    () => ({
+      isCashOpen,
+      activeCashSessionId,
+      refreshCashStatus,
+    }),
+    [isCashOpen, activeCashSessionId, refreshCashStatus]
+  );
+
   const cashSessionValue = useMemo<CashSessionContextType>(
     () => ({
       isCashOpen,
@@ -2335,11 +2418,13 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
   return (
     <BusinessSettingsContext.Provider value={businessSettingsValue}>
-      <CashSessionContext.Provider value={cashSessionValue}>
-        <OfflineStatusContext.Provider value={offlineStatusValue}>
-          <SettingsContext.Provider value={contextValue}>{children}</SettingsContext.Provider>
-        </OfflineStatusContext.Provider>
-      </CashSessionContext.Provider>
+      <CashOpenStatusContext.Provider value={cashOpenStatusValue}>
+        <CashSessionContext.Provider value={cashSessionValue}>
+          <OfflineStatusContext.Provider value={offlineStatusValue}>
+            <SettingsContext.Provider value={contextValue}>{children}</SettingsContext.Provider>
+          </OfflineStatusContext.Provider>
+        </CashSessionContext.Provider>
+      </CashOpenStatusContext.Provider>
     </BusinessSettingsContext.Provider>
   );
 };
@@ -2347,4 +2432,5 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 export const useSettings = () => useContext(SettingsContext);
 export const useBusinessSettings = () => useContext(BusinessSettingsContext);
 export const useCashSession = () => useContext(CashSessionContext);
+export const useCashOpenStatus = () => useContext(CashOpenStatusContext);
 export const useOfflineStatus = () => useContext(OfflineStatusContext);

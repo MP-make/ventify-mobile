@@ -1,11 +1,13 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { ActivityIndicator, Alert, Switch, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { useIsFocused } from '@react-navigation/native';
 import { doc, serverTimestamp, setDoc } from 'firebase/firestore';
 import { Check, Gift, Save, Search, X } from 'lucide-react-native';
 
 import { SectionHeading } from '@/components/ui';
-import { useProducts } from '@/context/ProductsContext';
+import { useProductsCatalog } from '@/context/ProductsContext';
 import { useDebouncedValue } from '@/hooks/use-debounced-value';
+import { useFocusMemo } from '@/hooks/use-focus-memo';
 import { filterCatalogIndex } from '@/lib/catalog-filters';
 import { db } from '@/lib/firebase';
 import { formatPEN, ui } from '@/lib/theme';
@@ -14,6 +16,7 @@ import type { DiscountSettings, Product } from '@/types';
 import { settingsStyles as styles } from './settingsStyles';
 
 const isActiveGiftProduct = (product: Product): boolean => product.active !== false;
+const EMPTY_PRODUCTS: Product[] = [];
 
 export interface GiftsSettingsTabProps {
   accountId?: string | null;
@@ -23,7 +26,8 @@ export interface GiftsSettingsTabProps {
 
 export const GiftsSettingsTab = React.memo<GiftsSettingsTabProps>(
   ({ accountId, canManageSettings, discountSettings }) => {
-    const { catalogIndex, productsById } = useProducts();
+    const isFocused = useIsFocused();
+    const { catalogIndex, productsById } = useProductsCatalog();
     const [enableGifts, setEnableGifts] = useState(discountSettings.enableGifts !== false);
     const [giftProductIds, setGiftProductIds] = useState<string[]>(
       Array.isArray(discountSettings.giftProductIds) ? discountSettings.giftProductIds : []
@@ -47,14 +51,16 @@ export const GiftsSettingsTab = React.memo<GiftsSettingsTabProps>(
 
     const giftProductIdSet = useMemo(() => new Set(giftProductIds), [giftProductIds]);
 
-    const filteredGiftCatalog = useMemo(
+    const filteredGiftCatalog = useFocusMemo(
       () =>
         filterCatalogIndex(catalogIndex, {
           query: debouncedGiftSearch,
           include: isActiveGiftProduct,
           limit: 30,
         }),
-      [catalogIndex, debouncedGiftSearch]
+      [catalogIndex, debouncedGiftSearch],
+      isFocused,
+      EMPTY_PRODUCTS
     );
 
     const toggleGiftProductId = useCallback(

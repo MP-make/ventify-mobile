@@ -24,6 +24,7 @@ import {
 } from 'lucide-react-native';
 
 import { useDebouncedValue } from '@/hooks/use-debounced-value';
+import { useFocusMemo } from '@/hooks/use-focus-memo';
 import { formatDatePE, formatPEN, ui } from '@/lib/theme';
 import { resolveReceiptDocumentMeta } from '@/lib/printing/escpos-builder';
 import { getHistoryDateBounds, toEpochMillis } from '@/services/crm-compat';
@@ -57,6 +58,7 @@ const DOC_FILTER_OPTIONS: ReadonlyArray<{ id: DocFilter; label: string }> = [
 ];
 
 type DocMetaResult = ReturnType<typeof resolveReceiptDocumentMeta>;
+const EMPTY_HISTORY_SALES: HistorySale[] = [];
 
 interface DocBadgeProps {
   sale: Sale;
@@ -704,64 +706,63 @@ export const HistorySalesTab = React.memo<HistorySalesTabProps>(
     const effectiveCustomStart = dateRange === 'custom' ? customStartDate : '';
     const effectiveCustomEnd = dateRange === 'custom' ? customEndDate : '';
 
-    const lastFilteredSalesRef = useRef<HistorySale[]>([]);
-    const filteredSales = useMemo(() => {
-      if (!isFocused) return lastFilteredSalesRef.current;
+    const filteredSales = useFocusMemo<HistorySale[]>(
+      () => {
+        const bounds = getHistoryDateBounds(dateRange, effectiveCustomStart, effectiveCustomEnd);
+        const trimmedSearch = debouncedSearchQuery.toLowerCase().trim();
 
-      const bounds = getHistoryDateBounds(dateRange, effectiveCustomStart, effectiveCustomEnd);
-      const trimmedSearch = debouncedSearchQuery.toLowerCase().trim();
+        return mergedSales.filter((sale) => {
+          const saleDate = sale._dateMs ?? toEpochMillis(sale.date || (sale as any).createdAt);
 
-      const next = mergedSales.filter((sale) => {
-        const saleDate = sale._dateMs ?? toEpochMillis(sale.date || (sale as any).createdAt);
+          if (bounds.start !== undefined && saleDate < bounds.start) return false;
+          if (bounds.end !== undefined && saleDate > bounds.end) return false;
 
-        if (bounds.start !== undefined && saleDate < bounds.start) return false;
-        if (bounds.end !== undefined && saleDate > bounds.end) return false;
-
-        if (docFilter !== 'all') {
-          const docTypeStr = String(sale.documentType || '').toLowerCase();
-          if (docFilter === 'factura' && !docTypeStr.includes('factura') && docTypeStr !== '01') {
-            return false;
+          if (docFilter !== 'all') {
+            const docTypeStr = String(sale.documentType || '').toLowerCase();
+            if (docFilter === 'factura' && !docTypeStr.includes('factura') && docTypeStr !== '01') {
+              return false;
+            }
+            if (docFilter === 'boleta' && !docTypeStr.includes('boleta') && docTypeStr !== '03') {
+              return false;
+            }
+            if (
+              docFilter === 'nota_venta' &&
+              (docTypeStr.includes('factura') ||
+                docTypeStr === '01' ||
+                docTypeStr.includes('boleta') ||
+                docTypeStr === '03')
+            ) {
+              return false;
+            }
           }
-          if (docFilter === 'boleta' && !docTypeStr.includes('boleta') && docTypeStr !== '03') {
-            return false;
-          }
-          if (
-            docFilter === 'nota_venta' &&
-            (docTypeStr.includes('factura') ||
-              docTypeStr === '01' ||
-              docTypeStr.includes('boleta') ||
-              docTypeStr === '03')
-          ) {
-            return false;
-          }
-        }
 
-        if (trimmedSearch.length > 0) {
-          const docNum = String(sale.documentNumber || sale.saleNumber || '').toLowerCase();
-          const custName = String(sale.customerName || '').toLowerCase();
-          const custDoc = String(sale.customerDni || sale.customerRuc || '').toLowerCase();
-          if (
-            !docNum.includes(trimmedSearch) &&
-            !custName.includes(trimmedSearch) &&
-            !custDoc.includes(trimmedSearch)
-          ) {
-            return false;
+          if (trimmedSearch.length > 0) {
+            const docNum = String(sale.documentNumber || sale.saleNumber || '').toLowerCase();
+            const custName = String(sale.customerName || '').toLowerCase();
+            const custDoc = String(sale.customerDni || sale.customerRuc || '').toLowerCase();
+            if (
+              !docNum.includes(trimmedSearch) &&
+              !custName.includes(trimmedSearch) &&
+              !custDoc.includes(trimmedSearch)
+            ) {
+              return false;
+            }
           }
-        }
 
-        return true;
-      });
-      lastFilteredSalesRef.current = next;
-      return next;
-    }, [
+          return true;
+        });
+      },
+      [
+        mergedSales,
+        dateRange,
+        effectiveCustomStart,
+        effectiveCustomEnd,
+        docFilter,
+        debouncedSearchQuery,
+      ],
       isFocused,
-      mergedSales,
-      dateRange,
-      effectiveCustomStart,
-      effectiveCustomEnd,
-      docFilter,
-      debouncedSearchQuery,
-    ]);
+      EMPTY_HISTORY_SALES
+    );
 
     const lastPeriodKpisRef = useRef<PeriodKpis>(EMPTY_PERIOD_KPIS);
     const periodKpis = useMemo<PeriodKpis>(() => {

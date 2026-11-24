@@ -146,11 +146,11 @@ const PinLockModalContent: React.FC = React.memo(() => {
   const triggerShake = useCallback(() => {
     Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error).catch(() => {});
     Animated.sequence([
-      Animated.timing(shakeAnim, { toValue: 12, duration: 50, useNativeDriver: true }),
-      Animated.timing(shakeAnim, { toValue: -12, duration: 50, useNativeDriver: true }),
-      Animated.timing(shakeAnim, { toValue: 8, duration: 50, useNativeDriver: true }),
-      Animated.timing(shakeAnim, { toValue: -8, duration: 50, useNativeDriver: true }),
-      Animated.timing(shakeAnim, { toValue: 0, duration: 50, useNativeDriver: true }),
+      Animated.timing(shakeAnim, { toValue: 12, duration: 50, useNativeDriver: true, isInteraction: false }),
+      Animated.timing(shakeAnim, { toValue: -12, duration: 50, useNativeDriver: true, isInteraction: false }),
+      Animated.timing(shakeAnim, { toValue: 8, duration: 50, useNativeDriver: true, isInteraction: false }),
+      Animated.timing(shakeAnim, { toValue: -8, duration: 50, useNativeDriver: true, isInteraction: false }),
+      Animated.timing(shakeAnim, { toValue: 0, duration: 50, useNativeDriver: true, isInteraction: false }),
     ]).start();
   }, [shakeAnim]);
 

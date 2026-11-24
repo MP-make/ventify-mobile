@@ -282,6 +282,7 @@ const CartContext = createContext<CartContextType>({
 });
 
 const CartBadgeContext = createContext<number>(0);
+const PausedSalesCountContext = createContext<number>(0);
 
 export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const { branchId, accountId, user } = useAuthSession();
@@ -1127,9 +1128,11 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   return (
     <CartBadgeContext.Provider value={badgeCount}>
-      <CartActionsContext.Provider value={actionsValue}>
-        <CartContext.Provider value={contextValue}>{children}</CartContext.Provider>
-      </CartActionsContext.Provider>
+      <PausedSalesCountContext.Provider value={pausedSales.length}>
+        <CartActionsContext.Provider value={actionsValue}>
+          <CartContext.Provider value={contextValue}>{children}</CartContext.Provider>
+        </CartActionsContext.Provider>
+      </PausedSalesCountContext.Provider>
     </CartBadgeContext.Provider>
   );
 };
@@ -1137,3 +1140,4 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
 export const useCart = () => useContext(CartContext);
 export const useCartActions = () => useContext(CartActionsContext);
 export const useCartBadgeCount = (): number => useContext(CartBadgeContext);
+export const usePausedSalesCount = (): number => useContext(PausedSalesCountContext);

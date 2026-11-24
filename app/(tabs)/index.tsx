@@ -7,12 +7,11 @@ import {
   StyleSheet,
   Alert,
   ActivityIndicator,
+  useWindowDimensions,
 } from 'react-native';
 import { FlashList } from '@shopify/flash-list';
 import {
   Search,
-  Plus,
-  ShoppingBag,
   X,
   Package,
   Barcode,
@@ -23,36 +22,64 @@ import { useIsFocused } from '@react-navigation/native';
 import * as Haptics from 'expo-haptics';
 
 import { useCartActions } from '@/context/CartContext';
-import { useProducts } from '@/context/ProductsContext';
+import { useProductsCatalog } from '@/context/ProductsContext';
 import { useAuthSession } from '@/context/AuthContext';
 import { useBusinessSettings } from '@/context/SettingsContext';
 import { formatPEN, ui } from '@/lib/theme';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { BarcodeScannerModal } from '@/components/BarcodeScannerModal';
-import { PresentationVariantModal } from '@/components/PresentationVariantModal';
-import { WeightQuantityModal } from '@/components/WeightQuantityModal';
-import { CheckoutModal } from '@/components/CheckoutModal';
-import { CompanionScannerModal } from '@/components/CompanionScannerModal';
-import { QuotesManagerModal } from '@/components/QuotesManagerModal';
+import type { PresentationVariantModal as PresentationVariantModalType } from '@/components/PresentationVariantModal';
+import type { WeightQuantityModal as WeightQuantityModalType } from '@/components/WeightQuantityModal';
+import type { CheckoutModal as CheckoutModalType } from '@/components/CheckoutModal';
 import { InlineFilterBar, type FilterGroup, type FilterOption } from '@/components/InlineFilterBar';
-import { ReservationReceiptModal } from '@/components/ReservationReceiptModal';
+import type { ReservationReceiptModal as ReservationReceiptModalType } from '@/components/ReservationReceiptModal';
 import { PosInlineScannerCard } from '@/components/pos/PosInlineScannerCard';
 import { PosPausedSalesBadge } from '@/components/pos/PosPausedSalesBadge';
 import { PosBottomCartBar } from '@/components/pos/PosBottomCartBar';
-import { PosCartDrawerModal } from '@/components/pos/PosCartDrawerModal';
-import { PosPromoGiftModal } from '@/components/pos/PosPromoGiftModal';
-import { PosPausedSalesModal } from '@/components/pos/PosPausedSalesModal';
-import { PosWeighablePickerModal } from '@/components/pos/PosWeighablePickerModal';
-import { PosReservationModal } from '@/components/pos/PosReservationModal';
-import { PosQuickConceptModal } from '@/components/pos/PosQuickConceptModal';
+import type { PosCartDrawerModal as PosCartDrawerModalType } from '@/components/pos/PosCartDrawerModal';
+import type { PosPromoGiftModal as PosPromoGiftModalType } from '@/components/pos/PosPromoGiftModal';
+import type { PosPausedSalesModal as PosPausedSalesModalType } from '@/components/pos/PosPausedSalesModal';
+import type { PosReservationModal as PosReservationModalType } from '@/components/pos/PosReservationModal';
 import type { QuickSaleBannerPayload } from '@/components/pos/useQuickSaleAction';
 import {
   filterCatalogIndex,
   getCatalogCategoryCounts,
 } from '@/lib/catalog-filters';
 import { useDebouncedValue } from '@/hooks/use-debounced-value';
+import { useFocusMemo } from '@/hooks/use-focus-memo';
 import { catalogSizeInput } from '@/lib/product-attributes';
 import type { Product, ProductPresentation, ProductVariant } from '@/types';
+
+let cachedCheckoutModal: typeof CheckoutModalType | null = null;
+const getCheckoutModal = () =>
+  (cachedCheckoutModal ??= (require('@/components/CheckoutModal') as typeof import('@/components/CheckoutModal')).CheckoutModal);
+
+let cachedPosReservationModal: typeof PosReservationModalType | null = null;
+const getPosReservationModal = () =>
+  (cachedPosReservationModal ??= (require('@/components/pos/PosReservationModal') as typeof import('@/components/pos/PosReservationModal')).PosReservationModal);
+
+let cachedPosCartDrawerModal: typeof PosCartDrawerModalType | null = null;
+const getPosCartDrawerModal = () =>
+  (cachedPosCartDrawerModal ??= (require('@/components/pos/PosCartDrawerModal') as typeof import('@/components/pos/PosCartDrawerModal')).PosCartDrawerModal);
+
+let cachedPosPromoGiftModal: typeof PosPromoGiftModalType | null = null;
+const getPosPromoGiftModal = () =>
+  (cachedPosPromoGiftModal ??= (require('@/components/pos/PosPromoGiftModal') as typeof import('@/components/pos/PosPromoGiftModal')).PosPromoGiftModal);
+
+let cachedPosPausedSalesModal: typeof PosPausedSalesModalType | null = null;
+const getPosPausedSalesModal = () =>
+  (cachedPosPausedSalesModal ??= (require('@/components/pos/PosPausedSalesModal') as typeof import('@/components/pos/PosPausedSalesModal')).PosPausedSalesModal);
+
+let cachedPresentationVariantModal: typeof PresentationVariantModalType | null = null;
+const getPresentationVariantModal = () =>
+  (cachedPresentationVariantModal ??= (require('@/components/PresentationVariantModal') as typeof import('@/components/PresentationVariantModal')).PresentationVariantModal);
+
+let cachedWeightQuantityModal: typeof WeightQuantityModalType | null = null;
+const getWeightQuantityModal = () =>
+  (cachedWeightQuantityModal ??= (require('@/components/WeightQuantityModal') as typeof import('@/components/WeightQuantityModal')).WeightQuantityModal);
+
+let cachedReservationReceiptModal: typeof ReservationReceiptModalType | null = null;
+const getReservationReceiptModal = () =>
+  (cachedReservationReceiptModal ??= (require('@/components/ReservationReceiptModal') as typeof import('@/components/ReservationReceiptModal')).ReservationReceiptModal);
 
 const EMPTY_PRODUCTS: Product[] = [];
 const EMPTY_OPTIONS: string[] = ['Todas'];
@@ -82,10 +109,22 @@ const PosProductCard = React.memo<PosProductCardProps>(
     const formattedPrice = formatPEN(price);
     const brandLabel = showAttributes ? (item.brand || '').trim() : '';
     const sizeLabel = showAttributes ? catalogSizeInput(item).trim() : '';
+    const attrText =
+      brandLabel && sizeLabel
+        ? `Marca: ${brandLabel} · Medida: ${sizeLabel}`
+        : brandLabel
+        ? `Marca: ${brandLabel}`
+        : sizeLabel
+        ? `Medida: ${sizeLabel}`
+        : '';
 
     return (
       <TouchableOpacity
-        style={[styles.productCard, isOutOfStock && styles.productCardDisabled]}
+        style={[
+          styles.productCard,
+          attrText ? styles.productCardAttr : styles.productCardPlain,
+          isOutOfStock && styles.productCardDisabled,
+        ]}
         onPress={handlePress}
         disabled={isOutOfStock}
         accessibilityRole="button"
@@ -119,11 +158,9 @@ const PosProductCard = React.memo<PosProductCardProps>(
               </Text>
             </View>
           </View>
-          {brandLabel || sizeLabel ? (
+          {attrText ? (
             <Text style={styles.productAttrText} numberOfLines={1}>
-              {[brandLabel ? `Marca: ${brandLabel}` : '', sizeLabel ? `Medida: ${sizeLabel}` : '']
-                .filter(Boolean)
-                .join(' · ')}
+              {attrText}
             </Text>
           ) : null}
         </View>
@@ -131,7 +168,7 @@ const PosProductCard = React.memo<PosProductCardProps>(
         <View style={styles.productPriceCol}>
           <Text style={styles.productPrice}>{formattedPrice}</Text>
           <View style={[styles.addPlusBtn, isOutOfStock && styles.addPlusBtnDisabled]}>
-            <Plus size={16} color={isOutOfStock ? ui.textMuted : ui.onPrimary} />
+            <Text style={[styles.addPlusGlyph, isOutOfStock && styles.addPlusGlyphDisabled]}>+</Text>
           </View>
         </View>
       </TouchableOpacity>
@@ -142,6 +179,7 @@ const PosProductCard = React.memo<PosProductCardProps>(
 export default function PosCounterScreen() {
   const insets = useSafeAreaInsets();
   const isFocused = useIsFocused();
+  const { width: windowWidth, height: windowHeight } = useWindowDimensions();
   const { branchId, accountId, user } = useAuthSession();
   const scanScope = `${user?.uid}:${accountId}:${branchId}`;
   const scanScopeRef = useRef(scanScope);
@@ -167,7 +205,7 @@ export default function PosCounterScreen() {
     findByBarcode,
     findByBarcodeRemote,
     getProductStock,
-  } = useProducts();
+  } = useProductsCatalog();
   const { addItem } = useCartActions();
 
   // 1. Buscador, Categorías y Filtros de Catálogo
@@ -179,7 +217,6 @@ export default function PosCounterScreen() {
   const isCameraActiveRef = useRef(false);
   isCameraActiveRef.current = isCameraActive;
   const [torchOn, setTorchOn] = useState(false);
-  const [fullscreenScannerOpen, setFullscreenScannerOpen] = useState(false);
   const lastScannedCodeRef = useRef<string>('');
   const scanCooldownRef = useRef<boolean>(false);
   const scanCooldownTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -206,11 +243,7 @@ export default function PosCounterScreen() {
   const [checkoutModalOpen, setCheckoutModalOpen] = useState(false);
   const [variantModalProduct, setVariantModalProduct] = useState<Product | null>(null);
   const [weightModalProduct, setWeightModalProduct] = useState<Product | null>(null);
-  const [weightSelectorOpen, setWeightSelectorOpen] = useState(false);
-  const [companionScannerOpen, setCompanionScannerOpen] = useState(false);
-  const [quotesModalOpen, setQuotesModalOpen] = useState(false);
   const [promoModalOpen, setPromoModalOpen] = useState(false);
-  const [quickSaleModalOpen, setQuickSaleModalOpen] = useState(false);
   const [pausedModalOpen, setPausedModalOpen] = useState(false);
   const [cartDrawerOpen, setCartDrawerOpen] = useState(false);
 
@@ -399,57 +432,43 @@ export default function PosCounterScreen() {
   const debouncedSearchQuery = useDebouncedValue(searchQuery, 150);
 
   // Focus-gated memos: freeze cached snapshots while the POS tab is blurred
-  const availableBrandsCacheRef = useRef<string[] | null>(null);
-  const availableBrands = useMemo(() => {
-    if (!isFocused && availableBrandsCacheRef.current !== null) {
-      return availableBrandsCacheRef.current;
-    }
-    if (!isFocused) return EMPTY_OPTIONS;
-    const next = ['Todas', ...catalogIndex.brands];
-    availableBrandsCacheRef.current = next;
-    return next;
-  }, [isFocused, catalogIndex]);
+  const availableBrands = useFocusMemo(
+    () => ['Todas', ...catalogIndex.brands],
+    [catalogIndex.brands],
+    isFocused,
+    EMPTY_OPTIONS
+  );
 
-  const availableSizesCacheRef = useRef<string[] | null>(null);
-  const availableSizes = useMemo(() => {
-    if (!isFocused && availableSizesCacheRef.current !== null) {
-      return availableSizesCacheRef.current;
-    }
-    if (!isFocused) return EMPTY_OPTIONS;
-    const next = ['Todas', ...catalogIndex.sizes];
-    availableSizesCacheRef.current = next;
-    return next;
-  }, [isFocused, catalogIndex]);
+  const availableSizes = useFocusMemo(
+    () => ['Todas', ...catalogIndex.sizes],
+    [catalogIndex.sizes],
+    isFocused,
+    EMPTY_OPTIONS
+  );
 
-  const filteredProductsCacheRef = useRef<Product[] | null>(null);
-  const filteredProducts = useMemo(() => {
-    if (!isFocused && filteredProductsCacheRef.current !== null) {
-      return filteredProductsCacheRef.current;
-    }
-    if (!isFocused) return EMPTY_PRODUCTS;
-    const next = filterCatalogIndex(catalogIndex, {
-      query: debouncedSearchQuery,
-      category: selectedCategory,
-      brand: selectedBrand,
-      size: selectedSize,
-    });
-    filteredProductsCacheRef.current = next;
-    return next;
-  }, [isFocused, catalogIndex, debouncedSearchQuery, selectedCategory, selectedBrand, selectedSize]);
+  const filteredProducts = useFocusMemo(
+    () =>
+      filterCatalogIndex(catalogIndex, {
+        query: debouncedSearchQuery,
+        category: selectedCategory,
+        brand: selectedBrand,
+        size: selectedSize,
+      }),
+    [catalogIndex, debouncedSearchQuery, selectedCategory, selectedBrand, selectedSize],
+    isFocused,
+    EMPTY_PRODUCTS
+  );
 
-  const categoryCountsCacheRef = useRef<FilterOption[] | null>(null);
-  const categoryListWithCounts = useMemo(() => {
-    if (!isFocused && categoryCountsCacheRef.current !== null) {
-      return categoryCountsCacheRef.current;
-    }
-    if (!isFocused) return EMPTY_CATEGORY_OPTIONS;
-    const next = getCatalogCategoryCounts(categories, catalogIndex).map((option) => ({
-      ...option,
-      count: catalogComplete ? option.count : undefined,
-    }));
-    categoryCountsCacheRef.current = next;
-    return next;
-  }, [isFocused, categories, catalogIndex, catalogComplete]);
+  const categoryListWithCounts = useFocusMemo(
+    () =>
+      getCatalogCategoryCounts(categories, catalogIndex).map((option) => ({
+        ...option,
+        count: catalogComplete ? option.count : undefined,
+      })),
+    [categories, catalogIndex.categoryCountsVersion, catalogComplete],
+    isFocused,
+    EMPTY_CATEGORY_OPTIONS
+  );
 
   const brandOptions = useMemo(() => availableBrands.map((b) => ({ name: b })), [availableBrands]);
   const sizeOptions = useMemo(() => availableSizes.map((s) => ({ name: s })), [availableSizes]);
@@ -549,10 +568,27 @@ export default function PosCounterScreen() {
   const keyExtractor = useCallback((item: Product) => item.id, []);
   const getItemType = useCallback(
     (item: Product) =>
-      enableCatalogFilters && (item.brand || Boolean(item.sizes?.length || item.sizeLabel))
+      enableCatalogFilters &&
+      Boolean((item.brand || '').trim() || catalogSizeInput(item).trim())
         ? 'product_attr'
         : 'product',
     [enableCatalogFilters]
+  );
+  const overridePosItemLayout = useCallback(
+    (layout: { span?: number; size?: number }, item: Product) => {
+      const hasAttr =
+        enableCatalogFilters &&
+        Boolean((item.brand || '').trim() || catalogSizeInput(item).trim());
+      layout.size = hasAttr ? 108 : 88;
+    },
+    [enableCatalogFilters]
+  );
+  const estimatedListSize = useMemo(
+    () => ({
+      width: Math.max(windowWidth, 320),
+      height: Math.max(windowHeight - 240, 320),
+    }),
+    [windowWidth, windowHeight]
   );
   const renderPosItem = useCallback(
     ({ item }: { item: Product }) => (
@@ -564,6 +600,22 @@ export default function PosCounterScreen() {
       />
     ),
     [getProductStock, enableCatalogFilters, handleProductSelect]
+  );
+  const posEmptyComponent = useMemo(
+    () => (
+      <View style={styles.emptyBox}>
+        <Package size={44} color={ui.textMuted} />
+        <Text style={styles.emptyTitle}>
+          {products.length === 0 ? 'Aún no hay productos' : 'No se encontraron productos'}
+        </Text>
+        <Text style={styles.emptySubtitle}>
+          {products.length === 0
+            ? 'Cuando agregues productos, aparecerán aquí para iniciar una venta.'
+            : 'Prueba otra búsqueda o selecciona una categoría distinta.'}
+        </Text>
+      </View>
+    ),
+    [products.length]
   );
 
   // Callbacks estables para modales y barra inferior
@@ -585,20 +637,6 @@ export default function PosCounterScreen() {
     setResTicketModalOpen(false);
     setCreatedResTicket(null);
   }, []);
-  const handleCloseQuickSaleModal = useCallback(() => setQuickSaleModalOpen(false), []);
-  const handleCloseWeightSelector = useCallback(() => setWeightSelectorOpen(false), []);
-  const handleSelectWeighableProduct = useCallback((product: Product) => {
-    setWeightSelectorOpen(false);
-    setWeightModalProduct(product);
-  }, []);
-  const handleCloseFullscreenScanner = useCallback(() => setFullscreenScannerOpen(false), []);
-  const handleFullscreenScan = useCallback(
-    (code: string) => {
-      setFullscreenScannerOpen(false);
-      void handleBarcodeDetected(code);
-    },
-    [handleBarcodeDetected]
-  );
   const handleCloseVariantModal = useCallback(() => setVariantModalProduct(null), []);
   const handleConfirmVariantModal = useCallback(
     (
@@ -613,7 +651,7 @@ export default function PosCounterScreen() {
         quantity: opts.quantity,
       });
     },
-    [addItem, getProductStock]
+    [addItem]
   );
   const handleCloseWeightModal = useCallback(() => setWeightModalProduct(null), []);
   const handleConfirmWeightModal = useCallback(
@@ -626,10 +664,8 @@ export default function PosCounterScreen() {
         isWeightBased: true,
       });
     },
-    [addItem, getProductStock]
+    [addItem]
   );
-  const handleCloseCompanionScanner = useCallback(() => setCompanionScannerOpen(false), []);
-  const handleCloseQuotesModal = useCallback(() => setQuotesModalOpen(false), []);
 
   return (
     <View style={styles.container}>
@@ -724,26 +760,19 @@ export default function PosCounterScreen() {
             <ActivityIndicator size="large" color={ui.primary} />
             <Text style={styles.loadingText}>Cargando catálogo POS...</Text>
           </View>
-        ) : filteredProducts.length === 0 ? (
-          <View style={styles.emptyBox}>
-            <Package size={44} color={ui.textMuted} />
-            <Text style={styles.emptyTitle}>
-              {products.length === 0 ? 'Aún no hay productos' : 'No se encontraron productos'}
-            </Text>
-            <Text style={styles.emptySubtitle}>
-              {products.length === 0
-                ? 'Cuando agregues productos, aparecerán aquí para iniciar una venta.'
-                : 'Prueba otra búsqueda o selecciona una categoría distinta.'}
-            </Text>
-          </View>
         ) : (
           <FlashList
             data={filteredProducts}
-            estimatedItemSize={enableCatalogFilters ? 94 : 82}
+            estimatedItemSize={enableCatalogFilters ? 108 : 88}
+            overrideItemLayout={overridePosItemLayout}
+            estimatedListSize={estimatedListSize}
+            drawDistance={250}
+            extraData={branchId}
             keyExtractor={keyExtractor}
             getItemType={getItemType}
             contentContainerStyle={styles.listContent}
             renderItem={renderPosItem}
+            ListEmptyComponent={filteredProducts.length === 0 ? posEmptyComponent : undefined}
           />
         )}
       </View>
@@ -769,111 +798,106 @@ export default function PosCounterScreen() {
         onShowQuickSaleBanner={handleShowQuickSaleBanner}
       />
 
-      {/* 5. MODALES AISLADOS */}
-      {cartDrawerOpen && (
-        <PosCartDrawerModal
-          visible={cartDrawerOpen}
-          onClose={handleCloseCartDrawer}
-          onOpenPromos={handleOpenPromos}
-          onOpenReservation={handleOpenReservation}
-          onOpenCheckout={handleOpenCheckout}
-          onShowQuickSaleBanner={handleShowQuickSaleBanner}
-        />
-      )}
+      {/* 5. MODALES AISLADOS (lazy-required bajo demanda) */}
+      {cartDrawerOpen &&
+        (() => {
+          const PosCartDrawerModal = getPosCartDrawerModal();
+          return (
+            <PosCartDrawerModal
+              visible={cartDrawerOpen}
+              onClose={handleCloseCartDrawer}
+              onOpenPromos={handleOpenPromos}
+              onOpenReservation={handleOpenReservation}
+              onOpenCheckout={handleOpenCheckout}
+              onShowQuickSaleBanner={handleShowQuickSaleBanner}
+            />
+          );
+        })()}
 
-      {quickSaleModalOpen && (
-        <PosQuickConceptModal
-          visible={quickSaleModalOpen}
-          onClose={handleCloseQuickSaleModal}
-        />
-      )}
+      {reservationModalOpen &&
+        (() => {
+          const PosReservationModal = getPosReservationModal();
+          return (
+            <PosReservationModal
+              visible={reservationModalOpen}
+              onClose={handleCloseReservation}
+              onCreated={handleReservationCreated}
+            />
+          );
+        })()}
 
-      {reservationModalOpen && (
-        <PosReservationModal
-          visible={reservationModalOpen}
-          onClose={handleCloseReservation}
-          onCreated={handleReservationCreated}
-        />
-      )}
+      {pausedModalOpen &&
+        (() => {
+          const PosPausedSalesModal = getPosPausedSalesModal();
+          return (
+            <PosPausedSalesModal
+              visible={pausedModalOpen}
+              onClose={handleClosePausedModal}
+            />
+          );
+        })()}
 
-      {pausedModalOpen && (
-        <PosPausedSalesModal
-          visible={pausedModalOpen}
-          onClose={handleClosePausedModal}
-        />
-      )}
+      {variantModalProduct !== null &&
+        (() => {
+          const PresentationVariantModal = getPresentationVariantModal();
+          return (
+            <PresentationVariantModal
+              visible={Boolean(variantModalProduct)}
+              product={variantModalProduct}
+              onClose={handleCloseVariantModal}
+              onConfirm={handleConfirmVariantModal}
+            />
+          );
+        })()}
 
-      {weightSelectorOpen && (
-        <PosWeighablePickerModal
-          visible={weightSelectorOpen}
-          onClose={handleCloseWeightSelector}
-          onSelectProduct={handleSelectWeighableProduct}
-        />
-      )}
+      {weightModalProduct !== null &&
+        (() => {
+          const WeightQuantityModal = getWeightQuantityModal();
+          return (
+            <WeightQuantityModal
+              visible={Boolean(weightModalProduct)}
+              product={weightModalProduct}
+              onClose={handleCloseWeightModal}
+              onConfirm={handleConfirmWeightModal}
+            />
+          );
+        })()}
 
-      {fullscreenScannerOpen && (
-        <BarcodeScannerModal
-          visible={fullscreenScannerOpen}
-          onClose={handleCloseFullscreenScanner}
-          onScan={handleFullscreenScan}
-        />
-      )}
+      {promoModalOpen &&
+        (() => {
+          const PosPromoGiftModal = getPosPromoGiftModal();
+          return (
+            <PosPromoGiftModal
+              visible={promoModalOpen}
+              onClose={handleClosePromos}
+            />
+          );
+        })()}
 
-      {variantModalProduct !== null && (
-        <PresentationVariantModal
-          visible={Boolean(variantModalProduct)}
-          product={variantModalProduct}
-          onClose={handleCloseVariantModal}
-          onConfirm={handleConfirmVariantModal}
-        />
-      )}
+      {checkoutModalOpen &&
+        (() => {
+          const CheckoutModal = getCheckoutModal();
+          return (
+            <CheckoutModal
+              visible={checkoutModalOpen}
+              onClose={handleCloseCheckout}
+              branch={activeBranch}
+            />
+          );
+        })()}
 
-      {weightModalProduct !== null && (
-        <WeightQuantityModal
-          visible={Boolean(weightModalProduct)}
-          product={weightModalProduct}
-          onClose={handleCloseWeightModal}
-          onConfirm={handleConfirmWeightModal}
-        />
-      )}
-
-      {promoModalOpen && (
-        <PosPromoGiftModal
-          visible={promoModalOpen}
-          onClose={handleClosePromos}
-        />
-      )}
-
-      {checkoutModalOpen && (
-        <CheckoutModal
-          visible={checkoutModalOpen}
-          onClose={handleCloseCheckout}
-          branch={activeBranch}
-        />
-      )}
-
-      {companionScannerOpen && (
-        <CompanionScannerModal
-          visible={companionScannerOpen}
-          onClose={handleCloseCompanionScanner}
-        />
-      )}
-
-      {quotesModalOpen && (
-        <QuotesManagerModal
-          visible={quotesModalOpen}
-          onClose={handleCloseQuotesModal}
-        />
-      )}
-
-      {resTicketModalOpen && (
-        <ReservationReceiptModal
-          visible={resTicketModalOpen}
-          onClose={handleCloseResTicket}
-          reservation={createdResTicket}
-          business={businessSettings}
-        />
-      )}
+      {resTicketModalOpen &&
+        (() => {
+          const ReservationReceiptModal = getReservationReceiptModal();
+          return (
+            <ReservationReceiptModal
+              visible={resTicketModalOpen}
+              onClose={handleCloseResTicket}
+              reservation={createdResTicket}
+              business={businessSettings}
+            />
+          );
+        })()}
     </View>
   );
 }
@@ -1025,10 +1049,16 @@ const styles = StyleSheet.create({
     backgroundColor: ui.surface,
     borderRadius: 14,
     paddingHorizontal: 16,
-    paddingVertical: 15,
+    paddingVertical: 10,
     marginBottom: 10,
     borderWidth: 1,
     borderColor: ui.border,
+  },
+  productCardPlain: {
+    height: 78,
+  },
+  productCardAttr: {
+    height: 98,
   },
   productInfo: {
     flex: 1,
@@ -1101,6 +1131,16 @@ const styles = StyleSheet.create({
   },
   addPlusBtnDisabled: {
     backgroundColor: ui.border,
+  },
+  addPlusGlyph: {
+    fontSize: 18,
+    lineHeight: 20,
+    fontWeight: '700',
+    color: ui.onPrimary,
+    textAlign: 'center',
+  },
+  addPlusGlyphDisabled: {
+    color: ui.textMuted,
   },
   productCardDisabled: {
     opacity: 0.72,

@@ -228,12 +228,14 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
           duration: 1500,
           easing: Easing.inOut(Easing.quad),
           useNativeDriver: true,
+          isInteraction: false,
         }),
         Animated.timing(laserProgress, {
           toValue: 0,
           duration: 1500,
           easing: Easing.inOut(Easing.quad),
           useNativeDriver: true,
+          isInteraction: false,
         }),
       ])
     );
@@ -270,12 +272,14 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
           duration: 800,
           easing: Easing.out(Easing.ease),
           useNativeDriver: true,
+          isInteraction: false,
         }),
         Animated.timing(pulseScale, {
           toValue: 1,
           duration: 800,
           easing: Easing.inOut(Easing.ease),
           useNativeDriver: true,
+          isInteraction: false,
         }),
       ])
     );
@@ -343,12 +347,14 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
         toValue: 1,
         duration: 200,
         useNativeDriver: true,
+        isInteraction: false,
       }),
       Animated.timing(bannerTranslateAnim, {
         toValue: 0,
         duration: 200,
         easing: Easing.out(Easing.back(1.5)),
         useNativeDriver: true,
+        isInteraction: false,
       }),
     ]).start();
 
@@ -360,6 +366,7 @@ export const CompanionScannerModal: React.FC<CompanionScannerModalProps> = React
         toValue: 0,
         duration: 300,
         useNativeDriver: true,
+        isInteraction: false,
       }).start(() => {
         setLastDetectedBanner(null);
       });

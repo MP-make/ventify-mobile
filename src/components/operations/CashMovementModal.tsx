@@ -209,43 +209,44 @@ export const CashMovementModal = React.memo<CashMovementModalProps>(({
 
     const effectiveLimit = activeCashSession?.cashierExpenseLimit ?? accountExpenseLimit;
     const effectiveRole = isCashier ? 'cashier' : role || undefined;
-    const online = await checkIsOnlineLive(isOnline);
-
-    if (
-      isExpense &&
-      cashierNeedsPinAuthorization(effectiveRole, -amt, { cashierExpenseLimit: effectiveLimit })
-    ) {
-      if (!online) {
-        Alert.alert(
-          'Sin Conexión',
-          'Los egresos que requieren PIN de autorización solo pueden registrarse con internet.'
-        );
-        return;
-      }
-      setPendingPinExpense({
-        sessionId: sessId,
-        amount: amt,
-        reason: movementReason.trim(),
-        expenseCategoryId: movementCategory as ExpenseCategoryId,
-        ...(isAdvance ? { employeeId: movementEmployeeId } : {}),
-        receiptType: movementReceiptType,
-        ...(movementReceiptType !== 'ninguno' && movementReceiptNumber.trim()
-          ? { receiptNumber: movementReceiptNumber.trim() }
-          : {}),
-      });
-      setPinInput('');
-      setPinError('');
-      setPinModalVisible(true);
-      return;
-    }
-
-    if (isAdvance && !online) {
-      Alert.alert('Sin Conexión', 'Los adelantos a trabajadores requieren conexión a internet.');
-      return;
-    }
 
     setIsSavingMovement(true);
     try {
+      const online = await checkIsOnlineLive(isOnline);
+
+      if (
+        isExpense &&
+        cashierNeedsPinAuthorization(effectiveRole, -amt, { cashierExpenseLimit: effectiveLimit })
+      ) {
+        if (!online) {
+          Alert.alert(
+            'Sin Conexión',
+            'Los egresos que requieren PIN de autorización solo pueden registrarse con internet.'
+          );
+          return;
+        }
+        setPendingPinExpense({
+          sessionId: sessId,
+          amount: amt,
+          reason: movementReason.trim(),
+          expenseCategoryId: movementCategory as ExpenseCategoryId,
+          ...(isAdvance ? { employeeId: movementEmployeeId } : {}),
+          receiptType: movementReceiptType,
+          ...(movementReceiptType !== 'ninguno' && movementReceiptNumber.trim()
+            ? { receiptNumber: movementReceiptNumber.trim() }
+            : {}),
+        });
+        setPinInput('');
+        setPinError('');
+        setPinModalVisible(true);
+        return;
+      }
+
+      if (isAdvance && !online) {
+        Alert.alert('Sin Conexión', 'Los adelantos a trabajadores requieren conexión a internet.');
+        return;
+      }
+
       if (!online) {
         await enqueueOfflineCashMovement({
           accountId,

@@ -15,7 +15,6 @@ import { useCartBadgeCount } from '@/context/CartContext';
 import { ui } from '@/lib/theme';
 
 const TabHeader = React.memo(() => <Header />);
-const renderHeader = () => <TabHeader />;
 
 type TabIconProps = { color: string; size: number; focused: boolean };
 
@@ -91,7 +90,7 @@ function AuthenticatedTabLayout() {
 
   const screenOptions = useMemo(
     () => ({
-      header: renderHeader,
+      headerShown: false,
       lazy: true,
       tabBarPosition: (expanded ? 'left' : 'bottom') as 'left' | 'bottom',
       tabBarLabelPosition: (expanded ? 'beside-icon' : 'below-icon') as 'beside-icon' | 'below-icon',
@@ -119,22 +118,25 @@ function AuthenticatedTabLayout() {
   );
 
   return (
-    <Tabs screenOptions={screenOptions}>
-      {/* 1. POS (Punto de Venta) */}
-      <Tabs.Screen name="index" options={posOptions} />
+    <View style={styles.tabsRoot}>
+      <TabHeader />
+      <Tabs screenOptions={screenOptions}>
+        {/* 1. POS (Punto de Venta) */}
+        <Tabs.Screen name="index" options={posOptions} />
 
-      {/* 2. Catálogo / Inventario / Kardex */}
-      <Tabs.Screen name="catalog" options={CATALOG_OPTIONS} />
+        {/* 2. Catálogo / Inventario / Kardex */}
+        <Tabs.Screen name="catalog" options={CATALOG_OPTIONS} />
 
-      {/* 3. Operaciones (Caja Z, CRM Fiados, Reservas) */}
-      <Tabs.Screen name="operations" options={OPERATIONS_OPTIONS} />
+        {/* 3. Operaciones (Caja Z, CRM Fiados, Reservas) */}
+        <Tabs.Screen name="operations" options={OPERATIONS_OPTIONS} />
 
-      {/* 4. Historial, Facturación SUNAT y Venty IA */}
-      <Tabs.Screen name="history" options={HISTORY_OPTIONS} />
+        {/* 4. Historial, Facturación SUNAT y Venty IA */}
+        <Tabs.Screen name="history" options={HISTORY_OPTIONS} />
 
-      {/* 5. Ajustes de Terminal y Hardware */}
-      <Tabs.Screen name="settings" options={SETTINGS_OPTIONS} />
-    </Tabs>
+        {/* 5. Ajustes de Terminal y Hardware */}
+        <Tabs.Screen name="settings" options={SETTINGS_OPTIONS} />
+      </Tabs>
+    </View>
   );
 }
 
@@ -147,6 +149,9 @@ export default function TabLayout() {
 }
 
 const styles = StyleSheet.create({
+  tabsRoot: {
+    flex: 1,
+  },
   bootPlaceholder: {
     flex: 1,
     backgroundColor: ui.background,

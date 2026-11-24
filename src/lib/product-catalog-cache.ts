@@ -37,8 +37,8 @@ export interface CatalogCacheLoadResult {
 }
 
 export const PRODUCT_CATALOG_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-export const PRODUCT_CATALOG_CACHE_CHUNK_SIZE = 150;
-const CACHE_YIELD_BUDGET_MS = 6;
+export const PRODUCT_CATALOG_CACHE_CHUNK_SIZE = 60;
+const CACHE_YIELD_BUDGET_MS = 3.5;
 const writesByScope = new Map<string, Promise<void>>();
 const latestWriteIdByScope = new Map<string, number>();
 const deltaWritesByKey = new Map<string, Promise<unknown>>();
@@ -265,6 +265,7 @@ export async function writeProductCatalogDelta(
 }
 
 const defaultYield = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+const defaultWriteYield = () => new Promise<void>((resolve) => setTimeout(resolve, 16));
 
 /** Reads bounded JSON chunks and overlays any pending delta while honoring a 6ms yield budget. */
 export async function loadProductCatalogCache(
@@ -454,7 +455,7 @@ async function writeProductCatalogCacheNow(
   const generation = options.generation;
   const chunkSize = Math.max(1, options.chunkSize ?? PRODUCT_CATALOG_CACHE_CHUNK_SIZE);
   const chunks = Math.ceil(products.length / chunkSize);
-  const yieldControl = options.yieldControl ?? defaultYield;
+  const yieldControl = options.yieldControl ?? defaultWriteYield;
   const previousManifest = parseManifest(await readStorageItem(storage, manifestKey(key)));
   let writtenChunks = 0;
   let sliceStart = performance.now();

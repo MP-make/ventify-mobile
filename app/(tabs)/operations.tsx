@@ -34,6 +34,7 @@ import {
   useCashSession,
   useOfflineStatus,
 } from '@/context/SettingsContext';
+import { useFocusMemo } from '@/hooks/use-focus-memo';
 import { usePermissions } from '@/hooks/usePermissions';
 import { db } from '@/lib/firebase';
 import {
@@ -93,6 +94,48 @@ import type {
 
 const VENTY_ICON = require('../../assets/venty-icon.webp');
 const BRANCH_SESSIONS_TTL_MS = 45_000;
+const CASH_LISTENER_BLUR_GRACE_MS = 30_000;
+const EMPTY_SESSION_SALES: any[] = [];
+const EMPTY_OFFLINE_CASH_DELTA: OfflineCashBreakdownDelta = {
+  cash: 0,
+  yape: 0,
+  plin: 0,
+  card: 0,
+  transfer: 0,
+  credit: 0,
+  totalDigital: 0,
+  totalAll: 0,
+  count: 0,
+  counts: {
+    cash: 0,
+    yape: 0,
+    plin: 0,
+    card: 0,
+    transfer: 0,
+    credit: 0,
+    total: 0,
+  },
+};
+const EMPTY_SALES_BREAKDOWN: SalesBreakdown = {
+  cash: 0,
+  yape: 0,
+  plin: 0,
+  card: 0,
+  transfer: 0,
+  credit: 0,
+  totalDigital: 0,
+  totalAll: 0,
+  usingSessionFallback: false,
+  counts: {
+    cash: 0,
+    yape: 0,
+    plin: 0,
+    card: 0,
+    transfer: 0,
+    credit: 0,
+    total: 0,
+  },
+};
 
 export default function OperationsScreen() {
   const insets = useSafeAreaInsets();
@@ -288,57 +331,46 @@ export default function OperationsScreen() {
   );
 
   // ============================================================================
-  // EFECTO: MOVIMIENTOS DE CAJA EN VIVO (STALE-WHILE-REVALIDATE EN FOCO)
+  // EFECTO: MOVIMIENTOS Y VENTAS DEL TURNO EN VIVO (GRACE PERIOD 30S EN BLUR)
   // ============================================================================
   const currentSessionId =
     activeCashSession?.sessionId || activeCashSession?.id || null;
 
-  useEffect(() => {
-    if (!currentSessionId || !accountId || !isCashOpen) {
+  const movementsUnsubRef = useRef<(() => void) | null>(null);
+  const salesUnsubRef = useRef<(() => void) | null>(null);
+  const cashListenersScopeRef = useRef<string | null>(null);
+  const cashListenersBlurTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cashListenersTaskRef = useRef<{ cancel?: () => void } | null>(null);
+
+  const cleanupCashListeners = useCallback((resetData: boolean) => {
+    if (cashListenersBlurTimerRef.current) {
+      clearTimeout(cashListenersBlurTimerRef.current);
+      cashListenersBlurTimerRef.current = null;
+    }
+    if (cashListenersTaskRef.current) {
+      cashListenersTaskRef.current.cancel?.();
+      cashListenersTaskRef.current = null;
+    }
+    if (typeof movementsUnsubRef.current === 'function') {
+      movementsUnsubRef.current();
+      movementsUnsubRef.current = null;
+    }
+    if (typeof salesUnsubRef.current === 'function') {
+      salesUnsubRef.current();
+      salesUnsubRef.current = null;
+    }
+    cashListenersScopeRef.current = null;
+
+    if (resetData) {
       loadedMovementsSessionRef.current = null;
       setMovements([]);
       setLoadingMovements(false);
-      return;
+      loadedSalesSessionRef.current = null;
+      setSessionSales([]);
+      setLoadingSessionSales(false);
     }
-    if (!isFocused || activeTab !== 'cash') return;
+  }, []);
 
-    const isDifferentSession =
-      loadedMovementsSessionRef.current !== currentSessionId;
-    if (isDifferentSession) {
-      setMovements([]);
-      setLoadingMovements(isOnline);
-    }
-
-    let cancelled = false;
-    let unsubscribeFn: (() => void) | undefined;
-
-    const task = InteractionManager.runAfterInteractions(() => {
-      if (cancelled) return;
-      unsubscribeFn = subscribeToSessionMovements(
-        currentSessionId,
-        accountId,
-        (movs) => {
-          if (!cancelled) {
-            loadedMovementsSessionRef.current = currentSessionId;
-            setMovements(movs);
-            setLoadingMovements(false);
-          }
-        }
-      );
-    });
-
-    return () => {
-      cancelled = true;
-      task.cancel();
-      if (typeof unsubscribeFn === 'function') {
-        unsubscribeFn();
-      }
-    };
-  }, [currentSessionId, accountId, isCashOpen, isFocused, activeTab, isOnline]);
-
-  // ============================================================================
-  // EFECTO: VENTAS DEL TURNO EN VIVO (STALE-WHILE-REVALIDATE EN FOCO)
-  // ============================================================================
   useEffect(() => {
     if (!isOnline) {
       setLoadingSessionSales(false);
@@ -348,25 +380,70 @@ export default function OperationsScreen() {
 
   useEffect(() => {
     if (!currentSessionId || !accountId || !isCashOpen) {
-      loadedSalesSessionRef.current = null;
-      setSessionSales([]);
-      setLoadingSessionSales(false);
+      cleanupCashListeners(true);
       return;
     }
-    if (!isFocused || activeTab !== 'cash') return;
 
-    const isDifferentSession =
-      loadedSalesSessionRef.current !== currentSessionId;
-    if (isDifferentSession) {
-      setSessionSales([]);
-      setLoadingSessionSales(isOnline);
+    if (activeTab !== 'cash') {
+      cleanupCashListeners(false);
+      return;
     }
 
-    let cancelled = false;
-    let unsubscribeFn: (() => void) | undefined;
+    const listenerScope = `${accountId}:${branchId || ''}:${currentSessionId}`;
+    if (cashListenersScopeRef.current && cashListenersScopeRef.current !== listenerScope) {
+      cleanupCashListeners(false);
+    }
 
-    const task = InteractionManager.runAfterInteractions(() => {
-      if (cancelled) return;
+    if (!isFocused) {
+      if (
+        !cashListenersBlurTimerRef.current &&
+        (movementsUnsubRef.current || salesUnsubRef.current || cashListenersTaskRef.current)
+      ) {
+        cashListenersBlurTimerRef.current = setTimeout(() => {
+          cashListenersBlurTimerRef.current = null;
+          cleanupCashListeners(false);
+        }, CASH_LISTENER_BLUR_GRACE_MS);
+      }
+      return;
+    }
+
+    if (cashListenersBlurTimerRef.current) {
+      clearTimeout(cashListenersBlurTimerRef.current);
+      cashListenersBlurTimerRef.current = null;
+    }
+
+    if (
+      cashListenersScopeRef.current === listenerScope &&
+      (movementsUnsubRef.current || salesUnsubRef.current || cashListenersTaskRef.current)
+    ) {
+      return;
+    }
+
+    if (loadedMovementsSessionRef.current !== currentSessionId) {
+      setMovements([]);
+      setLoadingMovements(isOnlineRef.current);
+    }
+    if (loadedSalesSessionRef.current !== currentSessionId) {
+      setSessionSales([]);
+      setLoadingSessionSales(isOnlineRef.current);
+    }
+
+    cashListenersScopeRef.current = listenerScope;
+    cashListenersTaskRef.current = InteractionManager.runAfterInteractions(() => {
+      if (cashListenersScopeRef.current !== listenerScope) return;
+      cashListenersTaskRef.current = null;
+
+      movementsUnsubRef.current = subscribeToSessionMovements(
+        currentSessionId,
+        accountId,
+        (movs) => {
+          if (cashListenersScopeRef.current !== listenerScope) return;
+          loadedMovementsSessionRef.current = currentSessionId;
+          setMovements(movs);
+          setLoadingMovements(false);
+        }
+      );
+
       const q = query(
         collection(db, 'sales'),
         where('accountId', '==', accountId),
@@ -374,10 +451,10 @@ export default function OperationsScreen() {
         limit(150)
       );
 
-      unsubscribeFn = onSnapshot(
+      salesUnsubRef.current = onSnapshot(
         q,
         (snapshot) => {
-          if (cancelled) return;
+          if (cashListenersScopeRef.current !== listenerScope) return;
           const salesList = snapshot.docs.map((d) => ({ id: d.id, ...d.data() }));
           salesList.sort((a: any, b: any) => {
             const tA = a.createdAt?.toMillis?.() || a.date || 0;
@@ -389,22 +466,27 @@ export default function OperationsScreen() {
           setLoadingSessionSales(false);
         },
         (err) => {
-          if (!cancelled) {
-            console.warn('[Operations] Error cargando ventas del turno:', err);
-            setLoadingSessionSales(false);
-          }
+          if (cashListenersScopeRef.current !== listenerScope) return;
+          console.warn('[Operations] Error cargando ventas del turno:', err);
+          setLoadingSessionSales(false);
         }
       );
     });
+  }, [
+    currentSessionId,
+    accountId,
+    branchId,
+    isCashOpen,
+    isFocused,
+    activeTab,
+    cleanupCashListeners,
+  ]);
 
+  useEffect(() => {
     return () => {
-      cancelled = true;
-      task.cancel();
-      if (unsubscribeFn) {
-        unsubscribeFn();
-      }
+      cleanupCashListeners(false);
     };
-  }, [currentSessionId, accountId, isCashOpen, isFocused, activeTab, isOnline]);
+  }, [cleanupCashListeners]);
 
   // ============================================================================
   // MEMOS FOCUS-GATEADOS DE CAJA Y DESGLOSE DE PAGOS
@@ -485,258 +567,209 @@ export default function OperationsScreen() {
     currentSessionId || ''
   }`;
 
-  const lastMergedSalesRef = useRef<{ scope: string; value: any[] } | null>(
-    null
+  const mergedSessionSales = useFocusMemo<any[]>(
+    () =>
+      mergeSalesWithOfflinePending(
+        sessionSales,
+        pendingOfflineSales,
+        offlineCashScope
+      ),
+    [cashScopeKey, sessionSales, pendingOfflineSales, offlineCashScope],
+    isFocused,
+    EMPTY_SESSION_SALES
   );
-  const mergedSessionSales = useMemo(() => {
-    if (
-      !isFocused &&
-      lastMergedSalesRef.current &&
-      lastMergedSalesRef.current.scope === cashScopeKey
-    ) {
-      return lastMergedSalesRef.current.value;
-    }
-    const next = mergeSalesWithOfflinePending(
-      sessionSales,
-      pendingOfflineSales,
-      offlineCashScope
-    );
-    lastMergedSalesRef.current = { scope: cashScopeKey, value: next };
-    return next;
-  }, [
+
+  const offlineCashDelta = useFocusMemo<OfflineCashBreakdownDelta>(
+    () =>
+      computeOfflineCashDelta(
+        pendingOfflineSales,
+        syncedOfflineIds,
+        offlineCashScope
+      ),
+    [cashScopeKey, pendingOfflineSales, syncedOfflineIds, offlineCashScope],
     isFocused,
-    cashScopeKey,
-    sessionSales,
-    pendingOfflineSales,
-    offlineCashScope,
-  ]);
+    EMPTY_OFFLINE_CASH_DELTA
+  );
 
-  const lastOfflineDeltaRef = useRef<{
-    scope: string;
-    value: OfflineCashBreakdownDelta;
-  } | null>(null);
-  const offlineCashDelta = useMemo(() => {
-    if (
-      !isFocused &&
-      lastOfflineDeltaRef.current &&
-      lastOfflineDeltaRef.current.scope === cashScopeKey
-    ) {
-      return lastOfflineDeltaRef.current.value;
-    }
-    const next = computeOfflineCashDelta(
-      pendingOfflineSales,
-      syncedOfflineIds,
-      offlineCashScope
-    );
-    lastOfflineDeltaRef.current = { scope: cashScopeKey, value: next };
-    return next;
-  }, [
-    isFocused,
-    cashScopeKey,
-    pendingOfflineSales,
-    syncedOfflineIds,
-    offlineCashScope,
-  ]);
+  const salesBreakdown = useFocusMemo<SalesBreakdown>(
+    () => {
+      let cash = 0;
+      let yape = 0;
+      let plin = 0;
+      let card = 0;
+      let transfer = 0;
+      let credit = 0;
 
-  const lastSalesBreakdownRef = useRef<{
-    scope: string;
-    value: SalesBreakdown;
-  } | null>(null);
-  const salesBreakdown = useMemo<SalesBreakdown>(() => {
-    if (
-      !isFocused &&
-      lastSalesBreakdownRef.current &&
-      lastSalesBreakdownRef.current.scope === cashScopeKey
-    ) {
-      return lastSalesBreakdownRef.current.value;
-    }
+      let countCash = 0;
+      let countYape = 0;
+      let countPlin = 0;
+      let countCard = 0;
+      let countTransfer = 0;
+      let countCredit = 0;
+      let usingSessionFallback = false;
 
-    let cash = 0;
-    let yape = 0;
-    let plin = 0;
-    let card = 0;
-    let transfer = 0;
-    let credit = 0;
+      if (sessionSales.length > 0) {
+        for (const sale of mergedSessionSales) {
+          if (
+            sale.status === 'cancelled' ||
+            sale.isDeposit ||
+            sale.isReturn ||
+            sale.type === 'deposit' ||
+            sale.type === 'return'
+          ) {
+            continue;
+          }
+          const total = Number(sale.chargedAmount ?? sale.total ?? 0);
+          const pMethod = (sale.paymentMethod || '').toLowerCase();
 
-    let countCash = 0;
-    let countYape = 0;
-    let countPlin = 0;
-    let countCard = 0;
-    let countTransfer = 0;
-    let countCredit = 0;
-    let usingSessionFallback = false;
+          if (Array.isArray(sale.payments) && sale.payments.length > 0) {
+            for (const split of sale.payments) {
+              const cat = (split.category || '').toLowerCase();
+              const amt = Number(split.chargedAmount ?? split.amount ?? 0);
+              const provider = (split.digitalProvider || '').toLowerCase();
 
-    if (sessionSales.length > 0) {
-      for (const sale of mergedSessionSales) {
-        if (
-          sale.status === 'cancelled' ||
-          sale.isDeposit ||
-          sale.isReturn ||
-          sale.type === 'deposit' ||
-          sale.type === 'return'
-        ) {
-          continue;
-        }
-        const total = Number(sale.chargedAmount ?? sale.total ?? 0);
-        const pMethod = (sale.paymentMethod || '').toLowerCase();
-
-        if (Array.isArray(sale.payments) && sale.payments.length > 0) {
-          for (const split of sale.payments) {
-            const cat = (split.category || '').toLowerCase();
-            const amt = Number(split.chargedAmount ?? split.amount ?? 0);
-            const provider = (split.digitalProvider || '').toLowerCase();
-
-            if (cat === 'cash') {
-              cash += amt;
-              countCash++;
-            } else if (cat === 'card') {
-              card += amt;
-              countCard++;
-            } else if (cat === 'digital') {
-              if (provider === 'yape') {
-                yape += amt;
-                countYape++;
-              } else if (provider === 'plin') {
-                plin += amt;
-                countPlin++;
-              } else {
-                transfer += amt;
-                countTransfer++;
+              if (cat === 'cash') {
+                cash += amt;
+                countCash++;
+              } else if (cat === 'card') {
+                card += amt;
+                countCard++;
+              } else if (cat === 'digital') {
+                if (provider === 'yape') {
+                  yape += amt;
+                  countYape++;
+                } else if (provider === 'plin') {
+                  plin += amt;
+                  countPlin++;
+                } else {
+                  transfer += amt;
+                  countTransfer++;
+                }
+              } else if (cat === 'credit') {
+                credit += amt;
+                countCredit++;
               }
-            } else if (cat === 'credit') {
-              credit += amt;
-              countCredit++;
             }
-          }
-        } else {
-          if (pMethod === 'efectivo' || pMethod === 'cash') {
-            cash += total;
-            countCash++;
-          } else if (pMethod === 'tarjeta' || pMethod === 'card') {
-            card += total;
-            countCard++;
-          } else if (pMethod === 'yape') {
-            yape += total;
-            countYape++;
-          } else if (pMethod === 'plin') {
-            plin += total;
-            countPlin++;
-          } else if (pMethod === 'transferencia' || pMethod === 'transfer') {
-            transfer += total;
-            countTransfer++;
-          } else if (pMethod === 'fiado' || pMethod === 'credit') {
-            credit += total;
-            countCredit++;
           } else {
-            if (sale.cashAmount && sale.cashAmount > 0) {
-              cash += sale.cashAmount;
+            if (pMethod === 'efectivo' || pMethod === 'cash') {
+              cash += total;
               countCash++;
-            }
-            if (sale.cardAmount && sale.cardAmount > 0) {
-              card += sale.cardAmount;
+            } else if (pMethod === 'tarjeta' || pMethod === 'card') {
+              card += total;
               countCard++;
-            }
-            if (sale.digitalAmount && sale.digitalAmount > 0) {
-              yape += sale.digitalAmount;
+            } else if (pMethod === 'yape') {
+              yape += total;
               countYape++;
+            } else if (pMethod === 'plin') {
+              plin += total;
+              countPlin++;
+            } else if (pMethod === 'transferencia' || pMethod === 'transfer') {
+              transfer += total;
+              countTransfer++;
+            } else if (pMethod === 'fiado' || pMethod === 'credit') {
+              credit += total;
+              countCredit++;
+            } else {
+              if (sale.cashAmount && sale.cashAmount > 0) {
+                cash += sale.cashAmount;
+                countCash++;
+              }
+              if (sale.cardAmount && sale.cardAmount > 0) {
+                card += sale.cardAmount;
+                countCard++;
+              }
+              if (sale.digitalAmount && sale.digitalAmount > 0) {
+                yape += sale.digitalAmount;
+                countYape++;
+              }
             }
           }
         }
+      } else if (activeCashSession) {
+        usingSessionFallback = true;
+        cash = activeCashSession.cashSales || 0;
+        card = activeCashSession.cardSales || 0;
+        const dig = (activeCashSession as any).digitalSales;
+        if (typeof dig === 'number') {
+          yape = dig;
+        } else if (typeof dig === 'object' && dig !== null) {
+          yape = dig.yape || 0;
+          plin = dig.plin || 0;
+          transfer = dig.transfer || 0;
+          card = dig.card || card;
+        }
+        credit = (activeCashSession as any).creditSales || 0;
+
+        cash += offlineCashDelta.cash;
+        yape += offlineCashDelta.yape;
+        plin += offlineCashDelta.plin;
+        card += offlineCashDelta.card;
+        transfer += offlineCashDelta.transfer;
+        credit += offlineCashDelta.credit;
+
+        countCash = offlineCashDelta.counts.cash;
+        countYape = offlineCashDelta.counts.yape;
+        countPlin = offlineCashDelta.counts.plin;
+        countCard = offlineCashDelta.counts.card;
+        countTransfer = offlineCashDelta.counts.transfer;
+        countCredit = offlineCashDelta.counts.credit;
       }
-    } else if (activeCashSession) {
-      usingSessionFallback = true;
-      cash = activeCashSession.cashSales || 0;
-      card = activeCashSession.cardSales || 0;
-      const dig = (activeCashSession as any).digitalSales;
-      if (typeof dig === 'number') {
-        yape = dig;
-      } else if (typeof dig === 'object' && dig !== null) {
-        yape = dig.yape || 0;
-        plin = dig.plin || 0;
-        transfer = dig.transfer || 0;
-        card = dig.card || card;
-      }
-      credit = (activeCashSession as any).creditSales || 0;
 
-      cash += offlineCashDelta.cash;
-      yape += offlineCashDelta.yape;
-      plin += offlineCashDelta.plin;
-      card += offlineCashDelta.card;
-      transfer += offlineCashDelta.transfer;
-      credit += offlineCashDelta.credit;
+      const totalDigital = yape + plin + card + transfer;
+      const totalAll = cash + totalDigital + credit;
 
-      countCash = offlineCashDelta.counts.cash;
-      countYape = offlineCashDelta.counts.yape;
-      countPlin = offlineCashDelta.counts.plin;
-      countCard = offlineCashDelta.counts.card;
-      countTransfer = offlineCashDelta.counts.transfer;
-      countCredit = offlineCashDelta.counts.credit;
-    }
-
-    const totalDigital = yape + plin + card + transfer;
-    const totalAll = cash + totalDigital + credit;
-
-    const next: SalesBreakdown = {
-      cash: Math.round(cash * 100) / 100,
-      yape: Math.round(yape * 100) / 100,
-      plin: Math.round(plin * 100) / 100,
-      card: Math.round(card * 100) / 100,
-      transfer: Math.round(transfer * 100) / 100,
-      credit: Math.round(credit * 100) / 100,
-      totalDigital: Math.round(totalDigital * 100) / 100,
-      totalAll: Math.round(totalAll * 100) / 100,
-      usingSessionFallback,
-      counts: {
-        cash: countCash,
-        yape: countYape,
-        plin: countPlin,
-        card: countCard,
-        transfer: countTransfer,
-        credit: countCredit,
-        total:
-          sessionSales.length > 0
-            ? mergedSessionSales.length
-            : offlineCashDelta.counts.total,
-      },
-    };
-    lastSalesBreakdownRef.current = { scope: cashScopeKey, value: next };
-    return next;
-  }, [
+      return {
+        cash: Math.round(cash * 100) / 100,
+        yape: Math.round(yape * 100) / 100,
+        plin: Math.round(plin * 100) / 100,
+        card: Math.round(card * 100) / 100,
+        transfer: Math.round(transfer * 100) / 100,
+        credit: Math.round(credit * 100) / 100,
+        totalDigital: Math.round(totalDigital * 100) / 100,
+        totalAll: Math.round(totalAll * 100) / 100,
+        usingSessionFallback,
+        counts: {
+          cash: countCash,
+          yape: countYape,
+          plin: countPlin,
+          card: countCard,
+          transfer: countTransfer,
+          credit: countCredit,
+          total:
+            sessionSales.length > 0
+              ? mergedSessionSales.length
+              : offlineCashDelta.counts.total,
+        },
+      };
+    },
+    [
+      cashScopeKey,
+      sessionSales.length,
+      mergedSessionSales,
+      activeCashSession,
+      offlineCashDelta,
+    ],
     isFocused,
-    cashScopeKey,
-    sessionSales.length,
-    mergedSessionSales,
-    activeCashSession,
-    offlineCashDelta,
-  ]);
-
-  const lastExpectedCashRef = useRef<{ scope: string; value: number } | null>(
-    null
+    EMPTY_SALES_BREAKDOWN
   );
-  const expectedCashAmount = useMemo(() => {
-    if (
-      !isFocused &&
-      lastExpectedCashRef.current &&
-      lastExpectedCashRef.current.scope === cashScopeKey
-    ) {
-      return lastExpectedCashRef.current.value;
-    }
-    const next =
+
+  const expectedCashAmount = useFocusMemo<number>(
+    () =>
       Math.round(
         ((activeCashSession?.expectedAmount ?? 0) +
           offlineCashDelta.cash +
           offlineManualCashNet) *
           100
-      ) / 100;
-    lastExpectedCashRef.current = { scope: cashScopeKey, value: next };
-    return next;
-  }, [
+      ) / 100,
+    [
+      cashScopeKey,
+      activeCashSession?.expectedAmount,
+      offlineCashDelta.cash,
+      offlineManualCashNet,
+    ],
     isFocused,
-    cashScopeKey,
-    activeCashSession?.expectedAmount,
-    offlineCashDelta.cash,
-    offlineManualCashNet,
-  ]);
+    0
+  );
 
   // ============================================================================
   // CARGA DE CLIENTES Y RESERVAS
@@ -1196,6 +1229,11 @@ export default function OperationsScreen() {
     [loadReservationsData]
   );
 
+  const handleSyncNow = useCallback(
+    () => triggerManualSync(true),
+    [triggerManualSync]
+  );
+
   const bottomInsetPadding = insets.bottom + 80;
   const listContentContainerStyle = useMemo(
     () => ({
@@ -1389,19 +1427,21 @@ export default function OperationsScreen() {
         />
       )}
 
-      <CashMovementModal
-        visible={movementModalState.visible}
-        initialType={movementModalState.initialType}
-        onClose={handleCloseMovementModal}
-        accountId={accountId}
-        branchId={branchId}
-        activeCashSession={activeCashSession}
-        user={user}
-        userProfile={userProfile}
-        role={role}
-        isCashier={isCashier}
-        onSuccess={handleMovementSuccess}
-      />
+      {movementModalState.visible && (
+        <CashMovementModal
+          visible={movementModalState.visible}
+          initialType={movementModalState.initialType}
+          onClose={handleCloseMovementModal}
+          accountId={accountId}
+          branchId={branchId}
+          activeCashSession={activeCashSession}
+          user={user}
+          userProfile={userProfile}
+          role={role}
+          isCashier={isCashier}
+          onSuccess={handleMovementSuccess}
+        />
+      )}
 
       {Boolean(completionTarget) && (
         <ReservationCompletionModal
@@ -1421,55 +1461,63 @@ export default function OperationsScreen() {
         />
       )}
 
-      <CloseCashModal
-        visible={closeModalVisible}
-        onClose={handleCloseCloseModal}
-        accountId={accountId}
-        branchId={branchId}
-        activeCashSession={activeCashSession}
-        expectedCashAmount={expectedCashAmount}
-        offlinePendingCount={offlineCashDelta.count + scopedOfflineCashMovements.length}
-        quarantinedCount={quarantinedCount}
-        isOnline={isOnline}
-        isSupervisor={isSupervisor}
-        user={user}
-        userProfile={userProfile}
-        onSyncNow={() => triggerManualSync(true)}
-        onSyncedOffline={refreshCashStatus}
-        onClosed={handleCashClosed}
-      />
+      {closeModalVisible && (
+        <CloseCashModal
+          visible={closeModalVisible}
+          onClose={handleCloseCloseModal}
+          accountId={accountId}
+          branchId={branchId}
+          activeCashSession={activeCashSession}
+          expectedCashAmount={expectedCashAmount}
+          offlinePendingCount={offlineCashDelta.count + scopedOfflineCashMovements.length}
+          quarantinedCount={quarantinedCount}
+          isOnline={isOnline}
+          isSupervisor={isSupervisor}
+          user={user}
+          userProfile={userProfile}
+          onSyncNow={handleSyncNow}
+          onSyncedOffline={refreshCashStatus}
+          onClosed={handleCashClosed}
+        />
+      )}
 
-      <ClosureSuccessModal
-        report={closureReport}
-        activeCashSession={activeCashSession}
-        businessSettings={businessSettings}
-        activeBranch={activeBranch}
-        user={user}
-        userProfile={userProfile}
-        onClose={handleCloseClosureSuccessModal}
-      />
+      {Boolean(closureReport) && (
+        <ClosureSuccessModal
+          report={closureReport}
+          activeCashSession={activeCashSession}
+          businessSettings={businessSettings}
+          activeBranch={activeBranch}
+          user={user}
+          userProfile={userProfile}
+          onClose={handleCloseClosureSuccessModal}
+        />
+      )}
 
-      <CustomerFormModal
-        visible={newCustomerModalVisible}
-        accountId={accountId}
-        onClose={handleCloseNewCustomerModal}
-        onSaved={handleCustomerSaved}
-      />
+      {newCustomerModalVisible && (
+        <CustomerFormModal
+          visible={newCustomerModalVisible}
+          accountId={accountId}
+          onClose={handleCloseNewCustomerModal}
+          onSaved={handleCustomerSaved}
+        />
+      )}
 
-      <FiadoPaymentModal
-        visible={paymentModalState.visible}
-        customer={paymentModalState.customer}
-        initialOpenFiados={paymentModalState.initialOpenFiados}
-        initialSelectedFiado={paymentModalState.initialSelectedFiado}
-        accountId={accountId}
-        branchId={branchId}
-        activeCashSession={activeCashSession}
-        user={user}
-        userProfile={userProfile}
-        role={role}
-        onClose={handleClosePaymentModal}
-        onPaymentSuccess={handlePaymentSuccess}
-      />
+      {paymentModalState.visible && (
+        <FiadoPaymentModal
+          visible={paymentModalState.visible}
+          customer={paymentModalState.customer}
+          initialOpenFiados={paymentModalState.initialOpenFiados}
+          initialSelectedFiado={paymentModalState.initialSelectedFiado}
+          accountId={accountId}
+          branchId={branchId}
+          activeCashSession={activeCashSession}
+          user={user}
+          userProfile={userProfile}
+          role={role}
+          onClose={handleClosePaymentModal}
+          onPaymentSuccess={handlePaymentSuccess}
+        />
+      )}
 
       {newReservationModalVisible && (
         <NewReservationModal
@@ -1485,58 +1533,66 @@ export default function OperationsScreen() {
         />
       )}
 
-      <CustomerDetailModal
-        visible={
-          customerDetailModalVisible &&
-          !returnFiadoTarget &&
-          !writeOffTarget &&
-          !paymentModalState.visible
-        }
-        customer={detailCustomer}
-        openFiados={detailOpenFiados}
-        fiadoHistory={detailFiadoHistory}
-        loading={loadingCustomerDetail}
-        isRecalculatingDebt={isRecalculatingDebt}
-        isSupervisor={isSupervisor}
-        canManageCustomers={canManageCustomers}
-        canProcessReturn={canProcessReturn}
-        isCashier={isCashier}
-        role={role}
-        onClose={handleCloseCustomerDetail}
-        onCollectDebt={handleCollectDebt}
-        onRecalculateDebt={handleRecalculateDebt}
-        onPayFiado={handlePaySpecificFiado}
-        onOpenReturnFiado={handleOpenReturnFiado}
-        onOpenWriteOff={handleOpenWriteOff}
-      />
+      {customerDetailModalVisible && (
+        <CustomerDetailModal
+          visible={
+            customerDetailModalVisible &&
+            !returnFiadoTarget &&
+            !writeOffTarget &&
+            !paymentModalState.visible
+          }
+          customer={detailCustomer}
+          openFiados={detailOpenFiados}
+          fiadoHistory={detailFiadoHistory}
+          loading={loadingCustomerDetail}
+          isRecalculatingDebt={isRecalculatingDebt}
+          isSupervisor={isSupervisor}
+          canManageCustomers={canManageCustomers}
+          canProcessReturn={canProcessReturn}
+          isCashier={isCashier}
+          role={role}
+          onClose={handleCloseCustomerDetail}
+          onCollectDebt={handleCollectDebt}
+          onRecalculateDebt={handleRecalculateDebt}
+          onPayFiado={handlePaySpecificFiado}
+          onOpenReturnFiado={handleOpenReturnFiado}
+          onOpenWriteOff={handleOpenWriteOff}
+        />
+      )}
 
-      <FiadoReturnModal
-        fiado={returnFiadoTarget}
-        accountId={accountId}
-        user={user}
-        userProfile={userProfile}
-        role={role}
-        onClose={handleCloseReturnFiado}
-        onSuccess={handleReturnFiadoSuccess}
-      />
+      {Boolean(returnFiadoTarget) && (
+        <FiadoReturnModal
+          fiado={returnFiadoTarget}
+          accountId={accountId}
+          user={user}
+          userProfile={userProfile}
+          role={role}
+          onClose={handleCloseReturnFiado}
+          onSuccess={handleReturnFiadoSuccess}
+        />
+      )}
 
-      <FiadoWriteOffModal
-        fiado={writeOffTarget}
-        accountId={accountId}
-        user={user}
-        userProfile={userProfile}
-        role={role}
-        onClose={handleCloseWriteOff}
-        onSuccess={handleWriteOffSuccess}
-      />
+      {Boolean(writeOffTarget) && (
+        <FiadoWriteOffModal
+          fiado={writeOffTarget}
+          accountId={accountId}
+          user={user}
+          userProfile={userProfile}
+          role={role}
+          onClose={handleCloseWriteOff}
+          onSuccess={handleWriteOffSuccess}
+        />
+      )}
 
-      <VentyAiModal
-        visible={ventyModalVisible}
-        onClose={handleCloseVentyModal}
-        accountId={accountId}
-        branchId={branchId}
-        isOnline={isOnline}
-      />
+      {ventyModalVisible && (
+        <VentyAiModal
+          visible={ventyModalVisible}
+          onClose={handleCloseVentyModal}
+          accountId={accountId}
+          branchId={branchId}
+          isOnline={isOnline}
+        />
+      )}
 
       {payrollModalOpen && (
         <PayrollUsersModal

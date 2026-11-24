@@ -1,7 +1,7 @@
 /** Small first render batch and bounded mapping work for large Firestore snapshots. */
 export const PRODUCT_CATALOG_FIRST_BATCH_SIZE = 80;
 export const PRODUCT_CATALOG_WORK_BATCH_SIZE = 100;
-export const PRODUCT_CATALOG_YIELD_BUDGET_MS = 6;
+export const PRODUCT_CATALOG_YIELD_BUDGET_MS = 3.5;
 const EMPTY_ARRAY: never[] = [];
 
 export interface CatalogBatchMetrics {

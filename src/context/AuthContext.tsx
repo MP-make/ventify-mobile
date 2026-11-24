@@ -148,6 +148,11 @@ export interface PlanAccessContextType {
   refreshAccess: () => Promise<void>;
 }
 
+export interface PlanAccessActionsContextType {
+  refreshAccess: () => Promise<void>;
+  getPlanLimitsSnapshot: () => PlanLimits | null;
+}
+
 export interface PinLockContextType {
   isPinLocked: boolean;
   pinCode: string;
@@ -420,6 +425,11 @@ const DEFAULT_PLAN_ACCESS: PlanAccessContextType = {
   refreshAccess: async () => {},
 };
 
+const DEFAULT_PLAN_ACCESS_ACTIONS: PlanAccessActionsContextType = {
+  refreshAccess: async () => {},
+  getPlanLimitsSnapshot: () => null,
+};
+
 const DEFAULT_PIN_LOCK: PinLockContextType = {
   isPinLocked: false,
   pinCode: '',
@@ -437,6 +447,9 @@ const DEFAULT_PIN_LOCK: PinLockContextType = {
 const AuthSessionContext = createContext<AuthSessionContextType>(DEFAULT_AUTH_SESSION);
 const NetworkStatusContext = createContext<NetworkStatusContextType>(DEFAULT_NETWORK_STATUS);
 const PlanAccessContext = createContext<PlanAccessContextType>(DEFAULT_PLAN_ACCESS);
+const PlanAccessActionsContext = createContext<PlanAccessActionsContextType>(
+  DEFAULT_PLAN_ACCESS_ACTIONS
+);
 const PinLockContext = createContext<PinLockContextType>(DEFAULT_PIN_LOCK);
 const AuthContext = createContext<AuthContextType>({
   ...DEFAULT_AUTH_SESSION,
@@ -752,7 +765,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const wasOfflineRef = useRef<boolean>(false);
   const isActiveRef = useRef<boolean>(true);
   const isSuperAdminRef = useRef<boolean>(false);
+  const limitsRef = useRef<PlanLimits | null>(null);
   const subscriptionRef = useRef<PlanSubscription | null>(null);
+  const lastWrittenPlanRef = useRef<{
+    key: string;
+    limits: PlanLimits | null;
+    subscription: PlanSubscription | null;
+    cachedAt: number;
+  } | null>(null);
   const checkedAccessScopeRef = useRef<string | null>(null);
   const lastAccessCheckAtRef = useRef<number>(0);
   const lastWrittenProfileRef = useRef<{
@@ -770,6 +790,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   isOnlineRef.current = isOnline;
   isActiveRef.current = isActive;
   isSuperAdminRef.current = isSuperAdmin;
+  limitsRef.current = limits;
   subscriptionRef.current = subscription;
   userProfileBranchIdRef.current = userProfile?.branchId;
   if (user?.uid || accountId) {
@@ -811,6 +832,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       branchesToClear.add('main');
       branchesToClear.add('account');
 
+      lastWrittenPlanRef.current = null;
       const cartKeysToRemove: string[] = [];
       const catalogKeysToRemove: string[] = [];
 
@@ -941,27 +963,52 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     []
   );
 
-  // 0. Monitoreo temprano de red (activo incluso antes del login)
+  // 0. Monitoreo temprano de red (activo incluso antes del login, con debounce en caídas breves)
   useEffect(() => {
     let isMounted = true;
+    let offlineTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const applyNetState = (online: boolean) => {
+      if (!isMounted) return;
+      if (online) {
+        if (offlineTimer) {
+          clearTimeout(offlineTimer);
+          offlineTimer = null;
+        }
+        isOnlineRef.current = true;
+        setIsOnline((prev) => (prev ? prev : true));
+        return;
+      }
+      if (offlineTimer) return;
+      offlineTimer = setTimeout(() => {
+        offlineTimer = null;
+        if (!isMounted) return;
+        isOnlineRef.current = false;
+        setIsOnline((prev) => (!prev ? prev : false));
+      }, 1500);
+    };
 
     NetInfo.fetch()
       .then((state) => {
         if (!isMounted) return;
         const online = Boolean(state.isConnected && state.isInternetReachable !== false);
         wasOfflineRef.current = !online;
+        isOnlineRef.current = online;
         setIsOnline(online);
       })
       .catch(() => {});
 
     const unsubscribeNet = NetInfo.addEventListener((state) => {
-      if (!isMounted) return;
       const online = Boolean(state.isConnected && state.isInternetReachable !== false);
-      setIsOnline(online);
+      applyNetState(online);
     });
 
     return () => {
       isMounted = false;
+      if (offlineTimer) {
+        clearTimeout(offlineTimer);
+        offlineTimer = null;
+      }
       unsubscribeNet();
     };
   }, []);
@@ -1861,18 +1908,35 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const nextSub = data.subscription ?? null;
       const nextLimits = data.limits ?? null;
       resolvedSubForClock = nextSub;
+      limitsRef.current = nextLimits;
       subscriptionRef.current = nextSub;
       setSubscription((prev) => (sameJsonValue(prev, nextSub) ? prev : nextSub));
       setLimits((prev) => (sameJsonValue(prev, nextLimits) ? prev : nextLimits));
       setAccessError(null);
-      writeMetaItemSyncOrAsync(
-        cacheKey,
-        JSON.stringify({
+      const nowWritten = Date.now();
+      const prevWrittenPlan = lastWrittenPlanRef.current;
+      const planChangedForDisk =
+        !prevWrittenPlan ||
+        prevWrittenPlan.key !== cacheKey ||
+        nowWritten - prevWrittenPlan.cachedAt > 12 * 60 * 60 * 1000 ||
+        !sameJsonValue(prevWrittenPlan.limits, nextLimits) ||
+        !sameJsonValue(prevWrittenPlan.subscription, nextSub);
+      if (planChangedForDisk) {
+        lastWrittenPlanRef.current = {
+          key: cacheKey,
           limits: nextLimits,
           subscription: nextSub,
-          cachedAt: Date.now(),
-        } satisfies CachedPlanPayload)
-      );
+          cachedAt: nowWritten,
+        };
+        writeMetaItemSyncOrAsync(
+          cacheKey,
+          JSON.stringify({
+            limits: nextLimits,
+            subscription: nextSub,
+            cachedAt: nowWritten,
+          } satisfies CachedPlanPayload)
+        );
+      }
     } catch (error) {
       if (!isCurrent()) return;
       const status = (error as { status?: number }).status;
@@ -2283,6 +2347,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     [isOnline]
   );
 
+  const getPlanLimitsSnapshot = useCallback(() => limitsRef.current, []);
+
+  const planAccessActionsValue = useMemo<PlanAccessActionsContextType>(
+    () => ({
+      refreshAccess,
+      getPlanLimitsSnapshot,
+    }),
+    [refreshAccess, getPlanLimitsSnapshot]
+  );
+
   const planAccessValue = useMemo<PlanAccessContextType>(
     () => ({
       limits,
@@ -2336,13 +2410,15 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   return (
     <AuthSessionContext.Provider value={authSessionValue}>
       <NetworkStatusContext.Provider value={networkStatusValue}>
-        <PlanAccessContext.Provider value={planAccessValue}>
-          <PinLockContext.Provider value={pinLockValue}>
-            <AuthContext.Provider value={contextValue}>
-              <PermissionsProvider>{children}</PermissionsProvider>
-            </AuthContext.Provider>
-          </PinLockContext.Provider>
-        </PlanAccessContext.Provider>
+        <PlanAccessActionsContext.Provider value={planAccessActionsValue}>
+          <PlanAccessContext.Provider value={planAccessValue}>
+            <PinLockContext.Provider value={pinLockValue}>
+              <AuthContext.Provider value={contextValue}>
+                <PermissionsProvider>{children}</PermissionsProvider>
+              </AuthContext.Provider>
+            </PinLockContext.Provider>
+          </PlanAccessContext.Provider>
+        </PlanAccessActionsContext.Provider>
       </NetworkStatusContext.Provider>
     </AuthSessionContext.Provider>
   );
@@ -2352,4 +2428,5 @@ export const useAuth = () => useContext(AuthContext);
 export const useAuthSession = () => useContext(AuthSessionContext);
 export const useNetworkStatus = () => useContext(NetworkStatusContext);
 export const usePlanAccess = () => useContext(PlanAccessContext);
+export const usePlanAccessActions = () => useContext(PlanAccessActionsContext);
 export const usePinLock = () => useContext(PinLockContext);

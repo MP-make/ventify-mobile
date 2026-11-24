@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect, useCallback } from 'react';
+import React, { useState, useMemo, useEffect, useCallback, useRef } from 'react';
 import {
   View,
   Text,
@@ -39,14 +39,21 @@ interface NormalizedFilterOption {
   initials: string;
 }
 
+const NON_ASCII_RE = /[^\x00-\x7F]/;
+
 // Normalización estricta sin tildes
 function normalizeText(text: string): string {
-  return (text || '')
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .trim();
+  const lower = (text || '').toLowerCase();
+  const clean = NON_ASCII_RE.test(lower)
+    ? lower.normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    : lower;
+  return clean.trim();
 }
+
+const DROPDOWN_ESTIMATED_LIST_SIZE = { width: 320, height: 180 };
+const overrideDropdownItemLayout = (layout: { span?: number; size?: number }) => {
+  layout.size = 36;
+};
 
 function matchesNormalizedQuery(normalizedQuery: string, item: NormalizedFilterOption): boolean {
   if (!normalizedQuery) return true;
@@ -116,7 +123,7 @@ const FilterGroupChip = React.memo<FilterGroupChipProps>(({ group, isOpen, onTog
   const handleClear = useCallback(() => {
     group.onClear();
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-  }, [group]);
+  }, [group.onClear]);
 
   return (
     <View style={styles.btnWrapper}>
@@ -168,6 +175,9 @@ export const InlineFilterBar: React.FC<InlineFilterBarProps> = React.memo(({ gro
     () => groups.find((g) => g.id === activeGroupId) || null,
     [groups, activeGroupId]
   );
+  const activeGroupRef = useRef(activeGroup);
+  activeGroupRef.current = activeGroup;
+  const activeOptions = activeGroup?.options;
 
   useEffect(() => {
     if (!searchQuery) {
@@ -181,14 +191,19 @@ export const InlineFilterBar: React.FC<InlineFilterBarProps> = React.memo(({ gro
   }, [searchQuery]);
 
   const effectiveQuery =
-    activeGroup && activeGroup.options.length > 20 ? debouncedSearchQuery : searchQuery;
+    activeOptions && activeOptions.length > 20 ? debouncedSearchQuery : searchQuery;
 
-  const normalizedGroupOptions = useMemo<NormalizedFilterOption[]>(() => {
-    if (!activeGroup) return [];
+  const normalizedGroupOptions = useMemo<{
+    options: NormalizedFilterOption[];
+    allOptions: FilterOption[];
+  }>(() => {
+    if (!activeOptions) return { options: [], allOptions: [] };
     const list: NormalizedFilterOption[] = [];
-    for (let i = 0; i < activeGroup.options.length; i += 1) {
-      const opt = activeGroup.options[i];
+    const allOptions: FilterOption[] = [];
+    for (let i = 0; i < activeOptions.length; i += 1) {
+      const opt = activeOptions[i];
       if (opt.name === 'Todas') continue;
+      allOptions.push(opt);
       const normalized = normalizeText(opt.name);
       const words = normalized.split(/\s+/).filter(Boolean);
       let initials = '';
@@ -197,24 +212,25 @@ export const InlineFilterBar: React.FC<InlineFilterBarProps> = React.memo(({ gro
       }
       list.push({ option: opt, normalized, words, initials });
     }
-    return list;
-  }, [activeGroup]);
+    return { options: list, allOptions };
+  }, [activeOptions]);
 
   const filteredOptions = useMemo<FilterOption[]>(() => {
-    if (!activeGroup) return [];
+    if (!activeOptions) return [];
     const normalizedQuery = normalizeText(effectiveQuery);
     if (!normalizedQuery) {
-      return normalizedGroupOptions.map((entry) => entry.option);
+      return normalizedGroupOptions.allOptions;
     }
     const result: FilterOption[] = [];
-    for (let i = 0; i < normalizedGroupOptions.length; i += 1) {
-      const entry = normalizedGroupOptions[i];
+    const entries = normalizedGroupOptions.options;
+    for (let i = 0; i < entries.length; i += 1) {
+      const entry = entries[i];
       if (matchesNormalizedQuery(normalizedQuery, entry)) {
         result.push(entry.option);
       }
     }
     return result;
-  }, [activeGroup, normalizedGroupOptions, effectiveQuery]);
+  }, [activeOptions, normalizedGroupOptions, effectiveQuery]);
 
   const toggleGroup = useCallback((groupId: string) => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
@@ -229,25 +245,24 @@ export const InlineFilterBar: React.FC<InlineFilterBarProps> = React.memo(({ gro
   }, []);
 
   const handleSelectAll = useCallback(() => {
-    if (!activeGroup) return;
-    activeGroup.onClear();
+    const group = activeGroupRef.current;
+    if (!group) return;
+    group.onClear();
     setActiveGroupId(null);
     setSearchQuery('');
     setDebouncedSearchQuery('');
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-  }, [activeGroup]);
+  }, []);
 
-  const handleSelectOption = useCallback(
-    (optName: string) => {
-      if (!activeGroup) return;
-      activeGroup.onSelect(optName);
-      setActiveGroupId(null);
-      setSearchQuery('');
-      setDebouncedSearchQuery('');
-      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    },
-    [activeGroup]
-  );
+  const handleSelectOption = useCallback((optName: string) => {
+    const group = activeGroupRef.current;
+    if (!group) return;
+    group.onSelect(optName);
+    setActiveGroupId(null);
+    setSearchQuery('');
+    setDebouncedSearchQuery('');
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+  }, []);
 
   const selectedValue = activeGroup?.selectedValue;
   const renderOptionItem = useCallback(
@@ -290,12 +305,12 @@ export const InlineFilterBar: React.FC<InlineFilterBarProps> = React.memo(({ gro
   );
 
   const listContainerStyle = useMemo(() => {
-    const estimatedTotalHeight = (normalizedGroupOptions.length + 1) * 38;
+    const estimatedTotalHeight = (normalizedGroupOptions.allOptions.length + 1) * 38;
     const clampedHeight = Math.min(180, Math.max(84, estimatedTotalHeight));
     return clampedHeight === 180
       ? styles.flashListContainer
       : [styles.flashListContainer, { height: clampedHeight }];
-  }, [normalizedGroupOptions.length]);
+  }, [normalizedGroupOptions.allOptions.length]);
 
   return (
     <View style={styles.container}>
@@ -348,12 +363,14 @@ export const InlineFilterBar: React.FC<InlineFilterBarProps> = React.memo(({ gro
               data={filteredOptions}
               renderItem={renderOptionItem}
               estimatedItemSize={36}
+              overrideItemLayout={overrideDropdownItemLayout}
+              estimatedListSize={DROPDOWN_ESTIMATED_LIST_SIZE}
               extraData={selectedValue}
               keyExtractor={keyExtractorByName}
               ListHeaderComponent={allHeaderElement}
               keyboardShouldPersistTaps="handled"
               nestedScrollEnabled
-              ListEmptyComponent={emptyComponent}
+              ListEmptyComponent={filteredOptions.length === 0 ? emptyComponent : undefined}
             />
           </View>
         </View>

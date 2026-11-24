@@ -699,7 +699,7 @@ export default function PosCounterScreen() {
 
           <View style={styles.searchCountBadge}>
             <Text style={styles.searchCountBadgeNumber}>
-              {!catalogComplete ? '…' : filteredProducts.length}
+              {catalogComplete || filteredProducts.length > 0 ? filteredProducts.length : '…'}
             </Text>
             <Text style={styles.searchCountBadgeLabel}>prod.</Text>
           </View>

@@ -428,6 +428,41 @@ export async function writeProductCatalogCache(
   return committed;
 }
 
+/** Updates metadata fields on an existing catalog manifest without rewriting chunk data. */
+export async function updateProductCatalogManifestMeta(
+  storage: CatalogCacheStorage,
+  key: string,
+  patch: { lastSyncMs?: number; allDocsHaveUpdatedAt?: boolean; cachedAt?: number }
+): Promise<boolean> {
+  const previous = writesByScope.get(key) || Promise.resolve();
+  let updated = false;
+  const writeOperation = previous.catch(() => {}).then(async () => {
+    const manifest = parseManifest(await readStorageItem(storage, manifestKey(key)));
+    if (!manifest) return;
+    const nextManifest: ProductCatalogCacheManifest = {
+      ...manifest,
+      ...(typeof patch.lastSyncMs === 'number' && Number.isFinite(patch.lastSyncMs)
+        ? { lastSyncMs: patch.lastSyncMs }
+        : {}),
+      ...(typeof patch.allDocsHaveUpdatedAt === 'boolean'
+        ? { allDocsHaveUpdatedAt: patch.allDocsHaveUpdatedAt }
+        : {}),
+      ...(typeof patch.cachedAt === 'number' && Number.isFinite(patch.cachedAt)
+        ? { cachedAt: patch.cachedAt }
+        : {}),
+    };
+    await storage.setItem(manifestKey(key), JSON.stringify(nextManifest));
+    updated = true;
+  });
+  writesByScope.set(key, writeOperation);
+  try {
+    await writeOperation;
+  } finally {
+    if (writesByScope.get(key) === writeOperation) writesByScope.delete(key);
+  }
+  return updated;
+}
+
 async function writeProductCatalogCacheNow(
   storage: CatalogCacheStorage,
   key: string,

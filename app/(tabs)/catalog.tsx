@@ -305,6 +305,7 @@ const CatalogPlanLimitBanner = React.memo(() => {
 
 interface CatalogInventorySummaryProps {
   catalogComplete: boolean;
+  hasProducts: boolean;
   canViewMargins: boolean;
   canManageProducts: boolean;
   valuationExpanded: boolean;
@@ -318,6 +319,7 @@ interface CatalogInventorySummaryProps {
 const CatalogInventorySummary = React.memo<CatalogInventorySummaryProps>(
   ({
     catalogComplete,
+    hasProducts,
     canViewMargins,
     canManageProducts,
     valuationExpanded,
@@ -328,6 +330,7 @@ const CatalogInventorySummary = React.memo<CatalogInventorySummaryProps>(
     onChangeStatusFilter,
   }) => {
     const { stats } = useProductsStats();
+    const statsReady = catalogComplete || hasProducts;
 
     const handleFilterAll = useCallback(() => {
       onChangeStatusFilter('all');
@@ -392,7 +395,7 @@ const CatalogInventorySummary = React.memo<CatalogInventorySummaryProps>(
               {canViewMargins && (
                 <View style={styles.valuationRow}>
                   <Text style={styles.valuationAmount}>
-                    {catalogComplete ? formatPEN(stats.valuation) : 'Sincronizando…'}
+                    {statsReady ? formatPEN(stats.valuation) : 'Sincronizando…'}
                   </Text>
                 </View>
               )}
@@ -405,11 +408,11 @@ const CatalogInventorySummary = React.memo<CatalogInventorySummaryProps>(
                   onPress={handleFilterAll}
                   accessibilityRole="button"
                   accessibilityLabel={
-                    catalogComplete
+                    statsReady
                       ? `Todos los productos (${stats.totalProducts})`
                       : 'Sincronizando catálogo'
                   }
-                  disabled={!catalogComplete}
+                  disabled={!statsReady}
                 >
                   <Text
                     style={[
@@ -418,7 +421,7 @@ const CatalogInventorySummary = React.memo<CatalogInventorySummaryProps>(
                     ]}
                   >
                     <Text style={styles.inventoryCountValue}>
-                      {catalogComplete ? stats.totalProducts : '…'}
+                      {statsReady ? stats.totalProducts : '…'}
                     </Text>{' '}
                     productos
                   </Text>
@@ -432,11 +435,11 @@ const CatalogInventorySummary = React.memo<CatalogInventorySummaryProps>(
                   onPress={handleFilterLow}
                   accessibilityRole="button"
                   accessibilityLabel={
-                    catalogComplete
+                    statsReady
                       ? `Stock bajo (${stats.lowStockCount})`
                       : 'Sincronizando catálogo'
                   }
-                  disabled={!catalogComplete}
+                  disabled={!statsReady}
                 >
                   <Text
                     style={[
@@ -446,7 +449,7 @@ const CatalogInventorySummary = React.memo<CatalogInventorySummaryProps>(
                     ]}
                   >
                     <Text style={styles.inventoryCountValue}>
-                      {catalogComplete ? stats.lowStockCount : '…'}
+                      {statsReady ? stats.lowStockCount : '…'}
                     </Text>{' '}
                     stock bajo
                   </Text>
@@ -460,11 +463,11 @@ const CatalogInventorySummary = React.memo<CatalogInventorySummaryProps>(
                   onPress={handleFilterOut}
                   accessibilityRole="button"
                   accessibilityLabel={
-                    catalogComplete
+                    statsReady
                       ? `Agotados (${stats.outOfStockCount})`
                       : 'Sincronizando catálogo'
                   }
-                  disabled={!catalogComplete}
+                  disabled={!statsReady}
                 >
                   <Text
                     style={[
@@ -474,7 +477,7 @@ const CatalogInventorySummary = React.memo<CatalogInventorySummaryProps>(
                     ]}
                   >
                     <Text style={styles.inventoryCountValue}>
-                      {catalogComplete ? stats.outOfStockCount : '…'}
+                      {statsReady ? stats.outOfStockCount : '…'}
                     </Text>{' '}
                     agotados
                   </Text>
@@ -2234,6 +2237,7 @@ const InventorySubTab = React.memo<InventorySubTabProps>(
 
         <CatalogInventorySummary
           catalogComplete={catalogComplete}
+          hasProducts={products.length > 0}
           canViewMargins={canViewMargins}
           canManageProducts={canManageProducts}
           valuationExpanded={valuationExpanded}
@@ -2271,7 +2275,7 @@ const InventorySubTab = React.memo<InventorySubTabProps>(
 
           <View style={styles.inventoryCountBadge}>
             <Text style={styles.inventoryCountNumber}>
-              {catalogComplete ? filteredProducts.length : '…'}
+              {catalogComplete || filteredProducts.length > 0 ? filteredProducts.length : '…'}
             </Text>
             <Text style={styles.inventoryCountLabel}>prod.</Text>
           </View>

@@ -16,14 +16,17 @@ import {
   where,
   onSnapshot,
   getDoc,
-  getDocs,
-  limit,
   Timestamp,
 } from 'firebase/firestore';
-import NetInfo from '@react-native-community/netinfo';
 import { catalogKVStorage } from '@/lib/native-kv-storage';
-import { db } from '@/lib/firebase';
+import { app, auth, db } from '@/lib/firebase';
 import { apiRequest } from '@/lib/api-client';
+import {
+  PRODUCTS_REST_PAGE_SIZE,
+  FirestoreRestError,
+  fetchProductsPageViaRest,
+  fetchProductsPageViaSdkFallback,
+} from '@/lib/firestore-rest-products';
 import { useAuthSession, useNetworkStatus, usePlanAccess, usePlanAccessActions } from './AuthContext';
 import { Product } from '@/types';
 import {
@@ -60,8 +63,6 @@ import {
   type CatalogProductIndex,
 } from '@/lib/catalog-filters';
 import {
-  PRODUCT_CATALOG_FIRST_BATCH_SIZE,
-  isAuthoritativeCatalogSnapshot,
   processCatalogInBatches,
   processCatalogIteratorInBatches,
   productsForCatalogScope,
@@ -74,6 +75,7 @@ import {
   loadProductCatalogCache,
   productCatalogCacheKey,
   readProductCatalogManifestSync,
+  updateProductCatalogManifestMeta,
   writeProductCatalogCache,
   writeProductCatalogDelta,
 } from '@/lib/product-catalog-cache';
@@ -141,11 +143,16 @@ export interface ProductsContextType
   productPlanLimit: ProductPlanLimitSummary | null;
 }
 
-const DELTA_SYNC_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const DELTA_SYNC_OVERLAP_MS = 60_000;
 const DELTA_COMPACTION_THRESHOLD = 200;
 const PUBLISH_COALESCE_MS = 120;
 const DELTA_PERSIST_DEBOUNCE_MS = 1200;
+const WARM_RECONCILE_INTERVAL_LEGACY_MS = 6 * 60 * 60 * 1000;
+const WARM_RECONCILE_INTERVAL_INDEXED_MS = 24 * 60 * 60 * 1000;
+const WARM_RECONCILE_START_DELAY_MS = 8_000;
+const COLD_PAGE_YIELD_MS = 40;
+const WARM_PAGE_YIELD_MS = 60;
+const COLD_PUBLISH_EVERY_PAGES = 4;
 
 let deltaQueryIndexMissing = false;
 
@@ -650,6 +657,16 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const scheduleDeltaFlushRef = useRef<() => void>(() => {});
   const rebuildOfflineOverlayRef = useRef<() => void>(() => {});
   const hydrateQueuesPromiseRef = useRef<Promise<void>>(Promise.resolve());
+  const onlineResumeHandlerRef = useRef<(() => void) | null>(null);
+  const prevIsOnlineRef = useRef<boolean>(isOnline);
+
+  useEffect(() => {
+    const wasOffline = !prevIsOnlineRef.current;
+    prevIsOnlineRef.current = isOnline;
+    if (wasOffline && isOnline) {
+      onlineResumeHandlerRef.current?.();
+    }
+  }, [isOnline]);
 
   // Account-scoped cache key so branch switches only recompute branch stock KPIs in memory
   const activeCacheKey =
@@ -694,7 +711,10 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         }
       }).then(() => {
         if (cancelled || inventoryIndexRef.current !== nextIndex) return;
-        if (catalogCompleteRef.current && activeScopeRef.current === activeCacheKey) {
+        if (
+          (catalogCompleteRef.current || productMapRef.current.size > 0) &&
+          activeScopeRef.current === activeCacheKey
+        ) {
           setInventorySummary(nextIndex.snapshot());
         }
       });
@@ -1191,13 +1211,14 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
     const nowMs = Date.now();
     const syncManifest = readProductCatalogManifestSync(scopeKey, catalogKVStorage);
-    const hasValidManifest = Boolean(
+    let manifestValid = Boolean(
       syncManifest && nowMs - syncManifest.cachedAt <= PRODUCT_CATALOG_CACHE_TTL_MS
     );
+    let manifestAllDocsHaveUpdatedAt = syncManifest?.allDocsHaveUpdatedAt;
     const forceFullRefresh = forceFullRefreshRef.current;
     forceFullRefreshRef.current = false;
 
-    if (hasValidManifest && syncManifest) {
+    if (manifestValid && syncManifest) {
       if (typeof syncManifest.lastSyncMs === 'number') {
         lastSyncMsRef.current = syncManifest.lastSyncMs;
       }
@@ -1206,32 +1227,29 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       }
     }
 
-    const canStartDeltaSync = Boolean(
-      scopeChanged &&
-        !deltaQueryIndexMissing &&
-        !forceFullRefresh &&
-        hasValidManifest &&
-        syncManifest?.allDocsHaveUpdatedAt === true &&
-        typeof syncManifest.lastSyncMs === 'number' &&
-        nowMs - syncManifest.lastSyncMs < DELTA_SYNC_MAX_AGE_MS
-    );
-
     let unsubscribe: (() => void) | undefined;
     let deltaTimer: ReturnType<typeof setTimeout> | undefined;
     let compactTimer: ReturnType<typeof setTimeout> | undefined;
     let coalescePublishTimer: ReturnType<typeof setTimeout> | undefined;
-    let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
-    let deferredFullTimer: ReturnType<typeof setTimeout> | undefined;
+    let warmReconcileTimer: ReturnType<typeof setTimeout> | undefined;
+    let reconcileWaitTimer: ReturnType<typeof setTimeout> | undefined;
     let deltaInteractionTask: { cancel?: () => void } | undefined;
     let compactInteractionTask: { cancel?: () => void } | undefined;
+    let reconcileInteractionTask: { cancel?: () => void } | undefined;
+    let reconcileAbortController: AbortController | null = null;
+    let activeReconcilePromise: Promise<void> | null = null;
     let processing = Promise.resolve();
     let cacheChunkPublished = false;
     let cacheHydrated = false;
     let cacheLoadFinished = !scopeChanged;
     let publishedOnce = false;
     let serverSnapshotApplied = false;
-    let isDeltaMode = canStartDeltaSync;
-    let latestCachedDocs: any[] | null = null;
+    let reconcileInProgress = false;
+    let reconcileCompleted = false;
+    const liveDeltaEventsDuringReconcile = new Map<
+      string,
+      { deleted: boolean; updatedAt: number }
+    >();
 
     const publishNow = () => {
       if (!isCurrent()) return;
@@ -1450,10 +1468,571 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
     scheduleDeltaFlushRef.current = scheduleDeltaPersist;
 
+    const waitForIdleFrame = (delayMs: number, signal?: AbortSignal): Promise<void> => {
+      if (!isCurrent() || signal?.aborted) {
+        return Promise.resolve();
+      }
+      return new Promise<void>((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          if (reconcileWaitTimer) {
+            clearTimeout(reconcileWaitTimer);
+            reconcileWaitTimer = undefined;
+          }
+          if (reconcileInteractionTask?.cancel) {
+            reconcileInteractionTask.cancel();
+            reconcileInteractionTask = undefined;
+          }
+          signal?.removeEventListener('abort', onAbort);
+          resolve();
+        };
+        const onAbort = () => finish();
+        signal?.addEventListener('abort', onAbort, { once: true });
+
+        reconcileWaitTimer = setTimeout(() => {
+          reconcileWaitTimer = undefined;
+          if (!isCurrent() || signal?.aborted) {
+            finish();
+            return;
+          }
+          reconcileInteractionTask = InteractionManager.runAfterInteractions(() => {
+            reconcileInteractionTask = undefined;
+            finish();
+          }) as { cancel?: () => void } | undefined;
+        }, delayMs);
+      });
+    };
+
+    const applyDeltaSnapshotChanges = async (
+      items: any[],
+      isDocsArray: boolean,
+      isServerAuthoritative: boolean
+    ) => {
+      let dirtyCount = 0;
+
+      if (items.length > 0) {
+        await processCatalogInBatches(items, (batch) => {
+          if (!isCurrent()) return;
+          for (const entry of batch) {
+            const changeType = isDocsArray ? 'modified' : entry.type;
+            const docSnap = isDocsArray ? entry : entry.doc;
+            if (!docSnap?.id) continue;
+            const productId = docSnap.id;
+
+            if (changeType === 'removed') {
+              localRecentProductsRef.current.delete(productId);
+              if (reconcileInProgress && isServerAuthoritative) {
+                liveDeltaEventsDuringReconcile.set(productId, {
+                  deleted: true,
+                  updatedAt: Date.now(),
+                });
+              }
+              if (removeProductFromRefs(productId)) {
+                if (isServerAuthoritative) {
+                  pendingDeltaUpsertsRef.current.delete(productId);
+                  pendingDeltaDeletesRef.current.add(productId);
+                }
+                dirtyCount += 1;
+              }
+            } else {
+              const mapped = mapSnapshotDoc(docSnap);
+              localRecentProductsRef.current.delete(productId);
+              const mappedUpdatedAt = (mapped as { updatedAt?: number }).updatedAt ?? Date.now();
+              if (isDeletedProduct(mapped)) {
+                if (reconcileInProgress && isServerAuthoritative) {
+                  liveDeltaEventsDuringReconcile.set(productId, {
+                    deleted: true,
+                    updatedAt: mappedUpdatedAt,
+                  });
+                }
+                if (removeProductFromRefs(productId)) {
+                  if (isServerAuthoritative) {
+                    pendingDeltaUpsertsRef.current.delete(productId);
+                    pendingDeltaDeletesRef.current.add(productId);
+                  }
+                  dirtyCount += 1;
+                }
+              } else {
+                if (reconcileInProgress && isServerAuthoritative) {
+                  liveDeltaEventsDuringReconcile.set(productId, {
+                    deleted: false,
+                    updatedAt: mappedUpdatedAt,
+                  });
+                }
+                if (upsertMapped(mapped)) {
+                  if (isServerAuthoritative) {
+                    pendingDeltaDeletesRef.current.delete(productId);
+                    pendingDeltaUpsertsRef.current.set(productId, mapped);
+                    if (!(mapped as { updatedAt?: number }).updatedAt) {
+                      allDocsHaveUpdatedAtRef.current = false;
+                    }
+                  }
+                  dirtyCount += 1;
+                }
+              }
+            }
+          }
+        });
+      }
+
+      if (!isCurrent()) return;
+      syncPendingOverlayToEffectiveRefs();
+      const canMarkComplete = cacheHydrated || reconcileCompleted;
+      if (isServerAuthoritative && canMarkComplete) {
+        lastSyncMsRef.current = Date.now();
+        authoritativeSnapshotReadyRef.current = true;
+        setCatalogComplete(true);
+        if (!reconcileInProgress) {
+          setRefreshing(false);
+        }
+        setError(null);
+      }
+
+      if (dirtyCount > 0) {
+        if (isDocsArray) {
+          publishNow();
+          setInventorySummary(inventoryIndexRef.current.snapshot());
+        } else {
+          scheduleCoalescedPublish();
+          if (canMarkComplete || productMapRef.current.size > 0) {
+            setInventorySummary(inventoryIndexRef.current.snapshot());
+          }
+        }
+        if (isServerAuthoritative && canMarkComplete) {
+          scheduleDeltaPersist();
+        }
+      }
+    };
+
+    let hydratePromise = Promise.resolve();
+
+    const startLiveDeltaListener = () => {
+      if (!isCurrent() || deltaQueryIndexMissing || unsubscribe) return;
+      const liveSinceMs =
+        cacheHydrated && lastSyncMsRef.current > 0
+          ? Math.max(0, lastSyncMsRef.current - DELTA_SYNC_OVERLAP_MS)
+          : Date.now() - 30_000;
+
+      const deltaQuery = query(
+        collection(db, 'products'),
+        where('accountId', '==', accountId),
+        where('updatedAt', '>', Timestamp.fromMillis(liveSinceMs))
+      );
+
+      unsubscribe = onSnapshot(
+        deltaQuery,
+        (snapshot) => {
+          if (!isCurrent()) return;
+          const fromCache = snapshot.metadata?.fromCache === true;
+
+          if (!fromCache) {
+            const isFirstServerDelta = !serverSnapshotApplied;
+            serverSnapshotApplied = true;
+            const items = isFirstServerDelta ? snapshot.docs : snapshot.docChanges();
+            processing = processing
+              .then(async () => {
+                await hydratePromise;
+                if (!isCurrent()) return;
+                await applyDeltaSnapshotChanges(items, isFirstServerDelta, true);
+              })
+              .catch((processingError) => {
+                if (!isCurrent()) return;
+                const message =
+                  processingError instanceof Error
+                    ? processingError.message
+                    : String(processingError);
+                if (!cacheHydrated && productMapRef.current.size === 0 && !reconcileInProgress) {
+                  setError(message);
+                  setRefreshing(false);
+                }
+                console.error(
+                  '[ProductsContext] Error processing delta products snapshot:',
+                  processingError
+                );
+              });
+            return;
+          }
+
+          if (!snapshot.empty) {
+            const docs = snapshot.docs;
+            processing = processing
+              .then(async () => {
+                await hydratePromise;
+                if (!isCurrent() || !cacheHydrated || serverSnapshotApplied) return;
+                await applyDeltaSnapshotChanges(docs, true, false);
+              })
+              .catch(() => {});
+          }
+        },
+        (snapshotError) => {
+          if (!isCurrent()) return;
+          if (isMissingFirestoreIndexError(snapshotError)) {
+            deltaQueryIndexMissing = true;
+            unsubscribe?.();
+            unsubscribe = undefined;
+            return;
+          }
+          const message =
+            snapshotError instanceof Error ? snapshotError.message : String(snapshotError);
+          if (!cacheHydrated && productMapRef.current.size === 0 && !reconcileInProgress) {
+            setError(message);
+            setRefreshing(false);
+          }
+          console.error('[ProductsContext] Error loading delta products snapshot:', snapshotError);
+        }
+      );
+    };
+
+    const runPaginatedCatalogSync = ({ silentWarm }: { silentWarm: boolean }): Promise<void> => {
+      if (!isCurrent() || reconcileInProgress) {
+        return activeReconcilePromise ?? Promise.resolve();
+      }
+      if (warmReconcileTimer) {
+        clearTimeout(warmReconcileTimer);
+        warmReconcileTimer = undefined;
+      }
+
+      reconcileInProgress = true;
+      reconcileCompleted = false;
+      liveDeltaEventsDuringReconcile.clear();
+
+      reconcileAbortController?.abort();
+      const abortController = new AbortController();
+      reconcileAbortController = abortController;
+
+      if (!silentWarm && (!cacheHydrated || forceFullRefresh)) {
+        setRefreshing(true);
+      }
+
+      let task: Promise<void> | null = null;
+      task = (async () => {
+        const projectId =
+          (app?.options as { projectId?: string } | undefined)?.projectId || 'ventify-xead3';
+
+        let forceSdkFallback = false;
+        let cursorDocName: string | null = null;
+        let cursorDocId: string | null = null;
+        let hasMore = true;
+        let pageCount = 0;
+        let dirtyCount = 0;
+        let serverAllDocsHaveUpdatedAt = true;
+        const serverIds = new Set<string>();
+        let abortedOrStopped = false;
+
+        try {
+          while (hasMore) {
+            if (!isCurrent() || abortController.signal.aborted || !isOnlineRef.current) {
+              abortedOrStopped = true;
+              break;
+            }
+
+            let pageDocs: Array<{ id: string; name?: string; data: () => Record<string, any> }> =
+              [];
+            let nextHasMore = false;
+
+            const currentUser = auth.currentUser;
+            let idToken: string | null = null;
+            if (!forceSdkFallback && currentUser) {
+              try {
+                idToken = await currentUser.getIdToken();
+              } catch {
+                idToken = null;
+              }
+            }
+
+            if (!isCurrent() || abortController.signal.aborted || !isOnlineRef.current) {
+              abortedOrStopped = true;
+              break;
+            }
+
+            let usedRestSuccess = false;
+            if (idToken && !forceSdkFallback) {
+              try {
+                const pageRes = await fetchProductsPageViaRest({
+                  projectId,
+                  accountId,
+                  idToken,
+                  pageSize: PRODUCTS_REST_PAGE_SIZE,
+                  startAfterDocName: cursorDocName,
+                  signal: abortController.signal,
+                });
+                pageDocs = pageRes.docs;
+                nextHasMore = pageRes.hasMore;
+                if (pageRes.lastDocName) {
+                  cursorDocName = pageRes.lastDocName;
+                }
+                if (pageDocs.length > 0) {
+                  cursorDocId = pageDocs[pageDocs.length - 1].id;
+                }
+                usedRestSuccess = true;
+              } catch (err) {
+                if (
+                  (err instanceof Error && err.name === 'AbortError') ||
+                  abortController.signal.aborted
+                ) {
+                  abortedOrStopped = true;
+                  break;
+                }
+
+                if (err instanceof FirestoreRestError && err.status === 401 && currentUser) {
+                  try {
+                    const refreshedToken = await currentUser.getIdToken(true);
+                    if (!isCurrent() || abortController.signal.aborted || !isOnlineRef.current) {
+                      abortedOrStopped = true;
+                      break;
+                    }
+                    const retryRes = await fetchProductsPageViaRest({
+                      projectId,
+                      accountId,
+                      idToken: refreshedToken,
+                      pageSize: PRODUCTS_REST_PAGE_SIZE,
+                      startAfterDocName: cursorDocName,
+                      signal: abortController.signal,
+                    });
+                    pageDocs = retryRes.docs;
+                    nextHasMore = retryRes.hasMore;
+                    if (retryRes.lastDocName) {
+                      cursorDocName = retryRes.lastDocName;
+                    }
+                    if (pageDocs.length > 0) {
+                      cursorDocId = pageDocs[pageDocs.length - 1].id;
+                    }
+                    usedRestSuccess = true;
+                  } catch (retryErr) {
+                    if (
+                      (retryErr instanceof Error && retryErr.name === 'AbortError') ||
+                      abortController.signal.aborted
+                    ) {
+                      abortedOrStopped = true;
+                      break;
+                    }
+                    forceSdkFallback = true;
+                  }
+                } else {
+                  forceSdkFallback = true;
+                }
+              }
+            } else {
+              forceSdkFallback = true;
+            }
+
+            if (!usedRestSuccess) {
+              if (!isCurrent() || abortController.signal.aborted || !isOnlineRef.current) {
+                abortedOrStopped = true;
+                break;
+              }
+              const sdkRes = await fetchProductsPageViaSdkFallback({
+                db,
+                accountId,
+                pageSize: PRODUCTS_REST_PAGE_SIZE,
+                startAfterDocId: cursorDocId,
+              });
+              pageDocs = sdkRes.docs;
+              nextHasMore = sdkRes.hasMore;
+              if (sdkRes.lastDocId) {
+                cursorDocId = sdkRes.lastDocId;
+                cursorDocName = `projects/${projectId}/databases/(default)/documents/products/${sdkRes.lastDocId}`;
+              }
+            }
+
+            if (!isCurrent() || abortController.signal.aborted) {
+              abortedOrStopped = true;
+              break;
+            }
+
+            pageCount += 1;
+            hasMore = nextHasMore;
+
+            if (pageDocs.length > 0) {
+              await processCatalogInBatches(pageDocs, (batch) => {
+                if (!isCurrent() || abortController.signal.aborted) return;
+                for (const docSnap of batch) {
+                  const mapped = mapSnapshotDoc(docSnap);
+                  localRecentProductsRef.current.delete(docSnap.id);
+                  const liveEvent = liveDeltaEventsDuringReconcile.get(docSnap.id);
+                  const restUpdatedAt = (mapped as { updatedAt?: number }).updatedAt ?? 0;
+
+                  if (liveEvent) {
+                    if (!liveEvent.deleted && !isDeletedProduct(mapped)) {
+                      serverIds.add(docSnap.id);
+                    }
+                    if (restUpdatedAt <= liveEvent.updatedAt) {
+                      continue;
+                    }
+                  }
+
+                  if (isDeletedProduct(mapped)) {
+                    if (removeProductFromRefs(docSnap.id)) {
+                      pendingDeltaUpsertsRef.current.delete(docSnap.id);
+                      pendingDeltaDeletesRef.current.add(docSnap.id);
+                      dirtyCount += 1;
+                    }
+                    continue;
+                  }
+                  serverIds.add(docSnap.id);
+                  if (!(mapped as { updatedAt?: number }).updatedAt) {
+                    serverAllDocsHaveUpdatedAt = false;
+                  }
+                  if (upsertMapped(mapped)) {
+                    pendingDeltaDeletesRef.current.delete(docSnap.id);
+                    pendingDeltaUpsertsRef.current.set(docSnap.id, mapped);
+                    dirtyCount += 1;
+                  }
+                }
+              });
+            }
+
+            if (!isCurrent() || abortController.signal.aborted) {
+              abortedOrStopped = true;
+              break;
+            }
+
+            if (!silentWarm) {
+              if (pageCount === 1) {
+                syncPendingOverlayToEffectiveRefs();
+                publishNow();
+                setInventorySummary(inventoryIndexRef.current.snapshot());
+              } else if (pageCount % COLD_PUBLISH_EVERY_PAGES === 0) {
+                syncPendingOverlayToEffectiveRefs();
+                scheduleCoalescedPublish();
+                setInventorySummary(inventoryIndexRef.current.snapshot());
+              }
+            }
+
+            if (hasMore) {
+              await waitForIdleFrame(
+                silentWarm ? WARM_PAGE_YIELD_MS : COLD_PAGE_YIELD_MS,
+                abortController.signal
+              );
+            }
+          }
+
+          if (!abortedOrStopped && !hasMore && !abortController.signal.aborted && isCurrent()) {
+            await processCatalogIteratorInBatches(productMapRef.current.keys(), (batch) => {
+              if (!isCurrent() || abortController.signal.aborted) return;
+              for (const productId of batch) {
+                if (
+                  !projectedCreatedIdsRef.current.has(productId) &&
+                  !liveDeltaEventsDuringReconcile.has(productId) &&
+                  !shouldRetainCatalogProduct(productId, serverIds, localRecentProductsRef.current)
+                ) {
+                  if (removeProductFromRefs(productId)) {
+                    pendingDeltaUpsertsRef.current.delete(productId);
+                    pendingDeltaDeletesRef.current.add(productId);
+                    dirtyCount += 1;
+                  }
+                }
+              }
+            });
+
+            if (!isCurrent() || abortController.signal.aborted) {
+              return;
+            }
+
+            syncPendingOverlayToEffectiveRefs();
+            if (!publishedOnce || dirtyCount > 0 || !silentWarm) {
+              publishNow();
+              setInventorySummary(inventoryIndexRef.current.snapshot());
+            }
+
+            reconcileCompleted = true;
+            setCatalogComplete(true);
+            authoritativeSnapshotReadyRef.current = true;
+            lastSyncMsRef.current = Date.now();
+            allDocsHaveUpdatedAtRef.current = serverAllDocsHaveUpdatedAt;
+            setRefreshing(false);
+            setError(null);
+
+            const storedDeltaCount = catalogKVStorage.isSyncCapable
+              ? getProductCatalogDeltaCountSync(accountId, catalogKVStorage)
+              : await getProductCatalogDeltaCount(accountId, catalogKVStorage).catch(() => 0);
+
+            if (!isCurrent()) return;
+
+            const needsFullCompaction =
+              !cacheHydrated ||
+              !manifestValid ||
+              forceFullRefresh ||
+              dirtyCount > DELTA_COMPACTION_THRESHOLD ||
+              storedDeltaCount >= DELTA_COMPACTION_THRESHOLD ||
+              manifestAllDocsHaveUpdatedAt !== serverAllDocsHaveUpdatedAt;
+
+            if (needsFullCompaction) {
+              scheduleFullCompaction(undefined, 1500);
+            } else {
+              if (dirtyCount > 0) {
+                scheduleDeltaPersist();
+              }
+              void updateProductCatalogManifestMeta(catalogKVStorage, scopeKey, {
+                lastSyncMs: lastSyncMsRef.current,
+                allDocsHaveUpdatedAt: serverAllDocsHaveUpdatedAt,
+                cachedAt: Date.now(),
+              }).catch(() => {});
+            }
+            manifestValid = true;
+            manifestAllDocsHaveUpdatedAt = serverAllDocsHaveUpdatedAt;
+          }
+        } catch (syncError) {
+          if (!isCurrent()) return;
+          const isAbort =
+            (syncError instanceof Error && syncError.name === 'AbortError') ||
+            abortController.signal.aborted;
+          if (!isAbort) {
+            const message =
+              syncError instanceof Error ? syncError.message : String(syncError);
+            if (!silentWarm) {
+              setRefreshing(false);
+              if (!cacheHydrated) {
+                setError(message);
+              }
+            }
+            console.error('[ProductsContext] Paginated catalog sync failed:', syncError);
+          }
+        } finally {
+          if (reconcileAbortController === abortController) {
+            reconcileAbortController = null;
+          }
+          if (activeReconcilePromise === task) {
+            activeReconcilePromise = null;
+          }
+          reconcileInProgress = false;
+          liveDeltaEventsDuringReconcile.clear();
+          if (isCurrent() && !silentWarm) {
+            setRefreshing(false);
+          }
+        }
+      })();
+
+      activeReconcilePromise = task;
+      return task;
+    };
+
     let appStateSubscription: { remove: () => void } | undefined;
     if (typeof AppState?.addEventListener === 'function') {
       appStateSubscription = AppState.addEventListener('change', (nextState) => {
-        if (nextState !== 'background' || !isCurrent()) return;
+        if (!isCurrent()) return;
+
+        if (nextState === 'active') {
+          if (activeReconcilePromise) {
+            void activeReconcilePromise.then(() => {
+              scheduleOrRunSync();
+            });
+          } else {
+            scheduleOrRunSync();
+          }
+          return;
+        }
+
+        if (nextState !== 'background') return;
+
+        if (warmReconcileTimer) {
+          clearTimeout(warmReconcileTimer);
+          warmReconcileTimer = undefined;
+        }
+        reconcileAbortController?.abort();
+
         if (!cacheLoadFinished && !authoritativeSnapshotReadyRef.current) return;
         if (productMapRef.current.size === 0 && !authoritativeSnapshotReadyRef.current) return;
 
@@ -1506,464 +2085,15 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       });
     }
 
-    const applySnapshotChanges = async (
-      changes: any[],
-      authoritativeDocs: any[],
-      completesFirstSnapshot: boolean,
-      isServerAuthoritative: boolean
-    ) => {
-      let dirtyCount = 0;
-
-      if (changes.length > 0) {
-        await processCatalogInBatches(changes, (batch) => {
-          if (!isCurrent()) return;
-          for (const change of batch) {
-            const productId = change.doc.id;
-            if (change.type === 'removed') {
-              localRecentProductsRef.current.delete(productId);
-              if (removeProductFromRefs(productId)) {
-                if (isServerAuthoritative) {
-                  pendingDeltaUpsertsRef.current.delete(productId);
-                  pendingDeltaDeletesRef.current.add(productId);
-                }
-                dirtyCount += 1;
-              }
-            } else {
-              const mapped = mapSnapshotDoc(change.doc);
-              localRecentProductsRef.current.delete(productId);
-              if (isDeletedProduct(mapped)) {
-                if (removeProductFromRefs(productId)) {
-                  if (isServerAuthoritative) {
-                    pendingDeltaUpsertsRef.current.delete(productId);
-                    pendingDeltaDeletesRef.current.add(productId);
-                  }
-                  dirtyCount += 1;
-                }
-              } else if (upsertMapped(mapped)) {
-                if (isServerAuthoritative) {
-                  pendingDeltaDeletesRef.current.delete(productId);
-                  pendingDeltaUpsertsRef.current.set(productId, mapped);
-                  if (!(mapped as { updatedAt?: number }).updatedAt) {
-                    allDocsHaveUpdatedAtRef.current = false;
-                  }
-                }
-                dirtyCount += 1;
-              }
-            }
-          }
-        });
-      }
-
-      if (!isCurrent()) return;
-      let serverAllDocsHaveUpdatedAt = true;
-
-      if (completesFirstSnapshot && isServerAuthoritative) {
-        const serverIds = new Set<string>();
-        let publishedFirstNetBatch = productMapRef.current.size > 0;
-        await processCatalogInBatches(authoritativeDocs, (batch) => {
-          if (!isCurrent()) return;
-          for (const docSnap of batch) {
-            const mapped = mapSnapshotDoc(docSnap);
-            localRecentProductsRef.current.delete(docSnap.id);
-            if (isDeletedProduct(mapped)) {
-              if (removeProductFromRefs(docSnap.id)) {
-                pendingDeltaUpsertsRef.current.delete(docSnap.id);
-                pendingDeltaDeletesRef.current.add(docSnap.id);
-                dirtyCount += 1;
-              }
-              continue;
-            }
-            serverIds.add(docSnap.id);
-            if (!(mapped as { updatedAt?: number }).updatedAt) {
-              serverAllDocsHaveUpdatedAt = false;
-            }
-            if (upsertMapped(mapped)) {
-              pendingDeltaDeletesRef.current.delete(docSnap.id);
-              pendingDeltaUpsertsRef.current.set(docSnap.id, mapped);
-              dirtyCount += 1;
-            }
-          }
-          if (!publishedFirstNetBatch && productMapRef.current.size > 0) {
-            publishedFirstNetBatch = true;
-            publishNow();
-          }
-        });
-
-        if (productMapRef.current.size > serverIds.size) {
-          await processCatalogIteratorInBatches(productMapRef.current.keys(), (batch) => {
-            if (!isCurrent()) return;
-            for (const productId of batch) {
-              if (
-                !projectedCreatedIdsRef.current.has(productId) &&
-                !shouldRetainCatalogProduct(productId, serverIds, localRecentProductsRef.current)
-              ) {
-                if (removeProductFromRefs(productId)) {
-                  pendingDeltaUpsertsRef.current.delete(productId);
-                  pendingDeltaDeletesRef.current.add(productId);
-                  dirtyCount += 1;
-                }
-              }
-            }
-          });
-        }
-      } else if (completesFirstSnapshot) {
-        await processCatalogInBatches(authoritativeDocs, (batch) => {
-          if (!isCurrent()) return;
-          for (const docSnap of batch) {
-            const mapped = mapSnapshotDoc(docSnap);
-            if (upsertMapped(mapped)) {
-              dirtyCount += 1;
-            }
-          }
-        });
-      }
-
-      if (!isCurrent()) return;
-      syncPendingOverlayToEffectiveRefs();
-
-      if (completesFirstSnapshot) {
-        if (!publishedOnce || dirtyCount > 0) {
-          publishNow();
-        }
-        setCatalogComplete(true);
-        if (isServerAuthoritative) {
-          authoritativeSnapshotReadyRef.current = true;
-          lastSyncMsRef.current = Date.now();
-          allDocsHaveUpdatedAtRef.current = serverAllDocsHaveUpdatedAt;
-        }
-        if (dirtyCount > 0 || !cacheHydrated) {
-          setInventorySummary(inventoryIndexRef.current.snapshot());
-        }
-        setRefreshing(false);
-        setError(null);
-        if (isServerAuthoritative) {
-          const storedDeltaCount = catalogKVStorage.isSyncCapable
-            ? getProductCatalogDeltaCountSync(accountId, catalogKVStorage)
-            : 0;
-          const manifestNeedsFullRewrite =
-            !cacheHydrated ||
-            !hasValidManifest ||
-            forceFullRefresh ||
-            !syncManifest?.lastSyncMs ||
-            Date.now() - syncManifest.lastSyncMs >= DELTA_SYNC_MAX_AGE_MS ||
-            syncManifest.allDocsHaveUpdatedAt !== serverAllDocsHaveUpdatedAt ||
-            dirtyCount > DELTA_COMPACTION_THRESHOLD ||
-            storedDeltaCount >= DELTA_COMPACTION_THRESHOLD;
-
-          if (manifestNeedsFullRewrite) {
-            scheduleFullCompaction(undefined, 1500);
-          } else if (
-            pendingDeltaUpsertsRef.current.size > 0 ||
-            pendingDeltaDeletesRef.current.size > 0
-          ) {
-            scheduleDeltaPersist();
-          }
-        }
-      } else if (catalogCompleteRef.current && dirtyCount > 0) {
-        scheduleCoalescedPublish();
-        if (isServerAuthoritative) {
-          lastSyncMsRef.current = Date.now();
-          scheduleDeltaPersist();
-        }
-      } else if (dirtyCount > 0 || !publishedOnce) {
-        publishNow();
-      }
-    };
-
-    const applyDeltaSnapshotChanges = async (
-      items: any[],
-      isDocsArray: boolean,
-      isServerAuthoritative: boolean
-    ) => {
-      let dirtyCount = 0;
-
-      if (items.length > 0) {
-        await processCatalogInBatches(items, (batch) => {
-          if (!isCurrent()) return;
-          for (const entry of batch) {
-            const changeType = isDocsArray ? 'modified' : entry.type;
-            const docSnap = isDocsArray ? entry : entry.doc;
-            if (!docSnap?.id) continue;
-            const productId = docSnap.id;
-
-            if (changeType === 'removed') {
-              localRecentProductsRef.current.delete(productId);
-              if (removeProductFromRefs(productId)) {
-                if (isServerAuthoritative) {
-                  pendingDeltaUpsertsRef.current.delete(productId);
-                  pendingDeltaDeletesRef.current.add(productId);
-                }
-                dirtyCount += 1;
-              }
-            } else {
-              const mapped = mapSnapshotDoc(docSnap);
-              localRecentProductsRef.current.delete(productId);
-              if (isDeletedProduct(mapped)) {
-                if (removeProductFromRefs(productId)) {
-                  if (isServerAuthoritative) {
-                    pendingDeltaUpsertsRef.current.delete(productId);
-                    pendingDeltaDeletesRef.current.add(productId);
-                  }
-                  dirtyCount += 1;
-                }
-              } else if (upsertMapped(mapped)) {
-                if (isServerAuthoritative) {
-                  pendingDeltaDeletesRef.current.delete(productId);
-                  pendingDeltaUpsertsRef.current.set(productId, mapped);
-                  if (!(mapped as { updatedAt?: number }).updatedAt) {
-                    allDocsHaveUpdatedAtRef.current = false;
-                  }
-                }
-                dirtyCount += 1;
-              }
-            }
-          }
-        });
-      }
-
-      if (!isCurrent()) return;
-      syncPendingOverlayToEffectiveRefs();
-      if (isServerAuthoritative) {
-        lastSyncMsRef.current = Date.now();
-        authoritativeSnapshotReadyRef.current = true;
-        setCatalogComplete(true);
-        setRefreshing(false);
-        setError(null);
-      }
-
-      if (dirtyCount > 0) {
-        if (isDocsArray) {
-          publishNow();
-          setInventorySummary(inventoryIndexRef.current.snapshot());
-        } else {
-          scheduleCoalescedPublish();
-        }
-        if (isServerAuthoritative) {
-          scheduleDeltaPersist();
-        }
-      }
-    };
-
-    let hydratePromise = Promise.resolve();
-
-    const startFullListener = () => {
-      if (!isCurrent()) return;
-      isDeltaMode = false;
-      const realtimeQuery = query(
-        collection(db, 'products'),
-        where('accountId', '==', accountId)
-      );
-
-      if (!hasValidManifest && productMapRef.current.size === 0) {
-        getDocs(query(realtimeQuery, limit(PRODUCT_CATALOG_FIRST_BATCH_SIZE)))
-          .then((quickSnap) => {
-            if (!isCurrent() || serverSnapshotApplied || quickSnap.empty) return;
-            let added = 0;
-            for (const docSnap of quickSnap.docs) {
-              if (!productMapRef.current.has(docSnap.id)) {
-                if (upsertMapped(mapSnapshotDoc(docSnap))) added += 1;
-              }
-            }
-            if (added > 0 && productMapRef.current.size > 0) {
-              publishNow();
-            }
-          })
-          .catch(() => {
-            // El listener completo de abajo maneja errores y reconexión.
-          });
-      }
-
-      unsubscribe = onSnapshot(
-        realtimeQuery,
-        (snapshot) => {
-          if (!isCurrent()) return;
-          const fromCache = snapshot.metadata?.fromCache === true;
-
-          if (!fromCache) {
-            if (fallbackTimer) {
-              clearTimeout(fallbackTimer);
-              fallbackTimer = undefined;
-            }
-            latestCachedDocs = null;
-            const isFirstServerSnapshot = !serverSnapshotApplied;
-            serverSnapshotApplied = true;
-            const changes = isFirstServerSnapshot ? [] : snapshot.docChanges();
-            const docs = isFirstServerSnapshot ? snapshot.docs : [];
-            processing = processing
-              .then(async () => {
-                await hydratePromise;
-                if (!isCurrent()) return;
-                await applySnapshotChanges(changes, docs, isFirstServerSnapshot, true);
-              })
-              .catch((processingError) => {
-                if (!isCurrent()) return;
-                const message =
-                  processingError instanceof Error
-                    ? processingError.message
-                    : String(processingError);
-                setError(message);
-                setRefreshing(false);
-                console.error(
-                  '[ProductsContext] Error processing products snapshot:',
-                  processingError
-                );
-              });
-            return;
-          }
-
-          latestCachedDocs = snapshot.docs;
-          const allowOfflineNow = !isOnlineRef.current;
-          if (isAuthoritativeCatalogSnapshot(fromCache, { allowOffline: allowOfflineNow })) {
-            if (fallbackTimer) {
-              clearTimeout(fallbackTimer);
-              fallbackTimer = undefined;
-            }
-            const docs = snapshot.docs;
-            processing = processing
-              .then(async () => {
-                await hydratePromise;
-                if (!isCurrent() || serverSnapshotApplied) return;
-                await applySnapshotChanges([], docs, true, false);
-              })
-              .catch((processingError) => {
-                if (!isCurrent()) return;
-                const message =
-                  processingError instanceof Error
-                    ? processingError.message
-                    : String(processingError);
-                setError(message);
-                setRefreshing(false);
-              });
-            return;
-          }
-
-          if (!fallbackTimer && !serverSnapshotApplied) {
-            fallbackTimer = setTimeout(async () => {
-              fallbackTimer = undefined;
-              if (!isCurrent() || serverSnapshotApplied) return;
-              const net = await NetInfo.fetch().catch(() => null);
-              const stillOffline = net
-                ? !(net.isConnected && net.isInternetReachable !== false)
-                : !isOnlineRef.current;
-              if (stillOffline && latestCachedDocs) {
-                const docs = latestCachedDocs;
-                processing = processing
-                  .then(async () => {
-                    await hydratePromise;
-                    if (!isCurrent() || serverSnapshotApplied) return;
-                    await applySnapshotChanges([], docs, true, false);
-                  })
-                  .catch(() => setRefreshing(false));
-              } else {
-                setRefreshing(false);
-              }
-            }, 4500);
-          }
-        },
-        (snapshotError) => {
-          if (!isCurrent()) return;
-          if (fallbackTimer) {
-            clearTimeout(fallbackTimer);
-            fallbackTimer = undefined;
-          }
-          const message =
-            snapshotError instanceof Error ? snapshotError.message : String(snapshotError);
-          setError(message);
-          setRefreshing(false);
-          console.error('[ProductsContext] Error loading products snapshot:', snapshotError);
-        }
-      );
-    };
-
-    const startDeltaListener = () => {
-      if (!isCurrent() || !syncManifest || typeof syncManifest.lastSyncMs !== 'number') {
-        startFullListener();
-        return;
-      }
-      isDeltaMode = true;
-      const sinceMs = Math.max(0, syncManifest.lastSyncMs - DELTA_SYNC_OVERLAP_MS);
-      const deltaQuery = query(
-        collection(db, 'products'),
-        where('accountId', '==', accountId),
-        where('updatedAt', '>', Timestamp.fromMillis(sinceMs))
-      );
-
-      unsubscribe = onSnapshot(
-        deltaQuery,
-        (snapshot) => {
-          if (!isCurrent() || !isDeltaMode) return;
-          const fromCache = snapshot.metadata?.fromCache === true;
-
-          if (!fromCache) {
-            const isFirstServerDelta = !serverSnapshotApplied;
-            serverSnapshotApplied = true;
-            const items = isFirstServerDelta ? snapshot.docs : snapshot.docChanges();
-            processing = processing
-              .then(async () => {
-                await hydratePromise;
-                if (!isCurrent() || !isDeltaMode || !cacheHydrated) return;
-                await applyDeltaSnapshotChanges(items, isFirstServerDelta, true);
-              })
-              .catch((processingError) => {
-                if (!isCurrent()) return;
-                const message =
-                  processingError instanceof Error
-                    ? processingError.message
-                    : String(processingError);
-                setError(message);
-                setRefreshing(false);
-                console.error(
-                  '[ProductsContext] Error processing delta products snapshot:',
-                  processingError
-                );
-              });
-            return;
-          }
-
-          if (!snapshot.empty) {
-            const docs = snapshot.docs;
-            processing = processing
-              .then(async () => {
-                await hydratePromise;
-                if (!isCurrent() || !isDeltaMode || !cacheHydrated || serverSnapshotApplied) return;
-                await applyDeltaSnapshotChanges(docs, true, false);
-              })
-              .catch(() => {});
-          }
-        },
-        (snapshotError) => {
-          if (!isCurrent()) return;
-          if (isMissingFirestoreIndexError(snapshotError)) {
-            deltaQueryIndexMissing = true;
-            isDeltaMode = false;
-            serverSnapshotApplied = false;
-            unsubscribe?.();
-            unsubscribe = undefined;
-            if (cacheHydrated) {
-              if (deferredFullTimer) clearTimeout(deferredFullTimer);
-              deferredFullTimer = setTimeout(() => {
-                deferredFullTimer = undefined;
-                if (isCurrent()) {
-                  startFullListener();
-                }
-              }, 1500);
-            } else {
-              startFullListener();
-            }
-            return;
-          }
-          const message =
-            snapshotError instanceof Error ? snapshotError.message : String(snapshotError);
-          setError(message);
-          setRefreshing(false);
-          console.error('[ProductsContext] Error loading delta products snapshot:', snapshotError);
-        }
-      );
-    };
-
     const hydrateCache = async (): Promise<void> => {
       if (!scopeChanged) {
         cacheLoadFinished = true;
+        cacheHydrated =
+          productMapRef.current.size > 0 &&
+          (manifestValid || authoritativeSnapshotReadyRef.current);
+        if (cacheHydrated && !forceFullRefresh) {
+          setRefreshing(false);
+        }
         return;
       }
       try {
@@ -1971,7 +2101,7 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         if (!isCurrent()) return;
         const skipIntermediatePublish = Boolean(syncManifest && syncManifest.chunks <= 4);
         const cacheResult = await loadProductCatalogCache(catalogKVStorage, scopeKey, (chunk) => {
-          if (!isCurrent() || (!isDeltaMode && serverSnapshotApplied)) return;
+          if (!isCurrent()) return;
           for (let i = 0; i < chunk.length; i += 1) {
             const cachedProduct = chunk[i];
             if (!cachedProduct || !cachedProduct.id) continue;
@@ -1995,11 +2125,10 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
           }
         });
         if (!isCurrent()) return;
-        if (!isDeltaMode && serverSnapshotApplied) {
-          return;
-        }
         if (cacheResult && !cacheResult.expired) {
           cacheHydrated = true;
+          manifestValid = true;
+          manifestAllDocsHaveUpdatedAt = cacheResult.allDocsHaveUpdatedAt;
           if (typeof cacheResult.lastSyncMs === 'number') {
             lastSyncMsRef.current = cacheResult.lastSyncMs;
           }
@@ -2010,7 +2139,9 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
           publishNow();
           setInventorySummary(inventoryIndexRef.current.snapshot());
           setCatalogComplete(true);
-          setRefreshing(false);
+          if (!forceFullRefresh) {
+            setRefreshing(false);
+          }
         } else {
           if (!cacheResult?.expired && productMapRef.current.size) {
             // A corrupt/incomplete cache must not leak partial stale data into an offline session.
@@ -2023,13 +2154,6 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
             syncPendingOverlayToEffectiveRefs();
             publishNow();
           }
-          if (isDeltaMode && isCurrent()) {
-            isDeltaMode = false;
-            serverSnapshotApplied = false;
-            unsubscribe?.();
-            unsubscribe = undefined;
-            startFullListener();
-          }
         }
       } catch (cacheError) {
         if (isCurrent() && scopeChanged) {
@@ -2041,13 +2165,6 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
           catalogFilterIndexRef.current.clear();
           syncPendingOverlayToEffectiveRefs();
           publishNow();
-          if (isDeltaMode) {
-            isDeltaMode = false;
-            serverSnapshotApplied = false;
-            unsubscribe?.();
-            unsubscribe = undefined;
-            startFullListener();
-          }
         }
         console.warn('[ProductsContext] Could not load catalog cache:', cacheError);
       } finally {
@@ -2055,23 +2172,57 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       }
     };
 
-    // Start MMKV hydration and Firestore network listener concurrently
+    const scheduleOrRunSync = () => {
+      if (!isCurrent() || !cacheLoadFinished || reconcileInProgress || reconcileCompleted) return;
+      if (!cacheHydrated || forceFullRefresh) {
+        if (isOnlineRef.current) {
+          void runPaginatedCatalogSync({ silentWarm: false });
+        } else {
+          setRefreshing(false);
+        }
+        return;
+      }
+      const reconcileIntervalMs = allDocsHaveUpdatedAtRef.current
+        ? WARM_RECONCILE_INTERVAL_INDEXED_MS
+        : WARM_RECONCILE_INTERVAL_LEGACY_MS;
+      if (!lastSyncMsRef.current || Date.now() - lastSyncMsRef.current >= reconcileIntervalMs) {
+        if (!warmReconcileTimer && isOnlineRef.current) {
+          warmReconcileTimer = setTimeout(() => {
+            warmReconcileTimer = undefined;
+            if (isCurrent() && isOnlineRef.current && !reconcileInProgress && !reconcileCompleted) {
+              void runPaginatedCatalogSync({ silentWarm: true });
+            }
+          }, WARM_RECONCILE_START_DELAY_MS);
+        }
+      }
+    };
+
+    onlineResumeHandlerRef.current = scheduleOrRunSync;
+
+    // Hydrate MMKV cache first without competing network downloads, then start live delta + paginated sync
     hydratePromise = hydrateCache();
-    if (canStartDeltaSync) {
-      startDeltaListener();
-    } else {
-      startFullListener();
-    }
+    void hydratePromise.then(() => {
+      if (!isCurrent()) return;
+
+      if (!deltaQueryIndexMissing) {
+        startLiveDeltaListener();
+      }
+
+      scheduleOrRunSync();
+    });
 
     return () => {
       if (effectGenerationRef.current === generation) effectGenerationRef.current += 1;
+      onlineResumeHandlerRef.current = null;
+      reconcileAbortController?.abort();
       if (deltaTimer) clearTimeout(deltaTimer);
       if (compactTimer) clearTimeout(compactTimer);
       if (coalescePublishTimer) clearTimeout(coalescePublishTimer);
-      if (fallbackTimer) clearTimeout(fallbackTimer);
-      if (deferredFullTimer) clearTimeout(deferredFullTimer);
+      if (warmReconcileTimer) clearTimeout(warmReconcileTimer);
+      if (reconcileWaitTimer) clearTimeout(reconcileWaitTimer);
       if (deltaInteractionTask?.cancel) deltaInteractionTask.cancel();
       if (compactInteractionTask?.cancel) compactInteractionTask.cancel();
+      if (reconcileInteractionTask?.cancel) reconcileInteractionTask.cancel();
       appStateSubscription?.remove();
       unsubscribe?.();
       publishCatalogStateRef.current = () => {};
@@ -2130,7 +2281,7 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     []
   );
 
-  const isCurrentScopePublished = catalogComplete && hasMatchingScope;
+  const isCurrentScopePublished = (catalogComplete || visibleProducts.length > 0) && hasMatchingScope;
   const stats = isCurrentScopePublished ? inventorySummary.stats : DEFAULT_STATS;
   const criticalAlerts = isCurrentScopePublished ? inventorySummary.alerts : EMPTY_ALERTS;
   const visibleCategories = hasMatchingScope ? categories : DEFAULT_CATEGORIES;

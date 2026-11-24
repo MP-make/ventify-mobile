@@ -1221,6 +1221,7 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     let compactTimer: ReturnType<typeof setTimeout> | undefined;
     let coalescePublishTimer: ReturnType<typeof setTimeout> | undefined;
     let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
+    let deferredFullTimer: ReturnType<typeof setTimeout> | undefined;
     let deltaInteractionTask: { cancel?: () => void } | undefined;
     let compactInteractionTask: { cancel?: () => void } | undefined;
     let processing = Promise.resolve();
@@ -1938,7 +1939,17 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
             serverSnapshotApplied = false;
             unsubscribe?.();
             unsubscribe = undefined;
-            startFullListener();
+            if (cacheHydrated) {
+              if (deferredFullTimer) clearTimeout(deferredFullTimer);
+              deferredFullTimer = setTimeout(() => {
+                deferredFullTimer = undefined;
+                if (isCurrent()) {
+                  startFullListener();
+                }
+              }, 1500);
+            } else {
+              startFullListener();
+            }
             return;
           }
           const message =
@@ -2058,6 +2069,7 @@ export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       if (compactTimer) clearTimeout(compactTimer);
       if (coalescePublishTimer) clearTimeout(coalescePublishTimer);
       if (fallbackTimer) clearTimeout(fallbackTimer);
+      if (deferredFullTimer) clearTimeout(deferredFullTimer);
       if (deltaInteractionTask?.cancel) deltaInteractionTask.cancel();
       if (compactInteractionTask?.cancel) compactInteractionTask.cancel();
       appStateSubscription?.remove();

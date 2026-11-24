@@ -322,13 +322,17 @@ export const CreateOrderModal: React.FC<CreateOrderModalProps> = React.memo(({
       visible={visible}
       animationType="slide"
       transparent={true}
+      statusBarTranslucent
       onRequestClose={onClose}
     >
       <KeyboardAvoidingView
         style={styles.modalOverlay}
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
       >
-        <View style={[styles.modalSheetContainer, { paddingBottom: Math.max(12, insets.bottom) }]}>
+        <View
+          style={[styles.modalSheetContainer, { paddingBottom: Math.max(12, insets.bottom) }]}
+          collapsable={false}
+        >
           {/* Header Submodal */}
           <View style={styles.subModalHeader}>
             <View>

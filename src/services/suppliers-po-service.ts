@@ -27,6 +27,9 @@ import {
   QueryDocumentSnapshot,
 } from 'firebase/firestore';
 import { cleanFirestoreData } from '@/lib/firebase-utils';
+import { metaKVStorage } from '@/lib/native-kv-storage';
+import { withTimeout } from '@/lib/online-guard';
+import { sharedRequestCache } from '@/lib/request-cache';
 
 // ============================================================================
 // CONSTANTES & COLECCIONES
@@ -42,7 +45,58 @@ export const LOW_STOCK_THRESHOLD = DEFAULT_MIN_STOCK_THRESHOLD;
 export const LOW_STOCK_ANY = '__any__';
 
 const PO_BACKGROUND_PAUSE_MS = 15_000;
+const PO_SWR_PREFIX = 'ventify_swr_po:';
+const SUPPLIERS_SWR_PREFIX = 'ventify_swr_suppliers:';
 const missingPurchaseOrderIndexes = new Set<string>();
+
+const serializeCacheValue = (value: unknown): unknown => {
+  if (value === null || value === undefined) return value;
+  if (value instanceof Date) {
+    const ms = value.getTime();
+    return Number.isFinite(ms) ? ms : null;
+  }
+  if (typeof value === 'object') {
+    const maybeTs = value as { toMillis?: () => number; seconds?: unknown; nanoseconds?: unknown };
+    if (typeof maybeTs.toMillis === 'function') {
+      return maybeTs.toMillis();
+    }
+    if (typeof maybeTs.seconds === 'number') {
+      const nanos = typeof maybeTs.nanoseconds === 'number' ? maybeTs.nanoseconds : 0;
+      return maybeTs.seconds * 1000 + Math.floor(nanos / 1_000_000);
+    }
+    if (Array.isArray(value)) {
+      return value.map(serializeCacheValue);
+    }
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (v !== undefined && typeof v !== 'function') {
+        out[k] = serializeCacheValue(v);
+      }
+    }
+    return out;
+  }
+  return value;
+};
+
+const readSwrArray = <T>(key: string): T[] => {
+  try {
+    const raw = metaKVStorage.getItemSync(key);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as T[]) : [];
+  } catch {
+    return [];
+  }
+};
+
+const writeSwrArray = <T>(key: string, items: T[], maxItems: number): void => {
+  try {
+    const payload = items.slice(0, maxItems).map(serializeCacheValue);
+    metaKVStorage.setItemSync(key, JSON.stringify(payload));
+  } catch {
+    // Ignore MMKV/serialization errors in environments without native storage
+  }
+};
 
 const isMissingPoIndexError = (err: any): boolean => {
   const code = String(err?.code || '').toLowerCase();
@@ -62,7 +116,8 @@ type AppStateLike = {
 
 const getAppState = (): AppStateLike | null => {
   try {
-    const rn = (typeof require !== 'undefined' ? require : () => null)('react-native');
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const rn = require('react-native');
     return rn?.AppState || null;
   } catch {
     return null;
@@ -108,7 +163,7 @@ const createAppStateManagedSubscription = (attach: () => () => void): (() => voi
     });
   }
 
-  if (typeof AppState?.currentState !== 'string' || AppState.currentState === 'active') {
+  if (AppState?.currentState !== 'background') {
     ensureAttached();
   }
 
@@ -532,6 +587,11 @@ export const purchaseOrderFromDoc = (docSnap: QueryDocumentSnapshot<DocumentData
 // 1. GESTIÓN DE PROVEEDORES (suppliers collection)
 // ============================================================================
 
+export const getCachedSuppliersSync = (accountId: string): Supplier[] => {
+  if (!accountId) return [];
+  return readSwrArray<Supplier>(`${SUPPLIERS_SWR_PREFIX}${accountId}`);
+};
+
 /**
  * Consulta asíncrona de proveedores de la cuenta
  */
@@ -551,7 +611,11 @@ export const getSuppliersAsync = async (
     constraints.push(firestoreLimit(300));
 
     const q = query(suppliersColl, ...constraints);
-    const snap = await getDocs(q);
+    const snap = await withTimeout(
+      getDocs(q),
+      10_000,
+      'Tiempo de espera agotado al consultar proveedores.'
+    );
 
     const list = snap.docs.map(supplierFromDoc);
     list.sort((a, b) => a.name.localeCompare(b.name, 'es', { sensitivity: 'base' }));
@@ -593,6 +657,9 @@ export const subscribeSuppliers = (
           try {
             const list = snapshot.docs.map(supplierFromDoc);
             list.sort((a, b) => a.name.localeCompare(b.name, 'es', { sensitivity: 'base' }));
+            if (onlyActive) {
+              writeSwrArray(`${SUPPLIERS_SWR_PREFIX}${accountId}`, list, 300);
+            }
             callback(list);
           } catch (err) {
             console.warn('[suppliers-po-service] Error procesando snapshot de proveedores:', err);
@@ -728,6 +795,11 @@ export const generateNextOrderNumber = async (accountId: string): Promise<string
   }
 };
 
+export const getCachedPurchaseOrdersSync = (accountId: string): PurchaseOrder[] => {
+  if (!accountId) return [];
+  return readSwrArray<PurchaseOrder>(`${PO_SWR_PREFIX}${accountId}`);
+};
+
 /**
  * Consulta asíncrona de órdenes de compra
  */
@@ -740,6 +812,7 @@ export const getPurchaseOrdersAsync = async (
 
   const hasStatusFilter = Boolean(statusFilter && statusFilter !== 'all');
   const indexKey = hasStatusFilter ? 'po:status' : 'po:all';
+  const timeoutMsg = 'Tiempo de espera agotado al consultar órdenes de compra.';
 
   const runFallback = async (): Promise<PurchaseOrder[]> => {
     const coll = collection(db, PURCHASE_ORDERS_COLLECTION);
@@ -748,7 +821,7 @@ export const getPurchaseOrdersAsync = async (
       fallbackConstraints.push(where('status', '==', statusFilter));
     }
     const q = query(coll, ...fallbackConstraints, firestoreLimit(200));
-    const snap = await getDocs(q);
+    const snap = await withTimeout(getDocs(q), 10_000, timeoutMsg);
     let orders = snap.docs.map(purchaseOrderFromDoc);
 
     if (hasStatusFilter) {
@@ -782,7 +855,7 @@ export const getPurchaseOrdersAsync = async (
     constraints.push(firestoreLimit(200));
 
     const q = query(coll, ...constraints);
-    const snap = await getDocs(q);
+    const snap = await withTimeout(getDocs(q), 10_000, timeoutMsg);
 
     let orders = snap.docs.map(purchaseOrderFromDoc);
 
@@ -794,14 +867,16 @@ export const getPurchaseOrdersAsync = async (
   } catch (err: any) {
     if (isMissingPoIndexError(err)) {
       missingPurchaseOrderIndexes.add(indexKey);
+      console.warn('[suppliers-po-service] Índice faltante en getPurchaseOrdersAsync, usando fallback sin orderBy:', err?.message || err);
+      try {
+        return await runFallback();
+      } catch (fallbackErr) {
+        console.error('[suppliers-po-service] Fallback getPurchaseOrders falló:', fallbackErr);
+        return [];
+      }
     }
-    console.warn('[suppliers-po-service] Error con orderBy en purchase_orders, usando fallback:', err?.message);
-    try {
-      return await runFallback();
-    } catch (fallbackErr) {
-      console.error('[suppliers-po-service] Fallback getPurchaseOrders falló:', fallbackErr);
-      return [];
-    }
+    console.warn('[suppliers-po-service] Error en getPurchaseOrdersAsync:', err?.message || err);
+    return [];
   }
 };
 
@@ -830,17 +905,22 @@ export const subscribePurchaseOrders = (
 
   const handleSnapshot = (snapshot: any) => {
     try {
-      let orders: PurchaseOrder[] = snapshot.docs.map(purchaseOrderFromDoc);
+      const allOrders: PurchaseOrder[] = snapshot.docs.map(purchaseOrderFromDoc);
 
-      if (branchId && branchId !== 'all') {
-        orders = orders.filter((o) => !o.branchId || o.branchId === branchId);
-      }
-
-      orders.sort((a, b) => {
+      allOrders.sort((a, b) => {
         const tA = a.createdAt instanceof Date ? a.createdAt.getTime() : Number(a.createdAt) || 0;
         const tB = b.createdAt instanceof Date ? b.createdAt.getTime() : Number(b.createdAt) || 0;
         return tB - tA;
       });
+
+      if (!hasStatusFilter) {
+        writeSwrArray(`${PO_SWR_PREFIX}${accountId}`, allOrders, 200);
+      }
+
+      const orders =
+        branchId && branchId !== 'all'
+          ? allOrders.filter((o) => !o.branchId || o.branchId === branchId)
+          : allOrders;
 
       callback(orders);
     } catch (err) {
@@ -1394,6 +1474,8 @@ export const receivePurchaseOrder = async (
     tx.update(orderRef, orderUpdate);
   });
 
+  sharedRequestCache.invalidatePrefix('kardex:');
+
   return {
     success: true,
     orderId,
@@ -1572,11 +1654,13 @@ export const calculatePurchaseOrderStats = (orders: PurchaseOrder[]): PurchaseOr
 
 export const SuppliersPOService = {
   getSuppliers,
+  getCachedSuppliersSync,
   getSuppliersAsync,
   subscribeSuppliers,
   saveSupplier,
   deleteSupplier,
   getPurchaseOrders,
+  getCachedPurchaseOrdersSync,
   getPurchaseOrdersAsync,
   subscribePurchaseOrders,
   createPurchaseOrder,

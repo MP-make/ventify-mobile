@@ -185,13 +185,17 @@ export const SupplierFormModal: React.FC<SupplierFormModalProps> = React.memo(({
       visible={visible}
       animationType="slide"
       transparent={true}
+      statusBarTranslucent
       onRequestClose={onClose}
     >
       <KeyboardAvoidingView
         style={styles.modalOverlay}
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
       >
-        <View style={[styles.modalSheetContainer, { paddingBottom: Math.max(12, insets.bottom) }]}>
+        <View
+          style={[styles.modalSheetContainer, { paddingBottom: Math.max(12, insets.bottom) }]}
+          collapsable={false}
+        >
           <View style={styles.subModalHeader}>
             <View>
               <Text style={styles.subModalTitle}>

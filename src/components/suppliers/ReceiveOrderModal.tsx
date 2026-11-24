@@ -137,6 +137,7 @@ export const ReceiveOrderModal: React.FC<ReceiveOrderModalProps> = React.memo(({
       visible={true}
       animationType="slide"
       transparent={true}
+      statusBarTranslucent
       onRequestClose={() => {
         if (!isSubmitting) onClose();
       }}
@@ -145,7 +146,10 @@ export const ReceiveOrderModal: React.FC<ReceiveOrderModalProps> = React.memo(({
         style={styles.modalOverlay}
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
       >
-        <View style={[styles.modalSheetContainer, { paddingBottom: Math.max(12, insets.bottom) }]}>
+        <View
+          style={[styles.modalSheetContainer, { paddingBottom: Math.max(12, insets.bottom) }]}
+          collapsable={false}
+        >
           <View style={styles.subModalHeader}>
             <View>
               <Text style={styles.subModalTitle}>

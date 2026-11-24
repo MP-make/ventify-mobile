@@ -168,6 +168,7 @@ export const PriceSuggestionModal: React.FC<PriceSuggestionModalProps> = React.m
       visible={visible}
       animationType="slide"
       transparent={true}
+      statusBarTranslucent
       onRequestClose={() => {
         if (!isApplyingPriceSuggestions) onClose();
       }}
@@ -176,7 +177,10 @@ export const PriceSuggestionModal: React.FC<PriceSuggestionModalProps> = React.m
         style={styles.modalOverlay}
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
       >
-        <View style={[styles.modalSheetContainer, { paddingBottom: Math.max(12, insets.bottom) }]}>
+        <View
+          style={[styles.modalSheetContainer, { paddingBottom: Math.max(12, insets.bottom) }]}
+          collapsable={false}
+        >
           <View style={styles.subModalHeader}>
             <View style={{ flex: 1 }}>
               <Text style={styles.subModalTitle}>Actualizar Precios de Venta</Text>

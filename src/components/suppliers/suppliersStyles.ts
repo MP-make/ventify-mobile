@@ -2,6 +2,7 @@ import { Platform, StyleSheet, type ViewStyle } from 'react-native';
 import { ui } from '@/lib/theme';
 
 export const LIST_CONTENT_STYLE: ViewStyle = {
+  flexGrow: 1,
   paddingHorizontal: 20,
   paddingBottom: 12,
 };
@@ -80,6 +81,9 @@ export const suppliersStyles = StyleSheet.create({
   tabContentContainer: {
     flex: 1,
     backgroundColor: ui.background,
+  },
+  listFlex: {
+    flex: 1,
   },
   sectionSubOnly: {
     fontSize: 12,
@@ -523,6 +527,7 @@ export const suppliersStyles = StyleSheet.create({
   },
   // Estados vacíos y carga
   centerContainer: {
+    flex: 1,
     padding: 32,
     alignItems: 'center',
     justifyContent: 'center',
@@ -533,6 +538,7 @@ export const suppliersStyles = StyleSheet.create({
     marginTop: 10,
   },
   emptyContainer: {
+    flex: 1,
     padding: 36,
     alignItems: 'center',
     justifyContent: 'center',
@@ -608,6 +614,7 @@ export const suppliersStyles = StyleSheet.create({
     justifyContent: 'center',
   },
   subModalBody: {
+    flexShrink: 1,
     paddingHorizontal: 16,
     paddingTop: 12,
   },

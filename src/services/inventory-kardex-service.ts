@@ -42,6 +42,7 @@ import { cleanFirestoreData } from '@/lib/firebase-utils';
 import { apiRequest } from '@/lib/api-client';
 import { sharedRequestCache } from '@/lib/request-cache';
 import { withTimeout } from '@/lib/online-guard';
+import { metaKVStorage } from '@/lib/native-kv-storage';
 import type { AuthoritativeProductStockPatch } from '@/lib/offline-stock-helpers';
 import {
   findProductByBarcode,
@@ -68,6 +69,71 @@ export const INVENTORY_ADJUSTMENTS_COLLECTION = 'inventory_adjustments';
 export const LOW_STOCK_THRESHOLD = 5;
 export const LOW_STOCK_ANY = '__any__';
 export const DEFAULT_MIN_STOCK_THRESHOLD = LOW_STOCK_THRESHOLD;
+
+const TRANSFERS_SWR_PREFIX = 'ventify_swr_transfers:';
+const KARDEX_SWR_PREFIX = 'ventify_swr_kardex:';
+const TRANSFERS_SWR_LIMIT = 100;
+const KARDEX_SWR_LIMIT = 60;
+
+const serializeCacheValue = (value: unknown): unknown => {
+  if (value === null || value === undefined) return value;
+  if (value instanceof Date) {
+    const ms = value.getTime();
+    return Number.isFinite(ms) ? ms : null;
+  }
+  if (typeof value === 'object') {
+    const maybeTs = value as { toMillis?: () => number; seconds?: unknown; nanoseconds?: unknown };
+    if (typeof maybeTs.toMillis === 'function') {
+      return maybeTs.toMillis();
+    }
+    if (typeof maybeTs.seconds === 'number') {
+      const nanos = typeof maybeTs.nanoseconds === 'number' ? maybeTs.nanoseconds : 0;
+      return maybeTs.seconds * 1000 + Math.floor(nanos / 1_000_000);
+    }
+    if (Array.isArray(value)) {
+      return value.map(serializeCacheValue);
+    }
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (v !== undefined && typeof v !== 'function') {
+        out[k] = serializeCacheValue(v);
+      }
+    }
+    return out;
+  }
+  return value;
+};
+
+const readSwrArray = <T>(key: string): T[] => {
+  try {
+    const raw = metaKVStorage.getItemSync(key);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as T[]) : [];
+  } catch {
+    return [];
+  }
+};
+
+const writeSwrArray = <T>(key: string, items: T[], maxItems: number): void => {
+  try {
+    const payload = items.slice(0, maxItems).map(serializeCacheValue);
+    metaKVStorage.setItemSync(key, JSON.stringify(payload));
+  } catch {
+    // Ignore MMKV/serialization errors in environments without native storage
+  }
+};
+
+const filterTransfersByBranch = (transfers: StockTransfer[], branchId?: string): StockTransfer[] => {
+  if (!branchId || branchId === 'all') return transfers;
+  return transfers.filter(
+    (t) =>
+      t.sourceBranchId === branchId ||
+      t.destinationBranchId === branchId ||
+      t.fromBranchId === branchId ||
+      t.toBranchId === branchId
+  );
+};
 
 const MAX_PRODUCT_IMAGE_BYTES = 10 * 1024 * 1024; // 10 MB
 const ALLOWED_IMAGE_MIME_TYPES: Record<string, string> = {
@@ -919,6 +985,9 @@ export const saveProduct = async (
             })
           );
         }
+        if (productData.accountId) {
+          sharedRequestCache.invalidatePrefix(`kardex:${productData.accountId}:`);
+        }
       } catch (err) {
         console.warn(`[InventoryService] Error registrando Kardex inicial para ${productId}:`, err);
       }
@@ -1277,6 +1346,10 @@ export const adjustProductStock = async (
     }
   }
 
+  if (resultSnapshot.diff !== 0) {
+    sharedRequestCache.invalidatePrefix(product.accountId ? `kardex:${product.accountId}:` : 'kardex:');
+  }
+
   return resultSnapshot;
 };
 
@@ -1301,61 +1374,91 @@ const isMissingInventoryIndexError = (err: any): boolean => {
   );
 };
 
+export const getCachedProductKardexSync = (
+  accountId: string,
+  branchId: string
+): any[] => {
+  if (!accountId) return [];
+  return readSwrArray<any>(`${KARDEX_SWR_PREFIX}${accountId}:${branchId || 'all'}`);
+};
+
 export const getProductKardex = async (
   accountId: string,
   branchId: string,
   productId?: string,
-  limitCount: number = 50
+  limitCount: number = 50,
+  options?: { forceRefresh?: boolean; rethrowError?: boolean }
 ): Promise<any[]> => {
-  const coll = collection(db, INVENTORY_MOVEMENTS_COLLECTION);
-  const constraints: any[] = [where('accountId', '==', accountId)];
-  if (branchId && branchId !== 'all') {
-    constraints.push(where('branchId', '==', branchId));
-  }
-  if (productId) {
-    constraints.push(where('productId', '==', productId));
-  }
-
-  const indexKey = `kardex:${branchId && branchId !== 'all' ? 'b' : 'all'}:${productId ? 'p' : 'all'}`;
-
-  const runFallback = async (): Promise<any[]> => {
-    const fallbackQuery = query(coll, ...constraints, firestoreLimit(limitCount));
-    const snap = await getDocs(fallbackQuery);
-    const items = snap.docs.map((d) => normalizeInventoryMovement(d.data(), d.id));
-
-    items.sort((a: any, b: any) => {
-      const tA = a.createdAt?.seconds ? a.createdAt.seconds * 1000 : Number(a.createdAt) || a.date || 0;
-      const tB = b.createdAt?.seconds ? b.createdAt.seconds * 1000 : Number(b.createdAt) || b.date || 0;
-      return tB - tA;
-    });
-
-    return items;
-  };
-
+  if (!accountId) return [];
+  const cacheKey = `kardex:${accountId}:${branchId || 'all'}:${productId || 'all'}:${limitCount}`;
   try {
-    if (missingInventoryIndexes.has(indexKey)) {
-      return await runFallback();
-    }
-    const q = query(
-      coll,
-      ...constraints,
-      orderBy('createdAt', 'desc'),
-      firestoreLimit(limitCount)
-    );
+    return await sharedRequestCache.getOrLoad(
+      cacheKey,
+      30_000,
+      async () => {
+        const coll = collection(db, INVENTORY_MOVEMENTS_COLLECTION);
+        const constraints: any[] = [where('accountId', '==', accountId)];
+        if (branchId && branchId !== 'all') {
+          constraints.push(where('branchId', '==', branchId));
+        }
+        if (productId) {
+          constraints.push(where('productId', '==', productId));
+        }
 
-    const snapshot = await getDocs(q);
-    return snapshot.docs.map((d) => normalizeInventoryMovement(d.data(), d.id));
+        const indexKey = `kardex:${branchId && branchId !== 'all' ? 'b' : 'all'}:${productId ? 'p' : 'all'}`;
+        const timeoutMsg = 'Tiempo de espera agotado al consultar movimientos.';
+
+        const runFallback = async (): Promise<any[]> => {
+          const fallbackQuery = query(coll, ...constraints, firestoreLimit(limitCount));
+          const snap = await withTimeout(getDocs(fallbackQuery), 10_000, timeoutMsg);
+          const items = snap.docs.map((d) => normalizeInventoryMovement(d.data(), d.id));
+
+          items.sort((a: any, b: any) => {
+            const tA = a.createdAt?.seconds ? a.createdAt.seconds * 1000 : Number(a.createdAt) || a.date || 0;
+            const tB = b.createdAt?.seconds ? b.createdAt.seconds * 1000 : Number(b.createdAt) || b.date || 0;
+            return tB - tA;
+          });
+
+          return items;
+        };
+
+        let items: any[];
+        if (missingInventoryIndexes.has(indexKey)) {
+          items = await runFallback();
+        } else {
+          try {
+            const q = query(
+              coll,
+              ...constraints,
+              orderBy('createdAt', 'desc'),
+              firestoreLimit(limitCount)
+            );
+            const snapshot = await withTimeout(getDocs(q), 10_000, timeoutMsg);
+            items = snapshot.docs.map((d) => normalizeInventoryMovement(d.data(), d.id));
+          } catch (err: any) {
+            if (!isMissingInventoryIndexError(err)) {
+              throw err;
+            }
+            missingInventoryIndexes.add(indexKey);
+            console.warn('[InventoryService] Índice faltante en getProductKardex, usando fallback sin orderBy:', err?.message || err);
+            items = await runFallback();
+          }
+        }
+
+        if (!productId) {
+          writeSwrArray(`${KARDEX_SWR_PREFIX}${accountId}:${branchId || 'all'}`, items, KARDEX_SWR_LIMIT);
+        }
+
+        return items;
+      },
+      { forceRefresh: options?.forceRefresh }
+    );
   } catch (err: any) {
-    if (isMissingInventoryIndexError(err)) {
-      missingInventoryIndexes.add(indexKey);
+    console.warn('[InventoryService] Error consultando Kardex:', err?.message || err);
+    if (options?.rethrowError) {
+      throw err;
     }
-    console.warn('[InventoryService] Error consultando Kardex (posible índice requerido):', err?.message);
-    try {
-      return await runFallback();
-    } catch (fallbackErr) {
-      console.error('[InventoryService] Fallback de Kardex falló:', fallbackErr);
-      return [];
-    }
+    return [];
   }
 };
 
@@ -1925,6 +2028,16 @@ export const completeStockTransfer = async (
     });
   });
   sharedRequestCache.invalidatePrefix('stock_transfers:');
+  sharedRequestCache.invalidatePrefix('kardex:');
+};
+
+export const getCachedStockTransfersSync = (
+  accountId: string,
+  branchId?: string
+): StockTransfer[] => {
+  if (!accountId) return [];
+  const transfers = readSwrArray<StockTransfer>(`${TRANSFERS_SWR_PREFIX}${accountId}`);
+  return filterTransfersByBranch(transfers, branchId);
 };
 
 /**
@@ -1934,12 +2047,12 @@ export const getStockTransfers = async (
   accountId: string,
   branchId?: string,
   status?: string,
-  options?: { forceRefresh?: boolean }
+  options?: { forceRefresh?: boolean; rethrowError?: boolean }
 ): Promise<StockTransfer[]> => {
   if (!accountId) return [];
-  const cacheKey = `stock_transfers:${accountId}:${branchId || 'all'}:${status || 'all'}`;
+  const cacheKey = `stock_transfers:${accountId}:${status || 'all'}`;
   try {
-    return await sharedRequestCache.getOrLoad(
+    const allTransfers = await sharedRequestCache.getOrLoad(
       cacheKey,
       45_000,
       async () => {
@@ -1951,9 +2064,14 @@ export const getStockTransfers = async (
         }
 
         const indexKey = `transfers:${status ? 'status' : 'all'}`;
+        const timeoutMsg = 'Tiempo de espera agotado al consultar transferencias.';
         let snapshot;
         if (missingInventoryIndexes.has(indexKey)) {
-          snapshot = await getDocs(query(coll, ...constraints, firestoreLimit(100)));
+          snapshot = await withTimeout(
+            getDocs(query(coll, ...constraints, firestoreLimit(100))),
+            10_000,
+            timeoutMsg
+          );
         } else {
           try {
             const q = query(
@@ -1962,17 +2080,17 @@ export const getStockTransfers = async (
               orderBy('createdAt', 'desc'),
               firestoreLimit(100)
             );
-            snapshot = await getDocs(q);
+            snapshot = await withTimeout(getDocs(q), 10_000, timeoutMsg);
           } catch (err: any) {
             if (!isMissingInventoryIndexError(err)) throw err;
             missingInventoryIndexes.add(indexKey);
             console.warn('[InventoryService] Índice faltante en getStockTransfers, usando fallback sin orderBy:', err?.message || err);
             const fallbackQ = query(coll, ...constraints, firestoreLimit(100));
-            snapshot = await getDocs(fallbackQ);
+            snapshot = await withTimeout(getDocs(fallbackQ), 10_000, timeoutMsg);
           }
         }
 
-        let transfers: StockTransfer[] = snapshot.docs.map((d) => {
+        const transfers: StockTransfer[] = snapshot.docs.map((d) => {
           const data = d.data();
           const srcId = data.sourceBranchId || data.fromBranchId || '';
           const destId = data.destinationBranchId || data.toBranchId || '';
@@ -1980,22 +2098,19 @@ export const getStockTransfers = async (
           const destName = data.destinationBranchName || data.toBranchName || '';
 
           const rawItems: any[] = data.items || data.products || [];
-          const normalizedItems: TransferItem[] = rawItems.map((it: any) => ({
-            productId: it.productId,
-            productName: it.productName || it.name || 'Producto',
-            sku: it.sku || '',
-            quantity: Number(it.quantity) || 0,
-            ...(it.variantId ? { variantId: it.variantId, variantName: it.variantName || '' } : {}),
-          }));
-
-          const normalizedProducts = rawItems.map((it: any) => ({
-            productId: it.productId,
-            name: it.productName || it.name || 'Producto',
-            productName: it.productName || it.name || 'Producto',
-            sku: it.sku || '',
-            quantity: Number(it.quantity) || 0,
-            ...(it.variantId ? { variantId: it.variantId, variantName: it.variantName || '' } : {}),
-          }));
+          const normalizedItems: TransferItem[] = [];
+          const normalizedProducts: NonNullable<StockTransfer['products']> = [];
+          for (const it of rawItems) {
+            const base: TransferItem = {
+              productId: it.productId,
+              productName: it.productName || it.name || 'Producto',
+              sku: it.sku || '',
+              quantity: Number(it.quantity) || 0,
+              ...(it.variantId ? { variantId: it.variantId, variantName: it.variantName || '' } : {}),
+            };
+            normalizedItems.push(base);
+            normalizedProducts.push({ ...base, name: base.productName });
+          }
 
           return {
             id: d.id,
@@ -2014,16 +2129,6 @@ export const getStockTransfers = async (
           } as StockTransfer;
         });
 
-        if (branchId && branchId !== 'all') {
-          transfers = transfers.filter(
-            (t) =>
-              t.sourceBranchId === branchId ||
-              t.destinationBranchId === branchId ||
-              t.fromBranchId === branchId ||
-              t.toBranchId === branchId
-          );
-        }
-
         // Ordenar descendente por fecha
         transfers.sort((a, b) => {
           const getTimestamp = (obj: any) => {
@@ -2036,12 +2141,21 @@ export const getStockTransfers = async (
           return getTimestamp(b) - getTimestamp(a);
         });
 
+        if (!status) {
+          writeSwrArray(`${TRANSFERS_SWR_PREFIX}${accountId}`, transfers, TRANSFERS_SWR_LIMIT);
+        }
+
         return transfers;
       },
       { forceRefresh: options?.forceRefresh }
     );
+
+    return filterTransfersByBranch(allTransfers, branchId);
   } catch (err) {
     console.error('[InventoryService] Error obteniendo transferencias:', err);
+    if (options?.rethrowError) {
+      throw err;
+    }
     return [];
   }
 };
@@ -2055,6 +2169,7 @@ export const InventoryKardexService = {
   uploadProductImageToStorage,
   findByBarcodeRemote,
   adjustProductStock,
+  getCachedProductKardexSync,
   getProductKardex,
   createStockTransfer,
   approveStockTransfer,
@@ -2063,6 +2178,7 @@ export const InventoryKardexService = {
   sendStockTransfer,
   emitTransferDespatchGuide,
   completeStockTransfer,
+  getCachedStockTransfersSync,
   getStockTransfers,
   calculateLowStockBranches,
   deriveLowStockBranches,

@@ -6,7 +6,7 @@
  * - Pestaña 2: Directorio de Proveedores (Búsqueda, tarjetas, llamadas, WhatsApp y formulario con autocompletado RUC SUNAT)
  */
 
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   View,
   Text,
@@ -16,6 +16,7 @@ import {
   Alert,
   ActivityIndicator,
   FlatList,
+  InteractionManager,
   Platform,
   StyleSheet,
   type ListRenderItem,
@@ -68,6 +69,7 @@ import { PriceSuggestionModal } from './suppliers/PriceSuggestionModal';
 
 export interface SuppliersPurchaseModalProps {
   visible: boolean;
+  isActive?: boolean;
   onClose: () => void;
   onStockUpdated?: () => void;
   initialTab?: 'orders' | 'suppliers';
@@ -83,6 +85,10 @@ class SuppliersErrorBoundary extends React.Component<
 
   static getDerivedStateFromError(error: Error) {
     return { error };
+  }
+
+  componentDidCatch(error: Error) {
+    console.error('[SuppliersPurchaseModal] Render boundary error:', error);
   }
 
   handleRetry = () => {
@@ -174,35 +180,114 @@ interface OrdersExtraData {
   isReceivingId: string | null;
 }
 
-export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = React.memo(({
+const SUBSCRIPTION_SAFETY_TIMEOUT_MS = 10_000;
+
+interface SuppliersModalShellProps {
+  visible: boolean;
+  onClose: () => void;
+  children: React.ReactNode;
+}
+
+const SuppliersModalShell: React.FC<SuppliersModalShellProps> = ({
   visible,
+  onClose,
+  children,
+}) => {
+  const insets = useSafeAreaInsets();
+  return (
+    <Modal
+      visible={visible}
+      animationType="slide"
+      transparent
+      statusBarTranslucent
+      onRequestClose={onClose}
+    >
+      <View
+        style={[styles.safeArea, { paddingTop: insets.top, paddingBottom: insets.bottom }]}
+        collapsable={false}
+      >
+        {children}
+      </View>
+    </Modal>
+  );
+};
+
+interface SuppliersRootContainerProps {
+  embedded: boolean;
+  asScreen: boolean;
+  visible: boolean;
+  onClose: () => void;
+  children: React.ReactNode;
+}
+
+const SuppliersRootContainer: React.FC<SuppliersRootContainerProps> = ({
+  embedded,
+  asScreen,
+  visible,
+  onClose,
+  children,
+}) => {
+  if (embedded) {
+    return (
+      <View style={styles.safeArea} collapsable={false}>
+        {children}
+      </View>
+    );
+  }
+  if (asScreen) {
+    return (
+      <SafeAreaView style={styles.safeArea} edges={['top', 'bottom']} collapsable={false}>
+        {children}
+      </SafeAreaView>
+    );
+  }
+  return (
+    <SuppliersModalShell visible={visible} onClose={onClose}>
+      {children}
+    </SuppliersModalShell>
+  );
+};
+
+const SuppliersPurchaseContent: React.FC<SuppliersPurchaseModalProps> = React.memo(({
+  visible,
+  isActive: isActiveProp,
   onClose,
   onStockUpdated,
   initialTab = 'orders',
   asScreen = false,
   embedded = false,
 }) => {
-  const insets = useSafeAreaInsets();
   const { accountId, userProfile } = useAuthSession();
   const { isOnline } = useOfflineStatus();
+  const effectiveIsActive = isActiveProp ?? visible;
 
   // --------------------------------------------------------------------------
   // ESTADOS PRINCIPALES: PESTAÑAS Y LISTADOS
   // --------------------------------------------------------------------------
   const [activeTab, setActiveTab] = useState<'orders' | 'suppliers'>(initialTab);
 
-  // Órdenes de compra
-  const [purchaseOrders, setPurchaseOrders] = useState<PurchaseOrder[]>([]);
+  // Órdenes de compra (SWR: hidratación instantánea desde caché en memoria)
+  const [purchaseOrders, setPurchaseOrders] = useState<PurchaseOrder[]>(() =>
+    accountId ? SuppliersPOService.getCachedPurchaseOrdersSync(accountId) : []
+  );
   const [ordersLoading, setOrdersLoading] = useState<boolean>(false);
   const [orderSearchQuery, setOrderSearchQuery] = useState<string>('');
   const [orderStatusFilter, setOrderStatusFilter] = useState<string>('all');
   const [expandedOrderId, setExpandedOrderId] = useState<string | null>(null);
   const [isReceivingId, setIsReceivingId] = useState<string | null>(null);
 
-  // Proveedores
-  const [suppliers, setSuppliers] = useState<Supplier[]>([]);
+  // Proveedores (SWR: hidratación instantánea desde caché en memoria)
+  const [suppliers, setSuppliers] = useState<Supplier[]>(() =>
+    accountId ? SuppliersPOService.getCachedSuppliersSync(accountId) : []
+  );
   const [suppliersLoading, setSuppliersLoading] = useState<boolean>(false);
   const [supplierSearchQuery, setSupplierSearchQuery] = useState<string>('');
+
+  const ordersCountRef = useRef<number>(purchaseOrders.length);
+  ordersCountRef.current = purchaseOrders.length;
+  const suppliersCountRef = useRef<number>(suppliers.length);
+  suppliersCountRef.current = suppliers.length;
+  const prevAccountIdRef = useRef<string | null>(accountId);
 
   const debouncedOrderSearch = useDebouncedValue(orderSearchQuery, 150);
   const debouncedSupplierSearch = useDebouncedValue(supplierSearchQuery, 150);
@@ -227,56 +312,117 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
     }
   }, [visible, initialTab]);
 
-  // --------------------------------------------------------------------------
-  // CARGA Y SUSCRIPCIÓN EN TIEMPO REAL
-  // --------------------------------------------------------------------------
+  // Re-hidratar SWR cuando cambia de cuenta sin limpiar caché ante micro-cortes de red
   useEffect(() => {
-    let isCurrentAccount = true;
-    if (!visible || !accountId) {
+    if (prevAccountIdRef.current === accountId) return;
+    prevAccountIdRef.current = accountId;
+    if (!accountId) {
+      ordersCountRef.current = 0;
+      suppliersCountRef.current = 0;
       setPurchaseOrders([]);
       setSuppliers([]);
       setOrdersLoading(false);
       setSuppliersLoading(false);
-      return () => {
-        isCurrentAccount = false;
-      };
+      return;
     }
-    if (!isOnline) {
+    const nextOrders = SuppliersPOService.getCachedPurchaseOrdersSync(accountId);
+    const nextSuppliers = SuppliersPOService.getCachedSuppliersSync(accountId);
+    ordersCountRef.current = nextOrders.length;
+    suppliersCountRef.current = nextSuppliers.length;
+    setPurchaseOrders(nextOrders);
+    setSuppliers(nextSuppliers);
+  }, [accountId]);
+
+  const activeNow = Boolean(visible && effectiveIsActive && accountId && isOnline);
+
+  // --------------------------------------------------------------------------
+  // CARGA Y SUSCRIPCIÓN EN TIEMPO REAL (DIFERIDA POST-INTERACCIONES)
+  // --------------------------------------------------------------------------
+  // Efecto 1: Órdenes de compra
+  useEffect(() => {
+    if (!activeNow || !accountId) {
       setOrdersLoading(false);
-      setSuppliersLoading(false);
-      return () => {
-        isCurrentAccount = false;
-      };
+      return;
     }
 
-    setPurchaseOrders([]);
-    setSuppliers([]);
-    setOrdersLoading(true);
-    const unsubscribeOrders = SuppliersPOService.subscribePurchaseOrders(
-      accountId,
-      (orders) => {
-        if (!isCurrentAccount) return;
-        setPurchaseOrders(orders);
+    let cancelled = false;
+    let unsubscribeOrders: (() => void) | null = null;
+
+    if (ordersCountRef.current === 0) {
+      setOrdersLoading(true);
+    }
+
+    const safetyTimer = setTimeout(() => {
+      if (!cancelled) {
         setOrdersLoading(false);
       }
-    );
+    }, SUBSCRIPTION_SAFETY_TIMEOUT_MS);
 
-    setSuppliersLoading(true);
-    const unsubscribeSuppliers = SuppliersPOService.subscribeSuppliers(
-      accountId,
-      (suppliersList) => {
-        if (!isCurrentAccount) return;
-        setSuppliers(suppliersList);
-        setSuppliersLoading(false);
-      }
-    );
+    const interactionTask = InteractionManager.runAfterInteractions(() => {
+      if (cancelled) return;
+      unsubscribeOrders = SuppliersPOService.subscribePurchaseOrders(
+        accountId,
+        (orders) => {
+          if (cancelled) return;
+          clearTimeout(safetyTimer);
+          setPurchaseOrders(orders);
+          setOrdersLoading(false);
+        }
+      );
+    });
 
     return () => {
-      isCurrentAccount = false;
-      unsubscribeOrders();
-      unsubscribeSuppliers();
+      cancelled = true;
+      clearTimeout(safetyTimer);
+      interactionTask.cancel();
+      unsubscribeOrders?.();
     };
-  }, [visible, accountId, isOnline]);
+  }, [activeNow, accountId]);
+
+  // Efecto 2: Proveedores (solo suscrito cuando pestaña Proveedores o sub-modales de orden/proveedor están activos)
+  const shouldSubscribeSuppliers = Boolean(
+    activeNow && (activeTab === 'suppliers' || createOrderModalVisible || supplierFormState.visible)
+  );
+
+  useEffect(() => {
+    if (!shouldSubscribeSuppliers || !accountId) {
+      setSuppliersLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    let unsubscribeSuppliers: (() => void) | null = null;
+
+    if (suppliersCountRef.current === 0) {
+      setSuppliersLoading(true);
+    }
+
+    const safetyTimer = setTimeout(() => {
+      if (!cancelled) {
+        setSuppliersLoading(false);
+      }
+    }, SUBSCRIPTION_SAFETY_TIMEOUT_MS);
+
+    const interactionTask = InteractionManager.runAfterInteractions(() => {
+      if (cancelled) return;
+      unsubscribeSuppliers = SuppliersPOService.subscribeSuppliers(
+        accountId,
+        (suppliersList) => {
+          if (cancelled) return;
+          clearTimeout(safetyTimer);
+          setSuppliers(suppliersList);
+          setSuppliersLoading(false);
+        }
+      );
+    });
+
+    return () => {
+      cancelled = true;
+      clearTimeout(safetyTimer);
+      interactionTask.cancel();
+      unsubscribeSuppliers?.();
+    };
+  }, [shouldSubscribeSuppliers, accountId]);
 
   // KPIs de órdenes de compra
   const orderStats = useMemo(() => {
@@ -541,356 +687,334 @@ export const SuppliersPurchaseModal: React.FC<SuppliersPurchaseModalProps> = Rea
     ]
   );
 
-  if (!visible) return null;
-
-  const headerElement = !embedded ? (
-    <View style={styles.header}>
-      <View style={styles.headerTitleRow}>
-        <BrandLogo size={34} wordmark={false} />
-        <View style={{ flex: 1, minWidth: 0 }}>
-          <Text style={styles.headerTitle}>Compras y proveedores</Text>
-          <Text style={styles.headerSubtitle}>Gestión de abastecimiento</Text>
+  return (
+    <SuppliersRootContainer
+      embedded={embedded}
+      asScreen={asScreen}
+      visible={visible}
+      onClose={onClose}
+    >
+      {!embedded && (
+        <View style={styles.header}>
+          <View style={styles.headerTitleRow}>
+            <BrandLogo size={34} wordmark={false} />
+            <View style={{ flex: 1, minWidth: 0 }}>
+              <Text style={styles.headerTitle}>Compras y proveedores</Text>
+              <Text style={styles.headerSubtitle}>Gestión de abastecimiento</Text>
+            </View>
+          </View>
+          <TouchableOpacity
+            style={styles.closeButton}
+            onPress={onClose}
+            activeOpacity={0.7}
+            accessibilityRole="button"
+            accessibilityLabel="Cerrar compras y proveedores"
+          >
+            <X size={20} color={ui.textSecondary} />
+          </TouchableOpacity>
         </View>
+      )}
+
+      {/* SELECTOR DE PESTAÑAS */}
+      <View style={styles.tabsBar}>
+        <TouchableOpacity
+          style={[styles.tabButton, activeTab === 'orders' && styles.tabButtonActive]}
+          onPress={() => setActiveTab('orders')}
+        >
+          <ClipboardList
+            size={17}
+            color={activeTab === 'orders' ? ui.primary : ui.textSecondary}
+          />
+          <Text
+            style={[styles.tabButtonText, activeTab === 'orders' && styles.tabButtonTextActive]}
+          >
+            Órdenes de Compra
+          </Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[styles.tabButton, activeTab === 'suppliers' && styles.tabButtonActive]}
+          onPress={() => setActiveTab('suppliers')}
+        >
+          <Contact
+            size={17}
+            color={activeTab === 'suppliers' ? ui.primary : ui.textSecondary}
+          />
+          <Text
+            style={[
+              styles.tabButtonText,
+              activeTab === 'suppliers' && styles.tabButtonTextActive,
+            ]}
+          >
+            Proveedores
+          </Text>
+        </TouchableOpacity>
       </View>
-      <TouchableOpacity
-        style={styles.closeButton}
-        onPress={onClose}
-        activeOpacity={0.7}
-        accessibilityRole="button"
-        accessibilityLabel="Cerrar compras y proveedores"
-      >
-        <X size={20} color={ui.textSecondary} />
-      </TouchableOpacity>
-    </View>
-  ) : null;
 
-  const bodyContent = (
-    <>
-      {headerElement}
-
-        {/* SELECTOR DE PESTAÑAS */}
-        <View style={styles.tabsBar}>
-          <TouchableOpacity
-            style={[styles.tabButton, activeTab === 'orders' && styles.tabButtonActive]}
-            onPress={() => setActiveTab('orders')}
-          >
-            <ClipboardList
-              size={17}
-              color={activeTab === 'orders' ? ui.primary : ui.textSecondary}
-            />
-            <Text
-              style={[styles.tabButtonText, activeTab === 'orders' && styles.tabButtonTextActive]}
-            >
-              Órdenes de Compra
-            </Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            style={[styles.tabButton, activeTab === 'suppliers' && styles.tabButtonActive]}
-            onPress={() => setActiveTab('suppliers')}
-          >
-            <Contact
-              size={17}
-              color={activeTab === 'suppliers' ? ui.primary : ui.textSecondary}
-            />
-            <Text
-              style={[
-                styles.tabButtonText,
-                activeTab === 'suppliers' && styles.tabButtonTextActive,
-              ]}
-            >
-              Proveedores
-            </Text>
-          </TouchableOpacity>
+      {!isOnline && (
+        <View
+          style={{
+            flexDirection: 'row',
+            alignItems: 'center',
+            gap: 8,
+            backgroundColor: ui.warningSoft,
+            borderBottomWidth: 1,
+            borderBottomColor: ui.warning,
+            paddingHorizontal: 14,
+            paddingVertical: 9,
+          }}
+        >
+          <WifiOff size={14} color={ui.warning} />
+          <Text style={{ flex: 1, fontSize: 12, fontWeight: '600', color: ui.warning }}>
+            Sin conexión · Compras y proveedores requieren internet para consultar o registrar cambios.
+          </Text>
         </View>
+      )}
 
-        {/* CONTENIDO SEGÚN LA PESTAÑA SELECCIONADA */}
-        <View style={{ flex: 1 }}>
-          {!isOnline && (
-            <View
-              style={{
-                flexDirection: 'row',
-                alignItems: 'center',
-                gap: 8,
-                backgroundColor: ui.warningSoft,
-                borderBottomWidth: 1,
-                borderBottomColor: ui.warning,
-                paddingHorizontal: 14,
-                paddingVertical: 9,
-              }}
-            >
-              <WifiOff size={14} color={ui.warning} />
-              <Text style={{ flex: 1, fontSize: 12, fontWeight: '600', color: ui.warning }}>
-                Sin conexión · Compras y proveedores requieren internet para consultar o registrar cambios.
+      {/* CONTENIDO SEGÚN LA PESTAÑA SELECCIONADA */}
+      {activeTab === 'orders' ? (
+        <View style={styles.tabContentContainer} collapsable={false}>
+          <Text style={styles.sectionSubOnly}>Abastecimiento y seguimiento de recepción.</Text>
+
+          {/* RESUMEN COMPACTO DE ABASTECIMIENTO */}
+          <View style={styles.kpiContainer}>
+            <View style={[styles.kpiCard, { borderColor: ui.warningSoft, backgroundColor: ui.warningSoft }]}>
+              <View style={styles.kpiHeaderRow}>
+                <Clock size={13} color={ui.warning} />
+                <Text style={[styles.kpiLabel, { color: ui.warning }]} numberOfLines={1}>Pendientes</Text>
+              </View>
+              <Text style={[styles.kpiValue, { color: ui.warning }]}>{orderStats.pendingCount}</Text>
+              <Text style={[styles.kpiSub, { color: ui.warning }]} numberOfLines={1}>
+                {formatPEN(orderStats.totalPendingAmount)}
               </Text>
             </View>
-          )}
-          {activeTab === 'orders' ? (
-            <View style={styles.tabContentContainer}>
-              <Text style={styles.sectionSubOnly}>Abastecimiento y seguimiento de recepción.</Text>
 
-              {/* RESUMEN COMPACTO DE ABASTECIMIENTO */}
-              <View style={styles.kpiContainer}>
-                <View style={[styles.kpiCard, { borderColor: ui.warningSoft, backgroundColor: ui.warningSoft }]}>
-                  <View style={styles.kpiHeaderRow}>
-                    <Clock size={13} color={ui.warning} />
-                    <Text style={[styles.kpiLabel, { color: ui.warning }]} numberOfLines={1}>Pendientes</Text>
-                  </View>
-                  <Text style={[styles.kpiValue, { color: ui.warning }]}>{orderStats.pendingCount}</Text>
-                  <Text style={[styles.kpiSub, { color: ui.warning }]} numberOfLines={1}>
-                    {formatPEN(orderStats.totalPendingAmount)}
-                  </Text>
-                </View>
-
-                <View style={[styles.kpiCard, { borderColor: ui.success, backgroundColor: ui.successSoft }]}>
-                  <View style={styles.kpiHeaderRow}>
-                    <CheckCircle2 size={13} color={ui.primary} />
-                    <Text style={[styles.kpiLabel, { color: ui.success }]} numberOfLines={1}>Recibidas</Text>
-                  </View>
-                  <Text style={[styles.kpiValue, { color: ui.success }]}>{orderStats.receivedCount}</Text>
-                  <Text style={[styles.kpiSub, { color: ui.success }]} numberOfLines={1}>
-                    {formatPEN(orderStats.totalInvested)}
-                  </Text>
-                </View>
-
-                <View style={[styles.kpiCard, { borderColor: ui.border, backgroundColor: ui.background }]}>
-                  <View style={styles.kpiHeaderRow}>
-                    <Boxes size={13} color={ui.textSecondary} />
-                    <Text style={[styles.kpiLabel, { color: ui.textSecondary }]} numberOfLines={1}>Total</Text>
-                  </View>
-                  <Text style={[styles.kpiValue, { color: ui.text }]}>{orderStats.totalOrders}</Text>
-                  <Text style={[styles.kpiSub, { color: ui.textSecondary }]} numberOfLines={1}>Histórico</Text>
-                </View>
+            <View style={[styles.kpiCard, { borderColor: ui.success, backgroundColor: ui.successSoft }]}>
+              <View style={styles.kpiHeaderRow}>
+                <CheckCircle2 size={13} color={ui.primary} />
+                <Text style={[styles.kpiLabel, { color: ui.success }]} numberOfLines={1}>Recibidas</Text>
               </View>
+              <Text style={[styles.kpiValue, { color: ui.success }]}>{orderStats.receivedCount}</Text>
+              <Text style={[styles.kpiSub, { color: ui.success }]} numberOfLines={1}>
+                {formatPEN(orderStats.totalInvested)}
+              </Text>
+            </View>
 
-              {/* BUSCADOR + NUEVA ORDEN EN UNA MISMA FILA */}
-              <View style={styles.searchActionRow}>
-                <View style={styles.searchBarInline}>
-                  <Search size={16} color={ui.textMuted} style={styles.searchIcon} />
-                  <TextInput
-                    style={styles.searchInput}
-                    placeholder="N° orden o proveedor..."
-                    placeholderTextColor={ui.textMuted}
-                    value={orderSearchQuery}
-                    onChangeText={setOrderSearchQuery}
-                    clearButtonMode={Platform.OS === 'ios' ? 'while-editing' : undefined}
-                  />
-                </View>
+            <View style={[styles.kpiCard, { borderColor: ui.border, backgroundColor: ui.background }]}>
+              <View style={styles.kpiHeaderRow}>
+                <Boxes size={13} color={ui.textSecondary} />
+                <Text style={[styles.kpiLabel, { color: ui.textSecondary }]} numberOfLines={1}>Total</Text>
+              </View>
+              <Text style={[styles.kpiValue, { color: ui.text }]}>{orderStats.totalOrders}</Text>
+              <Text style={[styles.kpiSub, { color: ui.textSecondary }]} numberOfLines={1}>Histórico</Text>
+            </View>
+          </View>
+
+          {/* BUSCADOR + NUEVA ORDEN EN UNA MISMA FILA */}
+          <View style={styles.searchActionRow}>
+            <View style={styles.searchBarInline}>
+              <Search size={16} color={ui.textMuted} style={styles.searchIcon} />
+              <TextInput
+                style={styles.searchInput}
+                placeholder="N° orden o proveedor..."
+                placeholderTextColor={ui.textMuted}
+                value={orderSearchQuery}
+                onChangeText={setOrderSearchQuery}
+                clearButtonMode={Platform.OS === 'ios' ? 'while-editing' : undefined}
+              />
+            </View>
+            <TouchableOpacity
+              style={styles.inlineActionBtn}
+              onPress={handleOpenCreateOrderModal}
+              activeOpacity={0.8}
+            >
+              <Plus size={16} color={ui.surface} />
+              <Text style={styles.inlineActionBtnText}>Nueva</Text>
+            </TouchableOpacity>
+          </View>
+
+          {/* CHIPS DE FILTRO DE ESTADO EN UNA SOLA FILA SIN SCROLL */}
+          <View style={styles.filterChipsRow}>
+            {ORDER_STATUS_FILTERS.map((chip) => {
+              const isSelected = orderStatusFilter === chip.id;
+              return (
                 <TouchableOpacity
-                  style={styles.inlineActionBtn}
-                  onPress={handleOpenCreateOrderModal}
-                  activeOpacity={0.8}
+                  key={chip.id}
+                  style={[styles.filterChip, isSelected && styles.filterChipActive]}
+                  onPress={() => setOrderStatusFilter(chip.id)}
                 >
-                  <Plus size={16} color={ui.surface} />
-                  <Text style={styles.inlineActionBtnText}>Nueva</Text>
-                </TouchableOpacity>
-              </View>
-
-              {/* CHIPS DE FILTRO DE ESTADO EN UNA SOLA FILA SIN SCROLL */}
-              <View style={styles.filterChipsRow}>
-                {ORDER_STATUS_FILTERS.map((chip) => {
-                  const isSelected = orderStatusFilter === chip.id;
-                  return (
-                    <TouchableOpacity
-                      key={chip.id}
-                      style={[styles.filterChip, isSelected && styles.filterChipActive]}
-                      onPress={() => setOrderStatusFilter(chip.id)}
-                    >
-                      <Text
-                        style={[styles.filterChipText, isSelected && styles.filterChipTextActive]}
-                        numberOfLines={1}
-                        ellipsizeMode="tail"
-                      >
-                        {chip.label}
-                      </Text>
-                    </TouchableOpacity>
-                  );
-                })}
-              </View>
-
-              {/* LISTADO DE ÓRDENES */}
-              {ordersLoading && purchaseOrders.length === 0 ? (
-                <View style={styles.centerContainer}>
-                  <ActivityIndicator size="large" color={ui.primary} />
-                  <Text style={styles.loadingText}>Cargando órdenes de compra...</Text>
-                </View>
-              ) : filteredOrders.length === 0 ? (
-                <View style={styles.emptyContainer}>
-                  <Truck size={48} color={ui.border} />
-                  <Text style={styles.emptyTitle}>No hay órdenes de compra</Text>
-                  <Text style={styles.emptySubtitle}>
-                    {orderSearchQuery
-                      ? 'No se encontraron coincidencias para la búsqueda.'
-                      : 'Empieza registrando una orden a tus proveedores para abastecer tu inventario.'}
+                  <Text
+                    style={[styles.filterChipText, isSelected && styles.filterChipTextActive]}
+                    numberOfLines={1}
+                    ellipsizeMode="tail"
+                  >
+                    {chip.label}
                   </Text>
-                  {!orderSearchQuery && (
-                    <TouchableOpacity
-                      style={styles.emptyActionButton}
-                      onPress={handleOpenCreateOrderModal}
-                    >
-                      <Plus size={16} color={ui.primary} />
-                      <Text style={styles.emptyActionButtonText}>Crear Primera Orden</Text>
-                    </TouchableOpacity>
-                  )}
-                </View>
-              ) : (
-                <FlatList
-                  data={filteredOrders}
-                  keyExtractor={keyExtractorById}
-                  renderItem={renderOrderItem}
-                  extraData={ordersExtraData}
-                  contentContainerStyle={LIST_CONTENT_STYLE}
-                  showsVerticalScrollIndicator={false}
-                  keyboardShouldPersistTaps="handled"
-                  initialNumToRender={10}
-                  maxToRenderPerBatch={10}
-                  windowSize={7}
-                />
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+
+          {/* LISTADO DE ÓRDENES */}
+          {ordersLoading && purchaseOrders.length === 0 ? (
+            <View style={styles.centerContainer}>
+              <ActivityIndicator size="large" color={ui.primary} />
+              <Text style={styles.loadingText}>Cargando órdenes de compra...</Text>
+            </View>
+          ) : filteredOrders.length === 0 ? (
+            <View style={styles.emptyContainer}>
+              <Truck size={48} color={ui.border} />
+              <Text style={styles.emptyTitle}>No hay órdenes de compra</Text>
+              <Text style={styles.emptySubtitle}>
+                {orderSearchQuery
+                  ? 'No se encontraron coincidencias para la búsqueda.'
+                  : 'Empieza registrando una orden a tus proveedores para abastecer tu inventario.'}
+              </Text>
+              {!orderSearchQuery && (
+                <TouchableOpacity
+                  style={styles.emptyActionButton}
+                  onPress={handleOpenCreateOrderModal}
+                >
+                  <Plus size={16} color={ui.primary} />
+                  <Text style={styles.emptyActionButtonText}>Crear Primera Orden</Text>
+                </TouchableOpacity>
               )}
             </View>
           ) : (
-            <View style={styles.tabContentContainer}>
-              <Text style={styles.sectionSubOnly}>Directorio, contactos y condiciones comerciales.</Text>
-
-              {/* BUSCADOR + NUEVO PROVEEDOR EN UNA MISMA FILA */}
-              <View style={styles.searchActionRow}>
-                <View style={styles.searchBarInline}>
-                  <Search size={16} color={ui.textMuted} style={styles.searchIcon} />
-                  <TextInput
-                    style={styles.searchInput}
-                    placeholder="Buscar RUC, nombre o categoría..."
-                    placeholderTextColor={ui.textMuted}
-                    value={supplierSearchQuery}
-                    onChangeText={setSupplierSearchQuery}
-                    clearButtonMode={Platform.OS === 'ios' ? 'while-editing' : undefined}
-                  />
-                </View>
-                <TouchableOpacity
-                  style={styles.inlineActionBtn}
-                  onPress={() => handleOpenSupplierForm()}
-                  activeOpacity={0.8}
-                >
-                  <Plus size={16} color={ui.surface} />
-                  <Text style={styles.inlineActionBtnText}>Nuevo</Text>
-                </TouchableOpacity>
-              </View>
-
-              {/* LISTADO DE PROVEEDORES */}
-              {suppliersLoading && suppliers.length === 0 ? (
-                <View style={styles.centerContainer}>
-                  <ActivityIndicator size="large" color={ui.primary} />
-                  <Text style={styles.loadingText}>Cargando proveedores...</Text>
-                </View>
-              ) : filteredSuppliers.length === 0 ? (
-                <View style={styles.emptyContainer}>
-                  <Building2 size={48} color={ui.border} />
-                  <Text style={styles.emptyTitle}>No hay proveedores</Text>
-                  <Text style={styles.emptySubtitle}>
-                    {supplierSearchQuery
-                      ? 'No se encontraron proveedores que coincidan con la búsqueda.'
-                      : 'Registra tus proveedores con su RUC para gestionar compras y llamadas rápidas.'}
-                  </Text>
-                  {!supplierSearchQuery && (
-                    <TouchableOpacity
-                      style={styles.emptyActionButton}
-                      onPress={() => handleOpenSupplierForm()}
-                    >
-                      <Plus size={16} color={ui.primary} />
-                      <Text style={styles.emptyActionButtonText}>Registrar Primer Proveedor</Text>
-                    </TouchableOpacity>
-                  )}
-                </View>
-              ) : (
-                <FlatList
-                  data={filteredSuppliers}
-                  keyExtractor={keyExtractorById}
-                  renderItem={renderSupplierItem}
-                  contentContainerStyle={LIST_CONTENT_STYLE}
-                  showsVerticalScrollIndicator={false}
-                  keyboardShouldPersistTaps="handled"
-                  initialNumToRender={10}
-                  maxToRenderPerBatch={10}
-                  windowSize={7}
-                />
-              )}
-            </View>
+            <FlatList
+              style={styles.listFlex}
+              data={filteredOrders}
+              keyExtractor={keyExtractorById}
+              renderItem={renderOrderItem}
+              extraData={ordersExtraData}
+              contentContainerStyle={LIST_CONTENT_STYLE}
+              removeClippedSubviews={false}
+              showsVerticalScrollIndicator={false}
+              keyboardShouldPersistTaps="handled"
+              initialNumToRender={10}
+              maxToRenderPerBatch={10}
+              windowSize={7}
+            />
           )}
         </View>
+      ) : (
+        <View style={styles.tabContentContainer} collapsable={false}>
+          <Text style={styles.sectionSubOnly}>Directorio, contactos y condiciones comerciales.</Text>
 
-        {/* SUB-MODAL 1: CREAR NUEVA ORDEN DE COMPRA (CONDICIONALMENTE MONTADO) */}
-        {createOrderModalVisible && (
-          <CreateOrderModal
-            visible={createOrderModalVisible}
-            suppliers={suppliers}
-            onClose={handleCloseCreateOrderModal}
-            onRequestNewSupplier={handleRequestNewSupplierFromOrder}
-          />
-        )}
+          {/* BUSCADOR + NUEVO PROVEEDOR EN UNA MISMA FILA */}
+          <View style={styles.searchActionRow}>
+            <View style={styles.searchBarInline}>
+              <Search size={16} color={ui.textMuted} style={styles.searchIcon} />
+              <TextInput
+                style={styles.searchInput}
+                placeholder="Buscar RUC, nombre o categoría..."
+                placeholderTextColor={ui.textMuted}
+                value={supplierSearchQuery}
+                onChangeText={setSupplierSearchQuery}
+                clearButtonMode={Platform.OS === 'ios' ? 'while-editing' : undefined}
+              />
+            </View>
+            <TouchableOpacity
+              style={styles.inlineActionBtn}
+              onPress={() => handleOpenSupplierForm()}
+              activeOpacity={0.8}
+            >
+              <Plus size={16} color={ui.surface} />
+              <Text style={styles.inlineActionBtnText}>Nuevo</Text>
+            </TouchableOpacity>
+          </View>
 
-        {/* SUB-MODAL 2: NUEVO / EDITAR PROVEEDOR CON SUNAT AUTOCOMPLETE */}
-        {supplierFormState.visible && (
-          <SupplierFormModal
-            visible={supplierFormState.visible}
-            editingSupplier={supplierFormState.editingSupplier}
-            onClose={handleCloseSupplierForm}
-          />
-        )}
-
-        {/* SUB-MODAL 3: RECEPCIÓN PARCIAL / COMPLETA EN ALMACÉN */}
-        {receiveModalOrder !== null && (
-          <ReceiveOrderModal
-            order={receiveModalOrder}
-            onClose={handleCloseReceiveModal}
-            onReceivingStateChange={setIsReceivingId}
-            onReceiptSuccess={handleReceiptSuccess}
-          />
-        )}
-
-        {/* SUB-MODAL 4: SUGERENCIA DE PRECIOS POR CAMBIO DE COSTO CPP */}
-        {priceSuggestionCostChanges !== null && (
-          <PriceSuggestionModal
-            visible={true}
-            costChanges={priceSuggestionCostChanges}
-            onClose={handleClosePriceSuggestions}
-            onApplied={handleAppliedPriceSuggestions}
-          />
-        )}
-    </>
-  );
-
-  if (embedded) {
-    return (
-      <SuppliersErrorBoundary>
-        <View style={styles.safeArea}>{bodyContent}</View>
-      </SuppliersErrorBoundary>
-    );
-  }
-
-  if (asScreen) {
-    return (
-      <SuppliersErrorBoundary>
-        <SafeAreaView style={styles.safeArea} edges={['top', 'bottom']}>
-          {bodyContent}
-        </SafeAreaView>
-      </SuppliersErrorBoundary>
-    );
-  }
-
-  return (
-    <Modal
-      visible={visible}
-      animationType="slide"
-      transparent
-      statusBarTranslucent
-      onRequestClose={onClose}
-    >
-      <SuppliersErrorBoundary>
-        <View style={[styles.safeArea, { paddingTop: insets.top, paddingBottom: insets.bottom }]}>
-          {bodyContent}
+          {/* LISTADO DE PROVEEDORES */}
+          {suppliersLoading && suppliers.length === 0 ? (
+            <View style={styles.centerContainer}>
+              <ActivityIndicator size="large" color={ui.primary} />
+              <Text style={styles.loadingText}>Cargando proveedores...</Text>
+            </View>
+          ) : filteredSuppliers.length === 0 ? (
+            <View style={styles.emptyContainer}>
+              <Building2 size={48} color={ui.border} />
+              <Text style={styles.emptyTitle}>No hay proveedores</Text>
+              <Text style={styles.emptySubtitle}>
+                {supplierSearchQuery
+                  ? 'No se encontraron proveedores que coincidan con la búsqueda.'
+                  : 'Registra tus proveedores con su RUC para gestionar compras y llamadas rápidas.'}
+              </Text>
+              {!supplierSearchQuery && (
+                <TouchableOpacity
+                  style={styles.emptyActionButton}
+                  onPress={() => handleOpenSupplierForm()}
+                >
+                  <Plus size={16} color={ui.primary} />
+                  <Text style={styles.emptyActionButtonText}>Registrar Primer Proveedor</Text>
+                </TouchableOpacity>
+              )}
+            </View>
+          ) : (
+            <FlatList
+              style={styles.listFlex}
+              data={filteredSuppliers}
+              keyExtractor={keyExtractorById}
+              renderItem={renderSupplierItem}
+              contentContainerStyle={LIST_CONTENT_STYLE}
+              removeClippedSubviews={false}
+              showsVerticalScrollIndicator={false}
+              keyboardShouldPersistTaps="handled"
+              initialNumToRender={10}
+              maxToRenderPerBatch={10}
+              windowSize={7}
+            />
+          )}
         </View>
-      </SuppliersErrorBoundary>
-    </Modal>
+      )}
+
+      {/* SUB-MODAL 1: CREAR NUEVA ORDEN DE COMPRA (CONDICIONALMENTE MONTADO) */}
+      {createOrderModalVisible && (
+        <CreateOrderModal
+          visible={createOrderModalVisible}
+          suppliers={suppliers}
+          onClose={handleCloseCreateOrderModal}
+          onRequestNewSupplier={handleRequestNewSupplierFromOrder}
+        />
+      )}
+
+      {/* SUB-MODAL 2: NUEVO / EDITAR PROVEEDOR CON SUNAT AUTOCOMPLETE */}
+      {supplierFormState.visible && (
+        <SupplierFormModal
+          visible={supplierFormState.visible}
+          editingSupplier={supplierFormState.editingSupplier}
+          onClose={handleCloseSupplierForm}
+        />
+      )}
+
+      {/* SUB-MODAL 3: RECEPCIÓN PARCIAL / COMPLETA EN ALMACÉN */}
+      {receiveModalOrder !== null && (
+        <ReceiveOrderModal
+          order={receiveModalOrder}
+          onClose={handleCloseReceiveModal}
+          onReceivingStateChange={setIsReceivingId}
+          onReceiptSuccess={handleReceiptSuccess}
+        />
+      )}
+
+      {/* SUB-MODAL 4: SUGERENCIA DE PRECIOS POR CAMBIO DE COSTO CPP */}
+      {priceSuggestionCostChanges !== null && (
+        <PriceSuggestionModal
+          visible={true}
+          costChanges={priceSuggestionCostChanges}
+          onClose={handleClosePriceSuggestions}
+          onApplied={handleAppliedPriceSuggestions}
+        />
+      )}
+    </SuppliersRootContainer>
   );
 });
+
+export const SuppliersPurchaseModal = React.memo<SuppliersPurchaseModalProps>((props) =>
+  !props.visible ? null : (
+    <SuppliersErrorBoundary>
+      <SuppliersPurchaseContent {...props} />
+    </SuppliersErrorBoundary>
+  )
+);
 
 export default SuppliersPurchaseModal;

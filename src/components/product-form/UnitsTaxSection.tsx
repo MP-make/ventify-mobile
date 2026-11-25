@@ -8,6 +8,7 @@ export interface UnitsTaxSectionProps {
   unitOfMeasure: string;
   allowDecimals: boolean;
   taxExemptionCode: '10' | '20' | '30';
+  showTaxSection: boolean;
   onSelectUnit: (code: string) => void;
   onToggleDecimals: (val: boolean) => void;
   onSelectTaxCode: (code: '10' | '20' | '30') => void;
@@ -17,6 +18,7 @@ export const UnitsTaxSection: React.FC<UnitsTaxSectionProps> = React.memo(({
   unitOfMeasure,
   allowDecimals,
   taxExemptionCode,
+  showTaxSection,
   onSelectUnit,
   onToggleDecimals,
   onSelectTaxCode,
@@ -24,7 +26,9 @@ export const UnitsTaxSection: React.FC<UnitsTaxSectionProps> = React.memo(({
   return (
     <>
       <View style={styles.formGroup}>
-        <Text style={styles.label}>Unidad de Medida (Estándar SUNAT)</Text>
+        <Text style={styles.label}>
+          {showTaxSection ? 'Unidad de Medida (Estándar SUNAT)' : 'Unidad de Medida'}
+        </Text>
         <View style={styles.unitsGrid}>
           {UNITS.map((u) => {
             const isSelected = unitOfMeasure === u.code;
@@ -63,29 +67,31 @@ export const UnitsTaxSection: React.FC<UnitsTaxSectionProps> = React.memo(({
         />
       </View>
 
-      <View style={styles.formGroup}>
-        <Text style={styles.label}>Afectación IGV (SUNAT)</Text>
-        <View style={styles.taxGrid}>
-          {TAX_CODES.map((tc) => {
-            const isSelected = taxExemptionCode === tc.code;
-            return (
-              <TouchableOpacity
-                key={tc.code}
-                style={[styles.taxChip, isSelected && styles.taxChipSelected]}
-                onPress={() => onSelectTaxCode(tc.code)}
-                activeOpacity={0.8}
-                accessibilityRole="button"
-                accessibilityState={{ selected: isSelected }}
-              >
-                <Text style={[styles.taxChipLabel, isSelected && styles.taxChipLabelSelected]}>
-                  {tc.label}
-                </Text>
-                <Text style={styles.taxChipDesc}>{tc.desc}</Text>
-              </TouchableOpacity>
-            );
-          })}
+      {showTaxSection && (
+        <View style={styles.formGroup}>
+          <Text style={styles.label}>Afectación IGV (SUNAT)</Text>
+          <View style={styles.taxGrid}>
+            {TAX_CODES.map((tc) => {
+              const isSelected = taxExemptionCode === tc.code;
+              return (
+                <TouchableOpacity
+                  key={tc.code}
+                  style={[styles.taxChip, isSelected && styles.taxChipSelected]}
+                  onPress={() => onSelectTaxCode(tc.code)}
+                  activeOpacity={0.8}
+                  accessibilityRole="button"
+                  accessibilityState={{ selected: isSelected }}
+                >
+                  <Text style={[styles.taxChipLabel, isSelected && styles.taxChipLabelSelected]}>
+                    {tc.label}
+                  </Text>
+                  <Text style={styles.taxChipDesc}>{tc.desc}</Text>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
         </View>
-      </View>
+      )}
     </>
   );
 });

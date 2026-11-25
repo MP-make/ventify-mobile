@@ -36,6 +36,7 @@ import {
   shareTicketWhatsApp,
 } from '@/services/thermal-printer-service';
 import { resolveReceiptDocumentMeta } from '@/lib/printing/escpos-builder';
+import { resolveReceiptBusiness } from '@/lib/invoicing/receipt-business';
 import type { Sale } from '@/types';
 
 type RecentSaleItem = SellerOwnReport['recentSales'][number] & {
@@ -135,34 +136,13 @@ export default function SellerScreen() {
   }, []);
 
   const receiptBusiness = useMemo(
-    () => ({
-      ...(businessData || {}),
-      ...(businessSettings || {}),
-      ...(emitterInfo || {}),
-      printedFormatResolution: emitterInfo?.printedFormatResolution || undefined,
-      businessName:
-        emitterInfo?.nombreComercial ||
-        emitterInfo?.razonSocial ||
-        businessSettings?.businessName ||
-        businessData?.businessName ||
-        'VENTIFY',
-      ruc: emitterInfo?.ruc || businessSettings?.ruc || businessData?.ruc || '',
-      address:
-        (businessSettings as any)?.commercialAddress ||
-        businessSettings?.address ||
-        activeBranch?.address ||
-        '',
-      phone:
-        activeBranch?.phone ||
-        (businessSettings as any)?.commercialPhone ||
-        businessSettings?.phone ||
-        '',
-      consultUrl:
-        (businessSettings as any)?.consultUrl ||
-        (businessData as any)?.consultUrl ||
-        'https://ventify.com.pe/comprobantes',
-    }),
-    [businessData, businessSettings, emitterInfo, activeBranch]
+    () =>
+      resolveReceiptBusiness({
+        business: businessSettings || businessData,
+        posSettings,
+        emitter: emitterInfo,
+      }),
+    [businessSettings, businessData, posSettings, emitterInfo]
   );
 
   const branchNameMap = useMemo(() => {
@@ -352,10 +332,13 @@ export default function SellerScreen() {
         branch: selectedSaleBranch,
         taxProfile,
         consultUrl: receiptBusiness.consultUrl,
-        receiptFooter:
-          posSettings?.ticketFooterMessage ||
-          businessSettings?.receiptFooter ||
-          '¡Gracias por su compra!',
+        ticketTemplate: receiptBusiness.ticketTemplate,
+        ...(selectedSaleBranch?.receiptFooter?.trim() || receiptBusiness.hasCustomFooter
+          ? {
+              receiptFooter:
+                selectedSaleBranch?.receiptFooter?.trim() || receiptBusiness.receiptFooter,
+            }
+          : {}),
       };
       let printedBt = false;
       if (cfg.connectionType === 'bluetooth' && cfg.selectedDevice?.address) {
@@ -390,10 +373,13 @@ export default function SellerScreen() {
         branch: selectedSaleBranch,
         taxProfile,
         consultUrl: receiptBusiness.consultUrl,
-        receiptFooter:
-          posSettings?.ticketFooterMessage ||
-          businessSettings?.receiptFooter ||
-          '¡Gracias por su compra!',
+        ticketTemplate: receiptBusiness.ticketTemplate,
+        ...(selectedSaleBranch?.receiptFooter?.trim() || receiptBusiness.hasCustomFooter
+          ? {
+              receiptFooter:
+                selectedSaleBranch?.receiptFooter?.trim() || receiptBusiness.receiptFooter,
+            }
+          : {}),
       };
       await shareTicketWhatsApp(
         {
@@ -688,11 +674,11 @@ export default function SellerScreen() {
                       branch={selectedSaleBranch}
                       taxProfile={taxProfile}
                       receiptFooter={
-                        posSettings?.ticketFooterMessage ||
-                        businessSettings?.receiptFooter ||
-                        '¡Gracias por su compra!'
+                        selectedSaleBranch?.receiptFooter?.trim() ||
+                        (receiptBusiness.hasCustomFooter ? receiptBusiness.receiptFooter : undefined)
                       }
                       paperWidth={paperWidth}
+                      compact={receiptBusiness.ticketTemplate === 'compact'}
                     />
                   </View>
                 </>

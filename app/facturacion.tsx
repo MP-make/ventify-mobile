@@ -30,6 +30,7 @@ import { usePermissions } from '@/hooks/usePermissions';
 import { useDebouncedValue } from '@/hooks/use-debounced-value';
 import { EinvoiceActionsModal } from '@/components/EinvoiceActionsModal';
 import { PlanLockedView } from '@/components/PlanFeatureGate';
+import { resolveSunatInvoicingAccess } from '@/lib/plan-entitlements';
 import { formatDatePE, formatPEN, ui } from '@/lib/theme';
 import {
   type DateRangePreset,
@@ -359,7 +360,13 @@ const EinvoiceRow = React.memo<EinvoiceRowProps>(({ item, onSelect }) => {
 export default function FacturacionScreen() {
   const router = useRouter();
   const { accountId, branchId } = useAuthSession();
-  const { activeBranchName, invoicingEnabled, taxProfile } = useBusinessSettings();
+  const {
+    configurationReady,
+    configurationError,
+    activeBranchName,
+    invoicingEnabled,
+    taxProfile,
+  } = useBusinessSettings();
   const {
     isOwner,
     isAdmin,
@@ -370,6 +377,20 @@ export default function FacturacionScreen() {
     canCreateCreditNotes,
   } = usePermissions();
   const { features, planName } = usePlanFeatures();
+
+  const sunatAccess = useMemo(
+    () =>
+      resolveSunatInvoicingAccess({
+        planAllowsSunatInvoicing: features.sunatInvoicing,
+        invoicingEnabled,
+      }),
+    [features.sunatInvoicing, invoicingEnabled]
+  );
+  const waitingAccountConfig =
+    features.sunatInvoicing &&
+    !invoicingEnabled &&
+    !configurationReady &&
+    !configurationError;
 
   const canAccessFacturacion =
     hasPermission('access_sales') &&
@@ -393,10 +414,13 @@ export default function FacturacionScreen() {
   const isMountedRef = useRef(true);
 
   useEffect(() => {
-    if (!features.sunatInvoicing && selectedEinvoice) {
-      setSelectedEinvoice(null);
+    if (!sunatAccess.allowed) {
+      if (selectedEinvoice) {
+        setSelectedEinvoice(null);
+      }
+      setEinvoices((prev) => (prev.length === 0 ? prev : []));
     }
-  }, [features.sunatInvoicing, selectedEinvoice]);
+  }, [sunatAccess.allowed, selectedEinvoice]);
 
   const effectiveBranch = useMemo(() => {
     if (features.multiBranch && hasAllBranchesAccess && scopeAllBranches) return undefined;
@@ -408,7 +432,7 @@ export default function FacturacionScreen() {
   const loadEinvoices = useCallback(
     async (isRefresh = false) => {
       abortRef.current?.abort();
-      if (!accountId || !canAccessFacturacion || !features.sunatInvoicing) {
+      if (!accountId || !canAccessFacturacion || !sunatAccess.allowed) {
         abortRef.current = null;
         setLoading(false);
         setRefreshing(false);
@@ -454,7 +478,7 @@ export default function FacturacionScreen() {
         }
       }
     },
-    [accountId, canAccessFacturacion, features.sunatInvoicing, effectiveBranch, bounds.fromIso, bounds.toIso]
+    [accountId, canAccessFacturacion, sunatAccess.allowed, effectiveBranch, bounds.fromIso, bounds.toIso]
   );
 
   useEffect(() => {
@@ -653,6 +677,43 @@ export default function FacturacionScreen() {
     return (
       <PlanLockedView
         feature="sunatInvoicing"
+        lockReason="plan"
+        asScreen
+        screenTitle="Facturación SUNAT"
+        onBack={() => router.back()}
+        currentPlanName={planName}
+      />
+    );
+  }
+
+  if (waitingAccountConfig) {
+    return (
+      <SafeAreaView style={styles.screen} edges={['top', 'bottom']}>
+        <View style={styles.topBar}>
+          <TouchableOpacity
+            onPress={() => router.back()}
+            style={styles.backBtn}
+            accessibilityRole="button"
+            accessibilityLabel="Volver"
+          >
+            <ArrowLeft size={20} color={ui.text} />
+          </TouchableOpacity>
+          <Text style={styles.topTitle}>Facturación SUNAT</Text>
+          <View style={styles.backBtn} />
+        </View>
+        <View style={styles.centerBox}>
+          <ActivityIndicator size="large" color={ui.primary} />
+          <Text style={styles.loadingText}>Verificando configuración de facturación...</Text>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  if (!sunatAccess.allowed) {
+    return (
+      <PlanLockedView
+        feature="sunatInvoicing"
+        lockReason="account_disabled"
         asScreen
         screenTitle="Facturación SUNAT"
         onBack={() => router.back()}

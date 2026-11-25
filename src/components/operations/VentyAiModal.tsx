@@ -9,7 +9,7 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { FlashList } from '@shopify/flash-list';
 import { Image } from 'expo-image';
 import { AlertCircle, AlertTriangle, Send, X } from 'lucide-react-native';
@@ -76,6 +76,7 @@ export const VentyAiModal = React.memo<VentyAiModalProps>(({
   branchId,
   isOnline,
 }) => {
+  const insets = useSafeAreaInsets();
   const [ventyInput, setVentyInput] = useState<string>('');
   const [ventyLoading, setVentyLoading] = useState<boolean>(false);
   const [ventyError, setVentyError] = useState<string | null>(null);
@@ -333,10 +334,17 @@ export const VentyAiModal = React.memo<VentyAiModalProps>(({
     <Modal
       visible={visible}
       animationType="slide"
-      presentationStyle="pageSheet"
+      transparent
+      statusBarTranslucent
       onRequestClose={handleClose}
     >
-      <SafeAreaView edges={['top', 'bottom']} style={styles.fullSheetContainer}>
+      <View
+        style={[
+          styles.fullSheetContainer,
+          { paddingTop: insets.top, paddingBottom: insets.bottom },
+        ]}
+        collapsable={false}
+      >
         <View style={styles.fullSheetHeader}>
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, flex: 1 }}>
             <Image
@@ -421,7 +429,7 @@ export const VentyAiModal = React.memo<VentyAiModalProps>(({
             </TouchableOpacity>
           </View>
         </KeyboardAvoidingView>
-      </SafeAreaView>
+      </View>
     </Modal>
   );
 });

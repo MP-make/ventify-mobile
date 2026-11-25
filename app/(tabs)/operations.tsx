@@ -14,7 +14,6 @@ import * as Haptics from 'expo-haptics';
 import {
   BarChart3,
   CalendarClock,
-  Lock,
   UserCheck,
   Users,
   Wallet,
@@ -72,6 +71,8 @@ import { PayrollUsersModal } from '@/components/PayrollUsersModal';
 import { ReservationCancellationModal } from '@/components/ReservationCancellationModal';
 import { ReservationCompletionModal } from '@/components/ReservationCompletionModal';
 import { ReservationReceiptModal } from '@/components/ReservationReceiptModal';
+import { SaleReceiptModal } from '@/components/SaleReceiptModal';
+import type { Sale } from '@/types';
 
 import { CashMovementModal } from '@/components/operations/CashMovementModal';
 import { CashTabView } from '@/components/operations/CashTabView';
@@ -247,6 +248,8 @@ export default function OperationsScreen() {
   );
   const [orderTicketModalOpen, setOrderTicketModalOpen] =
     useState<boolean>(false);
+  const [completedSaleReceipt, setCompletedSaleReceipt] = useState<Sale | null>(null);
+  const [completedSaleModalOpen, setCompletedSaleModalOpen] = useState<boolean>(false);
 
   // ============================================================================
   // MULTI-CAJA CON TTL DE 45_000 MS
@@ -1186,10 +1189,15 @@ export default function OperationsScreen() {
   }, []);
 
   const handleCompletionCompleted = useCallback(
-    (item: ReservationOrder) => {
+    (item: ReservationOrder, completedSale?: Sale) => {
       setCompletionTarget(null);
       void loadReservationsData();
       refreshCashStatus();
+      if (completedSale) {
+        setCompletedSaleReceipt(completedSale);
+        setCompletedSaleModalOpen(true);
+        return;
+      }
       setCreatedOrderTicket({
         ...item,
         status: 'completed',
@@ -1200,6 +1208,11 @@ export default function OperationsScreen() {
     },
     [loadReservationsData, refreshCashStatus]
   );
+
+  const handleCloseCompletedSaleModal = useCallback(() => {
+    setCompletedSaleModalOpen(false);
+    setCompletedSaleReceipt(null);
+  }, []);
 
   const confirmReservationCancellation = useCallback(
     async (refund: { refundMethod?: string; refundPercent?: number }) => {
@@ -1294,7 +1307,12 @@ export default function OperationsScreen() {
   return (
     <View style={styles.screen}>
       <View style={styles.compactHeaderRow}>
-        <Text style={styles.compactHeaderTitle}>
+        <Text
+          style={styles.compactHeaderTitle}
+          numberOfLines={1}
+          adjustsFontSizeToFit
+          minimumFontScale={0.85}
+        >
           {activeTab === 'cash'
             ? 'Caja'
             : activeTab === 'crm'
@@ -1303,7 +1321,10 @@ export default function OperationsScreen() {
         </Text>
         <View style={styles.compactHeaderActions}>
           <TouchableOpacity
-            style={styles.compactTeamButton}
+            style={[
+              styles.compactTeamButton,
+              !features.aiAssistant && styles.compactTeamButtonLocked,
+            ]}
             onPress={handleOpenVentyModal}
             accessibilityRole="button"
             accessibilityLabel={
@@ -1314,15 +1335,28 @@ export default function OperationsScreen() {
           >
             <Image
               source={VENTY_ICON}
-              style={styles.ventyBtnIcon}
+              style={[
+                styles.ventyBtnIcon,
+                !features.aiAssistant && styles.ventyBtnIconLocked,
+              ]}
               contentFit="contain"
             />
-            <Text style={styles.compactTeamButtonText}>Venty IA</Text>
-            {!features.aiAssistant && <Lock size={12} color={ui.accent} />}
+            <Text
+              style={[
+                styles.compactTeamButtonText,
+                !features.aiAssistant && styles.compactTeamButtonTextLocked,
+              ]}
+              numberOfLines={1}
+            >
+              Venty IA
+            </Text>
           </TouchableOpacity>
           {(canViewMargins || canViewReports) ? (
             <TouchableOpacity
-              style={styles.compactTeamButton}
+              style={[
+                styles.compactTeamButton,
+                !features.advancedAnalytics && styles.compactTeamButtonLocked,
+              ]}
               onPress={handleOpenPnlModal}
               accessibilityRole="button"
               accessibilityLabel={
@@ -1331,9 +1365,19 @@ export default function OperationsScreen() {
                   : 'Reporte de ganancias (requiere mejora de plan)'
               }
             >
-              <BarChart3 size={16} color={ui.primary} />
-              <Text style={styles.compactTeamButtonText}>Ganancias</Text>
-              {!features.advancedAnalytics && <Lock size={12} color={ui.accent} />}
+              <BarChart3
+                size={14}
+                color={features.advancedAnalytics ? ui.primary : '#8896AA'}
+              />
+              <Text
+                style={[
+                  styles.compactTeamButtonText,
+                  !features.advancedAnalytics && styles.compactTeamButtonTextLocked,
+                ]}
+                numberOfLines={1}
+              >
+                Ganancias
+              </Text>
             </TouchableOpacity>
           ) : null}
           {canManageUsers && features.teamManagement ? (
@@ -1343,8 +1387,10 @@ export default function OperationsScreen() {
               accessibilityRole="button"
               accessibilityLabel="Abrir equipo y planilla"
             >
-              <UserCheck size={16} color={ui.primary} />
-              <Text style={styles.compactTeamButtonText}>Equipo</Text>
+              <UserCheck size={14} color={ui.primary} />
+              <Text style={styles.compactTeamButtonText} numberOfLines={1}>
+                Equipo
+              </Text>
             </TouchableOpacity>
           ) : null}
         </View>
@@ -1676,6 +1722,16 @@ export default function OperationsScreen() {
           onClose={handleCloseOrderTicketModal}
           reservation={createdOrderTicket}
           business={businessSettings}
+          branch={activeBranch}
+        />
+      )}
+
+      {completedSaleModalOpen && (
+        <SaleReceiptModal
+          visible={completedSaleModalOpen}
+          sale={completedSaleReceipt}
+          branch={activeBranch}
+          onClose={handleCloseCompletedSaleModal}
         />
       )}
     </View>

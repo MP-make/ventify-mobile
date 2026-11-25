@@ -84,7 +84,8 @@ async function getDocsEnterpriseWithFallback(
 
 const getAppState = (): AppStateLike | null => {
   try {
-    const rn = (typeof require !== 'undefined' ? require : () => null)('react-native');
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const rn = require('react-native');
     return rn?.AppState || null;
   } catch {
     return null;
@@ -132,7 +133,7 @@ const createAppStateManagedFirestoreSubscription = (
     });
   }
 
-  if (typeof AppState?.currentState !== 'string' || AppState.currentState === 'active') {
+  if (AppState?.currentState !== 'background') {
     ensureAttached();
   }
 
@@ -160,12 +161,12 @@ const createActivePollingSubscription = (
   const AppState = getAppState();
   const hasAppStateListener = typeof AppState?.addEventListener === 'function';
   let listenerTriggered = false;
-  let isPaused = Boolean(AppState?.currentState && AppState.currentState !== 'active');
+  let isPaused = AppState?.currentState === 'background';
   let appStateSubscription: AppStateSubscription = null;
 
   const isAppActive = () => {
     if (listenerTriggered) return !isPaused;
-    return !isPaused && (!AppState?.currentState || AppState.currentState === 'active');
+    return !isPaused && AppState?.currentState !== 'background';
   };
 
   const abortInFlight = () => {
@@ -1216,10 +1217,10 @@ const mapTeamMemberDoc = (id: string, data: Record<string, any>, fallbackAccount
   return {
     id,
     uid: data.uid || id,
-    name: data.name || data.displayName || data.email || 'Colaborador',
-    displayName: data.displayName || data.name || '',
-    email: data.email || '',
-    phone: data.phone || '',
+    name: String(data.name || data.displayName || data.email || 'Colaborador'),
+    displayName: String(data.displayName || data.name || ''),
+    email: String(data.email || ''),
+    phone: String(data.phone || ''),
     role: rawRole,
     roleLabel: getRoleDisplay(rawRole),
     branchId: data.branchId || undefined,

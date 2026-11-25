@@ -26,6 +26,10 @@ import {
   type TaxProfileConfig,
   type TaxProfileInput,
 } from '@/lib/invoicing/receipt-amounts';
+import {
+  resolvePrintableLogoDataUri,
+  resolveReceiptBusiness,
+} from '@/lib/invoicing/receipt-business';
 import type { Branch } from '@/types';
 
 export interface ReceiptItem {
@@ -813,6 +817,33 @@ export const generateReceiptHTML = (
   `;
 };
 
+const preparePrintableBusinessAndBranch = async (
+  business: any,
+  branch?: Partial<Branch> | null,
+  ticketTemplate?: 'standard' | 'compact'
+): Promise<{ business: any; branch?: Partial<Branch> | null }> => {
+  const resolved = resolveReceiptBusiness({ business, branch, ticketTemplate });
+  if (!resolved.showLogo || !resolved.logoUri) {
+    return { business: business || {}, branch };
+  }
+  const printableLogo = await resolvePrintableLogoDataUri(resolved.logoUri);
+  if (!printableLogo) {
+    return { business: business || {}, branch };
+  }
+  return {
+    business: {
+      ...(business || {}),
+      receiptLogoDataUrl: printableLogo,
+    },
+    branch: branch
+      ? {
+          ...branch,
+          receiptLogoDataUrl: printableLogo,
+        }
+      : branch,
+  };
+};
+
 /**
  * Imprime el ticket usando el servicio nativo de impresión del sistema operativo (`expo-print`)
  */
@@ -823,6 +854,7 @@ export const printTicketPDF = async (
     taxProfile?: (TaxProfileInput & { taxRate?: number | null }) | null;
     receiptFooter?: string;
     consultUrl?: string;
+    ticketTemplate?: 'standard' | 'compact';
   }
 ): Promise<void> => {
   try {
@@ -833,6 +865,7 @@ export const printTicketPDF = async (
       taxProfile: config?.taxProfile,
       receiptFooter: config?.receiptFooter,
       consultUrl: config?.consultUrl,
+      ticketTemplate: config?.ticketTemplate,
       ...(receipt?.options || {}),
     };
 
@@ -842,10 +875,20 @@ export const printTicketPDF = async (
     } else if (receipt?.htmlContent) {
       htmlContent = receipt.htmlContent;
     } else if (receipt?.sale) {
-      htmlContent = buildReceiptHtml(receipt.sale, receipt.business || {}, htmlOptions);
+      const prepared = await preparePrintableBusinessAndBranch(
+        receipt.business,
+        htmlOptions.branch,
+        htmlOptions.ticketTemplate
+      );
+      htmlContent = buildReceiptHtml(receipt.sale, prepared.business, {
+        ...htmlOptions,
+        branch: prepared.branch,
+      });
     } else if (receipt?.documentTitle) {
+      const printableLogo = await resolvePrintableLogoDataUri(receipt.logoUrl);
+      const enrichedReceipt = printableLogo ? { ...receipt, logoUrl: printableLogo } : receipt;
       htmlContent = generateReceiptHTML(
-        receipt,
+        enrichedReceipt,
         width,
         (htmlOptions.taxProfile as TaxProfileConfig | null | undefined) ?? config?.taxProfile
       );
@@ -870,6 +913,7 @@ export interface ShareTicketWhatsAppConfig {
   taxProfile?: (TaxProfileInput & { taxRate?: number | null }) | null;
   receiptFooter?: string;
   consultUrl?: string;
+  ticketTemplate?: 'standard' | 'compact';
 }
 
 /**
@@ -898,8 +942,12 @@ export const shareTicketWhatsApp = async (
       htmlContent = receiptOrSale;
       customerPhone = typeof businessOrPhone === 'string' ? businessOrPhone : extraCfg.phone || '';
     } else if (receiptOrSale?.documentTitle) {
+      const printableLogo = await resolvePrintableLogoDataUri(receiptOrSale.logoUrl);
+      const enrichedReceipt = printableLogo
+        ? { ...receiptOrSale, logoUrl: printableLogo }
+        : receiptOrSale;
       htmlContent = generateReceiptHTML(
-        receiptOrSale,
+        enrichedReceipt,
         width,
         (extraCfg.taxProfile as TaxProfileConfig | null | undefined) ?? undefined
       );
@@ -907,13 +955,23 @@ export const shareTicketWhatsApp = async (
       docNumber = receiptOrSale.documentNumber || '';
       saleTotal = receiptOrSale.total;
     } else if (receiptOrSale?.sale) {
-      htmlContent = buildReceiptHtml(receiptOrSale.sale, receiptOrSale.business || {}, {
+      const shareOptions: EscPosOptions = {
         paperWidth: width,
         branch: extraCfg.branch,
         taxProfile: extraCfg.taxProfile,
         receiptFooter: extraCfg.receiptFooter,
         consultUrl: extraCfg.consultUrl,
+        ticketTemplate: extraCfg.ticketTemplate,
         ...(receiptOrSale.options || {}),
+      };
+      const prepared = await preparePrintableBusinessAndBranch(
+        receiptOrSale.business,
+        shareOptions.branch,
+        shareOptions.ticketTemplate
+      );
+      htmlContent = buildReceiptHtml(receiptOrSale.sale, prepared.business, {
+        ...shareOptions,
+        branch: prepared.branch,
       });
       customerPhone =
         typeof businessOrPhone === 'string'
@@ -923,12 +981,18 @@ export const shareTicketWhatsApp = async (
       saleTotal = receiptOrSale.sale?.total;
     } else {
       const businessObj = typeof businessOrPhone === 'object' ? businessOrPhone : {};
-      htmlContent = buildReceiptHtml(receiptOrSale, businessObj, {
+      const prepared = await preparePrintableBusinessAndBranch(
+        businessObj,
+        extraCfg.branch,
+        extraCfg.ticketTemplate
+      );
+      htmlContent = buildReceiptHtml(receiptOrSale, prepared.business, {
         paperWidth: width,
-        branch: extraCfg.branch,
+        branch: prepared.branch,
         taxProfile: extraCfg.taxProfile,
         receiptFooter: extraCfg.receiptFooter,
         consultUrl: extraCfg.consultUrl,
+        ticketTemplate: extraCfg.ticketTemplate,
       });
       customerPhone =
         typeof phoneOrConfig === 'string'

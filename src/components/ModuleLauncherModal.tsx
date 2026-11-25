@@ -25,6 +25,7 @@ import {
 import { useAuthSession, usePinLock, usePlanFeatures } from '@/context/AuthContext';
 import { useBusinessSettings } from '@/context/SettingsContext';
 import { usePermissions } from '@/hooks/usePermissions';
+import { resolveSunatInvoicingAccess } from '@/lib/plan-entitlements';
 import { ui } from '@/lib/theme';
 
 export interface ModuleLauncherModalProps {
@@ -102,7 +103,7 @@ const ModuleLauncherModalContent: React.FC<ModuleLauncherModalProps> = React.mem
     const { accountId, userProfile } = useAuthSession();
     const { features } = usePlanFeatures();
     const { lockTerminal } = usePinLock();
-    const { businessName, activeBranchName } = useBusinessSettings();
+    const { businessName, activeBranchName, invoicingEnabled } = useBusinessSettings();
     const {
       role,
       isOwner,
@@ -118,6 +119,10 @@ const ModuleLauncherModalContent: React.FC<ModuleLauncherModalProps> = React.mem
     const modules = useMemo<LauncherModuleItem[]>(() => {
       if (!accountId) return [];
       const list: LauncherModuleItem[] = [];
+      const sunatAccess = resolveSunatInvoicingAccess({
+        planAllowsSunatInvoicing: features.sunatInvoicing,
+        invoicingEnabled,
+      });
 
       if (canAccessDashboard) {
         list.push({
@@ -156,7 +161,11 @@ const ModuleLauncherModalContent: React.FC<ModuleLauncherModalProps> = React.mem
           route: '/facturacion',
           tintBg: ui.successSoft,
           tintColor: ui.success,
-          lockedBadge: features.sunatInvoicing ? undefined : 'Emprendedor',
+          lockedBadge: !sunatAccess.allowed
+            ? sunatAccess.lockReason === 'plan'
+              ? 'Emprendedor'
+              : 'Inactiva'
+            : undefined,
           icon: ReceiptText,
         });
       }
@@ -193,6 +202,7 @@ const ModuleLauncherModalContent: React.FC<ModuleLauncherModalProps> = React.mem
       accountId,
       features.advancedAnalytics,
       features.sunatInvoicing,
+      invoicingEnabled,
       features.multiBranch,
       canAccessDashboard,
       canViewReports,

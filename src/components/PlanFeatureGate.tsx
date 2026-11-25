@@ -22,6 +22,7 @@ import {
 import { APP_URL } from '@/lib/env';
 import {
   PLAN_FEATURE_METADATA,
+  type FeatureLockReason,
   type PlanFeatureKey,
 } from '@/lib/plan-entitlements';
 import { ui } from '@/lib/theme';
@@ -31,6 +32,7 @@ const stopResponder = () => true;
 
 export interface PlanLockedViewProps {
   feature: PlanFeatureKey;
+  lockReason?: FeatureLockReason;
   currentPlanName?: string;
   asScreen?: boolean;
   screenTitle?: string;
@@ -41,6 +43,7 @@ export interface PlanLockedViewProps {
 export const PlanLockedView = React.memo<PlanLockedViewProps>(
   ({
     feature,
+    lockReason = 'plan',
     currentPlanName,
     asScreen = false,
     screenTitle,
@@ -48,6 +51,11 @@ export const PlanLockedView = React.memo<PlanLockedViewProps>(
     compact = false,
   }) => {
     const meta = PLAN_FEATURE_METADATA[feature];
+    const isAccountDisabled = lockReason === 'account_disabled';
+    const description =
+      isAccountDisabled && feature === 'sunatInvoicing'
+        ? 'La facturación electrónica SUNAT está desactivada en tu cuenta actual. Solicita su activación con el equipo de Ventify para emitir boletas, facturas y notas electrónicas.'
+        : meta.description;
 
     const handleOpenPricing = useCallback(async () => {
       const target = `${APP_URL.replace(/\/$/, '')}/pricing`;
@@ -59,8 +67,9 @@ export const PlanLockedView = React.memo<PlanLockedViewProps>(
     }, []);
 
     const handleOpenWhatsApp = useCallback(async () => {
+      const topic = isAccountDisabled ? `activar ${meta.title} en mi cuenta` : meta.whatsappTopic;
       const text = encodeURIComponent(
-        `Hola equipo Ventify, quiero ${meta.whatsappTopic}. Actualmente estoy en ${currentPlanName || 'mi plan actual'}.`
+        `Hola equipo Ventify, quiero ${topic}. Actualmente estoy en ${currentPlanName || 'mi plan actual'}.`
       );
       const target = `${WHATSAPP_BASE_URL}?text=${text}`;
       try {
@@ -68,7 +77,7 @@ export const PlanLockedView = React.memo<PlanLockedViewProps>(
       } catch {
         Alert.alert('Error', 'No se pudo abrir WhatsApp.');
       }
-    }, [meta.whatsappTopic, currentPlanName]);
+    }, [isAccountDisabled, meta.title, meta.whatsappTopic, currentPlanName]);
 
     const body = (
       <ScrollView
@@ -81,9 +90,15 @@ export const PlanLockedView = React.memo<PlanLockedViewProps>(
         <View style={[styles.card, compact && styles.cardCompact]}>
           <View style={styles.badgeRow}>
             <View style={styles.requiredBadge}>
-              <Crown size={13} color={ui.accent} />
+              {isAccountDisabled ? (
+                <Lock size={13} color={ui.accent} />
+              ) : (
+                <Crown size={13} color={ui.accent} />
+              )}
               <Text style={styles.requiredBadgeText}>
-                Disponible en {meta.requiredTierLabel}
+                {isAccountDisabled
+                  ? 'Desactivada en tu cuenta'
+                  : `Disponible en ${meta.requiredTierLabel}`}
               </Text>
             </View>
             {currentPlanName ? (
@@ -102,7 +117,7 @@ export const PlanLockedView = React.memo<PlanLockedViewProps>(
           </View>
 
           <Text style={styles.title}>{meta.title}</Text>
-          <Text style={styles.description}>{meta.description}</Text>
+          <Text style={styles.description}>{description}</Text>
 
           <View style={styles.highlightsBox}>
             {meta.highlights.map((item) => (
@@ -114,27 +129,55 @@ export const PlanLockedView = React.memo<PlanLockedViewProps>(
           </View>
 
           <View style={styles.actionsCol}>
-            <TouchableOpacity
-              onPress={() => void handleOpenPricing()}
-              style={styles.primaryBtn}
-              activeOpacity={0.82}
-              accessibilityRole="button"
-              accessibilityLabel={`Ver planes para desbloquear ${meta.title}`}
-            >
-              <ExternalLink size={16} color={ui.onPrimary} />
-              <Text style={styles.primaryBtnText}>Ver planes</Text>
-            </TouchableOpacity>
+            {isAccountDisabled ? (
+              <>
+                <TouchableOpacity
+                  onPress={() => void handleOpenWhatsApp()}
+                  style={styles.primaryBtn}
+                  activeOpacity={0.82}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Solicitar activación de ${meta.title} por WhatsApp`}
+                >
+                  <MessageCircle size={16} color={ui.onPrimary} />
+                  <Text style={styles.primaryBtnText}>Solicitar activación por WhatsApp</Text>
+                </TouchableOpacity>
 
-            <TouchableOpacity
-              onPress={() => void handleOpenWhatsApp()}
-              style={styles.secondaryBtn}
-              activeOpacity={0.82}
-              accessibilityRole="button"
-              accessibilityLabel="Solicitar actualización de plan por WhatsApp"
-            >
-              <MessageCircle size={16} color={ui.primary} />
-              <Text style={styles.secondaryBtnText}>Hablar por WhatsApp</Text>
-            </TouchableOpacity>
+                <TouchableOpacity
+                  onPress={() => void handleOpenPricing()}
+                  style={styles.secondaryBtn}
+                  activeOpacity={0.82}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Ver planes para ${meta.title}`}
+                >
+                  <ExternalLink size={16} color={ui.primary} />
+                  <Text style={styles.secondaryBtnText}>Ver planes</Text>
+                </TouchableOpacity>
+              </>
+            ) : (
+              <>
+                <TouchableOpacity
+                  onPress={() => void handleOpenPricing()}
+                  style={styles.primaryBtn}
+                  activeOpacity={0.82}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Ver planes para desbloquear ${meta.title}`}
+                >
+                  <ExternalLink size={16} color={ui.onPrimary} />
+                  <Text style={styles.primaryBtnText}>Ver planes</Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  onPress={() => void handleOpenWhatsApp()}
+                  style={styles.secondaryBtn}
+                  activeOpacity={0.82}
+                  accessibilityRole="button"
+                  accessibilityLabel="Solicitar actualización de plan por WhatsApp"
+                >
+                  <MessageCircle size={16} color={ui.primary} />
+                  <Text style={styles.secondaryBtnText}>Hablar por WhatsApp</Text>
+                </TouchableOpacity>
+              </>
+            )}
           </View>
         </View>
       </ScrollView>
@@ -169,12 +212,13 @@ export const PlanLockedView = React.memo<PlanLockedViewProps>(
 export interface PlanUpgradeModalProps {
   visible: boolean;
   feature: PlanFeatureKey | null;
+  lockReason?: FeatureLockReason;
   currentPlanName?: string;
   onClose: () => void;
 }
 
 export const PlanUpgradeModal = React.memo<PlanUpgradeModalProps>(
-  ({ visible, feature, currentPlanName, onClose }) => {
+  ({ visible, feature, lockReason = 'plan', currentPlanName, onClose }) => {
     const insets = useSafeAreaInsets();
     if (!visible || !feature) return null;
 
@@ -210,6 +254,7 @@ export const PlanUpgradeModal = React.memo<PlanUpgradeModalProps>(
             </View>
             <PlanLockedView
               feature={feature}
+              lockReason={lockReason}
               currentPlanName={currentPlanName}
               compact
             />

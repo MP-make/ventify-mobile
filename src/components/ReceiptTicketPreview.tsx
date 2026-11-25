@@ -8,6 +8,7 @@ import { amountToWordsSoles } from '@/lib/invoicing/types';
 import { receiptAmountsForSale, type TaxProfileInput } from '@/lib/invoicing/receipt-amounts';
 import { buildSaleQrContent } from '@/lib/invoicing/qr-content';
 import { generateQrSvgData } from '@/lib/invoicing/qr-matrix';
+import { resolveReceiptBusiness } from '@/lib/invoicing/receipt-business';
 
 export interface ReceiptTicketPreviewProps {
   sale: Partial<Sale> & {
@@ -52,12 +53,17 @@ const formatMethodName = (method?: string, provider?: string): string => {
  */
 export const ReceiptTicketPreview: React.FC<ReceiptTicketPreviewProps> = React.memo(
   ({ sale, business, branch, taxProfile, receiptFooter, paperWidth = 80, compact = false }) => {
-    const merged = useMemo(
-      () => ({
-        ...(business || {}),
-        ...(branch || {}),
-      }),
-      [business, branch]
+    const resolved = useMemo(
+      () =>
+        resolveReceiptBusiness({
+          business,
+          branch,
+          receiptFooter,
+          consultUrl: sale.consultUrl,
+          saleFooterNote: sale.footerNote,
+          ticketTemplate: compact ? 'compact' : undefined,
+        }),
+      [business, branch, receiptFooter, sale.consultUrl, sale.footerNote, compact]
     );
 
     const rawDocType = String(sale.documentType || 'nota_venta').toLowerCase();
@@ -113,20 +119,22 @@ export const ReceiptTicketPreview: React.FC<ReceiptTicketPreviewProps> = React.m
       [amounts.total]
     );
 
-    const logoUri = merged.receiptLogoDataUrl || merged.receiptLogo || '';
-    const ruc = merged.ruc || '';
-    const fiscalAddress = merged.fiscalAddress || merged.address || '';
-    const storeAddress =
-      merged.commercialAddress && merged.commercialAddress !== fiscalAddress
-        ? merged.commercialAddress
+    const logoUri = resolved.showLogo ? resolved.logoUri : '';
+    const ruc = resolved.ruc;
+    const fiscalAddress = resolved.fiscalAddress;
+    const storeAddress = resolved.commercialAddress;
+    const businessName = resolved.businessName;
+    const branchSubtitle = resolved.branchName;
+    const razonSocialSubtitle =
+      resolved.razonSocial &&
+      resolved.razonSocial.toLowerCase() !== resolved.businessName.toLowerCase()
+        ? resolved.razonSocial
         : '';
-    const businessName =
-      business?.businessName || merged.businessName || branch?.name || 'Ventify POS';
-    const branchSubtitle =
-      branch?.name && branch.name !== businessName ? branch?.name || '' : '';
-    const slogan = merged.description || '';
-    const phone = merged.phone || (merged as any).commercialPhone || '';
-    const email = merged.email || '';
+    const slogan = resolved.showSlogan && !compact ? resolved.slogan : '';
+    const receiptHeader = resolved.receiptHeader;
+    const phone = resolved.phone;
+    const email = !compact ? resolved.email : '';
+    const website = !compact ? resolved.website : '';
 
     const customerName =
       sale.receiptCustomer?.name ||
@@ -188,11 +196,11 @@ export const ReceiptTicketPreview: React.FC<ReceiptTicketPreviewProps> = React.m
       () =>
         buildSaleQrContent(sale, {
           emitterRuc: ruc,
-          consultUrl: merged.consultUrl,
+          consultUrl: resolved.consultUrl,
           taxProfile,
           precomputedAmounts: amounts,
         }),
-      [sale, ruc, merged.consultUrl, taxProfile, amounts]
+      [sale, ruc, resolved.consultUrl, taxProfile, amounts]
     );
 
     const qrSvgData = useMemo(() => {
@@ -218,9 +226,8 @@ export const ReceiptTicketPreview: React.FC<ReceiptTicketPreviewProps> = React.m
 
     const sunatHash = (sale as any).sunatHash || (sale as any).hash || '';
     const resolutionText =
-      sale.printedFormatResolution || merged.printedFormatResolution || '';
-    const footerText =
-      receiptFooter || merged.receiptFooter || '¡Gracias por su compra!';
+      sale.printedFormatResolution || resolved.printedFormatResolution || '';
+    const footerText = resolved.receiptFooter;
 
     const ticketMaxWidth = paperWidth === 58 ? 276 : 332;
 
@@ -237,19 +244,26 @@ export const ReceiptTicketPreview: React.FC<ReceiptTicketPreviewProps> = React.m
             />
           )}
           <Text style={styles.businessTitle}>{businessName}</Text>
+          {Boolean(razonSocialSubtitle) && (
+            <Text style={styles.metaCenter}>{razonSocialSubtitle}</Text>
+          )}
           {Boolean(branchSubtitle) && (
             <Text style={styles.metaCenter}>Sucursal: {branchSubtitle}</Text>
           )}
           {Boolean(slogan) && <Text style={styles.slogan}>{slogan}</Text>}
-          {Boolean(ruc) && <Text style={styles.rucLine}>RUC: {ruc}</Text>}
-          {Boolean(fiscalAddress) && (
+          {Boolean(receiptHeader) && (
+            <Text style={styles.metaCenter}>{receiptHeader}</Text>
+          )}
+          {resolved.showRuc && Boolean(ruc) && <Text style={styles.rucLine}>RUC: {ruc}</Text>}
+          {resolved.showAddress && Boolean(fiscalAddress) && (
             <Text style={styles.metaCenter}>{fiscalAddress}</Text>
           )}
-          {Boolean(storeAddress) && (
+          {resolved.showAddress && Boolean(storeAddress) && (
             <Text style={styles.metaCenter}>Tienda: {storeAddress}</Text>
           )}
-          {Boolean(phone) && <Text style={styles.metaCenter}>Tel: {phone}</Text>}
-          {Boolean(email) && <Text style={styles.metaCenter}>Email: {email}</Text>}
+          {resolved.showPhone && Boolean(phone) && <Text style={styles.metaCenter}>Tel: {phone}</Text>}
+          {resolved.showEmail && Boolean(email) && <Text style={styles.metaCenter}>Email: {email}</Text>}
+          {Boolean(website) && <Text style={styles.metaCenter}>{website}</Text>}
         </View>
 
         {/* Banner título comprobante */}
@@ -437,7 +451,8 @@ export const ReceiptTicketPreview: React.FC<ReceiptTicketPreviewProps> = React.m
             </>
           )}
 
-          {sale.depositInfo && Number(sale.depositInfo.depositAmount) > 0 && (
+          {sale.depositInfo &&
+            Number((sale.depositInfo as any).appliedAmount ?? sale.depositInfo.depositAmount) > 0 && (
             <View style={styles.depositBox}>
               <View style={styles.totalRow}>
                 <Text style={styles.totalLabel}>Total original:</Text>
@@ -448,13 +463,13 @@ export const ReceiptTicketPreview: React.FC<ReceiptTicketPreviewProps> = React.m
               <View style={styles.totalRow}>
                 <Text style={styles.totalLabel}>Adelanto (-):</Text>
                 <Text style={styles.totalVal}>
-                  S/ {Number(sale.depositInfo.depositAmount).toFixed(2)}
+                  S/ {Number((sale.depositInfo as any).appliedAmount ?? sale.depositInfo.depositAmount).toFixed(2)}
                 </Text>
               </View>
               <View style={styles.totalRow}>
                 <Text style={[styles.totalLabel, { fontWeight: '700' }]}>Saldo restante:</Text>
                 <Text style={[styles.totalVal, { fontWeight: '700' }]}>
-                  S/ {Number(sale.depositInfo.remainingAmount ?? 0).toFixed(2)}
+                  S/ {Number(sale.depositInfo.remainingAmount ?? (sale.depositInfo as any).remainingBalance ?? 0).toFixed(2)}
                 </Text>
               </View>
             </View>

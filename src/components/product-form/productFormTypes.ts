@@ -17,6 +17,7 @@ export interface ProductFormData {
   category: string;
   barcode: string;
   barcodes?: string[];
+  generatedBarcodes?: string[];
   sku: string;
   brand?: string;
   sizeLabel?: string;

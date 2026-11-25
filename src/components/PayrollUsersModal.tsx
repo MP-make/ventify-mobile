@@ -17,14 +17,15 @@ import {
   TextInput,
   TouchableOpacity,
   ScrollView,
+  FlatList,
   StyleSheet,
   Alert,
   ActivityIndicator,
   Switch,
   Platform,
+  type ViewStyle,
 } from 'react-native';
-import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
-import { FlashList, type ContentStyle } from '@shopify/flash-list';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   X,
   Users,
@@ -91,7 +92,7 @@ const TeamMemberCardItem = React.memo<TeamMemberCardItemProps>(({ member, canEdi
   <View style={styles.memberCard}>
     <View style={styles.memberAvatar}>
       <Text style={styles.memberAvatarText}>
-        {member.name.charAt(0).toUpperCase()}
+        {(member.name || 'C').charAt(0).toUpperCase()}
       </Text>
     </View>
 
@@ -411,8 +412,72 @@ const payrollMovementKeyExtractor = (item: PayrollMovement) => item.id;
 const saleRequestKeyExtractor = (item: SaleRequest) => item.id;
 const branchKeyExtractor = (item: BranchItem) => item.id;
 const PayrollListGap10 = () => <View style={{ height: 10 }} />;
+const SUBSCRIPTION_SAFETY_TIMEOUT_MS = 10_000;
 
-export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
+interface PayrollErrorBoundaryState {
+  error: Error | null;
+}
+
+class PayrollErrorBoundary extends React.Component<
+  { children: React.ReactNode; onClose: () => void },
+  PayrollErrorBoundaryState
+> {
+  state: PayrollErrorBoundaryState = { error: null };
+
+  static getDerivedStateFromError(error: Error): PayrollErrorBoundaryState {
+    return { error };
+  }
+
+  componentDidCatch(error: Error) {
+    console.error('[PayrollUsersModal] Render boundary error:', error);
+  }
+
+  handleRetry = () => {
+    this.setState({ error: null });
+  };
+
+  render() {
+    if (this.state.error) {
+      return (
+        <Modal
+          visible
+          animationType="fade"
+          transparent
+          statusBarTranslucent
+          onRequestClose={this.props.onClose}
+        >
+          <View style={styles.errorOverlay} collapsable={false}>
+            <View style={styles.errorCard} collapsable={false}>
+              <Text style={styles.errorTitle}>No se pudo abrir Equipo y administración</Text>
+              <Text style={styles.errorMessage}>
+                {this.state.error.message || 'Ocurrió un error al mostrar esta pantalla.'}
+              </Text>
+              <View style={styles.errorActions}>
+                <TouchableOpacity
+                  style={styles.errorSecondaryBtn}
+                  onPress={this.props.onClose}
+                  accessibilityRole="button"
+                >
+                  <Text style={styles.errorSecondaryText}>Cerrar</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.errorPrimaryBtn}
+                  onPress={this.handleRetry}
+                  accessibilityRole="button"
+                >
+                  <Text style={styles.errorPrimaryText}>Reintentar</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        </Modal>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+const PayrollUsersContent: React.FC<PayrollUsersModalProps> = React.memo(({
   visible,
   isOpen,
   initialTab = 'team',
@@ -540,55 +605,87 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
 
   // 1. Suscripciones en tiempo real según pestaña activa
   useEffect(() => {
-    if (!isVisible || !accountId || !features.teamManagement) return;
+    if (!isVisible || !accountId || !features.teamManagement) {
+      setLoading(false);
+      return;
+    }
 
     let isActive = true;
     let unsubTeam: (() => void) | undefined;
     let unsubPayroll: (() => void) | undefined;
     let unsubRequests: (() => void) | undefined;
+    let safetyTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+      if (isActive) {
+        setLoading(false);
+      }
+    }, SUBSCRIPTION_SAFETY_TIMEOUT_MS);
+
+    const clearSafetyTimer = () => {
+      if (safetyTimer) {
+        clearTimeout(safetyTimer);
+        safetyTimer = null;
+      }
+    };
 
     setLoading(true);
 
     if (activeTab === 'team' || activeTab === 'payroll') {
       unsubTeam = subscribeToTeamMembers(accountId, (data) => {
+        if (!isActive) return;
         setTeamMembers(data);
         if (data.length > 0) {
           setSelectedEmployeeId((prev) => prev || data[0].id);
         }
-        if (activeTab === 'team') setLoading(false);
+        if (activeTab === 'team') {
+          clearSafetyTimer();
+          setLoading(false);
+        }
       });
     }
 
     if (activeTab === 'payroll') {
       unsubPayroll = subscribeToPayrollMovements(accountId, (data) => {
+        if (!isActive) return;
         setPayrollMovements(data);
         setPayrollLoadError(null);
+        clearSafetyTimer();
         setLoading(false);
       }, branchId, (error) => {
+        if (!isActive) return;
         setPayrollLoadError(error instanceof Error ? error.message : 'No se pudo cargar el historial de planilla.');
+        clearSafetyTimer();
         setLoading(false);
       });
     }
 
     if (activeTab === 'requests') {
       unsubRequests = subscribeToSaleRequests(accountId, (data) => {
+        if (!isActive) return;
         setSaleRequests(data);
+        clearSafetyTimer();
         setLoading(false);
       }, branchId);
     }
 
     if (activeTab === 'branches') {
       if (!features.multiBranch) {
+        clearSafetyTimer();
         setLoading(false);
-        return;
+        return () => {
+          isActive = false;
+        };
       }
       void loadBranches().finally(() => {
-        if (isActive) setLoading(false);
+        if (isActive) {
+          clearSafetyTimer();
+          setLoading(false);
+        }
       });
     }
 
     return () => {
       isActive = false;
+      clearSafetyTimer();
       unsubTeam?.();
       unsubPayroll?.();
       unsubRequests?.();
@@ -938,9 +1035,9 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
     setShowCreateRequestModal(false);
   }, []);
 
-  const listContentContainerStyle = useMemo<ContentStyle>(
-    () => ({ paddingHorizontal: 20, paddingTop: 8, paddingBottom: insets.bottom + 20 }),
-    [insets.bottom]
+  const listContentContainerStyle = useMemo<ViewStyle>(
+    () => ({ paddingHorizontal: 16, paddingTop: 8, paddingBottom: 24 }),
+    []
   );
 
   const renderTeamMemberItem = useCallback(
@@ -997,10 +1094,17 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
     <Modal
       visible={isVisible}
       animationType="slide"
-      presentationStyle="pageSheet"
+      transparent
+      statusBarTranslucent
       onRequestClose={onClose}
     >
-      <SafeAreaView edges={['top', 'bottom']} style={styles.container}>
+      <View
+        style={[
+          styles.container,
+          { paddingTop: insets.top, paddingBottom: insets.bottom },
+        ]}
+        collapsable={false}
+      >
         <ScreenHeading
           title="Equipo y administración"
           subtitle={activeBranchName || 'Personal, planillas, sucursales y solicitudes'}
@@ -1108,10 +1212,10 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
             <Text style={styles.loadingText}>Cargando datos de operaciones...</Text>
           </View>
         ) : (
-          <View style={styles.tabContentContainer}>
+          <View style={styles.tabContentContainer} collapsable={false}>
             {/* PESTAÑA 1: EQUIPO Y ROLES */}
             {activeTab === 'team' && (
-              <View style={{ flex: 1 }}>
+              <View style={styles.listFlex} collapsable={false}>
                 {/* Buscador + Botón Nuevo en una misma fila */}
                 <View style={styles.searchActionRow}>
                   <View style={styles.searchBarInline}>
@@ -1142,22 +1246,38 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
                   ) : null}
                 </View>
 
-                <FlashList
-                  data={filteredTeam}
-                  renderItem={renderTeamMemberItem}
-                  estimatedItemSize={100}
-                  keyExtractor={teamMemberKeyExtractor}
-                  extraData={canManageUsers}
-                  contentContainerStyle={listContentContainerStyle}
-                  ItemSeparatorComponent={PayrollListGap10}
-                  showsVerticalScrollIndicator={false}
-                />
+                {filteredTeam.length === 0 ? (
+                  <View style={styles.centerBox}>
+                    <Users size={44} color={ui.textMuted} />
+                    <Text style={styles.emptyTitle}>
+                      {searchQuery.trim() ? 'Sin coincidencias' : 'Sin colaboradores registrados'}
+                    </Text>
+                    <Text style={styles.emptySubtitle}>
+                      {searchQuery.trim()
+                        ? 'Prueba buscando con otro nombre, correo o rol.'
+                        : 'Agrega integrantes de tu equipo para asignar roles y permisos.'}
+                    </Text>
+                  </View>
+                ) : (
+                  <FlatList
+                    style={styles.listFlex}
+                    data={filteredTeam}
+                    renderItem={renderTeamMemberItem}
+                    keyExtractor={teamMemberKeyExtractor}
+                    extraData={canManageUsers}
+                    contentContainerStyle={listContentContainerStyle}
+                    ItemSeparatorComponent={PayrollListGap10}
+                    removeClippedSubviews={false}
+                    keyboardShouldPersistTaps="handled"
+                    showsVerticalScrollIndicator={false}
+                  />
+                )}
               </View>
             )}
 
             {/* PESTAÑA 2: PLANILLAS Y ADELANTOS */}
             {activeTab === 'payroll' && (
-              <View style={{ flex: 1 }}>
+              <View style={styles.listFlex} collapsable={false}>
                 <Text style={styles.sectionSubOnly}>Control de remuneraciones y adelantos</Text>
                 {/* Sub-navegación: Historial vs Registrar Pago */}
                 <View style={styles.payrollSubTabsRow}>
@@ -1198,7 +1318,8 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
                   /* FORMULARIO DE REGISTRO DE PAGO / ADELANTO */
                   <ScrollView
                     style={styles.scrollList}
-                    contentContainerStyle={[styles.formContent, { paddingBottom: insets.bottom + 30 }]}
+                    contentContainerStyle={[styles.formContent, { paddingBottom: 30 }]}
+                    keyboardShouldPersistTaps="handled"
                   >
                     {/* 1. Seleccionar Colaborador */}
                     <Text style={styles.inputLabel}>Colaborador a Remunerar:</Text>
@@ -1357,7 +1478,7 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
                   </ScrollView>
                 ) : (
                   /* HISTORIAL DE MOVIMIENTOS DE PLANILLA */
-                  <View style={{ flex: 1 }}>
+                  <View style={styles.listFlex} collapsable={false}>
                     {payrollLoadError ? (
                       <Text style={{ color: ui.danger, marginBottom: 12 }}>
                         No se pudo cargar el historial completo. {payrollLoadError}
@@ -1394,13 +1515,15 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
                         </Text>
                       </View>
                     ) : (
-                      <FlashList
+                      <FlatList
+                        style={styles.listFlex}
                         data={payrollMovements}
                         renderItem={renderPayrollMovementItem}
-                        estimatedItemSize={110}
                         keyExtractor={payrollMovementKeyExtractor}
                         contentContainerStyle={listContentContainerStyle}
                         ItemSeparatorComponent={PayrollListGap10}
+                        removeClippedSubviews={false}
+                        keyboardShouldPersistTaps="handled"
                         showsVerticalScrollIndicator={false}
                       />
                     )}
@@ -1411,7 +1534,7 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
 
             {/* PESTAÑA 3: BANDEJA DE SOLICITUDES DE VENTA */}
             {activeTab === 'requests' && (
-              <View style={{ flex: 1 }}>
+              <View style={styles.listFlex} collapsable={false}>
                 <View style={styles.sectionCompactRow}>
                   <Text style={styles.sectionCompactSub} numberOfLines={1}>
                     Revisa descuentos y autoriza pedidos
@@ -1464,14 +1587,16 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
                     </Text>
                   </View>
                 ) : (
-                  <FlashList
+                  <FlatList
+                    style={styles.listFlex}
                     data={filteredRequests}
                     renderItem={renderSaleRequestItem}
-                    estimatedItemSize={190}
                     keyExtractor={saleRequestKeyExtractor}
                     extraData={isSubmitting}
                     contentContainerStyle={listContentContainerStyle}
                     ItemSeparatorComponent={PayrollListGap10}
+                    removeClippedSubviews={false}
+                    keyboardShouldPersistTaps="handled"
                     showsVerticalScrollIndicator={false}
                   />
                 )}
@@ -1480,7 +1605,7 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
 
             {/* PESTAÑA 4: SUCURSALES (BRANCHES CRUD) */}
             {features.multiBranch && activeTab === 'branches' && (
-              <View style={{ flex: 1 }}>
+              <View style={styles.listFlex} collapsable={false}>
                 <View style={styles.sectionCompactRow}>
                   <Text style={styles.sectionCompactSub} numberOfLines={1}>
                     {branchesList.length} sedes registradas
@@ -1506,14 +1631,16 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
                     </Text>
                   </View>
                 ) : (
-                  <FlashList
+                  <FlatList
+                    style={styles.listFlex}
                     data={branchesList}
                     renderItem={renderBranchItem}
-                    estimatedItemSize={100}
                     keyExtractor={branchKeyExtractor}
                     extraData={canManageBranches}
                     contentContainerStyle={listContentContainerStyle}
                     ItemSeparatorComponent={PayrollListGap10}
+                    removeClippedSubviews={false}
+                    keyboardShouldPersistTaps="handled"
                     showsVerticalScrollIndicator={false}
                   />
                 )}
@@ -1567,8 +1694,18 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
             onClose={handleCloseBranchForm}
           />
         )}
-      </SafeAreaView>
+      </View>
     </Modal>
+  );
+});
+
+export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo((props) => {
+  const isVisible = props.visible !== undefined ? props.visible : Boolean(props.isOpen);
+  if (!isVisible) return null;
+  return (
+    <PayrollErrorBoundary onClose={props.onClose}>
+      <PayrollUsersContent {...props} />
+    </PayrollErrorBoundary>
   );
 });
 
@@ -1579,7 +1716,12 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
 const styles = StyleSheet.create({
   container: {
     flex: 1,
+    width: '100%',
+    height: '100%',
     backgroundColor: ui.background,
+  },
+  listFlex: {
+    flex: 1,
   },
   header: {
     flexDirection: 'row',
@@ -2372,6 +2514,65 @@ const styles = StyleSheet.create({
   },
   buttonDisabled: {
     opacity: 0.6,
+  },
+  errorOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(17, 28, 49, 0.55)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 20,
+  },
+  errorCard: {
+    width: '100%',
+    maxWidth: 420,
+    backgroundColor: ui.surface,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: ui.border,
+    padding: 20,
+    gap: 12,
+  },
+  errorTitle: {
+    fontSize: 17,
+    fontWeight: '800',
+    color: ui.text,
+  },
+  errorMessage: {
+    fontSize: 13,
+    lineHeight: 19,
+    color: ui.textSecondary,
+  },
+  errorActions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    gap: 10,
+    marginTop: 4,
+  },
+  errorSecondaryBtn: {
+    minHeight: 44,
+    paddingHorizontal: 14,
+    borderRadius: 10,
+    backgroundColor: ui.surfaceMuted,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  errorSecondaryText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: ui.textSecondary,
+  },
+  errorPrimaryBtn: {
+    minHeight: 44,
+    paddingHorizontal: 16,
+    borderRadius: 10,
+    backgroundColor: ui.primary,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  errorPrimaryText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: ui.onPrimary,
   },
 });
 

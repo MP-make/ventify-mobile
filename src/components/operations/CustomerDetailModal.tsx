@@ -7,7 +7,7 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Receipt, RotateCcw, ShieldAlert, X } from 'lucide-react-native';
 import { formatDatePE, formatPEN, ui } from '@/lib/theme';
 import type {
@@ -56,16 +56,24 @@ export const CustomerDetailModal = React.memo<CustomerDetailModalProps>(({
   onOpenReturnFiado,
   onOpenWriteOff,
 }) => {
+  const insets = useSafeAreaInsets();
   if (!visible || !customer) return null;
 
   return (
     <Modal
       visible={visible}
       animationType="slide"
-      presentationStyle="pageSheet"
+      transparent
+      statusBarTranslucent
       onRequestClose={onClose}
     >
-      <SafeAreaView edges={['top', 'bottom']} style={styles.fullSheetContainer}>
+      <View
+        style={[
+          styles.fullSheetContainer,
+          { paddingTop: insets.top, paddingBottom: insets.bottom },
+        ]}
+        collapsable={false}
+      >
         <View style={styles.fullSheetHeader}>
           <View style={{ flex: 1 }}>
             <Text style={styles.modalTitle} numberOfLines={1}>
@@ -277,7 +285,7 @@ export const CustomerDetailModal = React.memo<CustomerDetailModalProps>(({
             ))
           )}
         </ScrollView>
-      </SafeAreaView>
+      </View>
     </Modal>
   );
 });

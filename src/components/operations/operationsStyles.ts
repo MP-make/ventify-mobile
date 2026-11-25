@@ -164,9 +164,12 @@ export const operationsStyles = StyleSheet.create({
     flexShrink: 0,
   },
   ventyBtnIcon: {
-    width: 18,
-    height: 18,
+    width: 15,
+    height: 15,
     borderRadius: 4,
+  },
+  ventyBtnIconLocked: {
+    opacity: 0.42,
   },
   methodLogoImg: {
     width: 22,
@@ -1054,29 +1057,41 @@ export const operationsStyles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingHorizontal: 20,
-    paddingTop: 10,
+    gap: 6,
+    paddingHorizontal: 14,
+    paddingTop: 8,
     paddingBottom: 6,
   },
   compactHeaderTitle: {
-    fontSize: 20,
+    fontSize: 19,
     fontWeight: '800',
     color: ui.text,
     letterSpacing: -0.5,
+    flexShrink: 1,
+    minWidth: 0,
   },
   compactTeamButton: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 6,
-    paddingHorizontal: 10,
+    gap: 4,
+    paddingHorizontal: 7,
     paddingVertical: 6,
+    minHeight: 32,
     borderRadius: theme.borderRadius.md,
     backgroundColor: ui.primarySoft,
   },
+  compactTeamButtonLocked: {
+    backgroundColor: '#ECEFF5',
+    borderWidth: 1,
+    borderColor: '#D8DFEA',
+  },
   compactTeamButtonText: {
-    fontSize: ui.font.small,
+    fontSize: 11.5,
     color: ui.primary,
     fontWeight: '700',
+  },
+  compactTeamButtonTextLocked: {
+    color: '#8896AA',
   },
   centeredTabsContainer: {
     flexDirection: 'row',
@@ -1215,7 +1230,8 @@ export const operationsStyles = StyleSheet.create({
   compactHeaderActions: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
+    gap: 5,
+    flexShrink: 0,
   },
   modalSafe: {
     flex: 1,
@@ -1326,6 +1342,8 @@ export const operationsStyles = StyleSheet.create({
   },
   fullSheetContainer: {
     flex: 1,
+    width: '100%',
+    height: '100%',
     backgroundColor: ui.background,
   },
   fullSheetHeader: {

@@ -10,7 +10,7 @@ import {
   Platform,
   KeyboardAvoidingView,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { X, Send } from 'lucide-react-native';
 import * as Haptics from 'expo-haptics';
 
@@ -40,6 +40,7 @@ export const CreateSaleRequestModal = React.memo<CreateSaleRequestModalProps>(({
   userProfile,
   onClose,
 }) => {
+  const insets = useSafeAreaInsets();
   const { catalogIndex } = useProducts();
 
   const [customerName, setCustomerName] = useState<string>('');
@@ -173,15 +174,19 @@ export const CreateSaleRequestModal = React.memo<CreateSaleRequestModalProps>(({
     <Modal
       visible={visible}
       transparent
+      statusBarTranslucent
       animationType="fade"
       onRequestClose={handleRequestClose}
     >
-      <SafeAreaView edges={['top', 'bottom']} style={styles.modalSafe}>
+      <View
+        style={[styles.modalSafe, { paddingTop: insets.top, paddingBottom: insets.bottom }]}
+        collapsable={false}
+      >
         <KeyboardAvoidingView
           behavior={Platform.OS === 'ios' ? 'padding' : undefined}
           style={styles.modalOverlay}
         >
-          <View style={styles.modalDialog}>
+          <View style={styles.modalDialog} collapsable={false}>
             <View style={styles.modalHeader}>
               <Text style={styles.modalTitle}>Nueva Solicitud de Venta</Text>
               <TouchableOpacity
@@ -312,7 +317,7 @@ export const CreateSaleRequestModal = React.memo<CreateSaleRequestModalProps>(({
             </View>
           </View>
         </KeyboardAvoidingView>
-      </SafeAreaView>
+      </View>
     </Modal>
   );
 });

@@ -10,7 +10,7 @@ import { isLegacyReservedOrder } from '@/lib/crm-legacy';
  */
 
 import { db, auth } from '@/lib/firebase';
-import type { Customer } from '@/types';
+import type { Customer, Sale } from '@/types';
 import {
   collection,
   doc,
@@ -1434,7 +1434,7 @@ export const createReservationOrOrder = async (
 
     // 2. Guardar documento en el esquema compartido de Web
     const now = Date.now();
-    tx.set(docRef, {
+    tx.set(docRef, cleanFirestoreData({
       id: reservationId,
       accountId,
       branchId,
@@ -1459,7 +1459,7 @@ export const createReservationOrOrder = async (
         documentNumber: customer?.documentNumber || '',
       },
       ...(type === 'reservation' ? {
-        reservationNumber: canonicalReservationNumber,
+        reservationNumber: canonicalReservationNumber ?? 1,
         date: now,
         expiryDate: now + 7 * 24 * 60 * 60 * 1000,
       } : {
@@ -1470,7 +1470,7 @@ export const createReservationOrOrder = async (
       notes: notes || '',
       createdByName: userProfile.displayName || userProfile.email || 'Usuario',
       createdAt: serverTimestamp(),
-    });
+    }));
 
     // 3. Si se pagó adelanto, registrar en reservation_deposits / order_deposits
     if (normDeposit > 0) {
@@ -1478,7 +1478,7 @@ export const createReservationOrOrder = async (
       const depositDocRef = doc(collection(db, depositCollName));
       const depositId = depositDocRef.id;
 
-      tx.set(depositDocRef, {
+      tx.set(depositDocRef, cleanFirestoreData({
         id: depositId,
         reservationId,
         orderId: type === 'order' ? reservationId : null,
@@ -1496,7 +1496,7 @@ export const createReservationOrOrder = async (
         refundable: true,
         cashSessionId: sessionId || null,
         createdAt: serverTimestamp(),
-      });
+      }));
 
       // Actualizar sesión de caja activa si se suministró sessionId
       if (sessionId && sessionRef && sSnap) {
@@ -1512,7 +1512,7 @@ export const createReservationOrOrder = async (
         const isCash = paymentMethod === 'efectivo' || paymentMethod === 'cash';
         if (isCash) {
           const mvRef = doc(collection(db, CASH_MOVEMENTS_COLLECTION));
-          tx.set(mvRef, {
+          tx.set(mvRef, cleanFirestoreData({
             accountId,
             branchId,
             sessionId,
@@ -1525,7 +1525,7 @@ export const createReservationOrOrder = async (
             createdBy: userProfile.uid,
             createdByName: userProfile.displayName || userProfile.email || 'Usuario',
             createdAt: serverTimestamp(),
-          });
+          }));
         }
       }
     }
@@ -1718,6 +1718,8 @@ export interface CompletePaymentParams {
   amount?: number;
   paymentMethodId?: string;
   paymentCategory?: string;
+  cashReceived?: number;
+  changeGiven?: number;
   sellerId?: string;
   sellerName?: string;
   sessionId?: string;
@@ -1743,13 +1745,19 @@ export interface CompletePaymentParams {
   refundPercent?: number;
 }
 
+export interface CompleteReservationResult {
+  saleId?: string;
+  saleNumber?: number;
+  sale: Sale;
+}
+
 /** Completion uses the shared server transaction; cancellation releases held stock and can refund its deposit atomically. */
 export const completeOrCancelReservation = async (
   item: ReservationOrder,
   action: 'complete' | 'cancel',
   userProfile: UserProfileInfo,
   paymentInfo?: CompletePaymentParams
-): Promise<void> => {
+): Promise<CompleteReservationResult | void> => {
   if (action === 'complete') {
     if (!paymentInfo?.sessionId) throw new Error('Abre una caja antes de completar la entrega.');
     const paymentMethod = paymentInfo.paymentMethod || 'efectivo';
@@ -1773,6 +1781,7 @@ export const completeOrCancelReservation = async (
       throw new Error('La Factura requiere un RUC válido de 11 dígitos en el cliente.');
     }
 
+    const normalizedItems = normalizeOrderItems(item.items);
     const salePayload = cleanFirestoreData({
       accountId: item.accountId,
       branchId: item.branchId,
@@ -1806,7 +1815,7 @@ export const completeOrCancelReservation = async (
       customerRuc: cleanDoc.length === 11 ? cleanDoc : undefined,
       customerAddress: mergedCustomer.address || undefined,
       customerEmail: mergedCustomer.email || undefined,
-      items: normalizeOrderItems(item.items).map((it) => ({
+      items: normalizedItems.map((it) => ({
         id: it.id,
         name: it.name,
         price: Number(it.price) || 0,
@@ -1861,7 +1870,91 @@ export const completeOrCancelReservation = async (
         }
       })();
     }
-    return;
+
+    const savedSale = finalizeRes?.sale && typeof finalizeRes.sale === 'object' ? finalizeRes.sale : {};
+    const resolvedSaleId: string | undefined = savedSale.id || finalizeRes?.saleId || undefined;
+    const rawSaleNum = savedSale.saleNumber ?? finalizeRes?.saleNumber;
+    const resolvedSaleNumber: number | undefined =
+      typeof rawSaleNum === 'number' && Number.isFinite(rawSaleNum) ? rawSaleNum : undefined;
+    const seriesPrefix =
+      documentType === 'factura' ? 'F001' : documentType === 'boleta' ? 'B001' : 'NV01';
+    const resolvedDocNum =
+      savedSale.documentNumber ||
+      savedSale.correlative ||
+      (resolvedSaleNumber !== undefined
+        ? `${seriesPrefix}-${String(resolvedSaleNumber).padStart(6, '0')}`
+        : undefined);
+
+    const priorDeposit = roundCents(Number(item.depositAmount) || 0);
+    const rawDepositInfo = savedSale.depositInfo;
+    const appliedDeposit = roundCents(
+      Number(rawDepositInfo?.appliedAmount ?? rawDepositInfo?.depositAmount ?? priorDeposit) || 0
+    );
+    const depositInfo =
+      appliedDeposit > 0
+        ? {
+            ...(rawDepositInfo || {}),
+            type: item.type,
+            depositSaleId: item.id,
+            originalTotal: roundCents(Number(rawDepositInfo?.originalTotal ?? item.total) || 0),
+            depositAmount: appliedDeposit,
+            appliedAmount: appliedDeposit,
+            remainingAmount: 0,
+          }
+        : rawDepositInfo;
+
+    const richItems = (
+      Array.isArray(savedSale.items) && savedSale.items.length > 0
+        ? savedSale.items
+        : normalizedItems
+    ).map((it: any) => {
+      const qty = Number(it.quantity) || 1;
+      const price = Number(it.price) || 0;
+      return {
+        ...it,
+        id: it.id || it.productId,
+        productId: it.productId || it.id,
+        name: it.name || it.productName || 'Producto',
+        price,
+        quantity: qty,
+        lineTotal: it.lineTotal !== undefined ? Number(it.lineTotal) : roundCents(qty * price),
+      };
+    });
+
+    const completedSale: Sale = cleanFirestoreData({
+      ...salePayload,
+      ...savedSale,
+      id: resolvedSaleId || `sale_${item.id}`,
+      ...(resolvedSaleNumber !== undefined ? { saleNumber: resolvedSaleNumber } : {}),
+      ...(resolvedDocNum ? { documentNumber: resolvedDocNum, correlative: resolvedDocNum } : {}),
+      documentType: savedSale.documentType || documentType,
+      date: savedSale.date || Date.now(),
+      items: richItems,
+      total: Number(savedSale.total ?? salePayload.total ?? item.total) || 0,
+      subtotal: Number(savedSale.subtotal ?? salePayload.subtotal ?? item.total) || 0,
+      tax: Number(savedSale.tax ?? salePayload.tax ?? 0) || 0,
+      paymentMethod: savedSale.paymentMethod || paymentMethod,
+      paymentMethodName: savedSale.paymentMethodName || paymentMethod,
+      ...(Number.isFinite(paymentInfo.cashReceived) && Number(paymentInfo.cashReceived) > 0
+        ? { cashReceived: roundCents(Number(paymentInfo.cashReceived)) }
+        : {}),
+      ...(Number.isFinite(paymentInfo.changeGiven) && Number(paymentInfo.changeGiven) >= 0
+        ? { changeGiven: roundCents(Number(paymentInfo.changeGiven)) }
+        : {}),
+      userName: savedSale.userName || savedSale.completedByName || userProfile.displayName,
+      createdBy: savedSale.createdBy || userProfile.uid,
+      status: savedSale.status || 'completed',
+      sunatStatus:
+        savedSale.sunatStatus ||
+        (documentType === 'boleta' || documentType === 'factura' ? 'pending' : 'not_applicable'),
+      ...(depositInfo ? { depositInfo } : {}),
+    });
+
+    return {
+      saleId: resolvedSaleId,
+      saleNumber: resolvedSaleNumber,
+      sale: completedSale,
+    };
   }
 
   const targetColl = item.type === 'order' ? ORDERS_COLLECTION : RESERVATIONS_COLLECTION;

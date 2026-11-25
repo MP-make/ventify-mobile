@@ -11,6 +11,26 @@ export type PlanFeatureKey =
 
 export type PlanFeatureFlags = Record<PlanFeatureKey, boolean>;
 
+export type FeatureLockReason = 'plan' | 'account_disabled';
+
+export interface SunatInvoicingAccess {
+  allowed: boolean;
+  lockReason: FeatureLockReason | null;
+}
+
+export function resolveSunatInvoicingAccess(params: {
+  planAllowsSunatInvoicing: boolean;
+  invoicingEnabled: boolean;
+}): SunatInvoicingAccess {
+  if (!params.planAllowsSunatInvoicing) {
+    return { allowed: false, lockReason: 'plan' };
+  }
+  if (!params.invoicingEnabled) {
+    return { allowed: false, lockReason: 'account_disabled' };
+  }
+  return { allowed: true, lockReason: null };
+}
+
 export interface PlanEntitlements {
   tier: PlanTier;
   tierLabel: string;

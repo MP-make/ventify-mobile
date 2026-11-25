@@ -74,6 +74,7 @@ import {
   uploadProductImageToStorage,
   type StockTransfer,
 } from '@/services/inventory-kardex-service';
+import { contributeToGlobalCatalog } from '@/services/global-catalog-service';
 import type { ProductFormModal as ProductFormModalType, ProductFormData } from '@/components/ProductFormModal';
 import { collection, query, where, getDocs, limit as fsLimit } from 'firebase/firestore';
 import { db } from '@/lib/firebase';
@@ -2149,6 +2150,31 @@ const InventorySubTab = React.memo<InventorySubTabProps>(
           adjResultStock = adjRes?.updatedProductStock || null;
         } else {
           savedId = await saveProduct(productPayload, !formData.id, operatorProfile);
+        }
+
+        // Aporte colaborativo seguro al catálogo global (solo códigos reales, nunca bloquea el guardado)
+        if (formData.name) {
+          const generatedSet = new Set(
+            (formData.generatedBarcodes || []).map((c) => c.trim()).filter(Boolean)
+          );
+          const candidateCodes = Array.from(
+            new Set(
+              [formData.barcode, ...(formData.barcodes || [])]
+                .map((c) => (typeof c === 'string' ? c.trim() : ''))
+                .filter((c) => c.length >= 3 && !generatedSet.has(c))
+            )
+          ).slice(0, 5);
+
+          for (const code of candidateCodes) {
+            contributeToGlobalCatalog({
+              barcode: code,
+              name: formData.name,
+              imageUrl: resolvedImageUrl || undefined,
+              category: formData.category || undefined,
+              unitOfMeasure: formData.unitOfMeasure,
+              accountId,
+            }).catch(() => {});
+          }
         }
 
         const fullProduct: Product = {

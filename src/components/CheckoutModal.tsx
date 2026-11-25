@@ -35,6 +35,7 @@ import { sharedRequestCache } from '@/lib/request-cache';
 import { formatPEN, ui } from '@/lib/theme';
 import { numberToSpanishWordsPEN } from '@/lib/invoicing/types';
 import { computeSaleTaxBreakdown } from '@/lib/invoicing/receipt-amounts';
+import { resolveReceiptBusiness } from '@/lib/invoicing/receipt-business';
 import {
   createSaleTransaction,
   CreateSaleTransactionParams,
@@ -737,41 +738,19 @@ const CheckoutModalContent: React.FC<CheckoutModalProps> = React.memo(({
   ]);
 
   const receiptBusiness = useMemo(
-    () => ({
-      ...(businessData || {}),
-      ...(businessSettings || {}),
-      ...(emitterInfo || {}),
-      printedFormatResolution: emitterInfo?.printedFormatResolution || undefined,
-      businessName:
-        emitterInfo?.nombreComercial ||
-        emitterInfo?.razonSocial ||
-        businessSettings?.businessName ||
-        businessData?.businessName ||
-        'VENTIFY',
-      ruc: emitterInfo?.ruc || businessSettings?.ruc || businessData?.ruc || '',
-      address:
-        (businessSettings as any)?.commercialAddress ||
-        businessSettings?.address ||
-        resolvedBranch?.address ||
-        activeBranchName ||
-        '',
-      phone:
-        resolvedBranch?.phone ||
-        (businessSettings as any)?.commercialPhone ||
-        businessSettings?.phone ||
-        '',
-      consultUrl:
-        (businessSettings as any)?.consultUrl ||
-        (businessData as any)?.consultUrl ||
-        'https://ventify.com.pe/comprobantes',
-    }),
-    [businessData, businessSettings, emitterInfo, resolvedBranch, activeBranchName]
+    () =>
+      resolveReceiptBusiness({
+        business: businessSettings || businessData,
+        branch: resolvedBranch,
+        posSettings,
+        emitter: emitterInfo,
+      }),
+    [businessSettings, businessData, resolvedBranch, posSettings, emitterInfo]
   );
 
-  const resolvedReceiptFooter =
-    posSettings?.ticketFooterMessage ||
-    businessSettings?.receiptFooter ||
-    '¡Gracias por su compra!';
+  const resolvedReceiptFooter = receiptBusiness.hasCustomFooter
+    ? receiptBusiness.receiptFooter
+    : undefined;
 
   const handleApplyDiscount = useCallback(
     (clampedAmount: number, nextTotal: number) => {
@@ -1347,6 +1326,10 @@ const CheckoutModalContent: React.FC<CheckoutModalProps> = React.memo(({
     onClose();
   }, [isSuccessView, syncCustomerToCart, onClose]);
 
+  const headerItemsCount = isSuccessView
+    ? (saleResult?.saleSnapshot?.items?.length ?? saleResult?.items?.length ?? 0)
+    : items.length;
+
   return (
     <Modal visible={visible} animationType="slide" transparent={false} onRequestClose={handleClose}>
       <KeyboardAvoidingView
@@ -1360,7 +1343,7 @@ const CheckoutModalContent: React.FC<CheckoutModalProps> = React.memo(({
             </Text>
             <View style={styles.itemsCountBadge}>
               <Text style={styles.itemsCountBadgeText}>
-                {items.length} {items.length === 1 ? 'ítem' : 'ítems'}
+                {headerItemsCount} {headerItemsCount === 1 ? 'ítem' : 'ítems'}
               </Text>
             </View>
           </View>
@@ -1383,6 +1366,7 @@ const CheckoutModalContent: React.FC<CheckoutModalProps> = React.memo(({
             resolvedBranch={resolvedBranch}
             taxProfile={taxProfile}
             receiptFooter={resolvedReceiptFooter}
+            ticketTemplate={receiptBusiness.ticketTemplate}
             onNewSale={handleNewSale}
           />
         ) : (

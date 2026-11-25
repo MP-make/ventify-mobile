@@ -10,6 +10,7 @@ import {
   BusinessSettings,
   Branch,
   CartItem,
+  PosSettings,
 } from '../../types';
 import {
   numberToSpanishWordsPEN,
@@ -18,9 +19,11 @@ import {
   receiptAmountsForSale,
   type TaxProfileInput,
 } from '../invoicing/receipt-amounts';
+import { resolveReceiptBusiness } from '../invoicing/receipt-business';
 import { buildSaleQrContent } from '../invoicing/qr-content';
 import { buildQrSvgMarkup } from '../invoicing/qr-matrix';
 import { formatPEN, formatDatePE } from '../theme';
+import { uint8ArrayToBase64, toBase64 } from '../base64';
 
 // ============================================================================
 // 1. CONFIGURATION & INTERFACES
@@ -327,52 +330,7 @@ export class EscPosBuilder {
 // 3. BASE64 CONVERTER
 // ============================================================================
 
-const BASE64_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-
-/**
- * Encodes Uint8Array binary buffer to Base64 string
- * Safe for React Native native modules and Bluetooth bridges
- */
-export function uint8ArrayToBase64(bytes: Uint8Array): string {
-  const len = bytes.length;
-  if (len === 0) return '';
-
-  const chunkCount = Math.ceil(len / 3);
-  const out = new Array<string>(chunkCount);
-  const fullTripletsEnd = len - (len % 3);
-  let outIdx = 0;
-
-  for (let i = 0; i < fullTripletsEnd; i += 3) {
-    const triplet = (bytes[i] << 16) | (bytes[i + 1] << 8) | bytes[i + 2];
-    out[outIdx++] =
-      BASE64_CHARS[(triplet >> 18) & 0x3f] +
-      BASE64_CHARS[(triplet >> 12) & 0x3f] +
-      BASE64_CHARS[(triplet >> 6) & 0x3f] +
-      BASE64_CHARS[triplet & 0x3f];
-  }
-
-  const rem = len - fullTripletsEnd;
-  if (rem === 1) {
-    const b1 = bytes[fullTripletsEnd];
-    out[outIdx++] =
-      BASE64_CHARS[b1 >> 2] +
-      BASE64_CHARS[(b1 & 0x03) << 4] +
-      '==';
-  } else if (rem === 2) {
-    const b1 = bytes[fullTripletsEnd];
-    const b2 = bytes[fullTripletsEnd + 1];
-    out[outIdx++] =
-      BASE64_CHARS[b1 >> 2] +
-      BASE64_CHARS[((b1 & 0x03) << 4) | (b2 >> 4)] +
-      BASE64_CHARS[(b2 & 0x0f) << 2] +
-      '=';
-  }
-
-  return out.join('');
-}
-
-/** Alias export */
-export const toBase64 = uint8ArrayToBase64;
+export { uint8ArrayToBase64, toBase64 };
 
 // ============================================================================
 // 4. SALE RECEIPT ESC/POS BUILDER & SHARED NORMALIZERS
@@ -517,14 +475,15 @@ export function buildSaleReceiptEscPos(
     paperWidth: is58 ? 58 : 80,
   });
   const isCompact = options.ticketTemplate === 'compact';
-  const merged = { ...(business || {}), ...(options.branch || {}) } as Partial<BusinessSettings & Branch> & {
-    razonSocial?: string;
-    commercialName?: string;
-    email?: string;
-    sunatResolution?: string;
-    authorizationText?: string;
-    printedFormatResolution?: string;
-  };
+  const resolvedBiz = resolveReceiptBusiness({
+    business,
+    branch: options.branch,
+    receiptFooter: options.receiptFooter,
+    consultUrl: options.consultUrl,
+    ticketTemplate: options.ticketTemplate,
+    saleFooterNote: sale.footerNote,
+    defaultFooter: 'GRACIAS POR SU PREFERENCIA!',
+  });
 
   // 1. Kick cash drawer if requested
   if (options.openDrawer) {
@@ -549,32 +508,44 @@ export function buildSaleReceiptEscPos(
     builder.divider('*');
   }
 
-  const businessName = merged.commercialName || merged.businessName || merged.name || 'VENTIFY POS';
+  const businessName = resolvedBiz.businessName;
   builder.bold(true).size('double-height').line(businessName).size('normal').bold(false);
 
-  if (merged.razonSocial && merged.razonSocial !== businessName) {
-    builder.line(merged.razonSocial);
+  if (
+    resolvedBiz.razonSocial &&
+    resolvedBiz.razonSocial.toLowerCase() !== businessName.toLowerCase()
+  ) {
+    builder.line(resolvedBiz.razonSocial);
   }
-  if (merged.description && !isCompact) {
-    builder.line(`"${merged.description}"`);
+  if (resolvedBiz.branchName) {
+    builder.line(`Sucursal: ${resolvedBiz.branchName}`);
   }
-  if (merged.ruc) {
-    builder.bold(true).line(`RUC: ${merged.ruc}`).bold(false);
+  if (resolvedBiz.showSlogan && resolvedBiz.slogan && !isCompact) {
+    builder.line(`"${resolvedBiz.slogan}"`);
+  }
+  if (resolvedBiz.receiptHeader) {
+    builder.line(resolvedBiz.receiptHeader);
+  }
+  if (resolvedBiz.showRuc && resolvedBiz.ruc) {
+    builder.bold(true).line(`RUC: ${resolvedBiz.ruc}`).bold(false);
   }
 
-  const fiscalAddress = merged.fiscalAddress || merged.address;
-  const storeAddress = merged.commercialAddress;
-  if (fiscalAddress) {
+  const fiscalAddress = resolvedBiz.fiscalAddress;
+  const storeAddress = resolvedBiz.commercialAddress;
+  if (resolvedBiz.showAddress && fiscalAddress) {
     builder.line(fiscalAddress);
   }
-  if (storeAddress && storeAddress !== fiscalAddress) {
+  if (resolvedBiz.showAddress && storeAddress && storeAddress !== fiscalAddress) {
     builder.line(`Tienda: ${storeAddress}`);
   }
-  if (merged.commercialPhone || merged.phone) {
-    builder.line(`Telf: ${merged.commercialPhone || merged.phone}`);
+  if (resolvedBiz.showPhone && resolvedBiz.phone) {
+    builder.line(`Telf: ${resolvedBiz.phone}`);
   }
-  if (!isCompact && merged.email) {
-    builder.line(merged.email);
+  if (!isCompact && resolvedBiz.showEmail && resolvedBiz.email) {
+    builder.line(resolvedBiz.email);
+  }
+  if (!isCompact && resolvedBiz.website) {
+    builder.line(resolvedBiz.website);
   }
 
   // 4. Document Series & Number
@@ -723,11 +694,11 @@ export function buildSaleReceiptEscPos(
   }
 
   // 10. QR Code & Hash
-  const consultUrl = options.consultUrl || merged.consultUrl || sale.consultUrl || 'https://ventify.com.pe/comprobantes';
+  const consultUrl = options.consultUrl || sale.consultUrl || resolvedBiz.consultUrl;
   const qrData = buildSaleQrContent(
     isOfflinePending ? { ...sale, isOfflinePending: true } : sale,
     {
-      emitterRuc: merged.ruc,
+      emitterRuc: resolvedBiz.ruc,
       consultUrl,
       taxProfile: options.taxProfile,
       precomputedAmounts: amounts,
@@ -754,14 +725,12 @@ export function buildSaleReceiptEscPos(
   if (isFiscal && !isCompact) {
     const authText =
       sale.printedFormatResolution ||
-      merged.printedFormatResolution ||
-      merged.sunatResolution ||
-      merged.authorizationText ||
+      resolvedBiz.printedFormatResolution ||
       'Representacion impresa del comprobante electronico';
     builder.line(authText);
   }
 
-  const footer = options.receiptFooter || merged.receiptFooter || sale.footerNote || 'GRACIAS POR SU PREFERENCIA!';
+  const footer = resolvedBiz.receiptFooter;
   builder.feed(1);
   builder.bold(true).line(footer).bold(false);
   builder.divider('.');
@@ -888,15 +857,15 @@ export function buildReceiptHtml(
   const paperMm = is58 ? 58 : 80;
   const maxWidth = is58 ? '220px' : '300px';
   const isCompact = options.ticketTemplate === 'compact';
-  const merged = { ...(business || {}), ...(options.branch || {}) } as Partial<BusinessSettings & Branch> & {
-    razonSocial?: string;
-    commercialName?: string;
-    email?: string;
-    receiptLogoUrl?: string;
-    sunatResolution?: string;
-    authorizationText?: string;
-    printedFormatResolution?: string;
-  };
+  const resolvedBiz = resolveReceiptBusiness({
+    business,
+    branch: options.branch,
+    receiptFooter: options.receiptFooter,
+    consultUrl: options.consultUrl,
+    ticketTemplate: options.ticketTemplate,
+    saleFooterNote: sale.footerNote,
+    defaultFooter: '¡Gracias por su compra!',
+  });
 
   const {
     isOfflinePending,
@@ -913,16 +882,17 @@ export function buildReceiptHtml(
     ? String(rawWords)
     : `SON: ${rawWords}`;
 
-  const businessName = merged.commercialName || merged.businessName || merged.name || 'VENTIFY POS';
-  const consultUrl = options.consultUrl || merged.consultUrl || sale.consultUrl || 'https://ventify.com.pe/comprobantes';
-  const footer = options.receiptFooter || merged.receiptFooter || sale.footerNote || '¡Gracias por su compra!';
-  const logoUrl =
-    (merged as any).receiptLogoDataUrl ||
-    (merged as any).receiptLogo ||
-    merged.receiptLogoUrl ||
-    (merged as any).logoUrl;
-  const fiscalAddress = merged.fiscalAddress || merged.address;
-  const storeAddress = merged.commercialAddress;
+  const businessName = resolvedBiz.businessName;
+  const razonSocialSubtitle =
+    resolvedBiz.razonSocial &&
+    resolvedBiz.razonSocial.toLowerCase() !== businessName.toLowerCase()
+      ? resolvedBiz.razonSocial
+      : '';
+  const consultUrl = options.consultUrl || sale.consultUrl || resolvedBiz.consultUrl;
+  const footer = resolvedBiz.receiptFooter;
+  const logoUrl = resolvedBiz.showLogo ? resolvedBiz.logoUri : '';
+  const fiscalAddress = resolvedBiz.fiscalAddress;
+  const storeAddress = resolvedBiz.commercialAddress;
   const operator =
     sale.cashierUsername ||
     sale.sellerName ||
@@ -932,7 +902,7 @@ export function buildReceiptHtml(
   const qrData = buildSaleQrContent(
     isOfflinePending ? { ...sale, isOfflinePending: true } : sale,
     {
-      emitterRuc: merged.ruc,
+      emitterRuc: resolvedBiz.ruc,
       consultUrl,
       taxProfile: options.taxProfile,
       precomputedAmounts: amounts,
@@ -992,9 +962,7 @@ export function buildReceiptHtml(
 
   const resolutionText =
     sale.printedFormatResolution ||
-    merged.printedFormatResolution ||
-    merged.sunatResolution ||
-    merged.authorizationText ||
+    resolvedBiz.printedFormatResolution ||
     'Representación impresa del comprobante electrónico';
 
   return `
@@ -1032,13 +1000,16 @@ export function buildReceiptHtml(
     ${isOfflinePending ? '<div class="bold" style="background: #000; color: #fff; padding: 2px 4px; margin-bottom: 4px;">*** OFFLINE PENDIENTE ***</div>' : ''}
     ${logoUrl ? `<img src="${escapeHtml(logoUrl)}" alt="Logo" style="max-width: ${is58 ? '105px' : '136px'}; max-height: 54px; object-fit: contain; margin: 0 auto 6px; display: block;" />` : ''}
     <div class="title">${escapeHtml(businessName)}</div>
-    ${merged.razonSocial && merged.razonSocial !== businessName ? `<div style="font-size: 11px;">${escapeHtml(merged.razonSocial)}</div>` : ''}
-    ${merged.description && !isCompact ? `<div style="font-size: 11px; margin-top: 2px; font-style: italic;">"${escapeHtml(merged.description)}"</div>` : ''}
-    ${merged.ruc ? `<div class="bold" style="margin-top: 2px;">RUC: ${escapeHtml(merged.ruc)}</div>` : ''}
-    ${fiscalAddress ? `<div style="font-size: 11px;">${escapeHtml(fiscalAddress)}</div>` : ''}
-    ${storeAddress && storeAddress !== fiscalAddress ? `<div style="font-size: 11px;">Tienda: ${escapeHtml(storeAddress)}</div>` : ''}
-    ${merged.commercialPhone || merged.phone ? `<div style="font-size: 11px;">Telf: ${escapeHtml(String(merged.commercialPhone || merged.phone))}</div>` : ''}
-    ${!isCompact && merged.email ? `<div style="font-size: 11px;">${escapeHtml(merged.email)}</div>` : ''}
+    ${razonSocialSubtitle ? `<div style="font-size: 11px;">${escapeHtml(razonSocialSubtitle)}</div>` : ''}
+    ${resolvedBiz.branchName ? `<div style="font-size: 11px;">Sucursal: ${escapeHtml(resolvedBiz.branchName)}</div>` : ''}
+    ${resolvedBiz.showSlogan && resolvedBiz.slogan && !isCompact ? `<div style="font-size: 11px; margin-top: 2px; font-style: italic;">"${escapeHtml(resolvedBiz.slogan)}"</div>` : ''}
+    ${resolvedBiz.receiptHeader ? `<div style="font-size: 11px; margin-top: 2px;">${escapeHtml(resolvedBiz.receiptHeader)}</div>` : ''}
+    ${resolvedBiz.showRuc && resolvedBiz.ruc ? `<div class="bold" style="margin-top: 2px;">RUC: ${escapeHtml(resolvedBiz.ruc)}</div>` : ''}
+    ${resolvedBiz.showAddress && fiscalAddress ? `<div style="font-size: 11px;">${escapeHtml(fiscalAddress)}</div>` : ''}
+    ${resolvedBiz.showAddress && storeAddress && storeAddress !== fiscalAddress ? `<div style="font-size: 11px;">Tienda: ${escapeHtml(storeAddress)}</div>` : ''}
+    ${resolvedBiz.showPhone && resolvedBiz.phone ? `<div style="font-size: 11px;">Telf: ${escapeHtml(resolvedBiz.phone)}</div>` : ''}
+    ${!isCompact && resolvedBiz.showEmail && resolvedBiz.email ? `<div style="font-size: 11px;">${escapeHtml(resolvedBiz.email)}</div>` : ''}
+    ${!isCompact && resolvedBiz.website ? `<div style="font-size: 11px;">${escapeHtml(resolvedBiz.website)}</div>` : ''}
   </div>
 
   <div class="divider"></div>
@@ -1136,14 +1107,37 @@ export function buildReceiptHtml(
   `.trim();
 }
 
+export interface ReservationReceiptHtmlOptions {
+  paperWidth?: 80 | 58 | '80mm' | '58mm';
+  branch?: Partial<Branch> | null;
+  posSettings?: Partial<PosSettings> | null;
+  receiptFooter?: string;
+  ticketTemplate?: 'standard' | 'compact';
+}
+
 /**
  * Genera el HTML de impresión para un Comprobante de Reserva térmica (80mm/58mm).
- * Coincide exactamente con el comprobante de reserva de la versión web de Ventify.
+ * Refleja la configuración real del negocio configurada en Ventify Web.
  */
 export function buildReservationReceiptHtml(
   reservation: any,
-  business: Partial<BusinessSettings & Branch> = {}
+  business: Partial<BusinessSettings & Branch> = {},
+  options: ReservationReceiptHtmlOptions = {}
 ): string {
+  const is58 = is58PaperWidth(options.paperWidth);
+  const paperMm = is58 ? 58 : 80;
+  const maxWidth = is58 ? '220px' : '300px';
+  const isCompact = options.ticketTemplate === 'compact';
+
+  const resolvedBiz = resolveReceiptBusiness({
+    business,
+    branch: options.branch,
+    posSettings: options.posSettings,
+    receiptFooter: options.receiptFooter,
+    ticketTemplate: options.ticketTemplate,
+    defaultFooter: '¡Gracias por su preferencia!',
+  });
+
   const isDelivered = reservation.status === 'completed' || reservation.status === 'delivered';
   const isCancelled = reservation.status === 'cancelled';
   const total = Number(reservation.total || 0);
@@ -1152,13 +1146,21 @@ export function buildReservationReceiptHtml(
   const resNumber = reservation.reservationNumber
     ? String(reservation.reservationNumber).padStart(6, '0')
     : String(reservation.id || 'N/A').slice(-6).toUpperCase();
-  const businessName = business.businessName || business.name || 'VENTIFY POS';
-  const businessRuc = business.ruc || '20123456789';
-  const businessAddress = business.address || business.commercialAddress || '';
-  const businessPhone = business.phone || '';
-  const customerName = reservation.customer?.name || reservation.customerName || 'Cliente General';
-  const customerDoc = reservation.customer?.documentNumber || reservation.customer?.dni || reservation.customerDni || '';
-  const customerPhone = reservation.customer?.phone || reservation.customerPhone || '';
+
+  const businessName = resolvedBiz.businessName;
+  const razonSocialSubtitle =
+    resolvedBiz.razonSocial &&
+    resolvedBiz.razonSocial.toLowerCase() !== businessName.toLowerCase()
+      ? resolvedBiz.razonSocial
+      : '';
+  const logoUrl = resolvedBiz.showLogo ? resolvedBiz.logoUri : '';
+  const fiscalAddress = resolvedBiz.fiscalAddress;
+  const storeAddress = resolvedBiz.commercialAddress;
+  const customerName = String(reservation.customer?.name || reservation.customerName || 'Cliente General');
+  const customerDoc = String(
+    reservation.customer?.documentNumber || reservation.customer?.dni || reservation.customerDni || ''
+  );
+  const customerPhone = String(reservation.customer?.phone || reservation.customerPhone || '');
 
   const createdDate = reservation.createdAt
     ? (typeof reservation.createdAt?.toDate === 'function' ? reservation.createdAt.toDate() : new Date(reservation.createdAt))
@@ -1177,12 +1179,17 @@ export function buildReservationReceiptHtml(
       const qty = Number(item.quantity) || 1;
       const price = Number(item.price || item.unitPrice || 0);
       const lineTotal = Number(item.total || (qty * price));
-      const name = item.productName || item.name || 'Producto';
+      const name = String(item.productName || item.name || 'Producto');
+      const variantName = item.variantName || item.variant?.name;
+      const presentationName = item.presentationName || item.presentation?.name;
+      const suffix =
+        (presentationName ? ` (${escapeHtml(String(presentationName))})` : '') +
+        (variantName ? ` [${escapeHtml(String(variantName))}]` : '');
       return `
         <tr>
           <td style="text-align: left; padding: 4px 0;">
-            <div style="font-weight: bold;">${name}</div>
-            <div style="font-size: 11px; color: #555;">${qty} x S/ ${price.toFixed(2)}</div>
+            <div style="font-weight: bold;">${escapeHtml(name)}${suffix}</div>
+            <div style="font-size: ${is58 ? '10px' : '11px'}; color: #555;">${qty} x S/ ${price.toFixed(2)}</div>
           </td>
           <td style="text-align: right; vertical-align: top; padding: 4px 0; font-weight: bold;">
             S/ ${lineTotal.toFixed(2)}
@@ -1197,49 +1204,56 @@ export function buildReservationReceiptHtml(
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Reserva #${resNumber}</title>
+  <title>Reserva #${escapeHtml(resNumber)}</title>
   <style>
     @page {
-      size: 80mm auto;
+      size: ${paperMm}mm auto;
       margin: 0;
     }
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
-      font-size: 13px;
+      font-size: ${is58 ? '11.5px' : '13px'};
       line-height: 1.35;
       color: #000;
       background: #fff;
-      margin: 0;
-      padding: 16px 12px;
-      max-width: 300px;
+      padding: ${is58 ? '12px 8px' : '16px 12px'};
+      max-width: ${maxWidth};
       margin: 0 auto;
     }
     .center { text-align: center; }
     .bold { font-weight: bold; }
     .divider { border-top: 1px dashed #000; margin: 8px 0; }
     .divider-double { border-top: 2px solid #000; margin: 8px 0; }
-    .row { display: flex; justify-content: space-between; margin: 3px 0; }
+    .row { display: flex; justify-content: space-between; margin: 3px 0; gap: 8px; }
     .table-items { width: 100%; border-collapse: collapse; margin: 8px 0; }
-    .title { font-size: 16px; font-weight: 800; letter-spacing: 0.5px; }
+    .title { font-size: ${is58 ? '14px' : '16px'}; font-weight: 800; letter-spacing: 0.5px; }
     .badge-status {
       display: inline-block;
       padding: 3px 8px;
       border-radius: 4px;
       font-weight: bold;
-      font-size: 12px;
+      font-size: ${is58 ? '11px' : '12px'};
       margin-top: 4px;
     }
   </style>
 </head>
 <body>
   <div class="center">
-    <div class="title">${businessName}</div>
-    ${businessAddress ? `<div style="font-size: 11px; color: #444;">${businessAddress}</div>` : ''}
-    <div style="font-size: 11px; color: #444;">RUC: ${businessRuc}</div>
-    ${businessPhone ? `<div style="font-size: 11px; color: #444;">Tel: ${businessPhone}</div>` : ''}
+    ${logoUrl ? `<img src="${escapeHtml(logoUrl)}" alt="Logo" style="max-width: ${is58 ? '105px' : '136px'}; max-height: 54px; object-fit: contain; margin: 0 auto 6px; display: block;" />` : ''}
+    <div class="title">${escapeHtml(businessName)}</div>
+    ${razonSocialSubtitle ? `<div style="font-size: 11px; color: #333;">${escapeHtml(razonSocialSubtitle)}</div>` : ''}
+    ${resolvedBiz.branchName ? `<div style="font-size: 11px; color: #444;">Sucursal: ${escapeHtml(resolvedBiz.branchName)}</div>` : ''}
+    ${!isCompact && resolvedBiz.showSlogan && resolvedBiz.slogan ? `<div style="font-size: 11px; color: #444; font-style: italic;">"${escapeHtml(resolvedBiz.slogan)}"</div>` : ''}
+    ${resolvedBiz.receiptHeader ? `<div style="font-size: 11px; color: #333; margin-top: 2px;">${escapeHtml(resolvedBiz.receiptHeader)}</div>` : ''}
+    ${resolvedBiz.showAddress && fiscalAddress ? `<div style="font-size: 11px; color: #444;">${escapeHtml(fiscalAddress)}</div>` : ''}
+    ${resolvedBiz.showAddress && storeAddress && storeAddress !== fiscalAddress ? `<div style="font-size: 11px; color: #444;">Tienda: ${escapeHtml(storeAddress)}</div>` : ''}
+    ${resolvedBiz.showRuc && resolvedBiz.ruc ? `<div style="font-size: 11px; color: #111; font-weight: bold;">RUC: ${escapeHtml(resolvedBiz.ruc)}</div>` : ''}
+    ${resolvedBiz.showPhone && resolvedBiz.phone ? `<div style="font-size: 11px; color: #444;">Tel: ${escapeHtml(resolvedBiz.phone)}</div>` : ''}
+    ${!isCompact && resolvedBiz.showEmail && resolvedBiz.email ? `<div style="font-size: 11px; color: #444;">${escapeHtml(resolvedBiz.email)}</div>` : ''}
+    ${!isCompact && resolvedBiz.website ? `<div style="font-size: 11px; color: #444;">${escapeHtml(resolvedBiz.website)}</div>` : ''}
     <div class="divider"></div>
-    <div class="bold" style="font-size: 14px; color: #1e40af;">COMPROBANTE DE RESERVA</div>
-    <div class="bold" style="font-size: 15px; margin-top: 2px;">#${resNumber}</div>
+    <div class="bold" style="font-size: ${is58 ? '12.5px' : '14px'}; color: #1e40af;">COMPROBANTE DE RESERVA</div>
+    <div class="bold" style="font-size: ${is58 ? '13.5px' : '15px'}; margin-top: 2px;">#${escapeHtml(resNumber)}</div>
     <div>
       <span class="badge-status" style="background: ${isDelivered ? '#dcfce7; color: #15803d;' : isCancelled ? '#fee2e2; color: #b91c1c;' : '#fef3c7; color: #b45309;'}">
         ${isDelivered ? 'ENTREGADO / COMPLETADO' : isCancelled ? 'CANCELADO' : 'PENDIENTE'}
@@ -1249,15 +1263,15 @@ export function buildReservationReceiptHtml(
 
   <div class="divider"></div>
   <div class="row"><span>Fecha:</span><span>${formattedDate} ${formattedTime}</span></div>
-  ${expiryDate ? `<div class="row"><span>Válida hasta:</span><span class="bold" style="color: #b91c1c;">${formatDatePE(expiryDate)}</span></div>` : ''}
-  ${reservation.reservationDays ? `<div class="row"><span>Vigencia:</span><span>${reservation.reservationDays} días</span></div>` : ''}
+  ${expiryDate ? `<div class="row"><span>Válida hasta:</span><span class="bold" style="color: #b91c1c;">${escapeHtml(formatDatePE(expiryDate))}</span></div>` : ''}
+  ${reservation.reservationDays ? `<div class="row"><span>Vigencia:</span><span>${escapeHtml(String(reservation.reservationDays))} días</span></div>` : ''}
 
   <div class="divider"></div>
   <div style="margin: 4px 0;">
     <div class="bold">CLIENTE:</div>
-    <div>${customerName.toUpperCase()}</div>
-    ${customerDoc ? `<div>DOC / DNI: ${customerDoc}</div>` : ''}
-    ${customerPhone ? `<div>Teléfono: ${customerPhone}</div>` : ''}
+    <div>${escapeHtml(customerName.toUpperCase())}</div>
+    ${customerDoc ? `<div>DOC / DNI: ${escapeHtml(customerDoc)}</div>` : ''}
+    ${customerPhone ? `<div>Teléfono: ${escapeHtml(customerPhone)}</div>` : ''}
   </div>
 
   <div class="divider"></div>
@@ -1274,7 +1288,7 @@ export function buildReservationReceiptHtml(
   </table>
 
   <div class="divider"></div>
-  <div class="row" style="font-size: 15px; font-weight: 800; margin: 4px 0;">
+  <div class="row" style="font-size: ${is58 ? '13.5px' : '15px'}; font-weight: 800; margin: 4px 0;">
     <span>TOTAL RESERVA:</span>
     <span>${formatPEN(total)}</span>
   </div>
@@ -1288,15 +1302,15 @@ export function buildReservationReceiptHtml(
   ${reservation.depositPaymentMethod || reservation.paymentMethod ? `
     <div class="row" style="font-size: 11px; color: #555;">
       <span>Método de adelanto:</span>
-      <span>${(reservation.depositPaymentMethod || reservation.paymentMethod || 'Efectivo').toUpperCase()}</span>
+      <span>${escapeHtml(String(reservation.depositPaymentMethod || reservation.paymentMethod || 'Efectivo').toUpperCase())}</span>
     </div>
   ` : ''}
 
-  <div class="row" style="font-size: 14px; font-weight: 800; margin-top: 4px; color: ${remaining > 0 ? '#b91c1c' : '#15803d'};">
+  <div class="row" style="font-size: ${is58 ? '13px' : '14px'}; font-weight: 800; margin-top: 4px; color: ${remaining > 0 ? '#b91c1c' : '#15803d'};">
     <span>${remaining > 0 ? '⏳ Saldo Pendiente:' : '✓ Saldo Cancelado:'}</span>
     <span>${formatPEN(remaining)}</span>
   </div>
-  ${remaining > 0 && !isDelivered ? `
+  ${remaining > 0 && !isDelivered && !isCancelled ? `
     <div class="center" style="font-size: 11px; color: #b45309; margin-top: 4px;">
       (A pagar al momento de recoger los productos)
     </div>
@@ -1305,14 +1319,14 @@ export function buildReservationReceiptHtml(
   ${reservation.notes ? `
     <div class="divider"></div>
     <div style="font-size: 11px; color: #444;">
-      <span class="bold">Observaciones:</span> ${reservation.notes}
+      <span class="bold">Observaciones:</span> ${escapeHtml(String(reservation.notes))}
     </div>
   ` : ''}
 
   <div class="divider-double"></div>
   <div class="center" style="font-size: 11px;">
-    <div>Conserve este comprobante para recoger sus productos.</div>
-    <div class="bold" style="margin-top: 6px;">¡Gracias por su preferencia!</div>
+    ${!isDelivered && !isCancelled ? '<div>Conserve este comprobante para recoger sus productos.</div>' : ''}
+    <div class="bold" style="margin-top: 6px;">${escapeHtml(resolvedBiz.receiptFooter)}</div>
   </div>
 </body>
 </html>

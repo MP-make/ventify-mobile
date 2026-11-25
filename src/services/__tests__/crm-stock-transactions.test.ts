@@ -50,6 +50,7 @@ vi.mock('firebase/firestore', () => {
   };
 });
 
+import { reservationCartLines } from '@/lib/presentation-parity';
 import { approveOrder, createReservationOrOrder } from '../crm-operations-service';
 
 const profile = { uid: 'user-1', displayName: 'Cajero', email: 'cashier@example.test' } as any;
@@ -125,5 +126,58 @@ describe('CRM stock transactions with duplicate product lines', () => {
     await expect(approveOrder('order-1')).rejects.toThrow('Stock insuficiente');
     expect(store.docs.get('products/p1')?.reservedStock['branch-1']).toBe(2);
     expect(store.docs.get('orders/order-1')?.status).toBe('pending');
+  });
+
+  it('writes reservations without any undefined fields for plain cart items', async () => {
+    const lines = reservationCartLines([
+      {
+        id: 'p1',
+        productId: 'p1',
+        name: 'Arroz',
+        quantity: 1,
+        price: 8,
+      } as any,
+    ]);
+
+    const createdId = await createReservationOrOrder({
+      accountId: 'account-1',
+      branchId: 'branch-1',
+      type: 'reservation',
+      depositAmount: 0,
+      paymentMethod: 'cash',
+      total: 8,
+      customer: {
+        name: 'Cliente Sin Variantes',
+        phone: undefined,
+        documentNumber: undefined,
+      },
+      pickupDate: undefined,
+      notes: undefined,
+      userProfile: profile,
+      items: lines,
+    });
+
+    const writtenDoc = store.docs.get(`reservations/${createdId}`);
+    expect(writtenDoc).toBeDefined();
+
+    const assertNoUndefined = (val: unknown, trace = 'root'): void => {
+      if (val === undefined) {
+        throw new Error(`Found undefined at ${trace}`);
+      }
+      if (val && typeof val === 'object') {
+        if (Array.isArray(val)) {
+          val.forEach((entry, index) => assertNoUndefined(entry, `${trace}[${index}]`));
+        } else {
+          for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
+            assertNoUndefined(v, `${trace}.${k}`);
+          }
+        }
+      }
+    };
+
+    assertNoUndefined(writtenDoc);
+    expect(writtenDoc?.items?.[0]).not.toHaveProperty('variantId');
+    expect(writtenDoc?.items?.[0]).not.toHaveProperty('variantName');
+    expect(writtenDoc?.items?.[0]).not.toHaveProperty('presentationId');
   });
 });

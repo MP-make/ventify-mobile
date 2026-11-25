@@ -12,7 +12,7 @@ import {
   Platform,
   KeyboardAvoidingView,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { X, Check } from 'lucide-react-native';
 import * as Haptics from 'expo-haptics';
 
@@ -36,6 +36,7 @@ export const BranchFormModal = React.memo<BranchFormModalProps>(({
   onSaved,
   onClose,
 }) => {
+  const insets = useSafeAreaInsets();
   const [name, setName] = useState<string>(() => editingBranch?.name || '');
   const [address, setAddress] = useState<string>(() => editingBranch?.address || '');
   const [phone, setPhone] = useState<string>(() => editingBranch?.phone || '');
@@ -106,15 +107,19 @@ export const BranchFormModal = React.memo<BranchFormModalProps>(({
     <Modal
       visible={visible}
       transparent
+      statusBarTranslucent
       animationType="slide"
       onRequestClose={handleRequestClose}
     >
-      <SafeAreaView edges={['top', 'bottom']} style={styles.modalSafe}>
+      <View
+        style={[styles.modalSafe, { paddingTop: insets.top, paddingBottom: insets.bottom }]}
+        collapsable={false}
+      >
         <KeyboardAvoidingView
           behavior={Platform.OS === 'ios' ? 'padding' : undefined}
           style={styles.modalOverlay}
         >
-          <View style={[styles.modalDialog, styles.modalDialogTall]}>
+          <View style={[styles.modalDialog, styles.modalDialogTall]} collapsable={false}>
             <View style={styles.modalHeader}>
               <Text style={styles.modalTitle}>
                 {editingBranch ? 'Editar Sucursal' : 'Nueva Sucursal'}
@@ -261,7 +266,7 @@ export const BranchFormModal = React.memo<BranchFormModalProps>(({
             </View>
           </View>
         </KeyboardAvoidingView>
-      </SafeAreaView>
+      </View>
     </Modal>
   );
 });

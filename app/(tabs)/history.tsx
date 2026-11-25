@@ -33,13 +33,21 @@ import * as Haptics from 'expo-haptics';
 import { type Href, useRouter } from 'expo-router';
 
 import { useAuthSession, useNetworkStatus, usePlanFeatures } from '@/context/AuthContext';
-import { type PlanFeatureKey } from '@/lib/plan-entitlements';
+import {
+  resolveSunatInvoicingAccess,
+  type FeatureLockReason,
+  type PlanFeatureKey,
+} from '@/lib/plan-entitlements';
 import { PlanLockedView, PlanUpgradeModal } from '@/components/PlanFeatureGate';
 import {
+  DEFAULT_PAYMENT_METHODS,
   useBusinessSettings,
   useCashOpenStatus,
   useOfflineStatus,
 } from '@/context/SettingsContext';
+import { tryResolveCheckoutPayment } from '@/lib/checkout-payment';
+import { resolveReceiptBusiness } from '@/lib/invoicing/receipt-business';
+import { PaymentMethodSelector } from '@/components/PaymentMethodSelector';
 import { useFocusMemo } from '@/hooks/use-focus-memo';
 import { usePermissions } from '@/hooks/usePermissions';
 import { ui, formatPEN, formatDatePE } from '@/lib/theme';
@@ -133,6 +141,7 @@ export default function HistoryScreen() {
     activeBranch,
     branches,
     posSettings,
+    paymentMethods,
     invoicingEnabled,
     taxProfile,
     emitterInfo,
@@ -150,34 +159,13 @@ export default function HistoryScreen() {
   isOnlineRef.current = isOnline;
 
   const receiptBusiness = useMemo(
-    () => ({
-      ...(businessData || {}),
-      ...(businessSettings || {}),
-      ...(emitterInfo || {}),
-      printedFormatResolution: emitterInfo?.printedFormatResolution || undefined,
-      businessName:
-        emitterInfo?.nombreComercial ||
-        emitterInfo?.razonSocial ||
-        businessSettings?.businessName ||
-        businessData?.businessName ||
-        'VENTIFY',
-      ruc: emitterInfo?.ruc || businessSettings?.ruc || businessData?.ruc || '',
-      address:
-        (businessSettings as any)?.commercialAddress ||
-        businessSettings?.address ||
-        activeBranch?.address ||
-        '',
-      phone:
-        activeBranch?.phone ||
-        (businessSettings as any)?.commercialPhone ||
-        businessSettings?.phone ||
-        '',
-      consultUrl:
-        (businessSettings as any)?.consultUrl ||
-        (businessData as any)?.consultUrl ||
-        'https://ventify.com.pe/comprobantes',
-    }),
-    [businessData, businessSettings, emitterInfo, activeBranch]
+    () =>
+      resolveReceiptBusiness({
+        business: businessSettings || businessData,
+        posSettings,
+        emitter: emitterInfo,
+      }),
+    [businessSettings, businessData, posSettings, emitterInfo]
   );
 
   const resolveSaleBranch = useCallback(
@@ -189,14 +177,41 @@ export default function HistoryScreen() {
   );
 
   const reservationBusiness = useMemo(
-    () => ({ ...(businessSettings || {}), ...(activeBranch || {}) }),
-    [businessSettings, activeBranch]
+    () =>
+      resolveReceiptBusiness({
+        business: businessSettings || businessData,
+        branch: activeBranch,
+        posSettings,
+        emitter: emitterInfo,
+        defaultFooter: '¡Gracias por su preferencia!',
+      }),
+    [businessSettings, businessData, activeBranch, posSettings, emitterInfo]
   );
 
+  const reservationPayMethods = useMemo(() => {
+    const eligible = paymentMethods.filter(
+      (m) => m.enabled !== false && m.kind !== 'credit' && m.kind !== 'mixed'
+    );
+    return eligible.length > 0
+      ? eligible
+      : DEFAULT_PAYMENT_METHODS.filter((m) => m.kind !== 'credit' && m.kind !== 'mixed');
+  }, [paymentMethods]);
+
   const { features, planName } = usePlanFeatures();
+  const sunatAccess = useMemo(
+    () =>
+      resolveSunatInvoicingAccess({
+        planAllowsSunatInvoicing: features.sunatInvoicing,
+        invoicingEnabled,
+      }),
+    [features.sunatInvoicing, invoicingEnabled]
+  );
   const [activeTab, setActiveTab] = useState<HistoryTab>('sales');
   const [pnlModalOpen, setPnlModalOpen] = useState<boolean>(false);
-  const [upgradeFeature, setUpgradeFeature] = useState<PlanFeatureKey | null>(null);
+  const [upgradeModal, setUpgradeModal] = useState<{
+    feature: PlanFeatureKey;
+    lockReason: FeatureLockReason;
+  } | null>(null);
 
   useEffect(() => {
     if (!features.advancedAnalytics && pnlModalOpen) {
@@ -312,9 +327,47 @@ export default function HistoryScreen() {
   // Modal de Cobro de Saldo Pendiente de Reserva
   const [paymentModalVisible, setPaymentModalVisible] = useState(false);
   const [reservationToPay, setReservationToPay] = useState<any | null>(null);
-  const [payMethod, setPayMethod] = useState<'efectivo' | 'yape' | 'plin' | 'tarjeta' | 'transferencia'>('efectivo');
+  const [selectedPayMethodId, setSelectedPayMethodId] = useState<string>('efectivo');
   const [payCashReceived, setPayCashReceived] = useState<string>('');
   const [isCompletingPayment, setIsCompletingPayment] = useState(false);
+
+  const selectedPayMethod = useMemo(
+    () =>
+      reservationPayMethods.find((m) => m.id === selectedPayMethodId) ||
+      reservationPayMethods.find((m) => m.kind === 'cash') ||
+      reservationPayMethods[0],
+    [reservationPayMethods, selectedPayMethodId]
+  );
+
+  const reservationRemainingAmount = useMemo(() => {
+    if (!reservationToPay) return 0;
+    return Math.max(
+      0,
+      Number(reservationToPay.total || 0) - Number(reservationToPay.depositAmount || 0)
+    );
+  }, [reservationToPay]);
+
+  const payMethodPreview = useMemo(() => {
+    if (!selectedPayMethod || !reservationToPay) return null;
+    const category =
+      selectedPayMethod.kind === 'cash' || selectedPayMethod.reportCategory === 'cash'
+        ? 'cash'
+        : selectedPayMethod.kind === 'digital'
+          ? 'transfer'
+          : 'card';
+    const resolved = tryResolveCheckoutPayment({
+      methods: reservationPayMethods,
+      selectedMethodId: selectedPayMethod.id,
+      total: reservationRemainingAmount,
+      category,
+    });
+    return resolved.ok ? resolved.value : null;
+  }, [selectedPayMethod, reservationToPay, reservationPayMethods, reservationRemainingAmount]);
+
+  const reservationChargedRemaining =
+    payMethodPreview?.chargedAmount ?? reservationRemainingAmount;
+  const isCashPayMethod =
+    selectedPayMethod?.kind === 'cash' || selectedPayMethod?.reportCategory === 'cash';
 
   // ============================================================================
   // ESTADOS DEL SUB-MÓDULO 2: ASISTENTE VENTY IA
@@ -326,27 +379,53 @@ export default function HistoryScreen() {
   // ============================================================================
   // ACCIONES DE RESERVAS
   // ============================================================================
-  const handleOpenPayReservation = useCallback((res: any) => {
-    setReservationToPay(res);
-    const totalVal = Number(res.total || 0);
-    const depositVal = Number(res.depositAmount || 0);
-    const remaining = Math.max(0, totalVal - depositVal);
-    setPayCashReceived(remaining.toFixed(2));
-    setPayMethod('efectivo');
-    setPaymentModalVisible(true);
-  }, []);
+  const handleOpenPayReservation = useCallback(
+    (res: any) => {
+      setReservationToPay(res);
+      const totalVal = Number(res.total || 0);
+      const depositVal = Number(res.depositAmount || 0);
+      const remaining = Math.max(0, totalVal - depositVal);
+      const preferredId = posSettings?.defaultMethodId;
+      const defaultMethod =
+        (preferredId && reservationPayMethods.find((m) => m.id === preferredId)) ||
+        reservationPayMethods.find((m) => m.kind === 'cash') ||
+        reservationPayMethods[0];
+      setSelectedPayMethodId(defaultMethod?.id || 'efectivo');
+      setPayCashReceived(remaining.toFixed(2));
+      setPaymentModalVisible(true);
+    },
+    [posSettings?.defaultMethodId, reservationPayMethods]
+  );
 
   const handleConfirmCompletePayment = async () => {
     if (!reservationToPay) return;
     const totalVal = Number(reservationToPay.total || 0);
     const depositVal = Number(reservationToPay.depositAmount || 0);
     const remaining = Math.max(0, totalVal - depositVal);
+    const chargedTotal = reservationChargedRemaining;
+    const parsedCash = payCashReceived.trim() ? parseNormalizedDecimal(payCashReceived) : chargedTotal;
+
+    if (isCashPayMethod && parsedCash !== null && parsedCash < chargedTotal - 0.009) {
+      Alert.alert(
+        'Monto insuficiente',
+        'El efectivo recibido no puede ser menor al saldo por cobrar.'
+      );
+      return;
+    }
+
+    const effectiveCash =
+      isCashPayMethod && parsedCash !== null && parsedCash > 0 ? parsedCash : undefined;
+    const changeGiven =
+      isCashPayMethod && effectiveCash !== undefined
+        ? Math.max(0, Math.round((effectiveCash - chargedTotal) * 100) / 100)
+        : undefined;
 
     setIsCompletingPayment(true);
     try {
       await assertOnlineForWrite('cobrar y entregar una reserva', isOnlineRef.current);
       const sessId = activeCashSessionId || undefined;
-      await completeOrCancelReservation(
+      const methodObj = selectedPayMethod;
+      const completionRes = await completeOrCancelReservation(
         {
           id: reservationToPay.id,
           accountId: reservationToPay.accountId || accountId,
@@ -368,8 +447,19 @@ export default function HistoryScreen() {
           email: user?.email || '',
         },
         {
-          paymentMethod: payMethod,
+          paymentMethod: methodObj?.name || 'Efectivo',
+          paymentMethodId: methodObj?.id || 'efectivo',
+          paymentCategory:
+            methodObj?.reportCategory || (isCashPayMethod ? 'cash' : 'digital'),
+          documentType: 'nota_venta',
           amount: remaining,
+          surchargeAmount: payMethodPreview?.surchargeAmount || 0,
+          chargedAmount: chargedTotal,
+          commissionAmount: payMethodPreview?.commissionAmount || 0,
+          commissionPercent: methodObj?.commissionPercent,
+          commissionRule: methodObj?.commissionRule,
+          cashReceived: effectiveCash,
+          changeGiven,
           sessionId: sessId,
         }
       );
@@ -377,14 +467,21 @@ export default function HistoryScreen() {
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       setPaymentModalVisible(false);
       void refreshCashStatus();
+      void fetchSalesPage(true);
 
-      setReceiptReservation({
-        ...reservationToPay,
-        status: 'completed',
-        depositAmount: totalVal,
-        remainingAmount: 0,
-      });
-      setReceiptModalVisible(true);
+      if (completionRes && completionRes.sale) {
+        setSelectedSale(completionRes.sale);
+        setDetailViewMode('ticket');
+        setSaleDetailModalVisible(true);
+      } else {
+        setReceiptReservation({
+          ...reservationToPay,
+          status: 'completed',
+          depositAmount: totalVal,
+          remainingAmount: 0,
+        });
+        setReceiptModalVisible(true);
+      }
     } catch (err: any) {
       Alert.alert('Error al Cobrar', err?.message || 'No se pudo completar el cobro y entrega.');
     } finally {
@@ -407,7 +504,7 @@ export default function HistoryScreen() {
                 const totalVal = Number(res.total || 0);
                 const depositVal = Number(res.depositAmount || 0);
                 const sessId = activeCashSessionId || undefined;
-                await completeOrCancelReservation(
+                const completionRes = await completeOrCancelReservation(
                   {
                     id: res.id,
                     accountId: res.accountId || accountId,
@@ -429,14 +526,25 @@ export default function HistoryScreen() {
                     email: user?.email || '',
                   },
                   {
-                    paymentMethod: 'efectivo',
+                    paymentMethod: 'Efectivo',
+                    paymentMethodId: 'efectivo',
+                    paymentCategory: 'cash',
+                    documentType: 'nota_venta',
                     amount: 0,
                     sessionId: sessId,
                   }
                 );
                 void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-                setReceiptReservation({ ...res, status: 'completed' });
-                setReceiptModalVisible(true);
+                void refreshCashStatus();
+                void fetchSalesPage(true);
+                if (completionRes && completionRes.sale) {
+                  setSelectedSale(completionRes.sale);
+                  setDetailViewMode('ticket');
+                  setSaleDetailModalVisible(true);
+                } else {
+                  setReceiptReservation({ ...res, status: 'completed' });
+                  setReceiptModalVisible(true);
+                }
               } catch (err: any) {
                 Alert.alert('Error', err?.message || 'No se pudo completar la entrega.');
               }
@@ -452,6 +560,7 @@ export default function HistoryScreen() {
       user?.uid,
       user?.email,
       userProfile?.displayName,
+      refreshCashStatus,
     ]
   );
 
@@ -793,10 +902,13 @@ export default function HistoryScreen() {
         branch: saleBranch,
         taxProfile,
         consultUrl: receiptBusiness.consultUrl,
-        receiptFooter:
-          posSettings?.ticketFooterMessage ||
-          businessSettings?.receiptFooter ||
-          '¡Gracias por su compra!',
+        ticketTemplate: receiptBusiness.ticketTemplate,
+        ...(saleBranch?.receiptFooter?.trim() || receiptBusiness.hasCustomFooter
+          ? {
+              receiptFooter:
+                saleBranch?.receiptFooter?.trim() || receiptBusiness.receiptFooter,
+            }
+          : {}),
       };
 
       let printedViaBluetooth = false;
@@ -840,10 +952,13 @@ export default function HistoryScreen() {
         branch: saleBranch,
         taxProfile,
         consultUrl: receiptBusiness.consultUrl,
-        receiptFooter:
-          posSettings?.ticketFooterMessage ||
-          businessSettings?.receiptFooter ||
-          '¡Gracias por su compra!',
+        ticketTemplate: receiptBusiness.ticketTemplate,
+        ...(saleBranch?.receiptFooter?.trim() || receiptBusiness.hasCustomFooter
+          ? {
+              receiptFooter:
+                saleBranch?.receiptFooter?.trim() || receiptBusiness.receiptFooter,
+            }
+          : {}),
       };
       await shareTicketWhatsApp(
         {
@@ -954,6 +1069,7 @@ export default function HistoryScreen() {
 
   const handleOpenSunatActions = useCallback(
     async (sale: Sale) => {
+      if (!sunatAccess.allowed) return;
       if (guardOfflinePendingSaleAction(sale, 'emitir o gestionar en SUNAT')) return;
       if (!accountId) return;
       setLoadingSunatAction(true);
@@ -1004,11 +1120,12 @@ export default function HistoryScreen() {
         setLoadingSunatAction(false);
       }
     },
-    [accountId, branchId, refreshSelectedSaleSunat, router, handleEmitMissingSunat]
+    [sunatAccess.allowed, accountId, branchId, refreshSelectedSaleSunat, router, handleEmitMissingSunat]
   );
 
   const handleQuickConsultOrRetrySunat = useCallback(
     async (sale: Sale) => {
+      if (!sunatAccess.allowed) return;
       if (guardOfflinePendingSaleAction(sale, 'consultar o reintentar en SUNAT')) return;
       if (!accountId) return;
       setLoadingSunatAction(true);
@@ -1039,7 +1156,7 @@ export default function HistoryScreen() {
         setLoadingSunatAction(false);
       }
     },
-    [accountId, refreshSelectedSaleSunat, handleEmitMissingSunat, applyEinvoiceToSalesState]
+    [sunatAccess.allowed, accountId, refreshSelectedSaleSunat, handleEmitMissingSunat, applyEinvoiceToSalesState]
   );
 
   const handleConfirmCancelSale = async () => {
@@ -1190,7 +1307,12 @@ export default function HistoryScreen() {
   return (
     <View style={styles.screen}>
       <View style={styles.compactHeaderRow}>
-        <Text style={styles.compactHeaderTitle}>
+        <Text
+          style={styles.compactHeaderTitle}
+          numberOfLines={1}
+          adjustsFontSizeToFit
+          minimumFontScale={0.85}
+        >
           {activeTab === 'sales' ? 'Ventas' : activeTab === 'reservations' ? 'Reservas' : 'Venty IA'}
         </Text>
         {activeTab === 'sales' ? (
@@ -1199,26 +1321,53 @@ export default function HistoryScreen() {
               canCreateCreditNotes ||
               ['owner', 'admin', 'manager'].includes(role || '')) && (
               <TouchableOpacity
-                style={styles.compactSunatButton}
-                onPress={() => router.push('/facturacion' as Href)}
+                style={[
+                  styles.compactSunatButton,
+                  !sunatAccess.allowed && styles.compactButtonLocked,
+                ]}
+                onPress={() => {
+                  if (!sunatAccess.allowed) {
+                    setUpgradeModal({
+                      feature: 'sunatInvoicing',
+                      lockReason: sunatAccess.lockReason || 'account_disabled',
+                    });
+                    return;
+                  }
+                  router.push('/facturacion' as Href);
+                }}
                 accessibilityRole="button"
                 accessibilityLabel={
-                  features.sunatInvoicing
+                  sunatAccess.allowed
                     ? 'Ir a Facturación Electrónica SUNAT'
-                    : 'Facturación Electrónica SUNAT (requiere mejora de plan)'
+                    : sunatAccess.lockReason === 'plan'
+                      ? 'Facturación Electrónica SUNAT (requiere mejora de plan)'
+                      : 'Facturación Electrónica SUNAT (desactivada en tu cuenta)'
                 }
               >
-                <FileText size={14} color={ui.primary} />
-                <Text style={styles.compactSunatButtonText}>Facturación</Text>
-                {!features.sunatInvoicing && <Lock size={12} color={ui.accent} />}
+                <FileText
+                  size={13}
+                  color={sunatAccess.allowed ? ui.primary : '#8896AA'}
+                />
+                <Text
+                  style={[
+                    styles.compactSunatButtonText,
+                    !sunatAccess.allowed && styles.compactButtonTextLocked,
+                  ]}
+                  numberOfLines={1}
+                >
+                  Facturación
+                </Text>
               </TouchableOpacity>
             )}
             {canViewReports && (
               <TouchableOpacity
-                style={styles.compactPnlButton}
+                style={[
+                  styles.compactPnlButton,
+                  !features.advancedAnalytics && styles.compactButtonLocked,
+                ]}
                 onPress={() => {
                   if (!features.advancedAnalytics) {
-                    setUpgradeFeature('advancedAnalytics');
+                    setUpgradeModal({ feature: 'advancedAnalytics', lockReason: 'plan' });
                     return;
                   }
                   setPnlModalOpen(true);
@@ -1230,9 +1379,19 @@ export default function HistoryScreen() {
                     : 'Estado de resultados (requiere mejora de plan)'
                 }
               >
-                <TrendingUp size={15} color={ui.primary} />
-                <Text style={styles.compactPnlButtonText}>Estado de resultados</Text>
-                {!features.advancedAnalytics && <Lock size={12} color={ui.accent} />}
+                <TrendingUp
+                  size={13}
+                  color={features.advancedAnalytics ? ui.primary : '#8896AA'}
+                />
+                <Text
+                  style={[
+                    styles.compactPnlButtonText,
+                    !features.advancedAnalytics && styles.compactButtonTextLocked,
+                  ]}
+                  numberOfLines={1}
+                >
+                  Estado de resultados
+                </Text>
               </TouchableOpacity>
             )}
           </View>
@@ -1475,11 +1634,11 @@ export default function HistoryScreen() {
                           branch={selectedSaleBranch}
                           taxProfile={taxProfile}
                           receiptFooter={
-                            posSettings?.ticketFooterMessage ||
-                            businessSettings?.receiptFooter ||
-                            '¡Gracias por su compra!'
+                            selectedSaleBranch?.receiptFooter?.trim() ||
+                            (receiptBusiness.hasCustomFooter ? receiptBusiness.receiptFooter : undefined)
                           }
                           paperWidth={detailPaperWidth}
+                          compact={receiptBusiness.ticketTemplate === 'compact'}
                         />
                       </View>
                     ) : (
@@ -2022,10 +2181,11 @@ export default function HistoryScreen() {
       )}
 
       <PlanUpgradeModal
-        visible={upgradeFeature !== null}
-        feature={upgradeFeature}
+        visible={upgradeModal !== null}
+        feature={upgradeModal?.feature ?? null}
+        lockReason={upgradeModal?.lockReason ?? 'plan'}
         currentPlanName={planName}
-        onClose={() => setUpgradeFeature(null)}
+        onClose={() => setUpgradeModal(null)}
       />
 
       {/* Modal de Rango de Fechas Personalizado */}
@@ -2152,6 +2312,7 @@ export default function HistoryScreen() {
           }}
           reservation={receiptReservation}
           business={reservationBusiness}
+          branch={activeBranch}
         />
       )}
 
@@ -2170,24 +2331,31 @@ export default function HistoryScreen() {
         <Modal
           visible={paymentModalVisible}
           transparent
+          statusBarTranslucent
           animationType="fade"
-          onRequestClose={() => setPaymentModalVisible(false)}
+          onRequestClose={() => !isCompletingPayment && setPaymentModalVisible(false)}
         >
           <KeyboardAvoidingView
             behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
             style={styles.modalOverlay}
           >
-            <View style={styles.modalContent}>
+            <View
+              collapsable={false}
+              style={[
+                styles.modalContent,
+                { maxHeight: '90%', paddingBottom: Math.max(insets.bottom, 16) },
+              ]}
+            >
               <View style={styles.modalHeader}>
-                <View>
+                <View style={{ flex: 1, paddingRight: 8 }}>
                   <Text style={styles.modalTitle}>Cobrar Saldo y Entregar</Text>
-                  <Text style={styles.modalSub}>
+                  <Text style={styles.modalSub} numberOfLines={1}>
                     {reservationToPay?.customer?.name || 'Cliente General'} · #
                     {String(reservationToPay?.id || '').slice(-6).toUpperCase()}
                   </Text>
                 </View>
                 <TouchableOpacity
-                  onPress={() => setPaymentModalVisible(false)}
+                  onPress={() => !isCompletingPayment && setPaymentModalVisible(false)}
                   style={styles.iconButton}
                   accessibilityRole="button"
                   accessibilityLabel="Cerrar cobro de reserva"
@@ -2197,155 +2365,118 @@ export default function HistoryScreen() {
               </View>
 
               {reservationToPay && (
-                <View style={{ marginVertical: 12 }}>
-                  <View
-                    style={{
-                      backgroundColor: '#F8FAFC',
-                      borderRadius: 8,
-                      padding: 12,
-                      marginBottom: 14,
-                    }}
+                <>
+                  <ScrollView
+                    style={styles.reservationModalScroll}
+                    showsVerticalScrollIndicator={false}
+                    keyboardShouldPersistTaps="handled"
+                    nestedScrollEnabled
                   >
-                    <View
-                      style={{
-                        flexDirection: 'row',
-                        justifyContent: 'space-between',
-                        marginBottom: 4,
-                      }}
-                    >
-                      <Text style={{ fontSize: 13, color: '#64748B' }}>Total de la Reserva:</Text>
-                      <Text style={{ fontSize: 13, fontWeight: '700', color: '#0F172A' }}>
-                        {formatPEN(reservationToPay.total)}
-                      </Text>
-                    </View>
-                    <View
-                      style={{
-                        flexDirection: 'row',
-                        justifyContent: 'space-between',
-                        marginBottom: 4,
-                      }}
-                    >
-                      <Text style={{ fontSize: 13, color: '#15803D' }}>
-                        Adelanto / Seña pagada:
-                      </Text>
-                      <Text style={{ fontSize: 13, fontWeight: '700', color: '#15803D' }}>
-                        - {formatPEN(reservationToPay.depositAmount || 0)}
-                      </Text>
-                    </View>
-                    <View style={{ height: 1, backgroundColor: '#E2E8F0', marginVertical: 6 }} />
-                    <View
-                      style={{
-                        flexDirection: 'row',
-                        justifyContent: 'space-between',
-                        alignItems: 'center',
-                      }}
-                    >
-                      <Text style={{ fontSize: 15, fontWeight: '800', color: ui.danger }}>
-                        SALDO A COBRAR:
-                      </Text>
-                      <Text style={{ fontSize: 18, fontWeight: '800', color: ui.danger }}>
-                        {formatPEN(
-                          Math.max(
-                            0,
-                            Number(reservationToPay.total || 0) -
-                              Number(reservationToPay.depositAmount || 0)
-                          )
-                        )}
-                      </Text>
-                    </View>
-                  </View>
-
-                  <Text style={styles.label}>Método de Pago para el Saldo</Text>
-                  <View
-                    style={{
-                      flexDirection: 'row',
-                      flexWrap: 'wrap',
-                      gap: 6,
-                      marginVertical: 8,
-                    }}
-                  >
-                    {(['efectivo', 'yape', 'plin', 'tarjeta', 'transferencia'] as const).map(
-                      (m) => (
-                        <TouchableOpacity
-                          key={m}
-                          style={{
-                            paddingHorizontal: 12,
-                            paddingVertical: 8,
-                            borderRadius: 8,
-                            borderWidth: 1,
-                            borderColor: payMethod === m ? ui.primary : ui.border,
-                            backgroundColor: payMethod === m ? ui.primarySoft : ui.surface,
-                          }}
-                          onPress={() => setPayMethod(m)}
-                        >
-                          <Text
-                            style={{
-                              fontSize: 12.5,
-                              fontWeight: '700',
-                              color: payMethod === m ? ui.primary : ui.textSecondary,
-                              textTransform: 'capitalize',
-                            }}
-                          >
-                            {m}
-                          </Text>
-                        </TouchableOpacity>
-                      )
-                    )}
-                  </View>
-
-                  {payMethod === 'efectivo' && (
-                    <View style={styles.inputGroup}>
-                      <Text style={styles.label}>Monto Recibido en Efectivo (S/)</Text>
-                      <TextInput
-                        style={styles.input}
-                        value={payCashReceived}
-                        onChangeText={setPayCashReceived}
-                        keyboardType="decimal-pad"
-                        placeholder="0.00"
-                      />
-                      {(parseNormalizedDecimal(payCashReceived) ?? 0) >
-                      Math.max(
-                        0,
-                        Number(reservationToPay.total || 0) -
-                          Number(reservationToPay.depositAmount || 0)
-                      ) ? (
-                        <Text
-                          style={{
-                            fontSize: 12,
-                            fontWeight: '700',
-                            color: ui.success,
-                            marginTop: 4,
-                          }}
-                        >
-                          Vuelto:{' '}
-                          {formatPEN(
-                            (parseNormalizedDecimal(payCashReceived) ?? 0) -
-                              Math.max(
-                                0,
-                                Number(reservationToPay.total || 0) -
-                                  Number(reservationToPay.depositAmount || 0)
-                              )
-                          )}
+                    <View style={styles.reservationSummaryCard}>
+                      <View style={styles.reservationSummaryRow}>
+                        <Text style={styles.reservationSummaryLabel}>Total de la Reserva:</Text>
+                        <Text style={styles.reservationSummaryVal}>
+                          {formatPEN(reservationToPay.total)}
+                        </Text>
+                      </View>
+                      <View style={styles.reservationSummaryRow}>
+                        <Text style={styles.reservationDepositLabel}>
+                          Adelanto / Seña pagada:
+                        </Text>
+                        <Text style={styles.reservationDepositVal}>
+                          - {formatPEN(reservationToPay.depositAmount || 0)}
+                        </Text>
+                      </View>
+                      <View style={styles.reservationSummaryDivider} />
+                      <View
+                        style={[
+                          styles.reservationSummaryRow,
+                          { marginBottom: 0 },
+                        ]}
+                      >
+                        <Text style={styles.reservationBalanceLabel}>SALDO A COBRAR:</Text>
+                        <Text style={styles.reservationBalanceVal}>
+                          {formatPEN(reservationChargedRemaining)}
+                        </Text>
+                      </View>
+                      {payMethodPreview && payMethodPreview.surchargeAmount > 0 ? (
+                        <Text style={styles.reservationSurchargeHint}>
+                          Saldo base {formatPEN(reservationRemainingAmount)} + recargo{' '}
+                          {formatPEN(payMethodPreview.surchargeAmount)}
                         </Text>
                       ) : null}
                     </View>
-                  )}
 
-                  <TouchableOpacity
-                    style={[styles.applyDateBtn, { marginTop: 14 }]}
-                    onPress={handleConfirmCompletePayment}
-                    disabled={isCompletingPayment}
-                  >
-                    {isCompletingPayment ? (
-                      <ActivityIndicator size="small" color={ui.onPrimary} />
-                    ) : (
-                      <>
-                        <CheckCircle2 size={16} color={ui.onPrimary} />
-                        <Text style={styles.applyDateBtnText}>Confirmar Cobro y Entregar</Text>
-                      </>
+                    <PaymentMethodSelector
+                      label="Método de Pago para el Saldo"
+                      methods={reservationPayMethods}
+                      selectedMethodId={selectedPayMethod?.id || ''}
+                      onSelect={(method) => {
+                        setSelectedPayMethodId(method.id);
+                      }}
+                      disabled={isCompletingPayment}
+                    />
+
+                    {isCashPayMethod && (
+                      <View style={styles.reservationCashInputGroup}>
+                        <Text style={styles.label}>Monto Recibido en Efectivo (S/)</Text>
+                        <TextInput
+                          style={styles.input}
+                          value={payCashReceived}
+                          onChangeText={setPayCashReceived}
+                          keyboardType="decimal-pad"
+                          placeholder={reservationChargedRemaining.toFixed(2)}
+                          placeholderTextColor={ui.textMuted}
+                        />
+                        {(parseNormalizedDecimal(payCashReceived) ?? 0) >
+                        reservationChargedRemaining ? (
+                          <Text style={styles.reservationChangeText}>
+                            Vuelto:{' '}
+                            {formatPEN(
+                              (parseNormalizedDecimal(payCashReceived) ?? 0) -
+                                reservationChargedRemaining
+                            )}
+                          </Text>
+                        ) : null}
+                      </View>
                     )}
-                  </TouchableOpacity>
-                </View>
+                  </ScrollView>
+
+                  <View style={styles.reservationModalActions}>
+                    <TouchableOpacity
+                      style={[
+                        styles.reservationConfirmBtn,
+                        isCompletingPayment && styles.buttonDisabled,
+                      ]}
+                      onPress={handleConfirmCompletePayment}
+                      disabled={isCompletingPayment}
+                      accessibilityRole="button"
+                      activeOpacity={0.85}
+                    >
+                      {isCompletingPayment ? (
+                        <ActivityIndicator size="small" color={ui.onPrimary} />
+                      ) : (
+                        <>
+                          <CheckCircle2 size={18} color={ui.onPrimary} />
+                          <Text style={styles.reservationConfirmBtnText}>
+                            {reservationChargedRemaining > 0
+                              ? `Confirmar cobro · ${formatPEN(reservationChargedRemaining)}`
+                              : 'Confirmar entrega'}
+                          </Text>
+                        </>
+                      )}
+                    </TouchableOpacity>
+
+                    <TouchableOpacity
+                      style={styles.reservationCancelBtn}
+                      onPress={() => !isCompletingPayment && setPaymentModalVisible(false)}
+                      disabled={isCompletingPayment}
+                      accessibilityRole="button"
+                    >
+                      <Text style={styles.reservationCancelBtnText}>Cancelar</Text>
+                    </TouchableOpacity>
+                  </View>
+                </>
               )}
             </View>
           </KeyboardAvoidingView>

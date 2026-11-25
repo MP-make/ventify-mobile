@@ -30,6 +30,7 @@ import {
 import { SectionHeading } from '@/components/ui';
 import { useOfflineStatus } from '@/context/SettingsContext';
 import type { AccountTaxProfile } from '@/lib/invoicing/receipt-amounts';
+import { resolveReceiptBusiness } from '@/lib/invoicing/receipt-business';
 import type { OfflineInventoryOperation } from '@/lib/offline-stock-helpers';
 import { formatDatePE, formatPEN, ui } from '@/lib/theme';
 import {
@@ -237,11 +238,12 @@ export const PrinterOfflineSettingsTab = React.memo<PrinterOfflineSettingsTabPro
         const total = 40.0;
         const subtotal = Math.round((total / divisor) * 100) / 100;
         const tax = Math.round((total - subtotal) * 100) / 100;
-        const receiptFooter =
-          posSettings?.ticketFooterMessage ||
-          businessSettings?.receiptFooter ||
-          activeBranch?.receiptFooter ||
-          '¡Gracias por su compra!';
+        const resolvedBiz = resolveReceiptBusiness({
+          business: businessSettings,
+          branch: activeBranch,
+          posSettings,
+        });
+        const receiptFooter = resolvedBiz.hasCustomFooter ? resolvedBiz.receiptFooter : undefined;
 
         const demoSale: any = {
           id: 'test_ticket',
@@ -274,12 +276,13 @@ export const PrinterOfflineSettingsTab = React.memo<PrinterOfflineSettingsTabPro
           {
             title: 'Prueba de Impresión',
             sale: demoSale,
-            business: { ...businessSettings, ...activeBranch },
+            business: resolvedBiz,
             options: {
               paperWidth: printerConfig.paperWidth,
               branch: activeBranch,
               taxProfile,
               receiptFooter,
+              ticketTemplate: resolvedBiz.ticketTemplate,
             },
           },
           {
@@ -287,6 +290,7 @@ export const PrinterOfflineSettingsTab = React.memo<PrinterOfflineSettingsTabPro
             branch: activeBranch,
             taxProfile,
             receiptFooter,
+            ticketTemplate: resolvedBiz.ticketTemplate,
           }
         );
       } catch (err: any) {

@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { getDepositSessionUpdates, getHistoryDateBounds, normalizeOrderItems, toEpochMillis } from '../crm-compat';
 
 describe('CRM cross-platform contracts', () => {
-  it('normalizes reservation and order lines to Web id/name fields while preserving variant data', () => {
+  it('normalizes reservation and order lines to Web id/name fields while preserving variant data and stripping undefined', () => {
     expect(normalizeOrderItems([{
       productId: 'p1', productName: 'Harina', price: 3.5, quantity: 2,
       variantId: 'v1', presentationId: 'box',
@@ -10,6 +10,19 @@ describe('CRM cross-platform contracts', () => {
       productId: 'p1', productName: 'Harina', id: 'p1', name: 'Harina', price: 3.5,
       quantity: 2, variantId: 'v1', presentationId: 'box',
     }]);
+
+    const [cleaned] = normalizeOrderItems([{
+      productId: 'p2',
+      productName: 'Azúcar',
+      price: 4,
+      quantity: 1,
+      variantId: undefined,
+      variantName: undefined,
+      presentationId: undefined,
+    }]);
+    expect(cleaned).not.toHaveProperty('variantId');
+    expect(cleaned).not.toHaveProperty('variantName');
+    expect(cleaned).not.toHaveProperty('presentationId');
   });
 
   it('credits order deposits to order buckets and cash only to drawer totals', () => {

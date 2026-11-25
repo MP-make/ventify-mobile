@@ -40,7 +40,8 @@ export interface CheckoutSuccessViewProps {
   receiptBusiness: any;
   resolvedBranch: Branch | null;
   taxProfile: TaxProfileInput | null;
-  receiptFooter: string;
+  receiptFooter?: string;
+  ticketTemplate?: 'standard' | 'compact';
   onNewSale: () => void;
 }
 
@@ -56,6 +57,7 @@ export const CheckoutSuccessView = React.memo<CheckoutSuccessViewProps>(({
   resolvedBranch,
   taxProfile,
   receiptFooter,
+  ticketTemplate = 'standard',
   onNewSale,
 }) => {
   const [receiptPaperWidth, setReceiptPaperWidth] = useState<58 | 80>(80);
@@ -96,6 +98,7 @@ export const CheckoutSuccessView = React.memo<CheckoutSuccessViewProps>(({
         taxProfile,
         consultUrl: receiptBusiness.consultUrl,
         receiptFooter,
+        ticketTemplate,
       };
 
       if (cfg.connectionType === 'bluetooth' && cfg.selectedDevice?.address) {
@@ -128,6 +131,7 @@ export const CheckoutSuccessView = React.memo<CheckoutSuccessViewProps>(({
             taxProfile,
             consultUrl: receiptBusiness.consultUrl,
             receiptFooter,
+            ticketTemplate,
           },
         },
         receiptBusiness,
@@ -138,6 +142,7 @@ export const CheckoutSuccessView = React.memo<CheckoutSuccessViewProps>(({
           taxProfile,
           consultUrl: receiptBusiness.consultUrl,
           receiptFooter,
+          ticketTemplate,
         }
       );
     } catch {
@@ -165,6 +170,7 @@ export const CheckoutSuccessView = React.memo<CheckoutSuccessViewProps>(({
 
         const message =
           `*${receiptBusiness.businessName || 'VENTIFY'}*\n` +
+          (receiptBusiness.ruc ? `RUC: ${receiptBusiness.ruc}\n` : '') +
           `🧾 *${docLabel}*: ${correlative}\n` +
           `📅 *Fecha*: ${formatDatePE(saleObj.date || Date.now())}\n` +
           (saleObj.customerName ? `👤 *Cliente*: ${saleObj.customerName}\n` : '') +
@@ -176,7 +182,7 @@ export const CheckoutSuccessView = React.memo<CheckoutSuccessViewProps>(({
             saleObj.paymentMethodName || saleObj.paymentMethod || ''
           ).toUpperCase()}\n` +
           (saleObj.changeGiven > 0 ? `💵 *Vuelto*: ${formatPEN(saleObj.changeGiven)}\n` : '') +
-          `\n_¡Muchas gracias por su preferencia!_`;
+          `\n_${receiptFooter || receiptBusiness?.receiptFooter || '¡Muchas gracias por su preferencia!'}_`;
 
         const cleanPhone = String(saleObj.customerPhone || '').replace(/\D/g, '');
         const whatsappUrl = cleanPhone
@@ -293,6 +299,7 @@ export const CheckoutSuccessView = React.memo<CheckoutSuccessViewProps>(({
               taxProfile={taxProfile}
               receiptFooter={receiptFooter}
               paperWidth={receiptPaperWidth}
+              compact={ticketTemplate === 'compact'}
             />
           </View>
         ) : null}

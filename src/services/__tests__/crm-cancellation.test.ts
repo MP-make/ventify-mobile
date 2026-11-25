@@ -30,9 +30,15 @@ describe('atomic CRM cancellation',()=>{
     fake.docs.set('products/p1',{accountId:'a1',stock:{b1:100},reservedStock:{b1:10}});
     fake.docs.set('reservations/r1',{accountId:'a1',branchId:'b1',status:'pending',attributionVersion:1,items:[{id:'p1',quantity:1,price:1},{id:'p1',quantity:1,presentationQty:2,price:2}]});
   });
-  it('sends the selected payment method and seller to the shared completion transaction',async()=>{
-    await completeOrCancelReservation({...stale,total:100},'complete',actor,{sessionId:'session-1',amount:100,paymentMethod:'Visa',paymentMethodId:'visa-terminal',paymentCategory:'card',sellerId:'seller-1',sellerName:'Ana'});
+  it('sends the selected payment method and seller to the shared completion transaction and returns the sale ticket payload',async()=>{
+    (apiRequest as any).mockResolvedValueOnce(undefined);
+    const fallbackRes=await completeOrCancelReservation({...stale,total:100,depositAmount:30} as any,'complete',actor,{sessionId:'session-1',amount:70,paymentMethod:'Visa',paymentMethodId:'visa-terminal',paymentCategory:'card',sellerId:'seller-1',sellerName:'Ana'});
     expect(apiRequest).toHaveBeenCalledWith('/api/sales/finalize',expect.objectContaining({body:expect.objectContaining({sale:expect.objectContaining({paymentMethod:'Visa',paymentMethodId:'visa-terminal',paymentCategory:'card',sellerId:'seller-1',sellerName:'Ana'})})}));
+    expect(fallbackRes?.sale).toMatchObject({total:100,paymentMethod:'Visa',depositInfo:{originalTotal:100,depositAmount:30,appliedAmount:30,remainingAmount:0}});
+
+    (apiRequest as any).mockResolvedValueOnce({saleId:'sale-99',saleNumber:99,sale:{id:'sale-99',saleNumber:99,documentNumber:'NV01-000099',total:100}});
+    const serverRes=await completeOrCancelReservation({...stale,total:100,depositAmount:25} as any,'complete',actor,{sessionId:'session-1',amount:75,paymentMethod:'Yape',paymentMethodId:'yape',paymentCategory:'digital',cashReceived:undefined});
+    expect(serverRes).toMatchObject({saleId:'sale-99',saleNumber:99,sale:{id:'sale-99',documentNumber:'NV01-000099',depositInfo:{originalTotal:100,depositAmount:25,appliedAmount:25,remainingAmount:0}}});
   });
   it('releases the current grouped reservation once, preserving physical stock and other reservations',async()=>{
     await completeOrCancelReservation(stale,'cancel',actor);

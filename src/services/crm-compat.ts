@@ -15,13 +15,28 @@ export function toEpochMillis(value: unknown): number {
   return 0;
 }
 
+export type NormalizedOrderItem = ReservationOrderItem & {
+  id: string;
+  name: string;
+  productId: string;
+  productName: string;
+  price: number;
+  quantity: number;
+};
+
 /** Normalize mobile lines to the canonical Web order line identifiers. */
-export function normalizeOrderItems(items: ReservationOrderItem[]) {
+export function normalizeOrderItems(items: ReservationOrderItem[]): NormalizedOrderItem[] {
   return items.map((item) => {
     const id = item.id || item.productId || '';
     const name = item.name || item.productName || 'Producto';
+    const definedEntries: Partial<ReservationOrderItem> = {};
+    for (const [key, value] of Object.entries(item)) {
+      if (value !== undefined) {
+        (definedEntries as Record<string, unknown>)[key] = value;
+      }
+    }
     return {
-      ...item,
+      ...definedEntries,
       id,
       name,
       productId: id,

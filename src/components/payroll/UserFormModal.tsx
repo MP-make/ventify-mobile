@@ -12,7 +12,7 @@ import {
   Platform,
   KeyboardAvoidingView,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { X, Check, ChevronDown, ChevronRight, RotateCcw } from 'lucide-react-native';
 import * as Haptics from 'expo-haptics';
 
@@ -131,6 +131,7 @@ export const UserFormModal = React.memo<UserFormModalProps>(({
   isAdminOrOwner,
   onClose,
 }) => {
+  const insets = useSafeAreaInsets();
   const [name, setName] = useState<string>(() => editingMember?.name || '');
   const [email, setEmail] = useState<string>(() => editingMember?.email || '');
   const [role, setRole] = useState<TeamRole>(() => editingMember?.role || 'cashier');
@@ -280,15 +281,19 @@ export const UserFormModal = React.memo<UserFormModalProps>(({
     <Modal
       visible={visible}
       transparent
+      statusBarTranslucent
       animationType="slide"
       onRequestClose={handleRequestClose}
     >
-      <SafeAreaView edges={['top', 'bottom']} style={styles.modalSafe}>
+      <View
+        style={[styles.modalSafe, { paddingTop: insets.top, paddingBottom: insets.bottom }]}
+        collapsable={false}
+      >
         <KeyboardAvoidingView
           behavior={Platform.OS === 'ios' ? 'padding' : undefined}
           style={styles.modalOverlay}
         >
-          <View style={[styles.modalDialog, styles.modalDialogTall]}>
+          <View style={[styles.modalDialog, styles.modalDialogTall]} collapsable={false}>
             <View style={styles.modalHeader}>
               <Text style={styles.modalTitle}>
                 {editingMember ? 'Editar Colaborador' : 'Nuevo Colaborador'}
@@ -511,7 +516,7 @@ export const UserFormModal = React.memo<UserFormModalProps>(({
             </View>
           </View>
         </KeyboardAvoidingView>
-      </SafeAreaView>
+      </View>
     </Modal>
   );
 });

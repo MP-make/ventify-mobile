@@ -56,12 +56,20 @@ import {
 import type { OfflineInventoryOperation } from '@/lib/offline-stock-helpers';
 import { assertOnlineForWrite, checkIsOnlineLive } from '@/lib/online-guard';
 
+import {
+  resolveAccountTaxProfile,
+  type AccountTaxProfile,
+} from '@/lib/invoicing/receipt-amounts';
+import { resolveReceiptBusiness } from '@/lib/invoicing/receipt-business';
+
 export const SETTINGS_CACHE_PREFIX = '@ventify_settings_cache_v1:';
 export const CASH_SESSION_CACHE_PREFIX = '@ventify_cash_session_cache_v1:';
 const SETTINGS_PERSIST_DEBOUNCE_MS = 400;
 
 interface CachedAccountSettings {
   primaryColor?: string;
+  appearanceSettings?: Record<string, any> | null;
+  accountBranding?: Record<string, any> | null;
   businessSettings?: BusinessSettings;
   posSettings?: PosSettings;
   allPaymentMethods?: PosPaymentMethodConfig[];
@@ -76,8 +84,132 @@ interface CachedAccountSettings {
     emitterRuc?: string;
     emitterRazonSocial?: string;
     emitterNombreComercial?: string;
+    emitterAddress?: string;
+    emitterPhone?: string;
+    emitterEmail?: string;
+    emitterLogoUrl?: string;
+    consultUrl?: string;
+    receiptFooter?: string;
   } | null;
 }
+
+const BRANDING_EXTRACT_KEYS = [
+  'businessName',
+  'commercialName',
+  'nombreComercial',
+  'razonSocial',
+  'name',
+  'ruc',
+  'taxId',
+  'address',
+  'fiscalAddress',
+  'direccionFiscal',
+  'commercialAddress',
+  'direccionComercial',
+  'phone',
+  'commercialPhone',
+  'telefono',
+  'whatsapp',
+  'whatsappNumber',
+  'email',
+  'correo',
+  'website',
+  'web',
+  'siteUrl',
+  'description',
+  'slogan',
+  'tagline',
+  'receiptHeader',
+  'ticketHeader',
+  'ticketHeaderMessage',
+  'headerMessage',
+  'headerText',
+  'receiptFooter',
+  'ticketFooterMessage',
+  'ticketFooter',
+  'footerMessage',
+  'footerText',
+  'receiptLogo',
+  'receiptLogoDataUrl',
+  'receiptLogoUrl',
+  'logoUrl',
+  'logo',
+  'logoDataUrl',
+  'companyLogo',
+  'businessLogo',
+  'brandLogo',
+  'ticketLogo',
+  'imageUrl',
+  'consultUrl',
+  'comprobantesUrl',
+  'printedFormatResolution',
+  'sunatResolution',
+  'authorizationText',
+  'ticketTemplate',
+  'showLogo',
+  'showReceiptLogo',
+  'printLogo',
+  'showRuc',
+  'showTaxId',
+  'printRuc',
+  'showAddress',
+  'showBusinessAddress',
+  'printAddress',
+  'showPhone',
+  'showBusinessPhone',
+  'printPhone',
+  'showEmail',
+  'printEmail',
+  'showSlogan',
+  'showDescription',
+  'printSlogan',
+  'receiptSettings',
+  'ticketSettings',
+  'ticketConfig',
+  'receiptConfig',
+  'receipt',
+  'branding',
+] as const;
+
+const pickNonEmptyString = (...values: unknown[]): string => {
+  for (let i = 0; i < values.length; i += 1) {
+    const val = values[i];
+    if (typeof val === 'string' && val.trim().length > 0) return val.trim();
+    if (typeof val === 'number' && Number.isFinite(val)) return String(val).trim();
+  }
+  return '';
+};
+
+const extractBrandingRecord = (data: Record<string, any> | undefined | null): Record<string, any> | null => {
+  if (!data || typeof data !== 'object') return null;
+  const out: Record<string, any> = {};
+  for (let i = 0; i < BRANDING_EXTRACT_KEYS.length; i += 1) {
+    const key = BRANDING_EXTRACT_KEYS[i];
+    const val = data[key];
+    if (val === undefined || val === null) continue;
+    if (typeof val === 'string') {
+      const trimmed = val.trim();
+      if (trimmed) out[key] = trimmed;
+    } else if (typeof val === 'boolean' || (typeof val === 'object' && !Array.isArray(val))) {
+      out[key] = val;
+    }
+  }
+  return Object.keys(out).length > 0 ? out : null;
+};
+
+const cleanNonEmptyBranchData = (data: Record<string, any>): Record<string, any> => {
+  const out: Record<string, any> = {};
+  for (const [key, val] of Object.entries(data)) {
+    if (val === undefined || val === null) continue;
+    if (typeof val === 'string') {
+      const trimmed = val.trim();
+      if (trimmed) out[key] = trimmed;
+    } else {
+      out[key] = val;
+    }
+  }
+  return out;
+};
 
 const isTimestampLike = (val: unknown): val is { seconds: number; nanoseconds: number } =>
   typeof val === 'object' &&
@@ -167,37 +299,7 @@ const getCashSessionCacheKey = (
   targetUserId: string
 ): string => `${CASH_SESSION_CACHE_PREFIX}${targetAccountId}:${targetBranchId}:${targetUserId}`;
 
-import {
-  resolveAccountTaxProfile,
-  type AccountTaxProfile,
-} from '@/lib/invoicing/receipt-amounts';
-
 declare module '@/types' {
-  interface Branch {
-    description?: string;
-    email?: string;
-    receiptFooter?: string;
-    printedFormatResolution?: string;
-  }
-  interface BusinessSettings {
-    commercialAddress?: string;
-    commercialPhone?: string;
-    description?: string;
-    fiscalAddress?: string;
-    receiptLogo?: string;
-    receiptLogoDataUrl?: string;
-    receiptFooter?: string;
-    consultUrl?: string;
-    printedFormatResolution?: string;
-    isAmazonExempt?: boolean;
-    taxExemptionCode?: string;
-    taxRate?: number;
-  }
-  interface PosSettings {
-    ticketFooterMessage?: string;
-    digitalPhone?: string;
-    digitalName?: string;
-  }
   interface Sale {
     correlative?: string;
     einvoiceId?: string;
@@ -320,6 +422,12 @@ export interface BusinessSettingsContextType {
     razonSocial?: string;
     nombreComercial?: string;
     printedFormatResolution?: string | null;
+    address?: string;
+    phone?: string;
+    email?: string;
+    logoUrl?: string;
+    consultUrl?: string;
+    receiptFooter?: string;
   } | null;
   paymentMethods: PosPaymentMethodConfig[];
   allPaymentMethods: PosPaymentMethodConfig[];
@@ -581,6 +689,12 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const [primaryColor, setPrimaryColor] = useState<string>(
     () => initialCached?.primaryColor || '#10B981'
   );
+  const [appearanceSettings, setAppearanceSettings] = useState<Record<string, any> | null>(
+    () => (initialCached?.appearanceSettings !== undefined ? initialCached.appearanceSettings : null)
+  );
+  const [accountBranding, setAccountBranding] = useState<Record<string, any> | null>(
+    () => (initialCached?.accountBranding !== undefined ? initialCached.accountBranding : null)
+  );
   const [businessSettings, setBusinessSettings] = useState<BusinessSettings>(
     () => initialCached?.businessSettings || DEFAULT_BUSINESS_SETTINGS
   );
@@ -608,6 +722,12 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     emitterRuc?: string;
     emitterRazonSocial?: string;
     emitterNombreComercial?: string;
+    emitterAddress?: string;
+    emitterPhone?: string;
+    emitterEmail?: string;
+    emitterLogoUrl?: string;
+    consultUrl?: string;
+    receiptFooter?: string;
   } | null>(() =>
     initialCached?.invoicingConfigRaw !== undefined ? initialCached.invoicingConfigRaw : null
   );
@@ -979,6 +1099,8 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       hasHydratedSettingsRef.current = false;
       settingsCacheSnapshotRef.current = null;
       authoritativeSettingsRef.current = {};
+      setAppearanceSettings(null);
+      setAccountBranding(null);
       return;
     }
 
@@ -996,6 +1118,8 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       hasHydratedSettingsRef.current = false;
       settingsCacheSnapshotRef.current = { accountId, data: {} };
       authoritativeSettingsRef.current = {};
+      setAppearanceSettings(null);
+      setAccountBranding(null);
     }
 
     const applyParsedSettings = (
@@ -1009,6 +1133,22 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
       if (parsed.primaryColor && !authoritativeSettingsRef.current.appearance) {
         setPrimaryColor((prev) => (prev === parsed.primaryColor ? prev : parsed.primaryColor!));
+      }
+      if (
+        parsed.appearanceSettings !== undefined &&
+        !authoritativeSettingsRef.current.appearance
+      ) {
+        setAppearanceSettings((prev) =>
+          isStructurallyEqual(prev, parsed.appearanceSettings) ? prev : parsed.appearanceSettings!
+        );
+      }
+      if (
+        parsed.accountBranding !== undefined &&
+        !authoritativeSettingsRef.current.account
+      ) {
+        setAccountBranding((prev) =>
+          isStructurallyEqual(prev, parsed.accountBranding) ? prev : parsed.accountBranding!
+        );
       }
       if (parsed.businessSettings && !authoritativeSettingsRef.current.business) {
         setBusinessSettings((prev) =>
@@ -1296,17 +1436,33 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   useEffect(() => {
     if (!accountId) return;
 
-    // 3.1. Ajustes de apariencia
+    // 3.1. Ajustes de apariencia y logotipo web
     const appearanceRef = doc(db, 'settings', `${accountId}_appearance`);
     const applyAppearance = (snap: any) => {
-      if (snap.exists()) {
-        authoritativeSettingsRef.current.appearance = true;
-        const data = snap.data();
-        if (data.primaryColor) {
-          setPrimaryColor((prev) => (prev === data.primaryColor ? prev : data.primaryColor));
-          persistSettingsSnapshot(accountId, { primaryColor: data.primaryColor });
+      if (!snap.exists()) {
+        if (snap.metadata?.fromCache === false) {
+          authoritativeSettingsRef.current.appearance = true;
+          setAppearanceSettings((prev) => (prev === null ? prev : null));
+          persistSettingsSnapshot(accountId, { appearanceSettings: null });
         }
+        return;
       }
+
+      authoritativeSettingsRef.current.appearance = true;
+      const data = snap.data() || {};
+      const nextAppearanceBranding = extractBrandingRecord(data);
+      setAppearanceSettings((prev) =>
+        isStructurallyEqual(prev, nextAppearanceBranding) ? prev : nextAppearanceBranding
+      );
+
+      const snapshotPatch: Partial<CachedAccountSettings> = {
+        appearanceSettings: nextAppearanceBranding,
+      };
+      if (data.primaryColor) {
+        setPrimaryColor((prev) => (prev === data.primaryColor ? prev : data.primaryColor));
+        snapshotPatch.primaryColor = data.primaryColor;
+      }
+      persistSettingsSnapshot(accountId, snapshotPatch);
     };
     const unsubAppearance = subscribeLiveDocument(
       appearanceRef,
@@ -1334,22 +1490,48 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       }
 
       authoritativeSettingsRef.current.business = true;
-      const data = snap.data();
+      const data = snap.data() || {};
+      const resolvedBizName =
+        pickNonEmptyString(
+          data.businessName,
+          data.commercialName,
+          data.nombreComercial,
+          data.razonSocial,
+          data.name
+        ) || 'Ventify POS';
+      const resolvedRuc = pickNonEmptyString(data.ruc, data.taxId);
+      const resolvedAddress = pickNonEmptyString(
+        data.address,
+        data.fiscalAddress,
+        data.direccionFiscal,
+        data.commercialAddress,
+        data.direccion
+      );
+      const resolvedPhone = pickNonEmptyString(
+        data.phone,
+        data.commercialPhone,
+        data.telefono,
+        data.whatsapp
+      );
+      const resolvedEmail = pickNonEmptyString(data.email, data.correo);
+      const resolvedWebsite = pickNonEmptyString(data.website, data.web, data.siteUrl);
+      const resolvedDescription = pickNonEmptyString(data.description, data.slogan, data.tagline);
+
       const loadedBiz: BusinessSettings = {
+        ...data,
         id: snap.id,
         accountId,
-        businessName: data.businessName || data.name || 'Ventify POS',
-        description: data.description || '',
-        ruc: data.ruc || data.taxId || '',
-        address: data.address || data.fiscalAddress || '',
-        phone: data.phone || data.commercialPhone || '',
-        email: data.email || '',
-        website: data.website || '',
+        businessName: resolvedBizName,
+        description: resolvedDescription,
+        ruc: resolvedRuc,
+        address: resolvedAddress,
+        phone: resolvedPhone,
+        email: resolvedEmail,
+        website: resolvedWebsite,
         enableFractionalUnits: data.enableFractionalUnits !== false,
         enableMinSalePrice: data.enableMinSalePrice !== false,
         createdAt: data.createdAt,
         updatedAt: data.updatedAt,
-        ...data,
       };
       setBusinessSettings((prev) => (isStructurallyEqual(prev, loadedBiz) ? prev : loadedBiz));
       persistSettingsSnapshot(accountId, { businessSettings: loadedBiz });
@@ -1532,18 +1714,29 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
           return;
         }
         setInvoicingEnabled((prev) => (prev === false ? prev : false));
+        setAccountBranding((prev) => (prev === null ? prev : null));
         if (snap.metadata?.fromCache === false) {
           authoritativeSettingsRef.current.account = true;
-          persistSettingsSnapshot(accountId, { invoicingEnabled: false });
+          persistSettingsSnapshot(accountId, {
+            invoicingEnabled: false,
+            accountBranding: null,
+          });
         }
         return;
       }
 
       authoritativeSettingsRef.current.account = true;
-      const data = snap.data();
+      const data = snap.data() || {};
       const enabled = Boolean(data.invoicingEnabled);
+      const nextAccountBranding = extractBrandingRecord(data);
       setInvoicingEnabled((prev) => (prev === enabled ? prev : enabled));
-      persistSettingsSnapshot(accountId, { invoicingEnabled: enabled });
+      setAccountBranding((prev) =>
+        isStructurallyEqual(prev, nextAccountBranding) ? prev : nextAccountBranding
+      );
+      persistSettingsSnapshot(accountId, {
+        invoicingEnabled: enabled,
+        accountBranding: nextAccountBranding,
+      });
     };
     const unsubAccount = subscribeLiveDocument(
       accountRef,
@@ -1679,6 +1872,34 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
               emitterRuc: data.config.emitter?.ruc,
               emitterRazonSocial: data.config.emitter?.razonSocial,
               emitterNombreComercial: data.config.emitter?.nombreComercial,
+              emitterAddress: pickNonEmptyString(
+                data.config.emitter?.fiscalAddress,
+                data.config.emitter?.direccionFiscal,
+                data.config.emitter?.address,
+                data.config.emitter?.direccion,
+                data.config.address
+              ) || undefined,
+              emitterPhone: pickNonEmptyString(
+                data.config.emitter?.phone,
+                data.config.emitter?.telefono,
+                data.config.emitter?.commercialPhone,
+                data.config.phone
+              ) || undefined,
+              emitterEmail: pickNonEmptyString(data.config.emitter?.email, data.config.email) || undefined,
+              emitterLogoUrl: pickNonEmptyString(
+                data.config.emitter?.receiptLogoDataUrl,
+                data.config.emitter?.receiptLogo,
+                data.config.emitter?.logoUrl,
+                data.config.receiptLogoDataUrl,
+                data.config.receiptLogo,
+                data.config.logoUrl
+              ) || undefined,
+              consultUrl: pickNonEmptyString(data.config.consultUrl, data.config.emitter?.consultUrl) || undefined,
+              receiptFooter: pickNonEmptyString(
+                data.config.receiptFooter,
+                data.config.ticketFooterMessage,
+                data.config.emitter?.receiptFooter
+              ) || undefined,
             };
             authoritativeSettingsRef.current.invoicingConfig = true;
             setInvoicingConfigRaw((prev) =>
@@ -1723,21 +1944,25 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
       authoritativeSettingsRef.current.branches = true;
       const list: Branch[] = snap.docs.map((d: any) => {
-        const data = d.data();
+        const raw = d.data() || {};
+        const cleaned = cleanNonEmptyBranchData(raw);
+        const branchName = pickNonEmptyString(cleaned.name) || 'Sucursal';
+        const resolvedAddress = pickNonEmptyString(
+          cleaned.address,
+          cleaned.commercialAddress,
+          cleaned.fiscalAddress
+        );
+        const resolvedPhone = pickNonEmptyString(cleaned.phone, cleaned.commercialPhone);
+        const resolvedEmail = pickNonEmptyString(cleaned.email);
         return {
+          ...cleaned,
           id: d.id,
-          name: data.name || 'Sucursal',
-          address: data.address || data.commercialAddress || '',
-          phone: data.phone || '',
-          email: data.email || '',
+          name: branchName,
           accountId,
-          isActive: data.isActive !== false,
-          ruc: data.ruc,
-          commercialAddress: data.commercialAddress,
-          fiscalAddress: data.fiscalAddress,
-          receiptLogo: data.receiptLogo,
-          receiptFooter: data.receiptFooter,
-          ...data,
+          isActive: cleaned.isActive !== false,
+          ...(resolvedAddress ? { address: resolvedAddress } : {}),
+          ...(resolvedPhone ? { phone: resolvedPhone } : {}),
+          ...(resolvedEmail ? { email: resolvedEmail } : {}),
         };
       });
 
@@ -2271,27 +2496,97 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     [branches, branchId]
   );
 
-  const activeBranchName = useMemo(
-    () => activeBranch?.name || businessSettings.businessName || 'Tienda Principal',
-    [activeBranch, businessSettings.businessName]
-  );
+  const emitterInfo = useMemo(() => {
+    if (!invoicingConfigRaw) return null;
+    return {
+      ruc: invoicingConfigRaw.emitterRuc,
+      razonSocial: invoicingConfigRaw.emitterRazonSocial,
+      nombreComercial: invoicingConfigRaw.emitterNombreComercial,
+      printedFormatResolution: invoicingConfigRaw.printedFormatResolution ?? null,
+      ...(invoicingConfigRaw.emitterAddress ? { address: invoicingConfigRaw.emitterAddress } : {}),
+      ...(invoicingConfigRaw.emitterPhone ? { phone: invoicingConfigRaw.emitterPhone } : {}),
+      ...(invoicingConfigRaw.emitterEmail ? { email: invoicingConfigRaw.emitterEmail } : {}),
+      ...(invoicingConfigRaw.emitterLogoUrl ? { logoUrl: invoicingConfigRaw.emitterLogoUrl } : {}),
+      ...(invoicingConfigRaw.consultUrl ? { consultUrl: invoicingConfigRaw.consultUrl } : {}),
+      ...(invoicingConfigRaw.receiptFooter ? { receiptFooter: invoicingConfigRaw.receiptFooter } : {}),
+    };
+  }, [invoicingConfigRaw]);
 
-  const scopedBusinessSettings = useMemo(() => {
+  const scopedBusinessSettings = useMemo<BusinessSettings>(() => {
     const base =
       businessSettings.accountId === accountId
         ? businessSettings
         : { ...DEFAULT_BUSINESS_SETTINGS, accountId: accountId || '' };
-    if (!invoicingConfigRaw) return base;
+    const businessInput =
+      base.businessName === 'Ventify POS'
+        ? { ...base, businessName: '' }
+        : base;
+    const resolved = resolveReceiptBusiness({
+      business: businessInput,
+      posSettings: posSettings?.accountId === accountId ? posSettings : null,
+      appearance: appearanceSettings,
+      account: accountBranding,
+      emitter: emitterInfo,
+    });
+
     return {
       ...base,
-      isAmazonExempt: invoicingConfigRaw.isAmazonExempt ?? base.isAmazonExempt,
-      taxExemptionCode: invoicingConfigRaw.taxExemptionCode ?? base.taxExemptionCode,
-      taxRate: invoicingConfigRaw.taxRate ?? base.taxRate,
+      businessName: resolved.businessName,
+      ...(resolved.razonSocial ? { razonSocial: resolved.razonSocial } : {}),
+      ruc: resolved.ruc || '',
+      address: resolved.fiscalAddress || base.address || '',
+      ...(resolved.fiscalAddress ? { fiscalAddress: resolved.fiscalAddress } : {}),
+      ...(resolved.commercialAddress ? { commercialAddress: resolved.commercialAddress } : {}),
+      phone: resolved.phone || base.phone || '',
+      ...(resolved.phone ? { commercialPhone: resolved.phone } : {}),
+      email: resolved.email || base.email || '',
+      website: resolved.website || base.website || '',
+      description: resolved.slogan || base.description || '',
+      ...(resolved.slogan ? { slogan: resolved.slogan } : {}),
+      ...(resolved.receiptHeader ? { receiptHeader: resolved.receiptHeader } : {}),
+      ...(resolved.logoUri
+        ? {
+            receiptLogo: resolved.logoUri,
+            receiptLogoUrl: resolved.logoUri,
+            logoUrl: resolved.logoUri,
+            ...(resolved.receiptLogoDataUrl ? { receiptLogoDataUrl: resolved.receiptLogoDataUrl } : {}),
+          }
+        : {}),
+      ...(resolved.hasCustomFooter
+        ? {
+            receiptFooter: resolved.receiptFooter,
+            ticketFooterMessage: resolved.receiptFooter,
+          }
+        : {}),
+      consultUrl: resolved.consultUrl,
+      showLogo: resolved.showLogo,
+      showRuc: resolved.showRuc,
+      showAddress: resolved.showAddress,
+      showPhone: resolved.showPhone,
+      showEmail: resolved.showEmail,
+      showSlogan: resolved.showSlogan,
+      isAmazonExempt: invoicingConfigRaw?.isAmazonExempt ?? base.isAmazonExempt,
+      taxExemptionCode: invoicingConfigRaw?.taxExemptionCode ?? base.taxExemptionCode,
+      taxRate: invoicingConfigRaw?.taxRate ?? base.taxRate,
       printedFormatResolution:
-        invoicingConfigRaw.printedFormatResolution || base.printedFormatResolution,
-      ruc: base.ruc || invoicingConfigRaw.emitterRuc || '',
+        resolved.printedFormatResolution ||
+        invoicingConfigRaw?.printedFormatResolution ||
+        base.printedFormatResolution,
     };
-  }, [accountId, businessSettings, invoicingConfigRaw]);
+  }, [
+    accountId,
+    businessSettings,
+    posSettings,
+    appearanceSettings,
+    accountBranding,
+    emitterInfo,
+    invoicingConfigRaw,
+  ]);
+
+  const activeBranchName = useMemo(
+    () => activeBranch?.name || scopedBusinessSettings.businessName || 'Tienda Principal',
+    [activeBranch, scopedBusinessSettings.businessName]
+  );
 
   const taxProfile = useMemo(
     () =>
@@ -2302,16 +2597,6 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       }),
     [scopedBusinessSettings]
   );
-
-  const emitterInfo = useMemo(() => {
-    if (!invoicingConfigRaw) return null;
-    return {
-      ruc: invoicingConfigRaw.emitterRuc,
-      razonSocial: invoicingConfigRaw.emitterRazonSocial,
-      nombreComercial: invoicingConfigRaw.emitterNombreComercial,
-      printedFormatResolution: invoicingConfigRaw.printedFormatResolution ?? null,
-    };
-  }, [invoicingConfigRaw]);
 
   const businessSettingsValue = useMemo<BusinessSettingsContextType>(
     () => ({

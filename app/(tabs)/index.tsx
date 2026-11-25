@@ -895,6 +895,7 @@ export default function PosCounterScreen() {
               onClose={handleCloseResTicket}
               reservation={createdResTicket}
               business={businessSettings}
+              branch={activeBranch}
             />
           );
         })()}

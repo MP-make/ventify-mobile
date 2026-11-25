@@ -33,7 +33,7 @@ import {
   type PlanSubscription,
 } from '@/context/AuthContext';
 import { APP_URL } from '@/lib/firebase';
-import { type PlanFeatureKey } from '@/lib/plan-entitlements';
+import { resolveSunatInvoicingAccess, type PlanFeatureKey } from '@/lib/plan-entitlements';
 import type { AccountTaxProfile } from '@/lib/invoicing/receipt-amounts';
 import { ui } from '@/lib/theme';
 import type { Branch, BusinessSettings, PosSettings } from '@/types';
@@ -335,7 +335,13 @@ export const BusinessSettingsTab = React.memo<BusinessSettingsTabProps>(
 
           <View style={planChipsContainerStyle}>
             {PLAN_MODULE_CHIPS.map((mod) => {
-              const enabled = features[mod.key];
+              const enabled =
+                mod.key === 'sunatInvoicing'
+                  ? resolveSunatInvoicingAccess({
+                      planAllowsSunatInvoicing: features.sunatInvoicing,
+                      invoicingEnabled,
+                    }).allowed
+                  : features[mod.key];
               return (
                 <View
                   key={mod.key}

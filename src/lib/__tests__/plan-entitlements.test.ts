@@ -1,10 +1,15 @@
-import { describe, expect, it } from 'vitest';
+import fs from 'fs';
+import path from 'path';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   arePlanEntitlementsEqual,
   PLAN_FEATURE_METADATA,
   resolvePlanEntitlements,
   resolvePlanTier,
+  resolveSunatInvoicingAccess,
 } from '../plan-entitlements';
+
+const WORKSPACE_ROOT = path.resolve(__dirname, '../../..');
 
 describe('plan-entitlements', () => {
   it('resolves all 9 live Firestore plans accurately', () => {
@@ -248,5 +253,254 @@ describe('plan-entitlements', () => {
     });
     expect(arePlanEntitlementsEqual(a, b)).toBe(true);
     expect(Object.keys(PLAN_FEATURE_METADATA)).toHaveLength(7);
+  });
+
+  it('gates SUNAT invoicing on both plan entitlement and account invoicingEnabled flag', () => {
+    expect(
+      resolveSunatInvoicingAccess({
+        planAllowsSunatInvoicing: false,
+        invoicingEnabled: false,
+      })
+    ).toEqual({ allowed: false, lockReason: 'plan' });
+
+    const emprendedorUnlimited = resolvePlanEntitlements({
+      planId: '51cz55Fiphrj2rkFtEgJ',
+      planName: 'Plan Emprendedor (Productos Ilimitados)',
+      branchesMax: 1,
+      usersMax: 2,
+      productsMax: -1,
+    });
+    expect(
+      resolveSunatInvoicingAccess({
+        planAllowsSunatInvoicing: emprendedorUnlimited.features.sunatInvoicing,
+        invoicingEnabled: false,
+      })
+    ).toEqual({ allowed: false, lockReason: 'account_disabled' });
+
+    expect(
+      resolveSunatInvoicingAccess({
+        planAllowsSunatInvoicing: emprendedorUnlimited.features.sunatInvoicing,
+        invoicingEnabled: true,
+      })
+    ).toEqual({ allowed: true, lockReason: null });
+
+    expect(
+      resolveSunatInvoicingAccess({
+        planAllowsSunatInvoicing: false,
+        invoicingEnabled: true,
+      })
+    ).toEqual({ allowed: false, lockReason: 'plan' });
+  });
+
+  describe('UI & Fabric regressions', () => {
+    afterEach(() => {
+      vi.resetModules();
+      vi.doUnmock('@/lib/firebase');
+      vi.doUnmock('firebase/firestore');
+    });
+
+    it('gates Facturación SUNAT in facturacion.tsx, ModuleLauncherModal, history.tsx, BusinessSettingsTab, and ProductFormModal via resolveSunatInvoicingAccess', () => {
+      const files = [
+        'app/facturacion.tsx',
+        'src/components/ModuleLauncherModal.tsx',
+        'app/(tabs)/history.tsx',
+        'src/components/settings/BusinessSettingsTab.tsx',
+        'src/components/ProductFormModal.tsx',
+      ];
+      for (const relPath of files) {
+        const source = fs.readFileSync(path.join(WORKSPACE_ROOT, relPath), 'utf8');
+        expect(source).toContain('resolveSunatInvoicingAccess');
+        expect(source).toContain('invoicingEnabled');
+      }
+
+      const facturacionSource = fs.readFileSync(
+        path.join(WORKSPACE_ROOT, 'app/facturacion.tsx'),
+        'utf8'
+      );
+      expect(facturacionSource).toContain('lockReason="account_disabled"');
+      expect(facturacionSource).toContain('!sunatAccess.allowed');
+      expect(facturacionSource).toContain('waitingAccountConfig');
+    });
+
+    it('keeps PayrollUsersModal Fabric-safe with PayrollErrorBoundary, FlatList, collapsable={false}, and no SafeAreaView/pageSheet/FlashList', () => {
+      const payrollSource = fs.readFileSync(
+        path.join(WORKSPACE_ROOT, 'src/components/PayrollUsersModal.tsx'),
+        'utf8'
+      );
+      const exportIdx = payrollSource.indexOf('export const PayrollUsersModal');
+      expect(exportIdx).toBeGreaterThan(-1);
+      const exportedBlock = payrollSource.slice(exportIdx);
+      expect(exportedBlock).toContain('<PayrollErrorBoundary');
+      expect(exportedBlock).toContain('<PayrollUsersContent');
+
+      expect(payrollSource).toContain('transparent');
+      expect(payrollSource).toContain('statusBarTranslucent');
+      expect(payrollSource).toContain('collapsable={false}');
+      expect(payrollSource).toContain('<FlatList');
+      expect(payrollSource).toContain('styles.listFlex');
+      expect(payrollSource).toContain('removeClippedSubviews={false}');
+      expect(payrollSource).not.toContain('SafeAreaView');
+      expect(payrollSource).not.toContain('presentationStyle="pageSheet"');
+      expect(payrollSource).not.toContain('FlashList');
+    });
+
+    it('keeps ProductFormModal Fabric-safe without Android height keyboard shrinkage and gates IGV section by invoicingEnabled', () => {
+      const modalSource = fs.readFileSync(
+        path.join(WORKSPACE_ROOT, 'src/components/ProductFormModal.tsx'),
+        'utf8'
+      );
+      const unitsTaxSource = fs.readFileSync(
+        path.join(WORKSPACE_ROOT, 'src/components/product-form/UnitsTaxSection.tsx'),
+        'utf8'
+      );
+
+      expect(unitsTaxSource).toContain('showTaxSection: boolean');
+      expect(unitsTaxSource).toContain('{showTaxSection && (');
+      expect(unitsTaxSource).toContain('Afectación IGV (SUNAT)');
+
+      expect(modalSource).toContain('transparent');
+      expect(modalSource).toContain('statusBarTranslucent');
+      expect(modalSource).toContain('collapsable={false}');
+      expect(modalSource).toContain("behavior={Platform.OS === 'ios' ? 'padding' : undefined}");
+      expect(modalSource).not.toContain("behavior={Platform.OS === 'ios' ? 'padding' : 'height'}");
+      expect(modalSource).toContain('showTaxSection={showTaxExemptionSection}');
+    });
+
+    it('keeps operations and history headers single-row with grey locked styles instead of Lock icons', () => {
+      const opsStyles = fs.readFileSync(
+        path.join(WORKSPACE_ROOT, 'src/components/operations/operationsStyles.ts'),
+        'utf8'
+      );
+      const opsHeaderRowMatch = opsStyles.match(/compactHeaderRow:\s*\{[^}]*\}/);
+      expect(opsHeaderRowMatch).not.toBeNull();
+      expect(opsHeaderRowMatch![0]).toMatch(/flexDirection:\s*'row'/);
+      expect(opsHeaderRowMatch![0]).toMatch(/justifyContent:\s*'space-between'/);
+      expect(opsStyles).toContain('compactTeamButtonLocked');
+      expect(opsStyles).toContain('compactTeamButtonTextLocked');
+
+      const historyStyles = fs.readFileSync(
+        path.join(WORKSPACE_ROOT, 'src/components/history/historyStyles.ts'),
+        'utf8'
+      );
+      const historyHeaderRowMatch = historyStyles.match(/compactHeaderRow:\s*\{[^}]*\}/);
+      expect(historyHeaderRowMatch).not.toBeNull();
+      expect(historyHeaderRowMatch![0]).toMatch(/flexDirection:\s*'row'/);
+      expect(historyHeaderRowMatch![0]).toMatch(/justifyContent:\s*'space-between'/);
+      expect(historyStyles).toContain('compactButtonLocked');
+      expect(historyStyles).toContain('compactButtonTextLocked');
+
+      const opsSource = fs.readFileSync(
+        path.join(WORKSPACE_ROOT, 'app/(tabs)/operations.tsx'),
+        'utf8'
+      );
+      expect(opsSource).toContain('compactTeamButtonLocked');
+      expect(opsSource).toContain('compactTeamButtonTextLocked');
+      expect(opsSource).not.toContain('<Lock');
+
+      const historySource = fs.readFileSync(
+        path.join(WORKSPACE_ROOT, 'app/(tabs)/history.tsx'),
+        'utf8'
+      );
+      const headerActionsSlice = historySource.slice(
+        historySource.indexOf('styles.compactHeaderActions'),
+        historySource.indexOf('tabSelectorRowCentered')
+      );
+      expect(headerActionsSlice).toContain('compactButtonLocked');
+      expect(headerActionsSlice).toContain('compactButtonTextLocked');
+      expect(headerActionsSlice).not.toContain('<Lock');
+    });
+
+    it('attaches subscribeToTeamMembers when AppState is inactive, active, or undefined, and skips background', async () => {
+      vi.resetModules();
+
+      const appStateObj: { currentState?: string; addEventListener: any } = {
+        currentState: 'inactive',
+        addEventListener: vi.fn(() => ({ remove: vi.fn() })),
+      };
+
+      const onSnapshotMock = vi.fn((_q: any, onNext: any) => {
+        onNext({
+          docs: [
+            {
+              id: 'user-1',
+              data: () => ({
+                accountId: 'acc-1',
+                name: 'Ana Admin',
+                email: 'ana@ventify.pe',
+                role: 'admin',
+                isActive: true,
+              }),
+            },
+          ],
+        });
+        return vi.fn();
+      });
+
+      const NativeModule = require('module');
+      const originalLoad = NativeModule._load;
+      const loadSpy = vi
+        .spyOn(NativeModule, '_load')
+        .mockImplementation((request: unknown, ...args: unknown[]) => {
+          if (request === 'react-native') {
+            return { AppState: appStateObj };
+          }
+          return originalLoad.call(NativeModule, request, ...args);
+        });
+
+      try {
+        vi.doMock('@/lib/firebase', () => ({
+          db: { mocked: true },
+          auth: {},
+          APP_URL: 'https://example.com',
+        }));
+        vi.doMock('firebase/firestore', () => ({
+          collection: vi.fn((_db: any, name: string) => ({ name })),
+          doc: vi.fn(),
+          addDoc: vi.fn(),
+          setDoc: vi.fn(),
+          getDoc: vi.fn(),
+          getDocs: vi.fn(async () => ({ docs: [] })),
+          updateDoc: vi.fn(),
+          deleteDoc: vi.fn(),
+          deleteField: vi.fn(),
+          query: vi.fn((...parts: any[]) => ({ parts })),
+          where: vi.fn((f: string, op: string, v: any) => ({ f, op, v })),
+          orderBy: vi.fn((field: string, dir: string) => ({ field, dir })),
+          limit: vi.fn((n: number) => ({ limit: n })),
+          onSnapshot: onSnapshotMock,
+          runTransaction: vi.fn(),
+          serverTimestamp: () => 'ts',
+        }));
+
+        const { subscribeToTeamMembers } = await import('../../services/enterprise-ops-service');
+
+        const cbInactive = vi.fn();
+        const unsub1 = subscribeToTeamMembers('acc-1', cbInactive);
+        expect(onSnapshotMock).toHaveBeenCalledTimes(1);
+        expect(cbInactive).toHaveBeenCalledTimes(1);
+        expect(cbInactive.mock.calls[0][0]).toHaveLength(1);
+        unsub1();
+
+        appStateObj.currentState = 'active';
+        const cbActive = vi.fn();
+        const unsub2 = subscribeToTeamMembers('acc-1', cbActive);
+        expect(onSnapshotMock).toHaveBeenCalledTimes(2);
+        unsub2();
+
+        appStateObj.currentState = undefined;
+        const cbUndef = vi.fn();
+        const unsub3 = subscribeToTeamMembers('acc-1', cbUndef);
+        expect(onSnapshotMock).toHaveBeenCalledTimes(3);
+        unsub3();
+
+        appStateObj.currentState = 'background';
+        const cbBg = vi.fn();
+        const unsub4 = subscribeToTeamMembers('acc-1', cbBg);
+        expect(onSnapshotMock).toHaveBeenCalledTimes(3);
+        unsub4();
+      } finally {
+        loadSpy.mockRestore();
+      }
+    });
   });
 });

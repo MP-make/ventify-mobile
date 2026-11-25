@@ -1,5 +1,5 @@
 import { catalogAttributeUpdate, catalogSizeInput } from '@/lib/product-attributes';
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
   AppState,
   View,
@@ -11,6 +11,7 @@ import {
   Alert,
   KeyboardAvoidingView,
   Platform,
+  StatusBar,
   ActivityIndicator,
   useWindowDimensions,
 } from 'react-native';
@@ -20,12 +21,20 @@ import * as Haptics from 'expo-haptics';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { ui } from '@/lib/theme';
 import { SectionHeading } from '@/components/ui';
-import { useAuthSession } from '@/context/AuthContext';
+import { useAuthSession, usePlanFeatures } from '@/context/AuthContext';
 import { useBusinessSettings, useOfflineStatus } from '@/context/SettingsContext';
+import { useProductsActions } from '@/context/ProductsContext';
 import { usePermissions } from '@/hooks/usePermissions';
 import { checkIsOnlineLive } from '@/lib/online-guard';
+import { resolveSunatInvoicingAccess } from '@/lib/plan-entitlements';
 import { normalizePresentation } from '@/lib/presentation-parity';
 import type { BranchPriceConfig, PriceTier, ProductAttribute, ProductVariant } from '@/types';
+import {
+  lookupGlobalProductDetailed,
+  mapGlobalUnitToMobileUnit,
+  sanitizeGlobalCatalogBarcode,
+  type GlobalProduct,
+} from '@/services/global-catalog-service';
 import {
   isLocalFileUri,
   mergeSingleBranchStock,
@@ -65,6 +74,7 @@ interface ProductFormModalProps {
   visible: boolean;
   onClose: () => void;
   product?: any | null;
+  initialBarcode?: string;
   onSave?: (productData: ProductFormData) => Promise<void> | void;
   branchId?: string;
   accountId?: string;
@@ -78,6 +88,7 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
   visible,
   onClose,
   product,
+  initialBarcode,
   onSave,
   branchId = 'main',
   accountId: accountIdProp,
@@ -86,11 +97,23 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
   const insets = useSafeAreaInsets();
   const { accountId: authAccountId } = useAuthSession();
   const effectiveAccountId = accountIdProp || authAccountId || '';
-  const { branches, posSettings } = useBusinessSettings();
+  const { branches, posSettings, invoicingEnabled } = useBusinessSettings();
+  const { features } = usePlanFeatures();
   const { isOnline: settingsIsOnline } = useOfflineStatus();
+  const { findByBarcode } = useProductsActions();
   const { canManageProducts, canViewMargins } = usePermissions();
   const enableCatalogFilters = !!posSettings?.enableCatalogFilters;
+  const showTaxExemptionSection = useMemo(
+    () =>
+      resolveSunatInvoicingAccess({
+        planAllowsSunatInvoicing: features.sunatInvoicing,
+        invoicingEnabled,
+      }).allowed,
+    [features.sunatInvoicing, invoicingEnabled]
+  );
   const compactLayout = windowWidth < 380;
+  const headerTopPadding =
+    Math.max(insets.top, Platform.OS === 'android' ? StatusBar.currentHeight ?? 0 : 0) + 8;
 
   const lastScanTimestampRef = useRef<number>(0);
   const scanningTargetRef = useRef<'main' | number>('main');
@@ -117,6 +140,34 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
   const [galleryImages, setGalleryImages] = useState<string[]>([]);
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
   const [stockByBranch, setStockByBranch] = useState<Record<string, number>>({});
+
+  // Sincronización colaborativa de catálogo global por código de barras
+  const [isSearchingCatalog, setIsSearchingCatalog] = useState(false);
+  const [catalogSuggestion, setCatalogSuggestion] = useState<GlobalProduct | null>(null);
+  const [catalogNotice, setCatalogNotice] = useState<{
+    type: 'success' | 'info' | 'warning';
+    text: string;
+  } | null>(null);
+
+  const nameRef = useRef(name);
+  nameRef.current = name;
+  const galleryImagesRef = useRef(galleryImages);
+  galleryImagesRef.current = galleryImages;
+  const unitOfMeasureRef = useRef(unitOfMeasure);
+  unitOfMeasureRef.current = unitOfMeasure;
+  const categoryRef = useRef(category);
+  categoryRef.current = category;
+  const barcodeRef = useRef(barcode);
+  barcodeRef.current = barcode;
+  const settingsIsOnlineRef = useRef(settingsIsOnline);
+  settingsIsOnlineRef.current = settingsIsOnline;
+  const catalogSuggestionRef = useRef<GlobalProduct | null>(catalogSuggestion);
+  catalogSuggestionRef.current = catalogSuggestion;
+
+  const categoryTouchedRef = useRef(false);
+  const lastSearchedBarcodeRef = useRef('');
+  const generatedBarcodesRef = useRef<Set<string>>(new Set());
+  const lookupRequestIdRef = useRef(0);
 
   const [priceTiers, setPriceTiers] = useState<PriceTier[]>([]);
   const [branchPricesDraft, setBranchPricesDraft] = useState<Record<string, BranchPriceDraft>>({});
@@ -158,17 +209,29 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
   useEffect(() => {
     if (!visible) {
       wasVisibleRef.current = false;
+      lookupRequestIdRef.current += 1;
+      setIsSearchingCatalog(false);
+      setCatalogSuggestion(null);
+      setCatalogNotice(null);
       return;
     }
     if (wasVisibleRef.current) return;
     wasVisibleRef.current = true;
     setUploadStatus(null);
+    setIsSearchingCatalog(false);
+    setCatalogSuggestion(null);
+    setCatalogNotice(null);
+    generatedBarcodesRef.current.clear();
     setFormSessionKey((k) => k + 1);
 
     if (product) {
+      const existingBarcode = product.barcode || '';
       setName(product.name || '');
       setCategory(product.category || 'Abarrotes');
-      setBarcode(product.barcode || '');
+      barcodeRef.current = existingBarcode;
+      setBarcode(existingBarcode);
+      lastSearchedBarcodeRef.current = existingBarcode.trim();
+      categoryTouchedRef.current = Boolean(product.category?.trim());
       setSku(product.sku || '');
       setBrand(product.brand || '');
       setSizeLabel(catalogSizeInput(product));
@@ -261,10 +324,14 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
         : [];
       setAttributesList(rawAttrs);
     } else {
-      // Reset para nuevo producto
+      // Reset para nuevo producto (sin autogenerar código ni consumir lecturas al abrir)
+      const seededBarcode = initialBarcode?.trim() || '';
       setName('');
       setCategory('Abarrotes');
-      setBarcode(generatePeruvianEan13());
+      barcodeRef.current = seededBarcode;
+      setBarcode(seededBarcode);
+      lastSearchedBarcodeRef.current = '';
+      categoryTouchedRef.current = false;
       setSku('');
       setBrand('');
       setSizeLabel('');
@@ -291,7 +358,19 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
     setScannerActive(false);
     setPresModalState({ open: false, editing: null });
     setVariantModalState({ open: false, editing: null });
-  }, [visible, product, branchId]);
+  }, [visible, product, branchId, initialBarcode]);
+
+  // Detección local de duplicados en inventario (0 lecturas Firestore)
+  const duplicateProduct = useMemo(() => {
+    const clean = barcode.trim();
+    if (!visible || clean.length < 3) return null;
+    const match = findByBarcode(clean);
+    if (!match?.product || match.product.id === product?.id) return null;
+    return {
+      name: match.product.name,
+      sku: match.product.sku,
+    };
+  }, [visible, barcode, findByBarcode, product?.id]);
 
   // --------------------------------------------------------------------------
   // CALLBACKS ESTABLES PARA SECCIONES MEMOIZADAS
@@ -322,10 +401,240 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
   }, []);
 
+  const handleChangeCategory = useCallback((val: string) => {
+    categoryTouchedRef.current = true;
+    categoryRef.current = val;
+    setCategory(val);
+  }, []);
+
+  const handleChangeBarcode = useCallback((val: string) => {
+    const prevTrimmed = barcodeRef.current.trim();
+    const nextTrimmed = val.trim();
+    barcodeRef.current = val;
+    setCatalogNotice(null);
+    if (nextTrimmed !== prevTrimmed) {
+      setCatalogSuggestion(null);
+    }
+    setBarcode(val);
+  }, []);
+
   const handleGenerateBarcode = useCallback(() => {
-    setBarcode(generatePeruvianEan13());
+    const ean = generatePeruvianEan13();
+    generatedBarcodesRef.current.add(ean);
+    lastSearchedBarcodeRef.current = ean;
+    lookupRequestIdRef.current += 1;
+    barcodeRef.current = ean;
+    setIsSearchingCatalog(false);
+    setCatalogSuggestion(null);
+    setCatalogNotice(null);
+    setBarcode(ean);
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
   }, []);
+
+  const applyCatalogSuggestion = useCallback((overrideMatch?: GlobalProduct) => {
+    const target = overrideMatch ?? catalogSuggestionRef.current;
+    if (!target) return;
+
+    if (target.name) {
+      nameRef.current = target.name;
+      setName(target.name);
+    }
+    if (target.category && (!categoryTouchedRef.current || !categoryRef.current.trim())) {
+      categoryRef.current = target.category;
+      setCategory(target.category);
+    }
+    const mappedUnit = mapGlobalUnitToMobileUnit(target.unitOfMeasure);
+    if (mappedUnit) {
+      unitOfMeasureRef.current = mappedUnit;
+      setUnitOfMeasure(mappedUnit);
+      if (['KGM', 'LTR', 'g', 'm'].includes(mappedUnit)) {
+        setAllowDecimals(true);
+      }
+    }
+    if (target.imageUrl) {
+      const targetImageUrl = target.imageUrl;
+      setGalleryImages((prev) => {
+        const next = [targetImageUrl, ...prev.filter((u) => u !== targetImageUrl)].slice(
+          0,
+          MAX_GALLERY_IMAGES
+        );
+        galleryImagesRef.current = next;
+        return next;
+      });
+    }
+
+    setCatalogSuggestion(null);
+    setCatalogNotice({
+      type: 'success',
+      text: `✨ Sincronizado con "${target.name}".`,
+    });
+    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+  }, []);
+
+  const runCatalogLookup = useCallback(
+    async (
+      rawCode: string,
+      {
+        source,
+        forceRefresh = false,
+      }: { source: 'auto' | 'scan' | 'manual'; forceRefresh?: boolean }
+    ) => {
+      const cleanCode = sanitizeGlobalCatalogBarcode(rawCode);
+      if (!cleanCode) {
+        if (source === 'manual') {
+          setCatalogNotice({
+            type: 'warning',
+            text: 'Ingresa al menos 3 caracteres válidos en el código de barras.',
+          });
+        }
+        return;
+      }
+
+      const preCheckId = lookupRequestIdRef.current;
+      const online = await checkIsOnlineLive(settingsIsOnlineRef.current);
+      if (
+        lookupRequestIdRef.current !== preCheckId ||
+        barcodeRef.current.trim() !== cleanCode
+      ) {
+        return;
+      }
+      if (!online) {
+        if (source === 'manual') {
+          setCatalogNotice({
+            type: 'warning',
+            text: 'Sin conexión a internet. Conéctate para sincronizar.',
+          });
+        }
+        return;
+      }
+
+      const requestId = ++lookupRequestIdRef.current;
+      lastSearchedBarcodeRef.current = cleanCode;
+      setIsSearchingCatalog(true);
+
+      try {
+        const outcome = await lookupGlobalProductDetailed(cleanCode, {
+          forceRefresh,
+          allowNetwork: true,
+        });
+
+        if (
+          lookupRequestIdRef.current !== requestId ||
+          barcodeRef.current.trim() !== cleanCode
+        ) {
+          return;
+        }
+
+        if (outcome.status === 'rate_limited') {
+          if (source === 'manual') {
+            setCatalogNotice({
+              type: 'warning',
+              text: 'Espera unos segundos antes de consultar más códigos.',
+            });
+          }
+          return;
+        }
+
+        const match = outcome.product;
+        if (!match) {
+          setCatalogSuggestion(null);
+          if (source === 'manual') {
+            setCatalogNotice({
+              type: 'info',
+              text: 'No se encontraron datos para este código en el catálogo global aún.',
+            });
+          }
+          return;
+        }
+
+        const currentName = nameRef.current.trim();
+        const hasImages = galleryImagesRef.current.length > 0;
+
+        // Caso 1: Sin nombre ni imágenes -> sincronización automática directa
+        if (!currentName && !hasImages) {
+          applyCatalogSuggestion(match);
+          return;
+        }
+
+        // Caso 2: El usuario ya ingresó datos -> mostrar tarjeta de sugerencia segura
+        const canSyncImage = Boolean(match.imageUrl && !hasImages);
+        const canSyncName = Boolean(
+          match.name && currentName.toLowerCase() !== match.name.trim().toLowerCase()
+        );
+        const mappedUnit = mapGlobalUnitToMobileUnit(match.unitOfMeasure);
+        const canSyncUnit = Boolean(mappedUnit && mappedUnit !== unitOfMeasureRef.current);
+
+        if (canSyncImage || canSyncName || canSyncUnit) {
+          setCatalogSuggestion(match);
+          if (source === 'manual') {
+            setCatalogNotice({
+              type: 'info',
+              text: `Datos encontrados para "${match.name}". Toca Sincronizar para aplicarlos.`,
+            });
+          }
+        } else {
+          setCatalogSuggestion(null);
+          if (source === 'manual') {
+            setCatalogNotice({
+              type: 'info',
+              text: 'Los datos ya coinciden con el catálogo global.',
+            });
+          }
+        }
+      } finally {
+        if (lookupRequestIdRef.current === requestId) {
+          setIsSearchingCatalog(false);
+        }
+      }
+    },
+    [applyCatalogSuggestion]
+  );
+
+  const handleManualCatalogSearch = useCallback(() => {
+    void runCatalogLookup(barcodeRef.current, { source: 'manual', forceRefresh: true });
+  }, [runCatalogLookup]);
+
+  const handleApplyCatalogSuggestion = useCallback(() => {
+    applyCatalogSuggestion();
+  }, [applyCatalogSuggestion]);
+
+  const handleDismissCatalogSuggestion = useCallback(() => {
+    setCatalogSuggestion(null);
+  }, []);
+
+  const handleDismissCatalogNotice = useCallback(() => {
+    setCatalogNotice(null);
+  }, []);
+
+  // Auto-búsqueda conservadora por efecto (debounce 750ms, mínimo 6 caracteres, online)
+  useEffect(() => {
+    if (!visible) return;
+    const clean = barcode.trim();
+    if (clean.length < 3) {
+      setCatalogSuggestion(null);
+      return;
+    }
+    if (clean.length < 6) return;
+    if (clean === lastSearchedBarcodeRef.current || generatedBarcodesRef.current.has(clean)) {
+      return;
+    }
+    if (!settingsIsOnline) return;
+
+    const timer = setTimeout(() => {
+      void runCatalogLookup(clean, { source: 'auto' });
+    }, 750);
+
+    return () => clearTimeout(timer);
+  }, [barcode, visible, settingsIsOnline, runCatalogLookup]);
+
+  // Auto-ocultar avisos de sincronización después de 4 segundos
+  useEffect(() => {
+    if (!catalogNotice) return;
+    const timer = setTimeout(() => {
+      setCatalogNotice(null);
+    }, 4000);
+    return () => clearTimeout(timer);
+  }, [catalogNotice]);
 
   const handleStartScanner = useCallback(
     async (target: 'main' | number = 'main') => {
@@ -342,27 +651,34 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
     [requestCameraPermission]
   );
 
-  const handleBarcodeScanned = useCallback(({ data }: { data: string }) => {
-    const now = Date.now();
-    if (now - lastScanTimestampRef.current < 1000) return;
-    lastScanTimestampRef.current = now;
+  const handleBarcodeScanned = useCallback(
+    ({ data }: { data: string }) => {
+      const now = Date.now();
+      if (now - lastScanTimestampRef.current < 1000) return;
+      lastScanTimestampRef.current = now;
 
-    if (data) {
-      const clean = data.trim();
-      const target = scanningTargetRef.current;
-      if (target === 'main') {
-        setBarcode(clean);
-      } else if (typeof target === 'number') {
-        setExtraBarcodes((prev) => {
-          const next = [...prev];
-          next[target] = clean;
-          return next;
-        });
+      if (data) {
+        const clean = data.trim();
+        const target = scanningTargetRef.current;
+        if (target === 'main') {
+          generatedBarcodesRef.current.delete(clean);
+          barcodeRef.current = clean;
+          setCatalogNotice(null);
+          setBarcode(clean);
+          void runCatalogLookup(clean, { source: 'scan' });
+        } else if (typeof target === 'number') {
+          setExtraBarcodes((prev) => {
+            const next = [...prev];
+            next[target] = clean;
+            return next;
+          });
+        }
+        setScannerActive(false);
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
       }
-      setScannerActive(false);
-      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
-    }
-  }, []);
+    },
+    [runCatalogLookup]
+  );
 
   const handleAddExtraBarcode = useCallback(() => {
     setExtraBarcodes((prev) => [...prev, '']);
@@ -384,6 +700,7 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
 
   const handleGenerateExtraBarcode = useCallback((index: number) => {
     const ean = generatePeruvianEan13();
+    generatedBarcodesRef.current.add(ean);
     setExtraBarcodes((prev) => {
       const next = [...prev];
       next[index] = ean;
@@ -665,6 +982,7 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
         category: category.trim() || 'General',
         barcode: barcode.trim(),
         barcodes: cleanExtraBarcodes,
+        generatedBarcodes: Array.from(generatedBarcodesRef.current),
         sku: sku.trim() || barcode.trim() || `SKU-${Date.now().toString().slice(-6)}`,
         ...catalogAttributeUpdate(product, enableCatalogFilters, brand, sizeLabel),
         unitOfMeasure,
@@ -704,13 +1022,16 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
   if (!visible) return null;
 
   return (
-    <Modal visible={visible} animationType="slide" transparent={false} onRequestClose={onClose}>
-      <KeyboardAvoidingView
-        style={styles.keyboardContainer}
-        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-      >
+    <Modal
+      visible={visible}
+      animationType="slide"
+      transparent
+      statusBarTranslucent
+      onRequestClose={onClose}
+    >
+      <View style={styles.keyboardContainer} collapsable={false}>
         {/* Cabecera */}
-        <View style={[styles.header, { paddingTop: Math.max(insets.top + 8, 16) }]}>
+        <View style={[styles.header, { paddingTop: headerTopPadding }]}>
           <View style={styles.headerTitleRow}>
             <View style={styles.headerIconWrapper}>
               <Package size={20} color={ui.primary} />
@@ -735,6 +1056,10 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
           </TouchableOpacity>
         </View>
 
+        <KeyboardAvoidingView
+          style={{ flex: 1 }}
+          behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        >
         {/* Visor de Escáner Integrado para Código de Barras */}
         {scannerActive && isAppActive ? (
           <View style={styles.scannerWrapper}>
@@ -793,8 +1118,16 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
             compactLayout={compactLayout}
             initialShowExtraBarcodes={initialShowExtraBarcodes}
             formSessionKey={formSessionKey}
-            onChangeBarcode={setBarcode}
+            isSearchingCatalog={isSearchingCatalog}
+            catalogSuggestion={catalogSuggestion}
+            catalogNotice={catalogNotice}
+            duplicateProduct={duplicateProduct}
+            onChangeBarcode={handleChangeBarcode}
             onGenerateBarcode={handleGenerateBarcode}
+            onManualCatalogSearch={handleManualCatalogSearch}
+            onApplyCatalogSuggestion={handleApplyCatalogSuggestion}
+            onDismissCatalogSuggestion={handleDismissCatalogSuggestion}
+            onDismissCatalogNotice={handleDismissCatalogNotice}
             onStartScanner={handleStartScanner}
             onAddExtraBarcode={handleAddExtraBarcode}
             onRemoveExtraBarcode={handleRemoveExtraBarcode}
@@ -810,7 +1143,7 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
             enableCatalogFilters={enableCatalogFilters}
             compactLayout={compactLayout}
             onChangeSku={setSku}
-            onChangeCategory={setCategory}
+            onChangeCategory={handleChangeCategory}
             onChangeBrand={setBrand}
             onChangeSizeLabel={setSizeLabel}
           />
@@ -819,6 +1152,7 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
             unitOfMeasure={unitOfMeasure}
             allowDecimals={allowDecimals}
             taxExemptionCode={taxExemptionCode}
+            showTaxSection={showTaxExemptionSection}
             onSelectUnit={handleSelectUnit}
             onToggleDecimals={setAllowDecimals}
             onSelectTaxCode={setTaxExemptionCode}
@@ -941,6 +1275,8 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
           </TouchableOpacity>
         </View>
 
+        </KeyboardAvoidingView>
+
         {/* Modal Secundario para Crear / Editar Presentación (Condicionalmente montado) */}
         {presModalState.open && (
           <PresentationFormSubModal
@@ -964,7 +1300,7 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = React.memo(({
             onSubmit={handleSubmitVariant}
           />
         )}
-      </KeyboardAvoidingView>
+      </View>
     </Modal>
   );
 });

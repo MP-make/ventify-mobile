@@ -12,16 +12,25 @@ export function normalizePresentation<T extends PresentationInput>(presentation:
   return { ...presentation, conversionFactor: presentationFactor(presentation) };
 }
 export function reservationCartLines(items: CartItem[]) {
-  return items.map(item => {
+  return items.map((item) => {
     if (!item.productId) throw new Error('El producto del carrito no tiene un identificador válido.');
     const factor = item.presentationQty || item.conversionFactor || presentationFactor(item.presentation);
+    const variantId = item.variantId || item.variant?.id;
+    const variantName = item.variantName || item.variant?.name;
+    const presentationId = item.presentationId || item.presentation?.id;
     return {
-      productId: item.productId, id: item.productId, productName: item.name, name: item.name,
-      quantity: item.quantity, price: item.price, sku: item.sku || '',
-      variantId: item.variantId || item.variant?.id,
-      variantName: item.variantName || item.variant?.name,
-      presentationId: item.presentationId || item.presentation?.id,
-      presentationQty: factor, conversionFactor: factor,
+      productId: item.productId,
+      id: item.productId,
+      productName: item.name,
+      name: item.name,
+      quantity: item.quantity,
+      price: item.price,
+      sku: item.sku || '',
+      ...(variantId ? { variantId } : {}),
+      ...(variantName ? { variantName } : {}),
+      ...(presentationId ? { presentationId } : {}),
+      presentationQty: factor,
+      conversionFactor: factor,
     };
   });
 }

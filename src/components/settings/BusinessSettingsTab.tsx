@@ -5,6 +5,7 @@ import {
   Linking,
   Modal,
   ScrollView,
+  StyleSheet,
   Switch,
   Text,
   TextInput,
@@ -18,6 +19,7 @@ import {
   Check,
   Crown,
   ExternalLink,
+  Lock,
   RefreshCw,
   Save,
   Store,
@@ -25,8 +27,13 @@ import {
 } from 'lucide-react-native';
 
 import { SectionHeading } from '@/components/ui';
-import type { PlanLimits, PlanSubscription } from '@/context/AuthContext';
+import {
+  usePlanFeatures,
+  type PlanLimits,
+  type PlanSubscription,
+} from '@/context/AuthContext';
 import { APP_URL } from '@/lib/firebase';
+import { type PlanFeatureKey } from '@/lib/plan-entitlements';
 import type { AccountTaxProfile } from '@/lib/invoicing/receipt-amounts';
 import { ui } from '@/lib/theme';
 import type { Branch, BusinessSettings, PosSettings } from '@/types';
@@ -41,6 +48,39 @@ const SUBSCRIPTION_BADGE_MAP: Record<string, { label: string; bg: string; color:
   canceled: { label: 'Cancelada', bg: ui.dangerSoft, color: ui.danger },
   cancelled: { label: 'Cancelada', bg: ui.dangerSoft, color: ui.danger },
 };
+
+const PLAN_MODULE_CHIPS: Array<{ key: PlanFeatureKey; label: string }> = [
+  { key: 'purchases', label: 'Compras' },
+  { key: 'sunatInvoicing', label: 'Facturación SUNAT' },
+  { key: 'advancedAnalytics', label: 'Reportes/KPIs' },
+  { key: 'aiAssistant', label: 'Venty IA' },
+  { key: 'multiBranch', label: 'Multi-sucursal' },
+];
+
+const planChipStyles = StyleSheet.create({
+  container: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+    marginTop: 2,
+  },
+  chip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingHorizontal: 9,
+    paddingVertical: 4,
+    borderRadius: 999,
+    borderWidth: 1,
+  },
+  text: {
+    fontSize: 11,
+    fontWeight: '700',
+  },
+});
+const planChipsContainerStyle = planChipStyles.container;
+const planChipStyle = planChipStyles.chip;
+const planChipTextStyle = planChipStyles.text;
 
 export interface BusinessSettingsTabProps {
   canManageSettings: boolean;
@@ -93,6 +133,7 @@ export const BusinessSettingsTab = React.memo<BusinessSettingsTabProps>(
     updateBusinessData,
     updatePosSettings,
   }) => {
+    const { features } = usePlanFeatures();
     const [bizName, setBizName] = useState('');
     const [bizRuc, setBizRuc] = useState('');
     const [bizAddress, setBizAddress] = useState('');
@@ -109,6 +150,12 @@ export const BusinessSettingsTab = React.memo<BusinessSettingsTabProps>(
     const [ticketTemplate, setTicketTemplate] = useState<'standard' | 'compact'>('standard');
     const [isSavingBiz, setIsSavingBiz] = useState(false);
     const [branchModalVisible, setBranchModalVisible] = useState(false);
+
+    useEffect(() => {
+      if (!features.multiBranch && branchModalVisible) {
+        setBranchModalVisible(false);
+      }
+    }, [features.multiBranch, branchModalVisible]);
 
     useEffect(() => {
       const biz = businessData || businessSettings;
@@ -286,6 +333,38 @@ export const BusinessSettingsTab = React.memo<BusinessSettingsTabProps>(
             </View>
           ) : null}
 
+          <View style={planChipsContainerStyle}>
+            {PLAN_MODULE_CHIPS.map((mod) => {
+              const enabled = features[mod.key];
+              return (
+                <View
+                  key={mod.key}
+                  style={[
+                    planChipStyle,
+                    {
+                      backgroundColor: enabled ? ui.successSoft : ui.surfaceMuted,
+                      borderColor: enabled ? ui.success : ui.border,
+                    },
+                  ]}
+                >
+                  {enabled ? (
+                    <Check size={12} color={ui.success} />
+                  ) : (
+                    <Lock size={11} color={ui.textMuted} />
+                  )}
+                  <Text
+                    style={[
+                      planChipTextStyle,
+                      { color: enabled ? ui.success : ui.textMuted },
+                    ]}
+                  >
+                    {mod.label}
+                  </Text>
+                </View>
+              );
+            })}
+          </View>
+
           <View style={styles.quickLinksRow}>
             <TouchableOpacity
               style={styles.quickLinkBtn}
@@ -330,7 +409,7 @@ export const BusinessSettingsTab = React.memo<BusinessSettingsTabProps>(
               <Text style={styles.settingLabel}>Sucursal Activa</Text>
               <Text style={styles.settingSubtext}>{activeBranchName || 'Tienda Principal'}</Text>
             </View>
-            {hasAllBranchesAccess && branches.length > 1 ? (
+            {features.multiBranch && hasAllBranchesAccess && branches.length > 1 ? (
               <TouchableOpacity
                 style={styles.secondaryOutlineBtn}
                 onPress={() => setBranchModalVisible(true)}
@@ -644,7 +723,7 @@ export const BusinessSettingsTab = React.memo<BusinessSettingsTabProps>(
           ) : null}
         </View>
 
-        {branchModalVisible && (
+        {features.multiBranch && branchModalVisible && (
           <Modal
             visible={branchModalVisible}
             transparent

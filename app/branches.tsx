@@ -33,7 +33,8 @@ import {
   User,
   X,
 } from 'lucide-react-native';
-import { useAuthSession, usePlanAccess } from '@/context/AuthContext';
+import { useAuthSession, usePlanAccess, usePlanFeatures } from '@/context/AuthContext';
+import { PlanLockedView } from '@/components/PlanFeatureGate';
 import { useBusinessSettings } from '@/context/SettingsContext';
 import { useDebouncedValue } from '@/hooks/use-debounced-value';
 import { usePermissions } from '@/hooks/usePermissions';
@@ -425,6 +426,7 @@ export default function BranchesScreen() {
   const router = useRouter();
   const { accountId, branchId, setActiveBranchId } = useAuthSession();
   const { limits } = usePlanAccess();
+  const { features, planName } = usePlanFeatures();
   const { refreshConfiguration } = useBusinessSettings();
   const { hasPermission, isOwner, isAdmin } = usePermissions();
 
@@ -443,6 +445,12 @@ export default function BranchesScreen() {
   const isMountedRef = useRef(true);
 
   useEffect(() => {
+    if (!features.multiBranch && modalVisible) {
+      setModalVisible(false);
+    }
+  }, [features.multiBranch, modalVisible]);
+
+  useEffect(() => {
     isMountedRef.current = true;
     return () => {
       isMountedRef.current = false;
@@ -451,7 +459,7 @@ export default function BranchesScreen() {
 
   const loadBranches = useCallback(
     async (isRefresh = false) => {
-      if (!accountId || !canAccess) {
+      if (!accountId || !canAccess || !features.multiBranch) {
         setLoading(false);
         setRefreshing(false);
         return;
@@ -472,7 +480,7 @@ export default function BranchesScreen() {
         }
       }
     },
-    [accountId, canAccess]
+    [accountId, canAccess, features.multiBranch]
   );
 
   useEffect(() => {
@@ -636,6 +644,18 @@ export default function BranchesScreen() {
       ) : null,
     [loading]
   );
+
+  if (!features.multiBranch) {
+    return (
+      <PlanLockedView
+        feature="multiBranch"
+        asScreen
+        screenTitle="Sucursales"
+        onBack={() => router.back()}
+        currentPlanName={planName}
+      />
+    );
+  }
 
   if (!canAccess) {
     return (

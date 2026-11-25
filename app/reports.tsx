@@ -24,12 +24,13 @@ import {
   ShieldAlert,
   X,
 } from 'lucide-react-native';
-import { useAuthSession } from '@/context/AuthContext';
+import { useAuthSession, usePlanFeatures } from '@/context/AuthContext';
 import { useBusinessSettings } from '@/context/SettingsContext';
 import { useProducts } from '@/context/ProductsContext';
 import { useDebouncedValue } from '@/hooks/use-debounced-value';
 import { usePermissions } from '@/hooks/usePermissions';
 import { FinancialPnlModal } from '@/components/FinancialPnlModal';
+import { PlanLockedView } from '@/components/PlanFeatureGate';
 import { formatDatePE, formatPEN, ui } from '@/lib/theme';
 import { getProductKardex } from '@/services/inventory-kardex-service';
 import {
@@ -631,6 +632,7 @@ export default function ReportsScreen() {
     isOwner,
     isAdmin,
   } = usePermissions();
+  const { features, planName } = usePlanFeatures();
 
   const [activeTab, setActiveTab] = useState<ReportTab>('sales');
   const [preset, setPreset] = useState<DateRangePreset>('month');
@@ -645,6 +647,12 @@ export default function ReportsScreen() {
   const [salesData, setSalesData] = useState<{ salesSummary: DashboardSalesBreakdown } | null>(null);
   const [pnlReport, setPnlReport] = useState<PnlReportResult | null>(null);
   const [pnlModalVisible, setPnlModalVisible] = useState(false);
+
+  useEffect(() => {
+    if (!features.advancedAnalytics && pnlModalVisible) {
+      setPnlModalVisible(false);
+    }
+  }, [features.advancedAnalytics, pnlModalVisible]);
   const [kardexItems, setKardexItems] = useState<any[]>([]);
   const [kardexBranchId, setKardexBranchId] = useState<string>('');
   const [closures, setClosures] = useState<CashClosureReportItem[]>([]);
@@ -659,9 +667,9 @@ export default function ReportsScreen() {
   const tabCacheRef = useRef<Map<string, TabCacheEntry>>(new Map());
 
   const effectiveBranch = useMemo(() => {
-    if (hasAllBranchesAccess && scopeAllBranches) return undefined;
+    if (features.multiBranch && hasAllBranchesAccess && scopeAllBranches) return undefined;
     return branchId || undefined;
-  }, [hasAllBranchesAccess, scopeAllBranches, branchId]);
+  }, [features.multiBranch, hasAllBranchesAccess, scopeAllBranches, branchId]);
 
   useEffect(() => {
     setKardexBranchId(effectiveBranch || 'all');
@@ -675,7 +683,7 @@ export default function ReportsScreen() {
   productsMapRef.current = productsById;
 
   const inventorySummary = useMemo(() => {
-    if (activeTab !== 'inventory') {
+    if (!features.advancedAnalytics || activeTab !== 'inventory') {
       return {
         activeCount: 0,
         totalUnits: 0,
@@ -735,12 +743,12 @@ export default function ReportsScreen() {
       outOfStockCount: isSingleActiveBranch ? stats.outOfStockCount : outOfStockCount,
       criticalList: criticalList.slice(0, 15),
     };
-  }, [activeTab, products, effectiveBranch, stats]);
+  }, [features.advancedAnalytics, activeTab, products, effectiveBranch, stats]);
 
   const loadTabData = useCallback(
     async (isRefresh = false) => {
       abortControllerRef.current?.abort();
-      if (!accountId || !canViewReports) {
+      if (!accountId || !canViewReports || !features.advancedAnalytics) {
         abortControllerRef.current = null;
         setLoading(false);
         setRefreshing(false);
@@ -953,6 +961,7 @@ export default function ReportsScreen() {
     [
       accountId,
       canViewReports,
+      features.advancedAnalytics,
       activeTab,
       preset,
       effectiveBranch,
@@ -1056,6 +1065,18 @@ export default function ReportsScreen() {
     });
   }, [posSettings.enableSellerAttribution, canViewReports]);
 
+  if (!features.advancedAnalytics) {
+    return (
+      <PlanLockedView
+        feature="advancedAnalytics"
+        asScreen
+        screenTitle="Reportes y Exportación"
+        onBack={() => router.back()}
+        currentPlanName={planName}
+      />
+    );
+  }
+
   if (!canViewReports) {
     return (
       <SafeAreaView style={styles.screen} edges={['top', 'bottom']}>
@@ -1124,7 +1145,7 @@ export default function ReportsScreen() {
               </TouchableOpacity>
             );
           })}
-          {hasAllBranchesAccess && (
+          {features.multiBranch && hasAllBranchesAccess && (
             <TouchableOpacity
               onPress={() => setScopeAllBranches((v) => !v)}
               style={[styles.pill, scopeAllBranches && styles.pillActive]}
@@ -1165,7 +1186,7 @@ export default function ReportsScreen() {
           loading={loading}
           refreshing={refreshing}
           tabError={tabError}
-          hasAllBranchesAccess={hasAllBranchesAccess}
+          hasAllBranchesAccess={features.multiBranch && hasAllBranchesAccess}
           branches={branches}
           kardexBranchId={kardexBranchId}
           onSelectBranch={setKardexBranchId}

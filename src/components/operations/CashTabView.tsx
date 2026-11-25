@@ -20,6 +20,7 @@ import {
   RefreshCw,
   Wallet,
 } from 'lucide-react-native';
+import { usePlanFeatures } from '@/context/AuthContext';
 import { formatDatePE, formatPEN, ui } from '@/lib/theme';
 import {
   expenseCategoryLabel,
@@ -295,6 +296,7 @@ export const CashTabView = React.memo<CashTabViewProps>(({
   onOpenCloseModal,
 }) => {
   const { width } = useWindowDimensions();
+  const { features } = usePlanFeatures();
   const isCompactWidth = width < 360;
   const [cashSubView, setCashSubView] = useState<'movements' | 'sales'>('movements');
 
@@ -340,7 +342,8 @@ export const CashTabView = React.memo<CashTabViewProps>(({
     [cashSubView]
   );
 
-  const hasMultiBranchAccess = (role === 'owner' || role === 'admin') && branches.length > 1;
+  const hasMultiBranchAccess =
+    features.multiBranch && (role === 'owner' || role === 'admin') && branches.length > 1;
   const hasBranchSessionEntries = Object.keys(branchSessions).length > 0;
 
   const multiCashSectionElement = useMemo(() => {

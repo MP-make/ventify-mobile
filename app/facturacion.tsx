@@ -24,11 +24,12 @@ import {
   ShieldAlert,
   X,
 } from 'lucide-react-native';
-import { useAuthSession } from '@/context/AuthContext';
+import { useAuthSession, usePlanFeatures } from '@/context/AuthContext';
 import { useBusinessSettings } from '@/context/SettingsContext';
 import { usePermissions } from '@/hooks/usePermissions';
 import { useDebouncedValue } from '@/hooks/use-debounced-value';
 import { EinvoiceActionsModal } from '@/components/EinvoiceActionsModal';
+import { PlanLockedView } from '@/components/PlanFeatureGate';
 import { formatDatePE, formatPEN, ui } from '@/lib/theme';
 import {
   type DateRangePreset,
@@ -368,6 +369,7 @@ export default function FacturacionScreen() {
     canViewReports,
     canCreateCreditNotes,
   } = usePermissions();
+  const { features, planName } = usePlanFeatures();
 
   const canAccessFacturacion =
     hasPermission('access_sales') &&
@@ -390,17 +392,23 @@ export default function FacturacionScreen() {
   const requestIdRef = useRef(0);
   const isMountedRef = useRef(true);
 
+  useEffect(() => {
+    if (!features.sunatInvoicing && selectedEinvoice) {
+      setSelectedEinvoice(null);
+    }
+  }, [features.sunatInvoicing, selectedEinvoice]);
+
   const effectiveBranch = useMemo(() => {
-    if (hasAllBranchesAccess && scopeAllBranches) return undefined;
+    if (features.multiBranch && hasAllBranchesAccess && scopeAllBranches) return undefined;
     return branchId || undefined;
-  }, [hasAllBranchesAccess, scopeAllBranches, branchId]);
+  }, [features.multiBranch, hasAllBranchesAccess, scopeAllBranches, branchId]);
 
   const bounds = useMemo(() => getDateRangeBounds(preset), [preset]);
 
   const loadEinvoices = useCallback(
     async (isRefresh = false) => {
       abortRef.current?.abort();
-      if (!accountId || !canAccessFacturacion) {
+      if (!accountId || !canAccessFacturacion || !features.sunatInvoicing) {
         abortRef.current = null;
         setLoading(false);
         setRefreshing(false);
@@ -446,7 +454,7 @@ export default function FacturacionScreen() {
         }
       }
     },
-    [accountId, canAccessFacturacion, effectiveBranch, bounds.fromIso, bounds.toIso]
+    [accountId, canAccessFacturacion, features.sunatInvoicing, effectiveBranch, bounds.fromIso, bounds.toIso]
   );
 
   useEffect(() => {
@@ -569,7 +577,7 @@ export default function FacturacionScreen() {
         <FacturacionTopFilters
           invoicingEnabled={invoicingEnabled}
           preset={preset}
-          hasAllBranchesAccess={hasAllBranchesAccess}
+          hasAllBranchesAccess={features.multiBranch && hasAllBranchesAccess}
           scopeAllBranches={scopeAllBranches}
           onSelectPreset={setPreset}
           onToggleScopeAllBranches={handleToggleScopeAllBranches}
@@ -611,6 +619,7 @@ export default function FacturacionScreen() {
     [
       invoicingEnabled,
       preset,
+      features.multiBranch,
       hasAllBranchesAccess,
       scopeAllBranches,
       handleToggleScopeAllBranches,
@@ -639,6 +648,18 @@ export default function FacturacionScreen() {
       ) : null,
     [loading, error]
   );
+
+  if (!features.sunatInvoicing) {
+    return (
+      <PlanLockedView
+        feature="sunatInvoicing"
+        asScreen
+        screenTitle="Facturación SUNAT"
+        onBack={() => router.back()}
+        currentPlanName={planName}
+      />
+    );
+  }
 
   if (!canAccessFacturacion) {
     return (

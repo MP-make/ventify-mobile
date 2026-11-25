@@ -14,6 +14,7 @@ import * as Haptics from 'expo-haptics';
 import {
   BarChart3,
   CalendarClock,
+  Lock,
   UserCheck,
   Users,
   Wallet,
@@ -28,7 +29,9 @@ import {
   where,
 } from 'firebase/firestore';
 
-import { useAuthSession, useNetworkStatus } from '@/context/AuthContext';
+import { useAuthSession, useNetworkStatus, usePlanFeatures } from '@/context/AuthContext';
+import { type PlanFeatureKey } from '@/lib/plan-entitlements';
+import { PlanUpgradeModal } from '@/components/PlanFeatureGate';
 import {
   useBusinessSettings,
   useCashSession,
@@ -167,12 +170,14 @@ export default function OperationsScreen() {
     canViewMargins,
     canViewReports,
   } = usePermissions();
+  const { features, planName } = usePlanFeatures();
   const isSupervisor = isOwner || isAdmin;
 
   const [activeTab, setActiveTab] = useState<OperationsTab>('cash');
   const [payrollModalOpen, setPayrollModalOpen] = useState<boolean>(false);
   const [pnlModalOpen, setPnlModalOpen] = useState<boolean>(false);
   const [ventyModalVisible, setVentyModalVisible] = useState<boolean>(false);
+  const [upgradeFeature, setUpgradeFeature] = useState<PlanFeatureKey | null>(null);
 
   // Multi-caja para Dueños y Administradores (con TTL de 45s en retorno a foco)
   const [branchSessions, setBranchSessions] = useState<
@@ -256,6 +261,7 @@ export default function OperationsScreen() {
   const fetchBranchSessions = useCallback(
     async (options?: { force?: boolean }) => {
       if (
+        !features.multiBranch ||
         (role !== 'owner' && role !== 'admin') ||
         !branches ||
         branches.length <= 1
@@ -303,16 +309,38 @@ export default function OperationsScreen() {
         }
       }
     },
-    [branches, role, accountId, branchId, isCashOpen]
+    [features.multiBranch, branches, role, accountId, branchId, isCashOpen]
   );
 
   useEffect(() => {
-    if (!isFocused || activeTab !== 'cash') return;
+    if (!features.multiBranch) {
+      branchSessionsGenerationRef.current += 1;
+      lastBranchSessionsFetchRef.current = 0;
+      lastBranchSessionsScopeRef.current = '';
+      setBranchSessions((prev) => (Object.keys(prev).length === 0 ? prev : {}));
+    }
+  }, [features.multiBranch]);
+
+  useEffect(() => {
+    if (!features.aiAssistant && ventyModalVisible) setVentyModalVisible(false);
+    if (!features.teamManagement && payrollModalOpen) setPayrollModalOpen(false);
+    if (!features.advancedAnalytics && pnlModalOpen) setPnlModalOpen(false);
+  }, [
+    features.aiAssistant,
+    ventyModalVisible,
+    features.teamManagement,
+    payrollModalOpen,
+    features.advancedAnalytics,
+    pnlModalOpen,
+  ]);
+
+  useEffect(() => {
+    if (!features.multiBranch || !isFocused || activeTab !== 'cash') return;
     const task = InteractionManager.runAfterInteractions(() => {
       void fetchBranchSessions();
     });
     return () => task.cancel();
-  }, [fetchBranchSessions, isFocused, activeTab]);
+  }, [features.multiBranch, fetchBranchSessions, isFocused, activeTab]);
 
   const handleRefreshBranchSessions = useCallback(() => {
     void fetchBranchSessions({ force: true });
@@ -892,12 +920,28 @@ export default function OperationsScreen() {
   // ============================================================================
   // CALLBACKS ESTABILIZADOS PARA SUBCOMPONENTES Y MODALES
   // ============================================================================
-  const handleOpenVentyModal = useCallback(() => setVentyModalVisible(true), []);
+  const handleOpenVentyModal = useCallback(() => {
+    if (!features.aiAssistant) {
+      setUpgradeFeature('aiAssistant');
+      return;
+    }
+    setVentyModalVisible(true);
+  }, [features.aiAssistant]);
   const handleCloseVentyModal = useCallback(() => setVentyModalVisible(false), []);
-  const handleOpenPnlModal = useCallback(() => setPnlModalOpen(true), []);
+  const handleOpenPnlModal = useCallback(() => {
+    if (!features.advancedAnalytics) {
+      setUpgradeFeature('advancedAnalytics');
+      return;
+    }
+    setPnlModalOpen(true);
+  }, [features.advancedAnalytics]);
   const handleClosePnlModal = useCallback(() => setPnlModalOpen(false), []);
-  const handleOpenPayrollModal = useCallback(() => setPayrollModalOpen(true), []);
+  const handleOpenPayrollModal = useCallback(() => {
+    if (!features.teamManagement) return;
+    setPayrollModalOpen(true);
+  }, [features.teamManagement]);
   const handleClosePayrollModal = useCallback(() => setPayrollModalOpen(false), []);
+  const handleCloseUpgradeModal = useCallback(() => setUpgradeFeature(null), []);
   const handleLoadSaleRequestToPos = useCallback(
     () => router.replace('/(tabs)'),
     [router]
@@ -1262,7 +1306,11 @@ export default function OperationsScreen() {
             style={styles.compactTeamButton}
             onPress={handleOpenVentyModal}
             accessibilityRole="button"
-            accessibilityLabel="Abrir asistente Venty IA"
+            accessibilityLabel={
+              features.aiAssistant
+                ? 'Abrir asistente Venty IA'
+                : 'Asistente Venty IA (requiere mejora de plan)'
+            }
           >
             <Image
               source={VENTY_ICON}
@@ -1270,19 +1318,25 @@ export default function OperationsScreen() {
               contentFit="contain"
             />
             <Text style={styles.compactTeamButtonText}>Venty IA</Text>
+            {!features.aiAssistant && <Lock size={12} color={ui.accent} />}
           </TouchableOpacity>
           {(canViewMargins || canViewReports) ? (
             <TouchableOpacity
               style={styles.compactTeamButton}
               onPress={handleOpenPnlModal}
               accessibilityRole="button"
-              accessibilityLabel="Abrir reporte de ganancias y resultados"
+              accessibilityLabel={
+                features.advancedAnalytics
+                  ? 'Abrir reporte de ganancias y resultados'
+                  : 'Reporte de ganancias (requiere mejora de plan)'
+              }
             >
               <BarChart3 size={16} color={ui.primary} />
               <Text style={styles.compactTeamButtonText}>Ganancias</Text>
+              {!features.advancedAnalytics && <Lock size={12} color={ui.accent} />}
             </TouchableOpacity>
           ) : null}
-          {canManageUsers ? (
+          {canManageUsers && features.teamManagement ? (
             <TouchableOpacity
               style={styles.compactTeamButton}
               onPress={handleOpenPayrollModal}
@@ -1584,7 +1638,7 @@ export default function OperationsScreen() {
         />
       )}
 
-      {ventyModalVisible && (
+      {features.aiAssistant && ventyModalVisible && (
         <VentyAiModal
           visible={ventyModalVisible}
           onClose={handleCloseVentyModal}
@@ -1594,7 +1648,7 @@ export default function OperationsScreen() {
         />
       )}
 
-      {payrollModalOpen && (
+      {features.teamManagement && payrollModalOpen && (
         <PayrollUsersModal
           visible={payrollModalOpen}
           onClose={handleClosePayrollModal}
@@ -1602,12 +1656,19 @@ export default function OperationsScreen() {
         />
       )}
 
-      {pnlModalOpen && (
+      {features.advancedAnalytics && pnlModalOpen && (
         <FinancialPnlModal
           visible={pnlModalOpen}
           onClose={handleClosePnlModal}
         />
       )}
+
+      <PlanUpgradeModal
+        visible={upgradeFeature !== null}
+        feature={upgradeFeature}
+        currentPlanName={planName}
+        onClose={handleCloseUpgradeModal}
+      />
 
       {orderTicketModalOpen && (
         <ReservationReceiptModal

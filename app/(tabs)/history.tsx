@@ -25,13 +25,16 @@ import {
   RefreshCw,
   CheckCircle2,
   FileText,
+  Lock,
   X,
   AlertTriangle,
 } from 'lucide-react-native';
 import * as Haptics from 'expo-haptics';
 import { type Href, useRouter } from 'expo-router';
 
-import { useAuthSession, useNetworkStatus } from '@/context/AuthContext';
+import { useAuthSession, useNetworkStatus, usePlanFeatures } from '@/context/AuthContext';
+import { type PlanFeatureKey } from '@/lib/plan-entitlements';
+import { PlanLockedView, PlanUpgradeModal } from '@/components/PlanFeatureGate';
 import {
   useBusinessSettings,
   useCashOpenStatus,
@@ -190,8 +193,16 @@ export default function HistoryScreen() {
     [businessSettings, activeBranch]
   );
 
+  const { features, planName } = usePlanFeatures();
   const [activeTab, setActiveTab] = useState<HistoryTab>('sales');
   const [pnlModalOpen, setPnlModalOpen] = useState<boolean>(false);
+  const [upgradeFeature, setUpgradeFeature] = useState<PlanFeatureKey | null>(null);
+
+  useEffect(() => {
+    if (!features.advancedAnalytics && pnlModalOpen) {
+      setPnlModalOpen(false);
+    }
+  }, [features.advancedAnalytics, pnlModalOpen]);
 
   // ============================================================================
   // ESTADOS DEL SUB-MÓDULO 1: HISTORIAL DE VENTAS Y SUNAT
@@ -1191,21 +1202,37 @@ export default function HistoryScreen() {
                 style={styles.compactSunatButton}
                 onPress={() => router.push('/facturacion' as Href)}
                 accessibilityRole="button"
-                accessibilityLabel="Ir a Facturación Electrónica SUNAT"
+                accessibilityLabel={
+                  features.sunatInvoicing
+                    ? 'Ir a Facturación Electrónica SUNAT'
+                    : 'Facturación Electrónica SUNAT (requiere mejora de plan)'
+                }
               >
                 <FileText size={14} color={ui.primary} />
                 <Text style={styles.compactSunatButtonText}>Facturación</Text>
+                {!features.sunatInvoicing && <Lock size={12} color={ui.accent} />}
               </TouchableOpacity>
             )}
             {canViewReports && (
               <TouchableOpacity
                 style={styles.compactPnlButton}
-                onPress={() => setPnlModalOpen(true)}
+                onPress={() => {
+                  if (!features.advancedAnalytics) {
+                    setUpgradeFeature('advancedAnalytics');
+                    return;
+                  }
+                  setPnlModalOpen(true);
+                }}
                 accessibilityRole="button"
-                accessibilityLabel="Abrir estado de resultados"
+                accessibilityLabel={
+                  features.advancedAnalytics
+                    ? 'Abrir estado de resultados'
+                    : 'Estado de resultados (requiere mejora de plan)'
+                }
               >
                 <TrendingUp size={15} color={ui.primary} />
                 <Text style={styles.compactPnlButtonText}>Estado de resultados</Text>
+                {!features.advancedAnalytics && <Lock size={12} color={ui.accent} />}
               </TouchableOpacity>
             )}
           </View>
@@ -1252,13 +1279,20 @@ export default function HistoryScreen() {
           style={[styles.tabButtonCentered, activeTab === 'ai' && styles.tabButtonActive]}
           onPress={() => setActiveTab('ai')}
           accessibilityRole="tab"
-          accessibilityLabel="Asistente Venty IA"
+          accessibilityLabel={
+            features.aiAssistant
+              ? 'Asistente Venty IA'
+              : 'Asistente Venty IA (requiere mejora de plan)'
+          }
           accessibilityState={{ selected: activeTab === 'ai' }}
         >
           <Image source={VENTY_ICON} style={styles.tabIconImg} contentFit="contain" />
           <Text style={[styles.tabButtonText, activeTab === 'ai' && styles.tabButtonTextActive]}>
             Asistente IA
           </Text>
+          {!features.aiAssistant && (
+            <Lock size={12} color={activeTab === 'ai' ? ui.primary : ui.textMuted} />
+          )}
         </TouchableOpacity>
       </View>
 
@@ -1329,15 +1363,18 @@ export default function HistoryScreen() {
       )}
 
       {/* SUB-MÓDULO 3: ASISTENTE VENTY IA */}
-      {activeTab === 'ai' && (
-        <HistoryAiChatTab
-          accountId={accountId}
-          branchId={branchId}
-          bottomInset={insets.bottom}
-          chatMessages={chatMessages}
-          setChatMessages={setChatMessages}
-        />
-      )}
+      {activeTab === 'ai' &&
+        (features.aiAssistant ? (
+          <HistoryAiChatTab
+            accountId={accountId}
+            branchId={branchId}
+            bottomInset={insets.bottom}
+            chatMessages={chatMessages}
+            setChatMessages={setChatMessages}
+          />
+        ) : (
+          <PlanLockedView feature="aiAssistant" currentPlanName={planName} />
+        ))}
 
       {/* ==================================================================== */}
       {/* MODAL: DETALLE DEL COMPROBANTE Y ACCIONES */}
@@ -1980,9 +2017,16 @@ export default function HistoryScreen() {
         </Modal>
       )}
 
-      {pnlModalOpen && (
+      {features.advancedAnalytics && pnlModalOpen && (
         <FinancialPnlModal visible={pnlModalOpen} onClose={() => setPnlModalOpen(false)} />
       )}
+
+      <PlanUpgradeModal
+        visible={upgradeFeature !== null}
+        feature={upgradeFeature}
+        currentPlanName={planName}
+        onClose={() => setUpgradeFeature(null)}
+      />
 
       {/* Modal de Rango de Fechas Personalizado */}
       {customDateModalOpen && (

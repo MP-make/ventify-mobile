@@ -26,6 +26,7 @@ import {
   Barcode,
   ChevronDown,
   ChevronUp,
+  Lock,
 } from 'lucide-react-native';
 import * as Haptics from 'expo-haptics';
 import { useIsFocused } from '@react-navigation/native';
@@ -40,7 +41,9 @@ import {
   useAuthSession,
   usePlanAccessActions,
   useNetworkStatus,
+  usePlanFeatures,
 } from '@/context/AuthContext';
+import { PlanLockedView } from '@/components/PlanFeatureGate';
 import { useBusinessSettings, useOfflineStatus } from '@/context/SettingsContext';
 import { usePermissions } from '@/hooks/usePermissions';
 import { checkIsOnlineLive, assertOnlineForWrite } from '@/lib/online-guard';
@@ -2367,6 +2370,7 @@ const InventorySubTab = React.memo<InventorySubTabProps>(
 
 export default function CatalogInventoryScreen() {
   const isFocused = useIsFocused();
+  const { features, planName } = usePlanFeatures();
   const { canManageInventoryAdjustments, hasPermission } = usePermissions();
   const showPurchasesTab = canManageInventoryAdjustments || hasPermission('access_suppliers');
 
@@ -2377,6 +2381,12 @@ export default function CatalogInventoryScreen() {
     transfers: false,
     purchases: false,
   });
+
+  useEffect(() => {
+    if (!features.transfers && activeTab === 'transfers') {
+      setActiveTab('inventory');
+    }
+  }, [features.transfers, activeTab]);
 
   // Kardex cache refs (state isolated in KardexSubTab)
   const lastKardexFetchRef = useRef<{ scopeKey: string; fetchedAt: number } | null>(null);
@@ -2440,25 +2450,27 @@ export default function CatalogInventoryScreen() {
             </Text>
           </TouchableOpacity>
 
-          <TouchableOpacity
-            style={[styles.tabBtn, activeTab === 'transfers' && styles.tabBtnActive]}
-            onPress={handleSelectTransfersTab}
-            activeOpacity={0.7}
-            accessibilityRole="tab"
-            accessibilityState={{ selected: activeTab === 'transfers' }}
-            accessibilityLabel="Transferencias"
-          >
-            <ArrowRightLeft
-              size={16}
-              color={activeTab === 'transfers' ? ui.primary : ui.textSecondary}
-            />
-            <Text
-              style={[styles.tabBtnText, activeTab === 'transfers' && styles.tabBtnTextActive]}
-              numberOfLines={1}
+          {features.transfers && (
+            <TouchableOpacity
+              style={[styles.tabBtn, activeTab === 'transfers' && styles.tabBtnActive]}
+              onPress={handleSelectTransfersTab}
+              activeOpacity={0.7}
+              accessibilityRole="tab"
+              accessibilityState={{ selected: activeTab === 'transfers' }}
+              accessibilityLabel="Transferencias"
             >
-              Transferencias
-            </Text>
-          </TouchableOpacity>
+              <ArrowRightLeft
+                size={16}
+                color={activeTab === 'transfers' ? ui.primary : ui.textSecondary}
+              />
+              <Text
+                style={[styles.tabBtnText, activeTab === 'transfers' && styles.tabBtnTextActive]}
+                numberOfLines={1}
+              >
+                Transferencias
+              </Text>
+            </TouchableOpacity>
+          )}
 
           {showPurchasesTab && (
             <TouchableOpacity
@@ -2467,7 +2479,9 @@ export default function CatalogInventoryScreen() {
               activeOpacity={0.7}
               accessibilityRole="tab"
               accessibilityState={{ selected: activeTab === 'purchases' }}
-              accessibilityLabel="Compras a proveedores"
+              accessibilityLabel={
+                features.purchases ? 'Compras a proveedores' : 'Compras a proveedores (requiere mejora de plan)'
+              }
             >
               <Truck size={15} color={activeTab === 'purchases' ? ui.primary : ui.textSecondary} />
               <Text
@@ -2476,6 +2490,9 @@ export default function CatalogInventoryScreen() {
               >
                 Compras
               </Text>
+              {!features.purchases && (
+                <Lock size={12} color={activeTab === 'purchases' ? ui.primary : ui.textMuted} />
+              )}
             </TouchableOpacity>
           )}
         </View>
@@ -2520,7 +2537,7 @@ export default function CatalogInventoryScreen() {
           </View>
         ) : null}
 
-        {visitedTabs.transfers ? (
+        {features.transfers && visitedTabs.transfers ? (
           <View
             key="panel-transfers"
             collapsable={false}
@@ -2549,13 +2566,17 @@ export default function CatalogInventoryScreen() {
             pointerEvents={activeTab === 'purchases' ? 'auto' : 'none'}
             importantForAccessibility={activeTab === 'purchases' ? 'yes' : 'no-hide-descendants'}
           >
-            <SuppliersPurchaseModal
-              visible
-              isActive={activeTab === 'purchases' && isFocused}
-              embedded
-              onClose={handleBackToInventoryTab}
-              onStockUpdated={handleStockAdjusted}
-            />
+            {features.purchases ? (
+              <SuppliersPurchaseModal
+                visible
+                isActive={activeTab === 'purchases' && isFocused}
+                embedded
+                onClose={handleBackToInventoryTab}
+                onStockUpdated={handleStockAdjusted}
+              />
+            ) : (
+              <PlanLockedView feature="purchases" currentPlanName={planName} />
+            )}
           </View>
         ) : null}
       </View>

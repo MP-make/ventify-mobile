@@ -42,7 +42,7 @@ import {
 } from 'lucide-react-native';
 import * as Haptics from 'expo-haptics';
 
-import { useAuthSession } from '@/context/AuthContext';
+import { useAuthSession, usePlanFeatures } from '@/context/AuthContext';
 import { useBusinessSettings, useCashSession } from '@/context/SettingsContext';
 import { useCartActions } from '@/context/CartContext';
 import { usePermissions } from '@/hooks/usePermissions';
@@ -423,22 +423,32 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
   const isVisible = visible !== undefined ? visible : Boolean(isOpen);
 
   const { accountId, branchId, userProfile } = useAuthSession();
+  const { features } = usePlanFeatures();
   const { hasPermission, isOwner, isAdmin } = usePermissions();
   const { activeBranchName, refreshConfiguration } = useBusinessSettings();
   const { isCashOpen, activeCashSession } = useCashSession();
   const { clearCart, addItem, setCustomer, setNotes, setSaleRequestId, setShippingAmount } = useCartActions();
 
   const canManageUsers = isOwner || isAdmin || hasPermission('manage_users');
-  const canManageBranches = isOwner || isAdmin || hasPermission('manage_branches');
+  const canManageBranches =
+    features.multiBranch && (isOwner || isAdmin || hasPermission('manage_branches'));
   const isAdminOrOwner = isOwner || isAdmin;
 
   // Pestaña activa
-  const [activeTab, setActiveTab] = useState<SubTab>(initialTab);
+  const [activeTab, setActiveTab] = useState<SubTab>(
+    initialTab === 'branches' && !features.multiBranch ? 'team' : initialTab
+  );
   useEffect(() => {
     if (isVisible && initialTab) {
-      setActiveTab(initialTab);
+      setActiveTab(initialTab === 'branches' && !features.multiBranch ? 'team' : initialTab);
     }
-  }, [isVisible, initialTab]);
+  }, [isVisible, initialTab, features.multiBranch]);
+
+  useEffect(() => {
+    if (!features.multiBranch && activeTab === 'branches') {
+      setActiveTab('team');
+    }
+  }, [features.multiBranch, activeTab]);
 
   // Estados de datos
   const [teamMembers, setTeamMembers] = useState<TeamMember[]>([]);
@@ -470,6 +480,12 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
   const [userFormVisible, setUserFormVisible] = useState<boolean>(false);
   const [editingMember, setEditingMember] = useState<TeamMember | null>(null);
   const [branchFormVisible, setBranchFormVisible] = useState<boolean>(false);
+
+  useEffect(() => {
+    if (!features.multiBranch && branchFormVisible) {
+      setBranchFormVisible(false);
+    }
+  }, [features.multiBranch, branchFormVisible]);
   const [editingBranch, setEditingBranch] = useState<BranchItem | null>(null);
   const [showCreateRequestModal, setShowCreateRequestModal] = useState<boolean>(false);
 
@@ -480,7 +496,7 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
   }>({ loadedAccountId: null, inFlight: null, requestSeq: 0 });
 
   const loadBranches = useCallback(async (force: boolean = false) => {
-    if (!accountId) return;
+    if (!accountId || !features.multiBranch) return;
     const state = branchesLoadStateRef.current;
     if (!force && state.loadedAccountId === accountId) {
       return;
@@ -508,10 +524,10 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
 
     state.inFlight = { accountId, seq, promise: request };
     return request;
-  }, [accountId]);
+  }, [accountId, features.multiBranch]);
 
   useEffect(() => {
-    if (!isVisible) {
+    if (!isVisible || !features.multiBranch) {
       branchesLoadStateRef.current.loadedAccountId = null;
       branchesLoadStateRef.current.inFlight = null;
       branchesLoadStateRef.current.requestSeq += 1;
@@ -520,11 +536,11 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
     if (accountId) {
       void loadBranches();
     }
-  }, [isVisible, accountId, loadBranches]);
+  }, [isVisible, accountId, features.multiBranch, loadBranches]);
 
   // 1. Suscripciones en tiempo real según pestaña activa
   useEffect(() => {
-    if (!isVisible || !accountId) return;
+    if (!isVisible || !accountId || !features.teamManagement) return;
 
     let isActive = true;
     let unsubTeam: (() => void) | undefined;
@@ -562,6 +578,10 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
     }
 
     if (activeTab === 'branches') {
+      if (!features.multiBranch) {
+        setLoading(false);
+        return;
+      }
       void loadBranches().finally(() => {
         if (isActive) setLoading(false);
       });
@@ -573,7 +593,7 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
       unsubPayroll?.();
       unsubRequests?.();
     };
-  }, [isVisible, accountId, branchId, activeTab, loadBranches]);
+  }, [isVisible, accountId, branchId, activeTab, features.teamManagement, features.multiBranch, loadBranches]);
 
   // Colaborador seleccionado en el formulario
   const currentSelectedEmployee = useMemo(() => {
@@ -1057,26 +1077,28 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
             ) : null}
           </TouchableOpacity>
 
-          <TouchableOpacity
-            style={[styles.tabButton, activeTab === 'branches' ? styles.tabButtonActive : styles.tabButtonIconOnly]}
-            onPress={() => {
-              Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
-              setActiveTab('branches');
-            }}
-            accessibilityRole="tab"
-            accessibilityLabel={`Sucursales (${branchesList.length})`}
-            accessibilityState={{ selected: activeTab === 'branches' }}
-          >
-            <Building2
-              size={16}
-              color={activeTab === 'branches' ? ui.primary : ui.textSecondary}
-            />
-            {activeTab === 'branches' ? (
-              <Text style={[styles.tabButtonText, styles.tabButtonTextActive]} numberOfLines={1}>
-                Sucursales ({branchesList.length})
-              </Text>
-            ) : null}
-          </TouchableOpacity>
+          {features.multiBranch ? (
+            <TouchableOpacity
+              style={[styles.tabButton, activeTab === 'branches' ? styles.tabButtonActive : styles.tabButtonIconOnly]}
+              onPress={() => {
+                Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
+                setActiveTab('branches');
+              }}
+              accessibilityRole="tab"
+              accessibilityLabel={`Sucursales (${branchesList.length})`}
+              accessibilityState={{ selected: activeTab === 'branches' }}
+            >
+              <Building2
+                size={16}
+                color={activeTab === 'branches' ? ui.primary : ui.textSecondary}
+              />
+              {activeTab === 'branches' ? (
+                <Text style={[styles.tabButtonText, styles.tabButtonTextActive]} numberOfLines={1}>
+                  Sucursales ({branchesList.length})
+                </Text>
+              ) : null}
+            </TouchableOpacity>
+          ) : null}
         </View>
 
         {/* CONTENIDO SEGÚN SUB-PESTAÑA */}
@@ -1457,7 +1479,7 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
             )}
 
             {/* PESTAÑA 4: SUCURSALES (BRANCHES CRUD) */}
-            {activeTab === 'branches' && (
+            {features.multiBranch && activeTab === 'branches' && (
               <View style={{ flex: 1 }}>
                 <View style={styles.sectionCompactRow}>
                   <Text style={styles.sectionCompactSub} numberOfLines={1}>
@@ -1535,7 +1557,7 @@ export const PayrollUsersModal: React.FC<PayrollUsersModalProps> = React.memo(({
           />
         )}
 
-        {branchFormVisible && (
+        {features.multiBranch && branchFormVisible && (
           <BranchFormModal
             key={editingBranch?.id || 'new'}
             visible={branchFormVisible}

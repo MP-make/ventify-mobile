@@ -3,7 +3,7 @@ import { View, Text, TouchableOpacity, Modal, ScrollView, StyleSheet, ActivityIn
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Store, ChevronDown, Bell, WifiOff, CloudOff, Check, X, MapPin, LayoutGrid, AlertTriangle, RefreshCw } from 'lucide-react-native';
 import { useRouter, type Href } from 'expo-router';
-import { useAuthSession } from '@/context/AuthContext';
+import { useAuthSession, usePlanFeatures } from '@/context/AuthContext';
 import {
   useBusinessSettings,
   useCashOpenStatus,
@@ -119,6 +119,7 @@ export const Header: React.FC<HeaderProps> = React.memo(({ title, showBranchSele
   const insets = useSafeAreaInsets();
   const router = useRouter();
   const { accountId, branchId, setActiveBranchId, allBranchesAccess, role } = useAuthSession();
+  const { features } = usePlanFeatures();
   const { businessName, activeBranchName, branches } = useBusinessSettings();
   const { isCashOpen } = useCashOpenStatus();
   const { isOnline, offlineQueueCount, quarantinedCount, isSyncingOffline, triggerManualSync } = useOfflineStatus();
@@ -126,7 +127,15 @@ export const Header: React.FC<HeaderProps> = React.memo(({ title, showBranchSele
   const [launcherVisible, setLauncherVisible] = useState(false);
 
   const canSwitchBranch =
-    Boolean(allBranchesAccess || role === 'owner' || role === 'admin') && branches.length > 1;
+    features.multiBranch &&
+    Boolean(allBranchesAccess || role === 'owner' || role === 'admin') &&
+    branches.length > 1;
+
+  useEffect(() => {
+    if (!features.multiBranch && branchModalVisible) {
+      setBranchModalVisible(false);
+    }
+  }, [features.multiBranch, branchModalVisible]);
 
   const handleOpenBranchModal = useCallback(() => {
     if (canSwitchBranch) setBranchModalVisible(true);
@@ -267,7 +276,7 @@ export const Header: React.FC<HeaderProps> = React.memo(({ title, showBranchSele
         ) : null}
       </View>
 
-      {branchModalVisible && (
+      {features.multiBranch && branchModalVisible && (
         <Modal visible={branchModalVisible} transparent animationType="fade" onRequestClose={handleCloseBranchModal}>
           <TouchableOpacity style={styles.overlay} activeOpacity={1} onPress={handleCloseBranchModal}>
             <View style={sheetStyle} onStartShouldSetResponder={stopResponder}>

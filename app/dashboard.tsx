@@ -26,10 +26,11 @@ import {
   Users,
   Wallet,
 } from 'lucide-react-native';
-import { useAuthSession } from '@/context/AuthContext';
+import { useAuthSession, usePlanFeatures } from '@/context/AuthContext';
 import { useBusinessSettings } from '@/context/SettingsContext';
 import { useProducts } from '@/context/ProductsContext';
 import { usePermissions } from '@/hooks/usePermissions';
+import { PlanLockedView } from '@/components/PlanFeatureGate';
 import { formatPEN, ui } from '@/lib/theme';
 import {
   calculateVariationPercent,
@@ -68,6 +69,7 @@ export default function DashboardScreen() {
   const { activeBranchName } = useBusinessSettings();
   const { productsById } = useProducts();
   const { canAccessDashboard, canViewMargins, hasAllBranchesAccess } = usePermissions();
+  const { features, planName } = usePlanFeatures();
 
   const [preset, setPreset] = useState<DateRangePreset>('7d');
   const [scopeAllBranches, setScopeAllBranches] = useState(false);
@@ -90,9 +92,9 @@ export default function DashboardScreen() {
   const isMountedRef = useRef(true);
 
   const effectiveBranch = useMemo(() => {
-    if (hasAllBranchesAccess && scopeAllBranches) return undefined;
+    if (features.multiBranch && hasAllBranchesAccess && scopeAllBranches) return undefined;
     return branchId || undefined;
-  }, [hasAllBranchesAccess, scopeAllBranches, branchId]);
+  }, [features.multiBranch, hasAllBranchesAccess, scopeAllBranches, branchId]);
 
   const bounds = useMemo(() => getDateRangeBounds(preset), [preset]);
 
@@ -100,7 +102,7 @@ export default function DashboardScreen() {
   productsMapRef.current = productsById;
 
   const loadIntelligence = useCallback(async () => {
-    if (!accountId || !canAccessDashboard) return;
+    if (!accountId || !canAccessDashboard || !features.advancedAnalytics) return;
     if (intelTimerRef.current) {
       clearTimeout(intelTimerRef.current);
       intelTimerRef.current = null;
@@ -131,12 +133,12 @@ export default function DashboardScreen() {
         setIntelLoading(false);
       }
     }
-  }, [accountId, canAccessDashboard, effectiveBranch]);
+  }, [accountId, canAccessDashboard, features.advancedAnalytics, effectiveBranch]);
 
   const loadDashboard = useCallback(
     async (isRefresh = false) => {
       dashboardAbortRef.current?.abort();
-      if (!accountId || !canAccessDashboard) {
+      if (!accountId || !canAccessDashboard || !features.advancedAnalytics) {
         dashboardAbortRef.current = null;
         setLoading(false);
         setRefreshing(false);
@@ -207,7 +209,7 @@ export default function DashboardScreen() {
         }
       }
     },
-    [accountId, canAccessDashboard, bounds.fromMs, bounds.toMs, effectiveBranch]
+    [accountId, canAccessDashboard, features.advancedAnalytics, bounds.fromMs, bounds.toMs, effectiveBranch]
   );
 
   useEffect(() => {
@@ -262,6 +264,18 @@ export default function DashboardScreen() {
       };
     });
   }, [comparison, bounds.toMs]);
+
+  if (!features.advancedAnalytics) {
+    return (
+      <PlanLockedView
+        feature="advancedAnalytics"
+        asScreen
+        screenTitle="Dashboard Ejecutivo"
+        onBack={() => router.back()}
+        currentPlanName={planName}
+      />
+    );
+  }
 
   if (!canAccessDashboard) {
     return (
@@ -366,7 +380,7 @@ export default function DashboardScreen() {
               </TouchableOpacity>
             );
           })}
-          {hasAllBranchesAccess && (
+          {features.multiBranch && hasAllBranchesAccess && (
             <TouchableOpacity
               onPress={() => setScopeAllBranches((v) => !v)}
               style={[styles.pill, scopeAllBranches && styles.pillActive]}

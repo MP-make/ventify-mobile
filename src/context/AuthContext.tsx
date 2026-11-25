@@ -81,6 +81,12 @@ import {
   type PinAttemptState,
   type StoredPinRecord,
 } from '@/lib/pin-mobile';
+import {
+  arePlanEntitlementsEqual,
+  DEFAULT_PLAN_ENTITLEMENTS,
+  resolvePlanEntitlements,
+  type PlanEntitlements,
+} from '@/lib/plan-entitlements';
 
 export type UserRole = 'owner' | 'admin' | 'manager' | 'cashier' | 'seller';
 
@@ -450,6 +456,7 @@ const PlanAccessContext = createContext<PlanAccessContextType>(DEFAULT_PLAN_ACCE
 const PlanAccessActionsContext = createContext<PlanAccessActionsContextType>(
   DEFAULT_PLAN_ACCESS_ACTIONS
 );
+const PlanFeaturesContext = createContext<PlanEntitlements>(DEFAULT_PLAN_ENTITLEMENTS);
 const PinLockContext = createContext<PinLockContextType>(DEFAULT_PIN_LOCK);
 const AuthContext = createContext<AuthContextType>({
   ...DEFAULT_AUTH_SESSION,
@@ -2369,6 +2376,31 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     [limits, subscription, accessChecking, accessError, accessBlocked, refreshAccess]
   );
 
+  const planId = subscription?.planId ?? null;
+  const planName = subscription?.planName ?? null;
+  const branchesMax = limits?.branches?.max ?? null;
+  const usersMax = limits?.users?.max ?? null;
+  const productsMax = limits?.products?.max ?? null;
+  const aiMessagesMax = limits?.aiMessages?.max ?? null;
+
+  const planEntitlementsRef = useRef<PlanEntitlements>(DEFAULT_PLAN_ENTITLEMENTS);
+  const planFeaturesValue = useMemo<PlanEntitlements>(() => {
+    const next = resolvePlanEntitlements({
+      isSuperAdmin,
+      planId,
+      planName,
+      branchesMax,
+      usersMax,
+      productsMax,
+      aiMessagesMax,
+    });
+    if (arePlanEntitlementsEqual(planEntitlementsRef.current, next)) {
+      return planEntitlementsRef.current;
+    }
+    planEntitlementsRef.current = next;
+    return next;
+  }, [isSuperAdmin, planId, planName, branchesMax, usersMax, productsMax, aiMessagesMax]);
+
   const pinLockValue = useMemo<PinLockContextType>(
     () => ({
       isPinLocked,
@@ -2412,11 +2444,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       <NetworkStatusContext.Provider value={networkStatusValue}>
         <PlanAccessActionsContext.Provider value={planAccessActionsValue}>
           <PlanAccessContext.Provider value={planAccessValue}>
-            <PinLockContext.Provider value={pinLockValue}>
-              <AuthContext.Provider value={contextValue}>
-                <PermissionsProvider>{children}</PermissionsProvider>
-              </AuthContext.Provider>
-            </PinLockContext.Provider>
+            <PlanFeaturesContext.Provider value={planFeaturesValue}>
+              <PinLockContext.Provider value={pinLockValue}>
+                <AuthContext.Provider value={contextValue}>
+                  <PermissionsProvider>{children}</PermissionsProvider>
+                </AuthContext.Provider>
+              </PinLockContext.Provider>
+            </PlanFeaturesContext.Provider>
           </PlanAccessContext.Provider>
         </PlanAccessActionsContext.Provider>
       </NetworkStatusContext.Provider>
@@ -2429,4 +2463,5 @@ export const useAuthSession = () => useContext(AuthSessionContext);
 export const useNetworkStatus = () => useContext(NetworkStatusContext);
 export const usePlanAccess = () => useContext(PlanAccessContext);
 export const usePlanAccessActions = () => useContext(PlanAccessActionsContext);
+export const usePlanFeatures = () => useContext(PlanFeaturesContext);
 export const usePinLock = () => useContext(PinLockContext);

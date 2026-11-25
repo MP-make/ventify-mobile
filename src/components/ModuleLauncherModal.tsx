@@ -22,7 +22,7 @@ import {
   UserCheck,
   X,
 } from 'lucide-react-native';
-import { useAuthSession, usePinLock } from '@/context/AuthContext';
+import { useAuthSession, usePinLock, usePlanFeatures } from '@/context/AuthContext';
 import { useBusinessSettings } from '@/context/SettingsContext';
 import { usePermissions } from '@/hooks/usePermissions';
 import { ui } from '@/lib/theme';
@@ -41,6 +41,7 @@ interface LauncherModuleItem {
   tintBg: string;
   tintColor: string;
   badgeCount?: number;
+  lockedBadge?: string;
   icon: LucideIcon;
 }
 
@@ -71,7 +72,12 @@ const LauncherTile = React.memo<{
         <View style={iconBoxStyle}>
           <Icon size={20} color={item.tintColor} />
         </View>
-        {item.badgeCount && item.badgeCount > 0 ? (
+        {item.lockedBadge ? (
+          <View style={styles.lockedPill}>
+            <Lock size={10} color={ui.accent} />
+            <Text style={styles.lockedPillText}>{item.lockedBadge}</Text>
+          </View>
+        ) : item.badgeCount && item.badgeCount > 0 ? (
           <View style={styles.badgePill}>
             <Text style={styles.badgePillText}>
               {item.badgeCount > 99 ? '99+' : item.badgeCount}
@@ -94,6 +100,7 @@ const ModuleLauncherModalContent: React.FC<ModuleLauncherModalProps> = React.mem
     const insets = useSafeAreaInsets();
     const router = useRouter();
     const { accountId, userProfile } = useAuthSession();
+    const { features } = usePlanFeatures();
     const { lockTerminal } = usePinLock();
     const { businessName, activeBranchName } = useBusinessSettings();
     const {
@@ -120,6 +127,7 @@ const ModuleLauncherModalContent: React.FC<ModuleLauncherModalProps> = React.mem
           route: '/dashboard',
           tintBg: ui.primarySoft,
           tintColor: ui.primary,
+          lockedBadge: features.advancedAnalytics ? undefined : 'Pro',
           icon: BarChart3,
         });
       }
@@ -132,6 +140,7 @@ const ModuleLauncherModalContent: React.FC<ModuleLauncherModalProps> = React.mem
           route: '/reports',
           tintBg: ui.accentSoft,
           tintColor: ui.accent,
+          lockedBadge: features.advancedAnalytics ? undefined : 'Pro',
           icon: FileSpreadsheet,
         });
       }
@@ -147,11 +156,15 @@ const ModuleLauncherModalContent: React.FC<ModuleLauncherModalProps> = React.mem
           route: '/facturacion',
           tintBg: ui.successSoft,
           tintColor: ui.success,
+          lockedBadge: features.sunatInvoicing ? undefined : 'Emprendedor',
           icon: ReceiptText,
         });
       }
 
-      if (hasPermission('access_branches') || hasPermission('manage_branches')) {
+      if (
+        features.multiBranch &&
+        (hasPermission('access_branches') || hasPermission('manage_branches'))
+      ) {
         list.push({
           id: 'branches',
           title: 'Sucursales',
@@ -178,6 +191,9 @@ const ModuleLauncherModalContent: React.FC<ModuleLauncherModalProps> = React.mem
       return list;
     }, [
       accountId,
+      features.advancedAnalytics,
+      features.sunatInvoicing,
+      features.multiBranch,
       canAccessDashboard,
       canViewReports,
       canCreateCreditNotes,
@@ -428,6 +444,20 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     fontSize: 11,
     fontWeight: '800',
+  },
+  lockedPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingHorizontal: 7,
+    paddingVertical: 3,
+    borderRadius: 999,
+    backgroundColor: ui.accentSoft,
+  },
+  lockedPillText: {
+    fontSize: 10,
+    fontWeight: '800',
+    color: ui.accent,
   },
   tileTitle: {
     fontSize: 14,
